@@ -23,7 +23,8 @@ module a_geom #(
                                                                             // (board B's b_render BAND8_MAXW; 0: 4-row bands always)
     parameter bit    VS_SFU_TAB2 = 1'b0,                                    // the vertex core's SFU tables shared by pairs of units
     parameter bit    VS_INT_DIV  = 1'b1,                                    // the vertex core's integer divider
-    parameter bit    VS_SINCOS   = 1'b1                                     // the vertex core's SIN / COS units
+    parameter bit    VS_SINCOS   = 1'b1,                                    // the vertex core's SIN / COS units
+    parameter int    VS_NL       = 16                                       // the vertex core's lanes per warp (16, 8 or 4)
 )(
     input  wire        clk, rst,
     // command port
@@ -145,7 +146,7 @@ module a_geom #(
     end
     assign g_draw_ok = dr_ok & ~sf_full;
     assign g_copy_busy = copy_busy;
-    a_vertex #(.NVEC(NVEC), .NSLOT(NSLOT), .NWARP(NWARP), .SFU_TAB2(VS_SFU_TAB2), .INT_DIV(VS_INT_DIV), .SINCOS(VS_SINCOS)) u_vtx (.clk, .rst,
+    a_vertex #(.NVEC(NVEC), .NSLOT(NSLOT), .NWARP(NWARP), .NL(VS_NL), .SFU_TAB2(VS_SFU_TAB2), .INT_DIV(VS_INT_DIV), .SINCOS(VS_SINCOS)) u_vtx (.clk, .rst,
         .iram_we, .iram_waddr, .iram_wdata, .param_we(g_param_we), .param_idx(g_param_idx), .param_data(g_param_data),
         .ad_we(g_ad_we), .ad_idx(g_ad_idx), .ad_en(g_ad_en), .ad_type(g_ad_type), .ad_norm(g_ad_norm), .ad_base(g_ad_base), .ad_size(g_ad_size),
         .ad_stride(g_ad_stride), .ad_off(g_ad_off),

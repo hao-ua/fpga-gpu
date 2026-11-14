@@ -4,7 +4,21 @@
 // model, program / uniforms / descriptors / draw state through the ports; the binner pushes (tri id, band range), in
 // order, and the triangle records in DDR (REC_BASE + id * 128 words) must equal the golden word for word.
 //   +SEED_<n>   (tools/gen/av_<n>_*, as_<n>_state.mem, as_<n>_rec.hex)
+//   defines (sim_gpu.ps1 -Defines): VS_NL8 / VS_NL4 the vertex core's lanes per warp (default 16); VS_ONEB the one-board
+//               configuration of the core (NWARP 4, SFU_TAB2 1, INT_DIV 0, SINCOS 0)
 `default_nettype none
+`ifdef VS_NL4
+`define TB_NLP .NL(4),
+`elsif VS_NL8
+`define TB_NLP .NL(8),
+`else
+`define TB_NLP
+`endif
+`ifdef VS_ONEB
+`define TB_CFG .NWARP(4), .SFU_TAB2(1'b1), .INT_DIV(1'b0), .SINCOS(1'b0),
+`else
+`define TB_CFG
+`endif
 module tb_a_geom;
     localparam int W = 24, TW = 96, NVEC = 8, VW = NVEC * TW, BANDW = 10, IDX_W = 20, DID_W = 12;
     localparam [28:0] REC_BASE = 29'h1000000, BINLIST_BASE = 29'h1800000;
@@ -33,7 +47,7 @@ module tb_a_geom;
     mig_app_model #(.RD_LAT(24), .RDY_PCT(70), .WDF_PCT(75)) mig (.ui_clk(clk), .rst, .app_en, .app_cmd, .app_addr, .app_wdf_data,
         .app_wdf_mask, .app_wdf_wren, .app_wdf_end, .app_rdy, .app_wdf_rdy, .app_rd_data, .app_rd_data_valid(app_rd_valid),
         .errors(mig_errors), .n_wr, .n_rd);
-    a_vertex #(.NVEC(NVEC)) u_vtx (.clk, .rst, .iram_we, .iram_waddr, .iram_wdata, .param_we, .param_idx, .param_data,
+    a_vertex #(`TB_NLP `TB_CFG .NVEC(NVEC)) u_vtx (.clk, .rst, .iram_we, .iram_waddr, .iram_wdata, .param_we, .param_idx, .param_data,
         .ad_we, .ad_idx, .ad_en, .ad_type, .ad_norm, .ad_base, .ad_size, .ad_stride, .ad_off, .ac_we, .ac_idx, .ac_const,
         .dr_start, .dr_mode, .dr_indexed, .dr_u8, .dr_idx_base, .dr_first, .dr_count, .dr_varmask(varmask), .dr_ok, .copy_busy(), .draw_done(), .dr_busy, .err_stack,
         .r_en, .r_addr, .r_rdy, .r_valid, .rd_data, .vo_valid, .vo_ready, .vo_pos, .vo_var, .vo_psize, .vo_prim, .vo_first);

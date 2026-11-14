@@ -25,6 +25,7 @@
 `default_nettype none
 module vtx_asm #(
     parameter int W = 24,
+    parameter int NL = 16,                       // lanes of the vertex core's warp (a reference's lane: 16, 8 or 4)
     parameter int NSLOT = 8,
     parameter int NVEC = 8,
     parameter int FD = 32,                       // reference FIFO depth (power of 2)
@@ -42,13 +43,14 @@ module vtx_asm #(
     // references from the feed
     input  wire        ref_valid,
     input  wire [$clog2(NSLOT)-1:0] ref_slot,
-    input  wire [3:0]  ref_lane,
+    input  wire [((NL > 1) ? $clog2(NL) : 1)-1:0] ref_lane,
     output wire        ref_ready,
     output wire [5:0]  ref_cnt,
     // result buffer
     input  wire [NSLOT-1:0] done,
     output reg  [$clog2(NSLOT)-1:0] rd_slot,
-    output reg  [3:0]  rd_vidx, rd_lane,
+    output reg  [3:0]  rd_vidx,
+    output reg  [((NL > 1) ? $clog2(NL) : 1)-1:0] rd_lane,
     input  wire [4*W-1:0] rd_data,               // valid the cycle after rd_*
     output reg         ref_dec,
     output reg  [$clog2(NSLOT)-1:0] ref_dec_slot,
@@ -71,7 +73,8 @@ module vtx_asm #(
     output reg  [4*W-1:0] pa_pos,
     output reg         pa_first
 );
-    localparam int SW = $clog2(NSLOT), RW = SW + 4, FW = $clog2(FD), DW = $clog2(DQ);
+    localparam int LNW = (NL > 1) ? $clog2(NL) : 1;
+    localparam int SW = $clog2(NSLOT), RW = SW + LNW, FW = $clog2(FD), DW = $clog2(DQ);   // a reference {slot, lane}
     // ---- draw FIFO: {varmask, count, mode}
     reg [42:0] dq [0:DQ-1]; reg [DW-1:0] d_wp, d_rp; reg [DW:0] d_cnt;
     assign dq_full = (d_cnt == (DW+1)'(DQ));
@@ -187,12 +190,12 @@ module vtx_asm #(
             // ---------------- the reader: the positions ahead of F, else the next row of V's vertex
             if (pa_req && pa_grant) begin p_run <= 1'b1; p_i <= 2'd0; end
             if (p_iss) begin
-                rd_slot <= p_ref[RW-1 -: SW]; rd_lane <= p_ref[3:0]; rd_vidx <= 4'd8; rd_v <= 1'b1; rd_p <= 1'b1; rd_l <= 1'b0;
+                rd_slot <= p_ref[RW-1 -: SW]; rd_lane <= p_ref[LNW-1:0]; rd_vidx <= 4'd8; rd_v <= 1'b1; rd_p <= 1'b1; rd_l <= 1'b0;
                 rd_pf <= f_first && (p_i == 2'd0); rd_item_q <= 4'd8;
                 p_i <= p_i + 2'd1;
                 if (p_i == 2'd2) begin p_run <= 1'b0; f_pd <= 1'b1; end
             end else if (v_iss) begin
-                rd_slot <= cur[RW-1 -: SW]; rd_lane <= cur[3:0]; rd_vidx <= ritem; rd_v <= 1'b1; rd_p <= 1'b0; rd_l <= rlast;
+                rd_slot <= cur[RW-1 -: SW]; rd_lane <= cur[LNW-1:0]; rd_vidx <= ritem; rd_v <= 1'b1; rd_p <= 1'b0; rd_l <= rlast;
                 rd_f <= (vi == 2'd0); rd_item_q <= ritem;
                 rrem <= rr & ~(10'd1 << ritem); vr_act <= ~rlast;
                 if (rlast) begin

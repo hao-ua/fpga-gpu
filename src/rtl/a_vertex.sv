@@ -16,10 +16,12 @@
 module a_vertex #(
     parameter int EXP_W = 7, MAN_W = 16,
     parameter int NWARP = 4,
+    parameter int NL = 16,                      // the vertex core's lanes per warp = vertices per warp and result slot (16, 8, 4)
     parameter bit SFU_TAB2 = 1'b0,              // the vertex core's SFU tables shared by pairs of units (shader_core_vs2 SFU_TAB2)
     parameter bit INT_DIV = 1'b1,               // the vertex core's integer divider (shader_core_vs2 INT_DIV)
     parameter bit SINCOS = 1'b1,                // the vertex core's SIN / COS units (shader_core_vs2 SINCOS)
-    parameter int NSLOT = 16,                    // result slots (>= the core's warps + the assembler's held references + the forming warp)
+    parameter int NSLOT = 16,                    // result slots (>= the core's warps + the assembler's held references + the forming warp;
+                                                 // <= 16); the buffer holds NSLOT x NL vertices
     parameter int NVEC = 8,
     parameter int NATTR = 16, NPARAM = 256, IRAM_DEPTH = 4096
 )(
@@ -79,16 +81,17 @@ module a_vertex #(
     output wire        prof_feed, prof_core, prof_asm
 );
     localparam int W = 1 + EXP_W + MAN_W, TW = 4*W, SW = $clog2(NSLOT), PAW = $clog2(NPARAM);
+    localparam int LNW = (NL > 1) ? $clog2(NL) : 1;                  // a lane of the core's warp
     wire        va_we, in_ready, in_start, in_bank, c_out_valid, c_out_ack, c_idle, c_err;
-    wire [3:0]  va_lane, va_idx; wire [4*W-1:0] va_data; wire [15:0] in_active; wire [1:0] in_warp;
-    wire [6:0]  c_out_sel; wire [16*W-1:0] c_out_row; wire [NWARP-1:0] busy_warps;
+    wire [LNW-1:0] va_lane; wire [3:0] va_idx; wire [4*W-1:0] va_data; wire [NL-1:0] in_active; wire [1:0] in_warp;
+    wire [6:0]  c_out_sel; wire [NL*W-1:0] c_out_row; wire [NWARP-1:0] busy_warps;
     // ---- the uniform shadow and its copy into the core's banks
     (* ram_style = "block" *) reg [TW-1:0] ushadow [0:NPARAM-1];
     initial for (int k = 0; k < NPARAM; k++) ushadow[k] = '0;      // ES 2.0: uniforms are 0 until set
     reg [NPARAM-1:0] dirty_cur, dirty_prev, cmask;
     reg  cp_run, cp_rd; reg [PAW-1:0] cp_idx; reg cbank; reg [TW-1:0] cp_q;
-    // the copy's second stage (timing: the BRAM's latch straight to the 16 lane banks' DI is too slow): cp_q2 is the
-    // BRAM's output register; a third, fabric stage cp_q3 (timing at 120 MHz: the 16 lanes' uniform copies are spread
+    // the copy's second stage (timing: the BRAM's latch straight to the NL lane banks' DI is too slow): cp_q2 is the
+    // BRAM's output register; a third, fabric stage cp_q3 (timing at 120 MHz: the NL lanes' uniform copies are spread
     // over the die, the route alone from the BRAM's output register fills the cycle): the write lands two cycles after
     // the read
     reg  cp_rd2, cp_rd3; reg [PAW-1:0] cp_idx2, cp_idx3; reg [TW-1:0] cp_q2, cp_q3;
@@ -128,7 +131,7 @@ module a_vertex #(
             if (in_start && in_ready) wpar[in_warp] <= in_bank;
         end
     end
-    shader_core_vs2 #(.EXP_W(EXP_W), .MAN_W(MAN_W), .NWARP(NWARP), .NPARAM(NPARAM), .NATTR(NATTR), .IRAM_DEPTH(IRAM_DEPTH),
+    shader_core_vs2 #(.EXP_W(EXP_W), .MAN_W(MAN_W), .NWARP(NWARP), .NL(NL), .NPARAM(NPARAM), .NATTR(NATTR), .IRAM_DEPTH(IRAM_DEPTH),
                       .SFU_TAB2(SFU_TAB2), .INT_DIV(INT_DIV), .SINCOS(SINCOS)) u_core (
         .clk, .rst, .iram_we, .iram_waddr, .iram_wdata, .param_we(cp_rd3), .param_bank(cbank), .param_idx(cp_idx3), .param_data(cp_q3),
         .va_we, .va_lane, .va_idx, .va_data, .in_ready, .in_warp, .in_start, .in_bank, .in_active, .busy_warps,
@@ -137,9 +140,9 @@ module a_vertex #(
     // the draw's parameters are held for the feed until its copy is done (the dispatcher changes nothing meanwhile: dr_ok is low)
     wire        f_busy, a_busy, launch, alloc, ref_valid, ref_ready, ref_dec, lq_empty, launch_ps;
     wire [SW-1:0] launch_slot, alloc_slot, ref_slot, ref_dec_slot, rd_slot;
-    wire [3:0]  ref_lane, rd_vidx, rd_lane; wire [5:0] ref_cnt; wire [7:0] launch_varmask;
+    wire [LNW-1:0] ref_lane, rd_lane; wire [3:0] rd_vidx; wire [5:0] ref_cnt; wire [7:0] launch_varmask;
     wire [NSLOT-1:0] slot_free, done; wire [4*W-1:0] rb_data;    // the result buffer's read bus
-    vtx_feed #(.W(W), .NSLOT(NSLOT)) u_feed (.clk, .rst,
+    vtx_feed #(.W(W), .NL(NL), .NSLOT(NSLOT)) u_feed (.clk, .rst,
         .dr_start(f_start), .dr_indexed(f_indexed), .dr_u8(f_u8), .dr_idx_base(f_idx_base), .dr_first(f_first), .dr_count(f_count),
         .dr_bank(cbank), .dr_varmask(f_vm), .dr_ps(f_ps),
         .busy(f_busy), .issue_idle(f_issue_idle), .dcopy_busy(f_dcopy_busy),
@@ -148,12 +151,12 @@ module a_vertex #(
         .va_we, .va_lane, .va_idx, .va_data, .in_ready, .in_start, .in_bank, .in_active,
         .launch, .launch_slot, .launch_varmask, .launch_ps, .alloc, .alloc_slot, .slot_free,
         .ref_valid, .ref_slot, .ref_lane, .ref_ready, .ref_cnt);
-    vtx_rbuf #(.W(W), .NSLOT(NSLOT), .LQ(8)) u_rbuf (.clk, .rst,
+    vtx_rbuf #(.W(W), .NL(NL), .NSLOT(NSLOT), .LQ(8)) u_rbuf (.clk, .rst,
         .out_valid(c_out_valid), .out_ack(c_out_ack), .out_sel(c_out_sel), .out_row(c_out_row),
         .launch, .launch_slot, .launch_varmask, .launch_ps, .alloc, .alloc_slot,
         .ref_inc(ref_valid & ref_ready), .ref_inc_slot(ref_slot), .ref_dec, .ref_dec_slot,
         .slot_free, .done, .lq_empty, .rd_slot, .rd_vidx, .rd_lane, .rd_data(rb_data));
-    vtx_asm #(.W(W), .NSLOT(NSLOT), .NVEC(NVEC)) u_asm (.clk, .rst,
+    vtx_asm #(.W(W), .NL(NL), .NSLOT(NSLOT), .NVEC(NVEC)) u_asm (.clk, .rst,
         .start(dr_start & dr_ok), .mode(dr_mode), .count(dr_count), .varmask(dr_varmask), .dq_full(a_dq_full), .draw_done, .busy(a_busy),
         .ref_valid, .ref_slot, .ref_lane, .ref_ready, .ref_cnt,
         .done, .rd_slot, .rd_vidx, .rd_lane, .rd_data(rb_data), .ref_dec, .ref_dec_slot,

@@ -1,9 +1,9 @@
 // vtx_rbuf — the vertex result buffer of board A's front end (a_vertex.sv). Finished warps leave
 //   the vertex core in launch order; this block copies each one's rows — gl_Position and the varyings the fragment
 //   shader reads (varmask) — out of the core's output store (out_sel, one row per cycle, the row registered) into a
-//   LANE-BANKED store: per lane one block RAM of vec4s, addressed by {result slot, vec4 index} (index 0..7 = varying,
-//   8 = gl_Position, 9 = the gl_PointSize row when ps_en: a POINTS draw), so a row of 16 lanes is written in one
-//   cycle and the assembler reads any vertex's vec4 in one.
+//   LANE-BANKED store: per lane (NL of them, the core's warp) one block RAM of vec4s, addressed by {result slot, vec4
+//   index} (index 0..7 = varying, 8 = gl_Position, 9 = the gl_PointSize row when ps_en: a POINTS draw), so a row of NL
+//   lanes is written in one cycle and the assembler reads any vertex's vec4 in one.
 //   NSLOT result slots: the feed allocates them in order (alloc clears the slot's done flag), the launch order maps the
 //   core's retiring warp to its slot (a small FIFO), done[slot] rises after the last row, and a reference count per
 //   slot (one per reference the feed pushes, one less per reference the assembler releases) says when a slot is free
@@ -11,6 +11,7 @@
 `default_nettype none
 module vtx_rbuf #(
     parameter int W = 24,
+    parameter int NL = 16,                       // lanes of the vertex core's warp (16, 8 or 4)
     parameter int NSLOT = 8,
     parameter int LQ = 8                         // launched-slot FIFO depth (>= the core's warps in flight)
 )(
@@ -19,7 +20,7 @@ module vtx_rbuf #(
     input  wire        out_valid,
     output reg         out_ack,
     output reg  [6:0]  out_sel,
-    input  wire [16*W-1:0] out_row,
+    input  wire [NL*W-1:0] out_row,
     // slots
     input  wire        launch,                   // slot launch_slot was launched into the core, with its draw's copy set:
     input  wire [$clog2(NSLOT)-1:0] launch_slot,
@@ -38,10 +39,10 @@ module vtx_rbuf #(
     // read port (the assembler)
     input  wire [$clog2(NSLOT)-1:0] rd_slot,
     input  wire [3:0]  rd_vidx,
-    input  wire [3:0]  rd_lane,
+    input  wire [((NL > 1) ? $clog2(NL) : 1)-1:0] rd_lane,
     output wire [4*W-1:0] rd_data
 );
-    localparam int SW = $clog2(NSLOT), AW = SW + 4;
+    localparam int SW = $clog2(NSLOT), AW = SW + 4, LNW = (NL > 1) ? $clog2(NL) : 1;
     // ---- launched-slot FIFO: {point size row, varmask, slot}
     localparam int LW = $clog2(LQ);
     reg [SW+8:0] lq [0:LQ-1]; reg [LW-1:0] lq_wp, lq_rp; reg [LW:0] lq_cnt;
@@ -96,11 +97,11 @@ module vtx_rbuf #(
     //      write enables (W / 8 bytes a component), the vec4 read whole
     if (W % 8 != 0) $error("vtx_rbuf: W must be a multiple of 8 (byte write enables)");
     localparam int CB = W / 8;
-    reg [3:0] rl_q;
+    reg [LNW-1:0] rl_q;
     always @(posedge clk) rl_q <= rd_lane;
-    wire [4*W-1:0] lane_q [0:15];
+    wire [4*W-1:0] lane_q [0:NL-1];
     genvar gl;
-    generate for (gl = 0; gl < 16; gl = gl + 1) begin : BL
+    generate for (gl = 0; gl < NL; gl = gl + 1) begin : BL
         (* ram_style="block" *) reg [4*W-1:0] m [0:(1 << AW)-1];
         reg [4*W-1:0] q;
         wire [4*W-1:0] wd = {4{out_row[gl*W +: W]}};

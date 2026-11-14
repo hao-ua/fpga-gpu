@@ -72,6 +72,7 @@ module b_render #(
                                                    // x two samples live; with 2 the 4-sample full-screen pass is TEX-latency-bound:
                                                    // 46 cycles per quad against an issue ideal of 25)
     parameter [28:0] DS_BASE  = 29'h0200_0000,
+    parameter bit    ROP_BLEND1 = 1'b0,            // b_rop's one blend unit shared by a pair's two pixels (b_rop BLEND1)
     parameter bit    VOL3D    = 1'b0,              // tmu24's 3D texture path (see there); off = constant-folded away
     parameter bit    F2_DUAL  = 1'b1,              // tmu24's F2 at two pixels per cycle (0 = the −0.6 k LUT fallback)
     parameter bit    TC_PF    = 1'b1,              // tmu24's texture-cache prefetch (0 = the 64 KB cache alone)
@@ -454,7 +455,7 @@ module b_render #(
     end
     wire        pl_nok = nx_ok || spn_ok;
     wire [10:0] pl_ny0 = nx_ok ? bq_y0[nx_slot] : spn_y0[10:0];
-    b_rop #(.CW(CW), .MAXW(MAXW), .NLINES(NLINES), .NLMAX(NLMAX), .CELLS(CELLS), .SAMPLES(1)) u_rop (.clk, .rst(rst_q), .width(rt_width), .nl, .band_y0, .fmt(rt_fmt),
+    b_rop #(.CW(CW), .MAXW(MAXW), .NLINES(NLINES), .NLMAX(NLMAX), .CELLS(CELLS), .SAMPLES(1), .BLEND1(ROP_BLEND1)) u_rop (.clk, .rst(rst_q), .width(rt_width), .nl, .band_y0, .fmt(rt_fmt),
         .color_base(rt_base), .bursts_per_line(rt_bpl), .ds_en, .ds_base, .ds_bpl,
         .band_start, .band_flush_req, .band_flush_done, .band_busy,
         .band_run, .flush_busy, .rmw_idle, .next_ok(pl_nok), .next_y0(pl_ny0), .pl_rdy, .pl_rdy_y0, .pf_clear(go),

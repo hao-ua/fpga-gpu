@@ -5,8 +5,8 @@
 //   processor through link_a_port -> link_loop -> link_b_port, B's EVENTs / READ_DATA / STATUS come back the same way.
 //   DDR3: ONE address space for both cores, as the two boards' address spaces were (word addresses, 4-byte units):
 //   board A's fixed regions at the bottom (the ingress ring 0-64 MB, records and bin lists up to 256 MB, REC_* / BINLIST_*
-//   / POOL_W below), the rest the host's, which keeps A's buffers and B's images apart (host heaps: A 256-448 MB, B 448 MB
-//   to 1 GB).
+//   / POOL_W below), B's draw buckets at 448-464 MB (B3D_DS_BASE, 16 MB), the rest the host's, which keeps A's buffers
+//   and B's images apart (host heaps: A 256-448 MB, B 464 MB to 1 GB).
 //   Arbiter ports, highest priority first: R0 B scanout (MUST_RUN), R1 A ingress ring, R2 A transfer engine, R3 B READ /
 //   COPY, R4 B xfer_lin, R5-R7 B band load / TMU / buckets, R8-R10 A geometry; W0 A ring, W1 A transfer engine, W2-W3 A
 //   geometry, W4 B WRITE_IMAGE, W5 B xfer_lin, W6 B FILL / COPY, W7 B band flush.
@@ -34,9 +34,13 @@ module board_ab_core #(
     parameter int    B3D_CELLS      = 2048,
     parameter int    DISP_MAXW      = 800,
     parameter int    DISP_LB_LINES  = 8,
-    // warps in flight: the vertex core (board A's geometry stage) and the fragment core
+    // warps in flight and lanes per warp: the vertex core (board A's geometry stage) and the fragment core
     parameter int    VS_NWARP       = 4,
     parameter int    B3D_NWARP      = 4,
+    parameter int    B3D_NL         = 4,                // 16, 8 or 4 (a warp = B3D_NL / 4 quads)
+    // B's draw buckets (word address): 448 MB, above board A's regions and below the host's B heap
+    parameter [28:0] B3D_DS_BASE    = 29'h0700_0000,
+    parameter bit    B3D_ROP_BLEND1 = 1'b1,             // one blend unit shared by a pair's two pixels (the same rate)
     // both shader cores' SFU tables shared by pairs of units (block RAM for nothing, bit-identical)
     parameter bit    SFU_TAB2       = 1'b1,
     // both shader cores' integer dividers: none (the compilers lower integer division to float ops; STATUS says so)
@@ -146,7 +150,8 @@ module board_ab_core #(
                    .B3D_NLINES(B3D_NLINES), .B3D_MAXW(B3D_MAXW), .B3D_CELLS(B3D_CELLS), .B3D_NWARP(B3D_NWARP),
                    .B3D_NTS(B3D_NTS), .B3D_NLMAX(B3D_NLMAX), .B3D_BAND8_MAXW(BAND8_MAXW), .DISP_MAXW(DISP_MAXW),
                    .DISP_LB_LINES(DISP_LB_LINES), .B3D_SFU_TAB2(SFU_TAB2), .B3D_INT_DIV(INT_DIV), .B3D_SINCOS(SINCOS), .B3D_XSFU(B3D_XSFU),
-                   .B3D_QRINF(B3D_QRINF), .B3D_TEXQ(B3D_TEXQ), .EXT_ARB(1'b1), .EXT_LINK(1'b1)) u_b (
+                   .B3D_QRINF(B3D_QRINF), .B3D_TEXQ(B3D_TEXQ), .B3D_NL(B3D_NL), .B3D_DS_BASE(B3D_DS_BASE),
+                   .B3D_ROP_BLEND1(B3D_ROP_BLEND1), .EXT_ARB(1'b1), .EXT_LINK(1'b1)) u_b (
         .clk_sys, .rst_sys, .calib_done, .clk200, .key1_n, .dbg_cmd_valid, .dbg_cmd,
         .app_en(), .app_cmd(), .app_addr(), .app_wdf_data(), .app_wdf_mask(), .app_wdf_wren(), .app_wdf_end(),
         .app_rdy(1'b0), .app_wdf_rdy(1'b0), .app_rd_data_valid(1'b0), .app_rd_data(256'd0),
@@ -197,6 +202,19 @@ module board_ab_core #(
         .app_en(app_en), .app_cmd(app_cmd), .app_addr(app_addr), .app_wdf_data(app_wdf_data),
         .app_wdf_mask(app_wdf_mask), .app_wdf_wren(app_wdf_wren), .app_wdf_end(app_wdf_end),
         .app_rdy(app_rdy), .app_wdf_rdy(app_wdf_rdy), .app_rd_data_valid(app_rd_data_valid), .app_rd_data(app_rd_data));
+
+    // synthesis translate_off
+    // the shared address space's fixed regions: board B never writes below the end of board A's (the ring, the record
+    // banks, the bin pools); A's geometry writes (W2, W3) stay inside its record banks and bin pools
+    localparam [28:0] A_END = BINLIST_BASE + 2 * POOL_W;
+    always @(posedge clk_sys) if (!rst_ddr) for (int i = 0; i < 8; i++) if (w_en[i] && w_rdy[i]) begin
+        if (i >= 4 && w_addr[i*29 +: 29] < A_END)
+            $fatal(1, "board_ab_core: board B write (port W%0d) at word %h, inside board A's regions (below %h)", i, w_addr[i*29 +: 29], A_END);
+        if ((i == 2 || i == 3) && (w_addr[i*29 +: 29] < REC_BASE || w_addr[i*29 +: 29] >= A_END))
+            $fatal(1, "board_ab_core: board A geometry write (port W%0d) at word %h, outside [%h, %h)", i, w_addr[i*29 +: 29], REC_BASE, A_END);
+    end
+    initial if (B3D_DS_BASE < A_END) $fatal(1, "board_ab_core: B3D_DS_BASE %h inside board A's regions (below %h)", B3D_DS_BASE, A_END);
+    // synthesis translate_on
 
     // LEDs: DDR calibrated, Ethernet link up (board A's)
     assign led = led_a;

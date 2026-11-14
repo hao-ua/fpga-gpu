@@ -68,6 +68,10 @@ module board_b_core
     parameter int    B3D_NTS        = 16,            // fragment-core triangle slots (b_render NTS)
     parameter int    B3D_TEXQ       = 8,             // TEX instructions live at once (b_render FS_TEXQ: with 2, multi-texture
                                                      // shaders run about 8 cycles per quad per sample)
+    // the draw buckets' region (word address; 8192 draws x 2 KB = 16 MB): written by the command processor's DRAW_STATE,
+    // read by b_render at a draw change
+    parameter [28:0] B3D_DS_BASE    = 29'h0200_0000,
+    parameter bit    B3D_ROP_BLEND1 = 1'b0,          // the ROP's one blend unit shared by a pair's two pixels (b_rop BLEND1)
     // TEX_SKIP: uncovered pixels of a quad unsampled where the program allows; TEX_W2: two texture-result writers in the
     // fragment core; FS_PRE: the program fetch ahead of the launch, off — b_render FS_PRE 0 folds its logic away
     parameter bit    B3D_TEX_SKIP   = 1'b1,
@@ -286,7 +290,7 @@ module board_b_core
     wire [31:0] rd_tjobs, rd_tast, rd_thit, rd_tmiss;   // the texture unit's cumulative counters: status words 18-21
     wire [24*32-1:0] rd_prof;                           // the render engine's cumulative profile counters (b_render hwprof): JTAG words 24-47
     b_render #(.NLINES(B3D_NLINES), .NLMAX(B3D_NLMAX), .BAND8_MAXW(B3D_BAND8_MAXW), .MAXW(B3D_MAXW), .CELLS(B3D_CELLS), .NTS(B3D_NTS), .FS_TEXQ(B3D_TEXQ),
-               .FS_SFU_TAB2(B3D_SFU_TAB2), .FS_INT_DIV(B3D_INT_DIV), .FS_SINCOS(B3D_SINCOS), .FS_NWARP(B3D_NWARP), .FS_NL(B3D_NL), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
+               .FS_SFU_TAB2(B3D_SFU_TAB2), .FS_INT_DIV(B3D_INT_DIV), .FS_SINCOS(B3D_SINCOS), .FS_NWARP(B3D_NWARP), .FS_NL(B3D_NL), .DS_BASE(B3D_DS_BASE), .ROP_BLEND1(B3D_ROP_BLEND1), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
                .TEX_SKIP(B3D_TEX_SKIP), .TEX_W2(B3D_TEX_W2), .FS_PRE(B3D_FS_PRE), .FS_XSFU(B3D_XSFU), .FS_XCLAMP(B3D_XCLAMP), .FS_QRINF(B3D_QRINF)) u_render (.clk(clk_sys), .rst(rst_ddr),
         .rs_valid, .rs_valid2, .rs_data, .rs_data2, .rs_ready, .rs_take2, .go(rd_go), .discard(rd_discard), .abort(rs_abort), .rt_base(rd_rt_base), .rt_bpl(rd_rt_bpl), .rt_width(rd_rt_width),
         .rt_height(rd_rt_height), .rt_fmt(rd_rt_fmt), .depth16(rd_depth16), .ds_en(rd_ds_en), .ds_base(rd_ds_base), .ds_bpl(rd_ds_bpl),
@@ -365,7 +369,7 @@ module board_b_core
 
     // ---------------- command processor ----------------
     wire [15:0] cp_cmds, cp_errs; wire [31:0] cp_images; wire h_active;
-    fb_cmd_b #(.SIM_MODE4(SIM_MODE4), .MAXW(B3D_MAXW), .VOL3D(VOL3D)) u_cp (
+    fb_cmd_b #(.SIM_MODE4(SIM_MODE4), .MAXW(B3D_MAXW), .VOL3D(VOL3D), .DS_BYTE({1'b0, B3D_DS_BASE} << 2)) u_cp (
         .clk(clk_sys), .rst(rst_ddr),
         .c_valid(cw_valid), .c_data(cw_data), .c_first(cw_first), .c_last(cw_last), .c_ready(cw_ready),
         .c_old(cw_old), .sync_wipe(rs_abort),

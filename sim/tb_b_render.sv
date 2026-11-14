@@ -124,7 +124,9 @@ module tb_b_render;
 `else
     localparam int TB_LDV = 0;                 // the board's (also -Defines TB_LDV0): two issued micro-ops per component
 `endif
+    // DS_BASE: the draw buckets where tools/b_ref.py's frames put them (B_DS_BASE, inside the one-board design's B heap)
     b_render #(.NLINES(TB_NL), .MAXW(1280), .CELLS((TB_NL == 8) ? 5120 : 4096), .NTS(TB_NTS), .FS_NWARP(TB_FSW), .F2_DUAL(TB_F2D), .TC_PF(TB_TPF), .FS_PRE(TB_PRE),
+               .DS_BASE(29'h0700_0000),
                .TEX_SKIP(TB_SKIP), .TEX_W2(TB_W2), .FS_STO2(TB_STO2), .FS_TEX2(TB_TEX2), .FS_LDV(TB_LDV),
 `ifdef TB_ADDDSP
                .FS_ADD_DSP(1'b1),

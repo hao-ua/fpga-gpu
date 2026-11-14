@@ -50,6 +50,7 @@ module board_a_core #(
     // the geometry stage: the vertex core's warps in flight (2..4), and the widest target that gets 8-row bands (wider ones
     // get 4; it must be board B's b_render BAND8_MAXW; 0 = 4-row bands always)
     parameter int    VS_NWARP       = 4,
+    parameter int    VS_NL          = 16,           // the vertex core's lanes per warp (16, 8 or 4; the same results, fewer LUTs)
     parameter int    BAND8_MAXW     = 1024,
     parameter bit    VS_SFU_TAB2    = 1'b0,         // the vertex core's SFU tables shared by pairs of units (bit-identical)
     parameter bit    VS_INT_DIV     = 1'b1,         // the vertex core's integer divider; 0: none (STATUS flags bit 31 set: the
@@ -240,7 +241,7 @@ module board_a_core #(
     wire [2:0]  g_ad_size, g_ad_type, g_dr_mode; wire [31:0] g_dr_first, g_dr_count; wire [1:0] g_st_cull; wire [12:0] g_st_did;
     wire [6:0]  g_st_lw; wire [19:0] g_tri_count;
     wire [31:0] g_c_vis; wire [13*32-1:0] g_prof;
-    a_geom #(.REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W), .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .NWARP(VS_NWARP),
+    a_geom #(.REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W), .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .NWARP(VS_NWARP), .VS_NL(VS_NL),
              .BAND8_MAXW(BAND8_MAXW), .VS_SFU_TAB2(VS_SFU_TAB2), .VS_INT_DIV(VS_INT_DIV), .VS_SINCOS(VS_SINCOS), .PROF(GEOM_PROF)) u_geom (.clk(clk_sys), .rst(rst_ddr),
         .g_frame(g_frame), .g_frame_done(g_frame_done), .g_rbusy(g_rbusy), .g_fb_ok(g_fb_ok), .g_draw_ok(g_draw_ok), .g_copy_busy(g_copy_busy),
         .g_ld_start(g_ld_start), .g_ld_addr(g_ld_addr), .g_ld_len(g_ld_len), .g_ld_done(g_ld_done),

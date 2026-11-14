@@ -12,7 +12,7 @@
 //     two: a component span is <= 16 bytes) up in the BURST CACHE (NCE fully associative entries of 32 bytes with a
 //     reference lock), issues a DDR read for a missing one and allocates an entry for it (any unlocked, round robin),
 //     and pushes a JOB {lane, attribute, format, byte offset, the entries} into the job FIFO; a disabled attribute pushes
-//     a CONST job. Launch requests (16 lanes, the draw's end, or the assembler's FIFO >= REF_THR references while the warp
+//     a CONST job. Launch requests (NL lanes, the draw's end, or the assembler's FIFO >= REF_THR references while the warp
 //     has lanes: the assembler waits for the forming warp's results, so without this the two would deadlock) are jobs too,
 //     so they stay ordered behind the lanes' writes. The next result slot is ANY slot vtx_rbuf reports free (not ring
 //     order: the assembler may hold a reference for a whole draw — a fan's first vertex — and waiting for that very slot
@@ -32,7 +32,8 @@
 `default_nettype none
 module vtx_feed #(
     parameter int W = 24,
-    parameter int NSLOT = 8,                     // result slots of vtx_rbuf
+    parameter int NL = 16,                       // lanes of the vertex core's warp (vertices per warp: 16, 8 or 4)
+    parameter int NSLOT = 8,                     // result slots of vtx_rbuf (<= 16: 4-bit slot in the launch job)
     parameter int REF_THR = 24,                  // launch the forming warp when the assembler's FIFO holds this many refs
     parameter int NCE = 16,                      // burst cache entries (<= 16: 4-bit ids in the job)
     parameter int JQ = 64                        // job FIFO depth (a power of 2)
@@ -68,12 +69,13 @@ module vtx_feed #(
     input  wire [255:0] rd_data,
     // vertex core: attributes of the warp being filled, launch
     output reg         va_we,
-    output reg  [3:0]  va_lane, va_idx,
+    output reg  [((NL > 1) ? $clog2(NL) : 1)-1:0] va_lane,
+    output reg  [3:0]  va_idx,
     output reg  [4*W-1:0] va_data,
     input  wire        in_ready,
     output reg         in_start,
     output reg         in_bank,                  // the launching warp's uniform bank
-    output reg  [15:0] in_active,
+    output reg  [NL-1:0] in_active,
     // result slots (vtx_rbuf): the launch order, the allocation of a slot, which slots are free
     output reg         launch,                   // with in_start: slot launch_slot runs in the core next
     output reg  [$clog2(NSLOT)-1:0] launch_slot,
@@ -85,11 +87,13 @@ module vtx_feed #(
     // reference stream (one per index, in index order) to the assembler
     output reg         ref_valid,
     output reg  [$clog2(NSLOT)-1:0] ref_slot,
-    output reg  [3:0]  ref_lane,
+    output reg  [((NL > 1) ? $clog2(NL) : 1)-1:0] ref_lane,
     input  wire        ref_ready,
     input  wire [5:0]  ref_cnt                   // the assembler's FIFO occupancy
 );
     localparam int SW = $clog2(NSLOT), CW = $clog2(NCE), JW = $clog2(JQ);
+    localparam int LNW = (NL > 1) ? $clog2(NL) : 1, CLW = $clog2(NL + 1);   // a lane; lanes filled (0..NL)
+    if (NSLOT > 16) $fatal(1, "vtx_feed: NSLOT <= 16 (the launch job's slot field)");
     localparam [W-1:0] ONE1 = ((1 << 6) - 1) << 16;         // FP24 1.0 = 0x3F0000 (W = 24)
     localparam [1:0] K_ATTR = 2'd0, K_CONST = 2'd1, K_LAUNCH = 2'd2;
     localparam [2:0] T_FP24 = 3'd6;
@@ -119,9 +123,9 @@ module vtx_feed #(
     reg         indexed, u8; reg [31:0] first, count, i;
     reg  [31:0] vidx;                            // the resolved vertex index
     reg  [SW-1:0] cs;                            // the forming warp's result slot
-    reg  [4:0]  cl;                              // lanes filled (0..16)
+    reg  [CLW-1:0] cl;                           // lanes filled (0..NL)
     reg         end_pend;                        // after the launch: the draw is over (no next index)
-    reg  [31:0] pv; reg [26:0] ptag [0:31]; reg [SW-1:0] pslot [0:31]; reg [3:0] plane [0:31];
+    reg  [31:0] pv; reg [26:0] ptag [0:31]; reg [SW-1:0] pslot [0:31]; reg [LNW-1:0] plane [0:31];
     wire hit = pv[vidx[4:0]] & (ptag[vidx[4:0]] == vidx[31:5]);
     typedef enum logic [2:0] {I_IDLE, I_COPY, I_IDX, I_PTQ, I_GATH, I_LAUNCH, I_NEWSLOT} ist_t;
     ist_t ist;
@@ -254,7 +258,7 @@ module vtx_feed #(
     assign jq_pop = p0_attr | p0_const | p0_launch;
     wire [511:0] cwin = {c_d[j_e1[CW-1:0]], c_d[j_e0[CW-1:0]]};
     wire [159:0] csel = cwin[j_o[4:2]*32 +: 160];
-    reg  p1_v, p1_const, p1_nm; reg [3:0] p1_lane, p1_a; reg [2:0] p1_ty, p1_sz; reg [1:0] p1_o; reg [159:0] p1_sel; reg [4*W-1:0] p1_cval;
+    reg  p1_v, p1_const, p1_nm; reg [LNW-1:0] p1_lane; reg [3:0] p1_a; reg [2:0] p1_ty, p1_sz; reg [1:0] p1_o; reg [159:0] p1_sel; reg [4*W-1:0] p1_cval;
     // a CONST job's value (nm = the draw's bank): p1_cval is the block RAM's output register, loaded at the pop
     always @(posedge clk) if (p0_attr | p0_const) p1_cval <= d_const[{j_nm, j_a}];
     wire [127:0] w128 = p1_sel[p1_o*8 +: 128];
@@ -267,7 +271,7 @@ module vtx_feed #(
         attr_conv #(.EXP_W(7), .MAN_W(W-8)) u_cv (.clk, .rst, .in_valid(p1_v), .raw(craw[gk]), .ty(p1_const ? T_FP24 : p1_ty), .nm(p1_nm),
             .out_valid(cres_v[gk]), .result(cres[gk]));
     end endgenerate
-    reg  [3:0] dl_lane [0:5], dl_a [0:5]; reg [2:0] dl_sz [0:5];     // the job's lane / attribute / size alongside the converters (latency 6)
+    reg  [LNW-1:0] dl_lane [0:5]; reg [3:0] dl_a [0:5]; reg [2:0] dl_sz [0:5];   // the job's lane / attribute / size alongside the converters (latency 6)
     wire wr_now = cres_v[0];
     assign busy = (ist != I_IDLE) | jv | (inflight != 8'd0) | in_start | va_we | ref_valid | jq_push;
     // ================================================================ sequential
@@ -309,10 +313,10 @@ module vtx_feed #(
                 if (!l_ph && s1_cross) begin l_e0 <= lk_e; l_ph <= 1'b1; end
                 else begin
                     l_ph <= 1'b0;
-                    jq_push <= 1'b1; jq_wd <= mkjob(K_ATTR, cl[3:0], s1_a, s1_ty, s1_nm, s1_sz, s1_addr[4:0], l_ph ? 4'(l_e0) : 4'(lk_e), 4'(lk_e), l_ph);
+                    jq_push <= 1'b1; jq_wd <= mkjob(K_ATTR, 4'(cl[LNW-1:0]), s1_a, s1_ty, s1_nm, s1_sz, s1_addr[4:0], l_ph ? 4'(l_e0) : 4'(lk_e), 4'(lk_e), l_ph);
                 end
             end
-            if (take_cn) begin jq_push <= 1'b1; jq_wd <= mkjob(K_CONST, cl[3:0], s1_a, T_FP24, dbank, 3'd4, 5'd0, 4'd0, 4'd0, 1'b0); end
+            if (take_cn) begin jq_push <= 1'b1; jq_wd <= mkjob(K_CONST, 4'(cl[LNW-1:0]), s1_a, T_FP24, dbank, 3'd4, 5'd0, 4'd0, 4'd0, 1'b0); end
             // ---------------- the address pipe (the draw's descriptor bank)
             if (adv) begin
                 s1_v <= s0_v; s1_en <= s0_en; s1_nm <= s0_nm; s1_a <= s0_a; s1_ty <= s0_ty; s1_sz <= s0_sz;
@@ -339,32 +343,32 @@ module vtx_feed #(
                 end
                 // the next index (or the draw's end); the FIFO-threshold launch comes first
                 I_IDX: begin
-                    if (ref_cnt >= 6'(REF_THR) && cl != 5'd0) ist <= I_LAUNCH;
+                    if (ref_cnt >= 6'(REF_THR) && cl != '0) ist <= I_LAUNCH;
                     else if (i == count) begin
-                        if (cl != 5'd0) begin end_pend <= 1'b1; ist <= I_LAUNCH; end else ist <= I_IDLE;
+                        if (cl != '0) begin end_pend <= 1'b1; ist <= I_LAUNCH; end else ist <= I_IDLE;
                     end else if (idx_ready && !ref_valid) begin vidx <= idx_val; i <= i + 32'd1; ip <= ip + (u8 ? 30'd1 : 30'd2); ist <= I_PTQ; end
                 end
                 // cache lookup: the reference (hit: the cached one; miss: the forming warp's next lane, then the gather)
                 I_PTQ: begin
-                    ref_valid <= 1'b1; ref_slot <= hit ? pslot[vidx[4:0]] : cs; ref_lane <= hit ? plane[vidx[4:0]] : cl[3:0];
+                    ref_valid <= 1'b1; ref_slot <= hit ? pslot[vidx[4:0]] : cs; ref_lane <= hit ? plane[vidx[4:0]] : cl[LNW-1:0];
                     if (hit) ist <= I_IDX;
                     else begin
-                        pv[vidx[4:0]] <= 1'b1; ptag[vidx[4:0]] <= vidx[31:5]; pslot[vidx[4:0]] <= cs; plane[vidx[4:0]] <= cl[3:0];
+                        pv[vidx[4:0]] <= 1'b1; ptag[vidx[4:0]] <= vidx[31:5]; pslot[vidx[4:0]] <= cs; plane[vidx[4:0]] <= cl[LNW-1:0];
                         ga <= 5'd0; ist <= I_GATH;
                     end
                 end
-                // the 16 attributes through the pipe; done when it has drained
+                // the 16 attributes through the pipe; done when it has drained; the warp is full with its NL-th lane
                 I_GATH: if (ga == 5'd16 && !s0_v && !s1_v) begin
-                    if (cl == 5'd15) begin cl <= 5'd16; ist <= I_LAUNCH; end else begin cl <= cl + 5'd1; ist <= I_IDX; end
+                    if (cl == CLW'(NL-1)) begin cl <= CLW'(NL); ist <= I_LAUNCH; end else begin cl <= cl + 1'b1; ist <= I_IDX; end
                 end
                 // launch the forming warp (a job, behind its lanes' writes), then take the next slot
                 I_LAUNCH: if (jq_space) begin                           // {varmask in lane / a, {bank, ps} in ty, the lanes in o, the slot in e0}
-                    jq_push <= 1'b1; jq_wd <= mkjob(K_LAUNCH, dvm[3:0], dvm[7:4], {1'b0, dbank, dps}, 1'b0, 3'd0, cl, 4'(cs), 4'd0, 1'b0);
+                    jq_push <= 1'b1; jq_wd <= mkjob(K_LAUNCH, dvm[3:0], dvm[7:4], {1'b0, dbank, dps}, 1'b0, 3'd0, 5'(cl), 4'(cs), 4'd0, 1'b0);
                     ist <= I_NEWSLOT;
                 end
                 I_NEWSLOT: if (ns_ok) begin
                     for (int k = 0; k < 32; k++) if (pslot[k] == ns) pv[k] <= 1'b0;
-                    alloc <= 1'b1; alloc_slot <= ns; cs <= ns; cl <= 5'd0;
+                    alloc <= 1'b1; alloc_slot <= ns; cs <= ns; cl <= '0;
                     ist <= end_pend ? I_IDLE : I_IDX;
                 end
                 default: ist <= I_IDLE;
@@ -376,11 +380,11 @@ module vtx_feed #(
             // ---------------- the build side
             p1_v <= p0_attr | p0_const;
             if (p0_attr | p0_const) begin
-                p1_const <= p0_const; p1_lane <= j_lane; p1_a <= j_a; p1_ty <= j_ty; p1_nm <= j_nm; p1_sz <= j_sz; p1_o <= j_o[1:0];
+                p1_const <= p0_const; p1_lane <= j_lane[LNW-1:0]; p1_a <= j_a; p1_ty <= j_ty; p1_nm <= j_nm; p1_sz <= j_sz; p1_o <= j_o[1:0];
                 p1_sel <= csel;
             end
             if (p0_launch) begin
-                in_start <= 1'b1; in_active <= 16'((17'd1 << j_o) - 17'd1); in_bank <= j_ty[1];
+                in_start <= 1'b1; in_active <= NL'((17'd1 << j_o) - 17'd1); in_bank <= j_ty[1];
                 launch <= 1'b1; launch_slot <= j_e0[SW-1:0]; launch_varmask <= {j_a, j_lane}; launch_ps <= j_ty[0];
             end
             dl_lane[0] <= p1_lane; dl_a[0] <= p1_a; dl_sz[0] <= p1_sz;

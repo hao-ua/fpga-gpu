@@ -9,7 +9,21 @@
 //               the same addresses (the host's run-to-run flow on the hardware) and its commands run; its records (in
 //               the other frame bank) and pushes must match its golden. A feed cache that is never invalidated
 //               would serve the first scene's bursts — this is the test that catches it.
+//   defines (sim_gpu.ps1 -Defines): VS_NL8 / VS_NL4 the vertex core's lanes per warp (default 16); VS_ONEB the one-board
+//               configuration of the core (NWARP 4, SFU_TAB2 1, INT_DIV 0, SINCOS 0)
 `default_nettype none
+`ifdef VS_NL4
+`define TB_GNLP .VS_NL(4),
+`elsif VS_NL8
+`define TB_GNLP .VS_NL(8),
+`else
+`define TB_GNLP
+`endif
+`ifdef VS_ONEB
+`define TB_GCFG .NWARP(4), .VS_SFU_TAB2(1'b1), .VS_INT_DIV(1'b0), .VS_SINCOS(1'b0),
+`else
+`define TB_GCFG
+`endif
 module tb_a_cmd;
     import fb_pkg::*;
     localparam int IDX_W = 20, BANDW = 10;
@@ -67,7 +81,7 @@ module tb_a_cmd;
         .app_wdf_mask, .app_wdf_wren, .app_wdf_end, .app_rdy, .app_wdf_rdy, .app_rd_data, .app_rd_data_valid(app_rd_valid),
         .errors(mig_errors), .n_wr, .n_rd);
     wire err_stack; wire [IDX_W-1:0] tri_count;
-    a_geom #(.REC_BASE(REC_BASE), .BINLIST_BASE(BINLIST_BASE)) u_geom (.clk, .rst,
+    a_geom #(`TB_GNLP `TB_GCFG .REC_BASE(REC_BASE), .BINLIST_BASE(BINLIST_BASE)) u_geom (.clk, .rst,
         .g_frame, .g_frame_done, .g_rbusy(), .g_fb_ok(), .g_draw_ok, .g_copy_busy, .g_ld_start, .g_ld_addr, .g_ld_len, .g_ld_done, .g_param_we, .g_param_idx, .g_param_data,
         .g_ad_we, .g_ad_idx, .g_ad_en, .g_ad_type, .g_ad_norm, .g_ad_base, .g_ad_size, .g_ad_stride, .g_ad_off, .g_ac_we, .g_ac_idx, .g_ac_const,
         .g_st_we, .g_st_vp, .g_st_z, .g_st_gb, .g_st_sc, .g_st_cull, .g_st_cw, .g_st_z0, .g_st_lw, .g_st_fsmask, .g_st_w, .g_st_h, .g_st_did, .c_vis,

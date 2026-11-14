@@ -15,7 +15,21 @@
 //   +MIGJIT_<n> / +MIGSTALL_<n> / +MIGSEED_<s>   DDR timing variation (sim/mig_app_model.sv)
 //   tools/sim_gpu.ps1 -Test tb_a_stress -All -Plusargs SEED_hl4,MIGJIT_80
 //                     -Extra src/rtl/proto/fb_pkg.sv,src/rtl/res/buf_table.sv,src/rtl/proto/fb_dispatch_a.sv,src/rtl/mem/mem_arb.sv,sim/mig_app_model.sv
+//   defines (sim_gpu.ps1 -Defines): VS_NL8 / VS_NL4 the vertex core's lanes per warp (default 16); VS_ONEB the one-board
+//                     configuration of the core (NWARP 4, SFU_TAB2 1, INT_DIV 0, SINCOS 0)
 `default_nettype none
+`ifdef VS_NL4
+`define TB_GNLP .VS_NL(4),
+`elsif VS_NL8
+`define TB_GNLP .VS_NL(8),
+`else
+`define TB_GNLP
+`endif
+`ifdef VS_ONEB
+`define TB_GCFG .NWARP(4), .VS_SFU_TAB2(1'b1), .VS_INT_DIV(1'b0), .VS_SINCOS(1'b0),
+`else
+`define TB_GCFG
+`endif
 module tb_a_stress;
     import fb_pkg::*;
     localparam int IDX_W = 20, QN = 1 << 19;
@@ -69,7 +83,7 @@ module tb_a_stress;
         .app_wdf_mask, .app_wdf_wren, .app_wdf_end, .app_rdy, .app_wdf_rdy, .app_rd_data, .app_rd_data_valid(app_rd_valid),
         .errors(mig_errors), .n_wr, .n_rd);
     wire err_stack; wire [IDX_W-1:0] tri_count;
-    a_geom #(.REC_BASE(REC_BASE), .BINLIST_BASE(BINLIST_BASE)) u_geom (.clk, .rst,
+    a_geom #(`TB_GNLP `TB_GCFG .REC_BASE(REC_BASE), .BINLIST_BASE(BINLIST_BASE)) u_geom (.clk, .rst,
         .g_frame, .g_frame_done, .g_rbusy(), .g_fb_ok(), .g_draw_ok, .g_copy_busy, .g_ld_start, .g_ld_addr, .g_ld_len, .g_ld_done, .g_param_we, .g_param_idx, .g_param_data,
         .g_ad_we, .g_ad_idx, .g_ad_en, .g_ad_type, .g_ad_norm, .g_ad_base, .g_ad_size, .g_ad_stride, .g_ad_off, .g_ac_we, .g_ac_idx, .g_ac_const,
         .g_st_we, .g_st_vp, .g_st_z, .g_st_gb, .g_st_sc, .g_st_cull, .g_st_cw, .g_st_z0, .g_st_lw, .g_st_fsmask, .g_st_w, .g_st_h, .g_st_did, .c_vis,
@@ -135,7 +149,7 @@ module tb_a_stress;
         end
     end
     task dump_state;
-        string s; int k;
+        string s; int k, lb, lm;
         $display("  dispatcher st %0d, queue %0d / %0d bursts taken, commands %0d, errors %0d (last %h), g_busy %b, g_draw_ok %b, g_copy_busy %b, draws started %0d / finished %0d",
                  disp.st, qi, ncmd, c_cmds, c_errs, last_err, g_busy, g_draw_ok, g_copy_busy, n_draw, n_done);
         $display("  a_vertex: dr_ok %b cp_run %b f_start %b dpar %b wpar %b busy_warps %b par_busy %b", u_geom.u_vtx.dr_ok, u_geom.u_vtx.cp_run, u_geom.u_vtx.f_start,
@@ -162,10 +176,11 @@ module tb_a_stress;
                  u_geom.u_vtx.u_asm.v_v, u_geom.u_vtx.u_asm.vi, u_geom.u_vtx.u_asm.vr_act, u_geom.u_vtx.u_asm.p_run, u_geom.u_vtx.u_asm.p_i,
                  u_geom.u_vtx.u_asm.pa_req, u_geom.u_vtx.u_asm.pa_grant, u_geom.u_vtx.u_asm.vout, u_geom.u_vtx.u_asm.pr_n, u_geom.u_vtx.u_asm.sg_v,
                  u_geom.u_vtx.u_asm.vo_valid, u_geom.u_vtx.u_asm.vo_ready);
+        lb = u_geom.u_vtx.u_asm.RW - u_geom.u_vtx.u_asm.SW; lm = (1 << lb) - 1;   // a reference {slot, lane}: the lane bits
         $display("  asm refs: F %0d.%0d %0d.%0d %0d.%0d  V %0d.%0d %0d.%0d %0d.%0d  p_ref %0d.%0d cur %0d.%0d",
-                 u_geom.u_vtx.u_asm.f_a >> 4, u_geom.u_vtx.u_asm.f_a & 15, u_geom.u_vtx.u_asm.f_b >> 4, u_geom.u_vtx.u_asm.f_b & 15, u_geom.u_vtx.u_asm.f_c >> 4, u_geom.u_vtx.u_asm.f_c & 15,
-                 u_geom.u_vtx.u_asm.wa >> 4, u_geom.u_vtx.u_asm.wa & 15, u_geom.u_vtx.u_asm.wb >> 4, u_geom.u_vtx.u_asm.wb & 15, u_geom.u_vtx.u_asm.wc >> 4, u_geom.u_vtx.u_asm.wc & 15,
-                 u_geom.u_vtx.u_asm.p_ref >> 4, u_geom.u_vtx.u_asm.p_ref & 15, u_geom.u_vtx.u_asm.cur >> 4, u_geom.u_vtx.u_asm.cur & 15);
+                 u_geom.u_vtx.u_asm.f_a >> lb, u_geom.u_vtx.u_asm.f_a & lm, u_geom.u_vtx.u_asm.f_b >> lb, u_geom.u_vtx.u_asm.f_b & lm, u_geom.u_vtx.u_asm.f_c >> lb, u_geom.u_vtx.u_asm.f_c & lm,
+                 u_geom.u_vtx.u_asm.wa >> lb, u_geom.u_vtx.u_asm.wa & lm, u_geom.u_vtx.u_asm.wb >> lb, u_geom.u_vtx.u_asm.wb & lm, u_geom.u_vtx.u_asm.wc >> lb, u_geom.u_vtx.u_asm.wc & lm,
+                 u_geom.u_vtx.u_asm.p_ref >> lb, u_geom.u_vtx.u_asm.p_ref & lm, u_geom.u_vtx.u_asm.cur >> lb, u_geom.u_vtx.u_asm.cur & lm);
         $display("  setup: st %0d busy %b la_out %0d la_cnt %0d la_pend %b vcnt %0d | binner busy %b | loader st %0d | arbiter reads in flight %0d r_en %b",
                  u_geom.u_set.st, u_geom.s_busy, u_geom.u_set.la_out, u_geom.u_set.la_cnt, u_geom.u_set.la_pend, u_geom.u_set.vcnt, u_geom.b_busy, u_geom.ld_st,
                  arb.ro_w - arb.ro_r, r_en);

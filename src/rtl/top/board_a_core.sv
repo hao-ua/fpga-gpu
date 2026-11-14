@@ -52,9 +52,9 @@ module board_a_core #(
     parameter int    VS_NWARP       = 4,
     parameter int    BAND8_MAXW     = 1024,
     parameter bit    VS_SFU_TAB2    = 1'b0,         // the vertex core's SFU tables shared by pairs of units (bit-identical)
-    parameter bit    VS_INT_DIV     = 1'b1,         // the vertex core's integer divider; 0: none (STATUS flags bit 31 set: the
+    parameter bit    VS_INT_DIV     = 1'b1,         // the vertex core's integer divider; 0: none (STATUS flags bit 30 set: the
                                                     // compiler lowers integer division to float ops)
-    parameter bit    VS_SINCOS      = 1'b1,         // the vertex core's SIN / COS units; 0: none (STATUS flags bit 30 set: the
+    parameter bit    VS_SINCOS      = 1'b1,         // the vertex core's SIN / COS units; 0: none (STATUS flags bit 31 set: the
                                                     // compiler lowers sin / cos to a range reduction and a polynomial)
     parameter bit    GEOM_PROF      = 1'b1          // the geometry stage's profile counters (STATUS words 101-113; 0: they read 0)
 )(
@@ -343,9 +343,9 @@ module board_a_core #(
     end
     localparam int RING = 1 << RING_LOG2;
     wire [RING_LOG2:0] q_free = RING - q_used;
-    // bit 31: the vertex core has no integer divider (IDIV / IMOD / UDIV / UMOD stop the warp; 0 on builds with one);
-    // bit 30: the vertex core has no SIN / COS units (SIN / COS stop the warp)
-    wire [31:0] flags = {~VS_INT_DIV, ~VS_SINCOS, 9'h0, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok, host_valid, mdio_init_done,
+    // bit 31: the vertex core has no SIN / COS units (SIN / COS stop the warp); bit 30: no integer divider (IDIV / IMOD /
+    // UDIV / UMOD stop the warp) — board B's flags have the same two bits for the fragment core; 0 on builds with them
+    wire [31:0] flags = {~VS_SINCOS, ~VS_INT_DIV, 9'h0, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok, host_valid, mdio_init_done,
                          duplex, speed, link_up, calib_done};
     wire [31:0] sw [0:STATUS_WORDS-1];
     assign sw[0]  = STATUS_LAYOUT;

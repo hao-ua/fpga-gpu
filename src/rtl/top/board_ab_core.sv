@@ -42,7 +42,7 @@ module board_ab_core #(
     // both shader cores' integer dividers: none (the compilers lower integer division to float ops; STATUS says so)
     parameter bit    INT_DIV        = 1'b0,
     // both shader cores' SIN / COS units: none (the compilers lower sin / cos to a range reduction and a polynomial;
-    // STATUS says so: board A's flags bit 30, board B's bit 31)
+    // STATUS says so: bit 31 of board A's flags and of board B's; bit 30 there = no integer divider)
     parameter bit    SINCOS         = 1'b0,
     // the fragment core's optional work-savers and queues, smaller than the two boards': SQRT / RCPM / RSQM as one
     // micro-op off (STATUS flags bit 28 clear: the compilers emit RSQRT + MUL etc.), 2 quarter-rate micro-ops in flight

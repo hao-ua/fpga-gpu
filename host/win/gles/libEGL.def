@@ -1,0 +1,36 @@
+LIBRARY libEGL.dll
+EXPORTS
+    eglBindAPI = libGLESv2.eglBindAPI @14
+    eglBindTexImage = libGLESv2.eglBindTexImage @20
+    eglChooseConfig = libGLESv2.eglChooseConfig @7
+    eglCopyBuffers = libGLESv2.eglCopyBuffers @33
+    eglCreateContext = libGLESv2.eglCreateContext @23
+    eglCreatePbufferFromClientBuffer = libGLESv2.eglCreatePbufferFromClientBuffer @18
+    eglCreatePbufferSurface = libGLESv2.eglCreatePbufferSurface @10
+    eglCreatePixmapSurface = libGLESv2.eglCreatePixmapSurface @11
+    eglCreateWindowSurface = libGLESv2.eglCreateWindowSurface @9
+    eglDestroyContext = libGLESv2.eglDestroyContext @24
+    eglDestroySurface = libGLESv2.eglDestroySurface @12
+    eglGetConfigAttrib = libGLESv2.eglGetConfigAttrib @8
+    eglGetConfigs = libGLESv2.eglGetConfigs @6
+    eglGetCurrentContext = libGLESv2.eglGetCurrentContext @26
+    eglGetCurrentDisplay = libGLESv2.eglGetCurrentDisplay @28
+    eglGetCurrentSurface = libGLESv2.eglGetCurrentSurface @27
+    eglGetDisplay = libGLESv2.eglGetDisplay @2
+    eglGetError = libGLESv2.eglGetError @1
+    eglGetProcAddress = libGLESv2.eglGetProcAddress @34
+    eglInitialize = libGLESv2.eglInitialize @3
+    eglMakeCurrent = libGLESv2.eglMakeCurrent @25
+    eglQueryAPI = libGLESv2.eglQueryAPI @15
+    eglQueryContext = libGLESv2.eglQueryContext @29
+    eglQueryString = libGLESv2.eglQueryString @5
+    eglQuerySurface = libGLESv2.eglQuerySurface @13
+    eglReleaseTexImage = libGLESv2.eglReleaseTexImage @21
+    eglReleaseThread = libGLESv2.eglReleaseThread @17
+    eglSurfaceAttrib = libGLESv2.eglSurfaceAttrib @19
+    eglSwapBuffers = libGLESv2.eglSwapBuffers @32
+    eglSwapInterval = libGLESv2.eglSwapInterval @22
+    eglTerminate = libGLESv2.eglTerminate @4
+    eglWaitClient = libGLESv2.eglWaitClient @16
+    eglWaitGL = libGLESv2.eglWaitGL @30
+    eglWaitNative = libGLESv2.eglWaitNative @31

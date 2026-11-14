@@ -1,0 +1,39 @@
+// fs2_interp — LDV interpolation on the scalar core: user varyings 0..7 through the
+// triangle store with per-quad slots (quads of a warp may belong to different triangles), LDV with a swizzle and a
+// partial write mask, LDV under a divergent IF, repeated inside a loop, the built-ins 8 / 9 / 10 from varin, DDX /
+// DDY of interpolated values, a TEX on an interpolated coordinate.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_interp.sasm --interp
+LDV    r1, 0
+LDV    r2, 1.wzyx
+LDV    r3.xy, 2.zw
+LDV    r4, 8
+TEX    r5, r1, #0
+LDV    r6, 7
+MAD    r7, r1, r2, r6
+SETP   SLT, r1.x, r2.x
+IF     L_else
+  LDV   r8, 3
+  ADD   r8, r8, r5
+  DDX   r9, r7
+L_else:
+ELSE   L_end
+  LDV   r8, 4.yyyy
+  MUL   r8, r8, r4
+  DDY   r9, r7
+L_end:
+ENDIF
+LOOP   3
+  LDV   r10, 5
+  ADD   r7, r7, r10.wzyx
+ENDL
+LDV    r11, 6
+LDV    r11.zw, 6.xy
+LDV    r12, 9
+LDV    r13, 10
+MAD    r7, r12, r13, r7
+ADD    r7, r7, r8
+ADD    r7, r7, r9
+ADD    r7, r7, r11
+STOZ   r2.w
+STO    r7
+END

@@ -1,0 +1,85 @@
+// fs2_ldv1 — the one-micro-op LDV of a user varying (shader_core_fs2 LDV1): the second step of every
+// component runs by itself MADD_LAT cycles after the first, in the same multiply-add lanes. Exercised here, mostly
+// visible with ONE warp (nothing else fills the cycles): multiply-add micro-ops of every kind (ADD MUL MAD, the DP
+// chains, DDX) that do not depend on the LDV and would issue into the automatic steps' cycles (mblk holds them);
+// one-cycle and compare micro-ops beside the automatic steps (their write slots against the LDV's, 2 x MADD_LAT away);
+// a quarter-rate op beside them; a multiply-add over a component an LDV is still writing and an LDV over a register a
+// multiply-add / another LDV is still writing (the single pending bit spans both steps); a read of the LDV's result
+// right behind it; a TEX coordinate and a colour store straight from it; three LDVs back to back (the ninth micro-op
+// would enter the lanes with the first one's automatic step) and DP chain steps behind them (no write slot of their
+// own: only mblk keeps them out — a register-writing multiply-add is already kept out by the LDV's write slot).
+// Golden: python3 tools/isa64.py fs2 tests/fs2_ldv1.sasm
+MOVI   r18, #1.5
+MOVI   r19, #0.75
+LDV    r1, 0
+ADD    r20, r18, r19
+MUL    r21, r18, r19
+MAD    r22, r18, r19, r18
+SUB    r20.xz, r19, r18
+LDV    r2, 1
+DP3    r23.x, r18, r19
+DP4    r23.yzw, r18, r19
+DDX    r24, r18
+LDV    r3, 2.wzyx
+MOV    r25, r18
+MOV    r26, r19
+SEL    r27, r18, r19, r18
+MIN    r28, r18, r19
+MAX    r25.xy, r18, r19
+MOV    r26.zw, r18
+SET    SLT, r28.zw, r19, r18
+LDV    r4, 3
+FLR    r29, r18
+MOV    r25.w, r19
+LDV    r5.xz, 4.yx
+LDV    r5.yw, 5
+LDV    r6, 5
+MUL    r6.x, r18, r19
+ADD    r6.w, r18, r19
+LDV    r7, 6
+ADD    r7.yw, r7, r18
+MUL    r7.x, r7, r7
+MUL    r30, r18, r19
+LDV    r30.zw, 7
+MAD    r31, r18, r19, r19
+LDV    r31, 7.yxwz
+LDV    r8, 7
+LDV    r8, 0
+LDV    r8.y, 1.w
+TEX    r9, r8, #1
+LDV    r10, 2
+STO    r10
+LDV    r11, 3
+MOV    r12, r11
+LDV    r13, 4
+LDV    r14, 5
+LDV    r15, 6
+DP4    r16, r18, r19
+DP3    r16.xw, r19, r18
+ADD    r12, r12, r13
+ADD    r12, r12, r14
+ADD    r12, r12, r15
+ADD    r12, r12, r16
+ADD    r17, r1, r2
+ADD    r17, r17, r3
+ADD    r17, r17, r4
+ADD    r17, r17, r5
+ADD    r17, r17, r6
+ADD    r17, r17, r7
+ADD    r17, r17, r8
+ADD    r17, r17, r9
+ADD    r17, r17, r12
+ADD    r17, r17, r20
+ADD    r17, r17, r21
+ADD    r17, r17, r22
+ADD    r17, r17, r23
+ADD    r17, r17, r24
+ADD    r17, r17, r25
+ADD    r17, r17, r26
+ADD    r17, r17, r27
+ADD    r17, r17, r28
+ADD    r17, r17, r29
+ADD    r17, r17, r30
+MAD    r17, r31, r10, r17
+STO    r17
+END

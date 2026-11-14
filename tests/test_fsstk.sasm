@@ -1,0 +1,35 @@
+// test_fsstk — IF stack overflow (tb_fs_ctx): nine nested IFs, the IF stack holds eight. The ninth IF must not issue:
+// the quad is killed (out_kill 1111), out_err is set and the core's err_stack flag sticks; the quad still retires.
+LDV   r1, 0
+MOV   r5, r1
+SETP  SGE, r1, r1          // every thread true
+IF    E1
+IF    E2
+IF    E3
+IF    E4
+IF    E5
+IF    E6
+IF    E7
+IF    E8
+IF    E9                   // ninth level -> stack violation
+STO   0, r5
+E9:
+ENDIF
+E8:
+ENDIF
+E7:
+ENDIF
+E6:
+ENDIF
+E5:
+ENDIF
+E4:
+ENDIF
+E3:
+ENDIF
+E2:
+ENDIF
+E1:
+ENDIF
+STO   0, r1
+END

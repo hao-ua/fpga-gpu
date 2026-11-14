@@ -1,0 +1,8 @@
+// b_fs_tex1 — board B frame bench (tb_b_render): one 2D sampler (0 at varying 0,
+// implicit LOD) times varying 1 — the shape of the t1 texperf shader and of OpenArena's single-texture surfaces.
+LDV   r1, 0
+TEX   r2, r1, #0
+LDV   r3, 1
+MUL   r4, r2, r3
+STO   0, r4
+END

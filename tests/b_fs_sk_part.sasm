@@ -1,0 +1,12 @@
+// b_fs_sk_part — B4 scan test (tb_b_render, BR_SKIPTEST=1): a register that held a texel gets new .xy from a
+// varying; the second fetch reads .xy only (its coordinate set), so the stale .zw do not matter. The scan must ALLOW
+// the sample skip.
+LDV   r1, 0
+TEX   r2, r1, #0
+LDV   r3, 1
+MUL   r4, r2, r3
+LDV   r2.xy, 1
+TEX   r6, r2, #0, .xy
+ADD   r4, r4, r6
+STO   0, r4
+END

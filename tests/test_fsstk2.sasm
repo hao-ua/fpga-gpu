@@ -1,0 +1,8 @@
+// test_fsstk2 — loop stack underflow (tb_fs_ctx): BREAK outside a loop must not issue; the quad is killed with
+// out_err set and retires.
+LDV   r1, 0
+MOV   r5, r1
+SETP  SGE, r1, r1
+BREAK                      // no loop open -> stack violation
+STO   0, r5
+END

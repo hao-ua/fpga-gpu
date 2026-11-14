@@ -1,0 +1,52 @@
+// fs2_tex — TEX on the scalar core: implicit / BIAS / LOD modes on different samplers, a
+// swizzled coordinate, a partial write mask, a dependent read (coordinates from texels), TEX into its own coordinate
+// register, two and three TEX back to back (more than TEXQ in flight), TEX under a divergent IF / ELSE, inside a loop
+// with its result feeding the next iteration's coordinate, a texel used right after its TEX (RAW on the scoreboard),
+// WAW on a TEX destination, texels into STO and STOZ.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_tex.sasm   (the texture unit = isa64.tex_model = tb_fs2's tmu_model2)
+LDV    r1, 0
+LDV    r2, 1
+LDV    r3, 8
+MOVI   r4, #0.75
+MOVI   r7, #2.5
+TEX    r5, r1, #0                 // 2D, implicit LOD
+TEX    r6, r1.yxwz, #3, BIAS      // swizzled coordinate, LOD bias
+TEX    r7.xz, r2, #5, LOD         // partial mask: y, w keep 2.5
+ADD    r8, r5, r6                 // waits for two TEX
+TEX    r1, r1, #1                 // destination = coordinate register
+TEX    r9, r8, #2                 // dependent read
+MUL    r10, r9, r7
+SETP   SLT, r3.x, r4.x            // gl_FragCoord.x differs per pixel: divergence inside every quad
+IF     L_else
+  TEX  r11, r2.wzyx, #4
+  ADD  r11, r11, r1
+L_else:
+ELSE   L_end
+  TEX  r11, r3, #6, BIAS
+  MUL  r11, r11, r2
+L_end:
+ENDIF
+MOV    r12, r2
+LOOP   3
+  TEX  r13, r12, #7
+  ADD  r12, r12, r13.wzyx
+ENDL
+TEX    r14, r1, #8
+TEX    r14, r2, #9                // WAW on a TEX destination
+SETP   SGE, r4.x, r4.x            // true everywhere
+LOOP   2
+  BREAK                           // every lane leaves: the rest of the body runs with no active lane
+  TEX  r19, r1, #13               // a TEX without active lanes: no request, nothing written (r19 stays unwritten)
+ENDL
+TEX    r15, r1, #10
+TEX    r16, r2, #11
+TEX    r17, r3, #12               // three back to back
+ADD    r18, r15, r16
+ADD    r18, r18, r17
+ADD    r18, r18, r14
+ADD    r18, r18, r10
+ADD    r18, r18, r11
+ADD    r18, r18, r12
+STOZ   r5.y
+STO    r18
+END

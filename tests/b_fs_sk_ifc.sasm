@@ -1,0 +1,16 @@
+// b_fs_sk_ifc — B4 scan test (tb_b_render, BR_SKIPTEST=1): texture coordinates changed under an IF that depends on a
+// texel, then fetched — an uncovered pixel takes the other branch and the covered pixels' level of detail changes.
+// The scan must REFUSE the sample skip for this program.
+LDV   r1, 0
+TEX   r2, r1, #0
+LDP   r3, 2
+LDV   r5, 1
+SETP  SLT, r2.x, r3.x
+IF    L_e
+ADD   r1, r1, r5
+L_e:
+ENDIF
+TEX   r6, r1, #0
+ADD   r4, r2, r6
+STO   0, r4
+END

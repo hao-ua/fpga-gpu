@@ -1,0 +1,33 @@
+// test_fsimul — fragment core (SIMT) integer ALU: per-lane IMUL / IDIV (incl. lanes dividing by zero and negative
+// operands), ISEQ / ISNE, a write mask, IMUL and IDIV in the two arms of a divergent IF / ELSE.
+// varying 0 per thread/component: ((p+1)*0.5 + c*0.125) % 3 + 0.25 ; param 4 = 1.5, param 6 = 2.0
+LDV  r1, 0
+LDP  r2, 6             // 2.0
+MUL  r3, r1, r2
+MUL  r3, r3, r2        // 4x in [1, 13)
+FTOI r4, r3            // ints 1..12 per lane
+LDP  r5, 4             // 1.5
+MUL  r6, r5, r2
+MUL  r6, r6, r2        // 6.0
+FTOI r6, r6            // 6
+ISUB r7, r4, r6        // ints -5..6, zero in some lanes
+IMUL r8, r7, r4
+IMUL r9, r8, r7
+IDIV r10, r9, r7       // zero lanes: x/0 = -1
+IDIV r11, r4, r7
+IDIV r12, r7, r6
+ISEQ r13, r10, r8
+ISNE r14, r11, r12
+MOV  r15, r6
+IDIV.yw r15, r9, r4    // write mask
+SETP SLT, r1, r5       // per thread x.x < 1.5 -> divergence
+IF   L_else
+IMUL r16, r7, r7
+L_else:
+ELSE L_end
+IDIV r16, r9, r6
+L_end:
+ENDIF
+ITOF r17, r10
+STO  0, r17
+END

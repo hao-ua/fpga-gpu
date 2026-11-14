@@ -1,0 +1,10 @@
+// b_fs_cube ? board B frame bench: cube map (sampler 1) at direction varying 0 .xyz, explicit LOD varying 1 .w
+LDV   r1, 0
+LDV   r2, 1
+MOV   r3, r1
+MAD   r3, r2, r2, r3
+TEX   r4, r1, #1
+TEX   r5, r3, #1, LOD
+ADD   r6, r4, r5
+STO   0, r6
+END

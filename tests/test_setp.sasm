@@ -1,0 +1,88 @@
+// test_setp — exercises ALL SETP CMP sub-ops (SLT/SGE/SEQ/SNE) on the VS core.
+// Each sub-op (ins[7:4]) must give its own comparison, not SLT's.
+// params (main() fixed): p0=0.5 p2=1.0 p7=0.5.  Results r10..r17 = 1.0 (true) / 0.0 (false).
+//
+// Uses BRP branch-if-TRUE (no F) to a bit[2]==0 target: `BRP D` jumps when pred is true, skipping the
+// "override to 0.0" (test_brp covers the F form). Targets D0..D7 are multiples of 8.
+LDP   r1, 0            // 0 : a = 0.5
+LDP   r2, 2            // 1 : b = 1.0 (true-marker / default)
+LDP   r3, 7            // 2 : c = 0.5 (== a)
+SUB   r4, r1, r1       // 3 : zero (false-marker)
+// ---- block0: SLT(0.5,1.0)=1  (start=4, D0=8) ----
+MOV   r10, r2          // 4 : default 1.0
+SETP  SLT, r1, r2      // 5
+BRP   D0               // 6 : if TRUE skip override
+MOV   r10, r4          // 7 : pred false -> 0.0
+D0:
+NOP                   // 8
+NOP                   // 9
+NOP                   // 10
+NOP                   // 11
+// ---- block1: SGE(0.5,1.0)=0  (start=12, D1=16) ----
+MOV   r11, r2          // 12
+SETP  SGE, r1, r2      // 13
+BRP   D1               // 14
+MOV   r11, r4          // 15
+D1:
+NOP                   // 16
+NOP                   // 17
+NOP                   // 18
+NOP                   // 19
+// ---- block2: SEQ(0.5,1.0)=0  (start=20, D2=24) ----
+MOV   r12, r2          // 20
+SETP  SEQ, r1, r2      // 21
+BRP   D2               // 22
+MOV   r12, r4          // 23
+D2:
+NOP                   // 24
+NOP                   // 25
+NOP                   // 26
+NOP                   // 27
+// ---- block3: SNE(0.5,1.0)=1  (start=28, D3=32) ----
+MOV   r13, r2          // 28
+SETP  SNE, r1, r2      // 29
+BRP   D3               // 30
+MOV   r13, r4          // 31
+D3:
+NOP                   // 32
+NOP                   // 33
+NOP                   // 34
+NOP                   // 35
+// ---- block4: SLT(0.5,0.5)=0  (start=36, D4=40) ----
+MOV   r14, r2          // 36
+SETP  SLT, r1, r3      // 37
+BRP   D4               // 38
+MOV   r14, r4          // 39
+D4:
+NOP                   // 40
+NOP                   // 41
+NOP                   // 42
+NOP                   // 43
+// ---- block5: SGE(0.5,0.5)=1  (start=44, D5=48) ----
+MOV   r15, r2          // 44
+SETP  SGE, r1, r3      // 45
+BRP   D5               // 46
+MOV   r15, r4          // 47
+D5:
+NOP                   // 48
+NOP                   // 49
+NOP                   // 50
+NOP                   // 51
+// ---- block6: SEQ(0.5,0.5)=1  (start=52, D6=56) ----
+MOV   r16, r2          // 52
+SETP  SEQ, r1, r3      // 53
+BRP   D6               // 54
+MOV   r16, r4          // 55
+D6:
+NOP                   // 56
+NOP                   // 57
+NOP                   // 58
+NOP                   // 59
+// ---- block7: SNE(0.5,0.5)=0  (start=60, D7=64) ----
+MOV   r17, r2          // 60
+SETP  SNE, r1, r3      // 61
+BRP   D7               // 62
+MOV   r17, r4          // 63
+D7:
+STO   0, r10           // 64
+END                   // 65

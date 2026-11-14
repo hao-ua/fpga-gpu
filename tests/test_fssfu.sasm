@@ -1,0 +1,23 @@
+// test_fssfu — exercises the FS SFU path (RCP/RSQRT/EXP2/LOG2).
+// Inputs are positive varyings; results checked within
+// a few ULP of the ideal-math golden (HW SFU = NR-seed/LUT approximation).
+LDV   r1, 0           // per-thread positive input (range ~[0.25,3.25))
+LDP   r8, 4           // uniform 1.5 (>1) for a clean positive LOG2
+RCP   r2, r1          // r2 = 1/r1
+RSQRT r3, r1          // r3 = 1/sqrt(r1)
+EXP2  r4, r1          // r4 = 2^r1
+LOG2  r5, r8          // r5 = log2(r8)
+SIN   r6, r1          // r6 = sin(r1)  (SFU quarter-wave LUT, full-range)
+COS   r7, r1          // r7 = cos(r1)
+// ---- stress the two PARALLEL transcendental ports (sincos ∥ SFU) + independent writeback buffers +
+//      cross-unit RAW hazards + a WAW that the per-register scoreboard must serialize ----
+SIN   r10, r1         // sincos issues, then...
+RCP   r11, r1         // ...SFU issues while the sin is still in flight (overlap)
+COS   r12, r1         // sincos
+RSQRT r13, r1         // SFU (overlaps the cos)
+SIN   r14, r8         // sin(1.5)
+RCP   r15, r6         // RAW across units: 1/sin(r1) — reads a sincos result on the SFU
+SIN   r16, r1         // WAW: r16 written by sin ...
+COS   r16, r8         // ... then overwritten by cos(1.5) — scoreboard must serialize (final = cos(1.5))
+STO   0, r2           // out_color = r2
+END

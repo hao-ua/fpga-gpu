@@ -1,0 +1,52 @@
+// fs2_qrinf — the quarter-rate classes with more than two micro-ops in flight (shader_core_fs2 QR_INF = 4):
+// whole-vec4 operations of one class back to back on independent registers (a vec4 is four micro-ops 4 cycles
+// apart, a SIN / COS or an SFU result ~21 cycles after its issue: the class fills), every class in turn and mixed, results
+// used at once, a later write over an earlier one of the same class whole and in part (WAW), and the converts and the
+// integer multiply chained. What it checks: the results come back to the right register and component in the order they
+// were issued (a collector's meta queue of QR_INF, the shared result queue of 4 x QR_INF) at 4 and at 8 warps, and the
+// same with QR_INF = 2 (tb_fs2 -Defines TB_QRINF2).
+// Golden: python3 tools/isa64.py fs2 tests/fs2_qrinf.sasm --exact-rcp; tb_fs2 with +TOL_8.
+LDV    r1, 8                         // per lane and component, 0.25 .. 3.25
+LDP    r2, 1                         // 0.75
+LDP    r3, 3                         // 1.25
+// SIN / COS: 16 micro-ops of the class back to back
+SIN    r4, r1
+COS    r5, r1
+SIN    r6, r2
+COS    r7, -r1
+// the SFU: every operation, plain and times an operand
+RCP    r8, r1
+RSQRT  r9, r1
+LOG2   r10, r1
+EXP2   r11, r2
+SQRT   r12, r1
+DIV    r13, r3, r1
+// converts and the integer multiply, chained
+FLR    r14, r1
+CEIL   r15, r1
+FTOI   r16, r1
+ITOF   r17, r16
+IMUL   r18, r16, r16
+IMUL   r19, r18, r16
+ITOF   r20, r19
+// results used at once
+ADD    r21, r4, r5
+MUL    r22, r8, r9
+SUB    r23, r14, r17
+// a later write over an earlier one of the same class: whole, then in part
+SIN    r24, r1
+SIN    r24, r2
+RCP    r25, r1
+RCP    r25.xy, r3.xy
+FLR    r26, r1
+CEIL   r26.zw, r1.zw
+ADD    r27, r24, r25
+// the classes mixed, a component each, then each class's result into the next one's argument
+SIN    r28.x, r1.x
+RCP    r28.y, r1.y
+FLR    r28.z, r1.z
+COS    r28.w, r1.w
+SIN    r29, r28
+RCP    r30, r29
+FLR    r31, r30
+END

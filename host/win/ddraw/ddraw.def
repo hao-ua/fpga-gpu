@@ -1,0 +1,16 @@
+LIBRARY ddraw.dll
+EXPORTS
+    AcquireDDThreadLock
+    DirectDrawCreate
+    DirectDrawCreateClipper
+    DirectDrawCreateEx
+    DirectDrawEnumerateA
+    DirectDrawEnumerateExA
+    DirectDrawEnumerateExW
+    DirectDrawEnumerateW
+    DllCanUnloadNow PRIVATE
+    DllGetClassObject PRIVATE
+    GetSurfaceFromDC
+    ReleaseDDThreadLock
+    SetAppCompatData
+    GPU2DD_ReadBack

@@ -1,0 +1,12 @@
+// OpenArena's fixed-function fragment programs and their constant-colour variants,
+// rows as b_ref.py's BR_UVSCREEN lays them out (varying 0 = both texture coordinates packed, varying 1 = the colour)
+// 'lm': RGBA texture x RGB lightmap x colour, coordinates packed
+LDV   r1, 0
+TEX   r2, r1, #0, .xy
+TEX   r3, r1.zwww, #1, .xy
+LDV   r1, 1
+MUL   r4, r1, r2
+MUL   r1.xyz, r4, r3
+MOV   r1.w, r4.w
+STO   0, r1
+END

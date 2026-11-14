@@ -1,0 +1,11 @@
+// b_fs_two ? board B frame bench: two varyings and gl_FragCoord (scaled by uniform 1), gl_FrontFacing
+LDV   r1, 0
+LDV   r2, 1
+LDV   r3, 8
+LDP   r4, 1
+MUL   r3, r3, r4
+MAD   r5, r1, r2, r3
+LDV   r6, 9
+MAD   r5, r6, r4, r5
+STO   0, r5
+END

@@ -1,0 +1,11 @@
+// test_movmod — verifies MOV honors source modifiers (negate/abs/-abs) on the VS core, so the compiler
+// can negate via a 1-cycle sign-flip instead of SUB-through-the-madd-unit. param0 (main() fixed) = 0.5.
+LDP   r1, 0           // 0.5
+MOV   r2, -r1         // -0.5  (negate a positive)
+MOV   r10, -r1        // -0.5  (negate)
+MOV   r11, !r2        //  0.5  (abs of -0.5)
+MOV   r12, -!r1       // -0.5  (-abs of 0.5)
+MOV   r13, -r2        //  0.5  (negate of -0.5)
+MOV   r14, r1         //  0.5  (plain MOV, no modifier -> unchanged)
+STO   0, r10
+END

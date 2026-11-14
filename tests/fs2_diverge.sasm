@@ -1,0 +1,42 @@
+// fs2_diverge — control flow over a warp of 4 quads (16 lanes): quads take different paths
+// (the predicate comes from gl_FragCoord, which differs per lane), nested IF inside a loop with per-lane BREAK and
+// CONT, DISCARD in one arm, a runtime-bounded loop, DDX in a divergent arm (helper lanes keep running), STOZ, and
+// the results folded into one STO so a wrong lane or a wrong mask shows.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_diverge.sasm
+LDV    r1, 8                         // per-lane gl_FragCoord
+LDP    r2, 0
+MOVI   r3, #0
+MOVI   r4.x, #1
+LOOP   5
+  MAD   r3, r1.x, r4.x, r3           // r3 += x each iteration
+  SETP  SLT, r2.x, r3.x
+  IF    L_in
+    SETP  SGE, r1.y, r2.y
+    BREAK                            // lanes with y >= p0.y leave the loop
+    DDX   r5.x, r3.x
+    ADD   r3.y, r3.y, r5.x
+  L_in:
+  ENDIF
+  SETP  SEQ, r1.z, r4.x
+  CONT                               // lanes with z == 1 skip the rest of the iteration
+  MUL   r3.z, r3.z, r2.z
+  ADD   r3.w, r3.w, r4.x
+ENDL
+SETP   SLT, r3.w, r2.w
+IF     L_else
+  MOVI  r6, #2
+  SETP  SGE, r1.x, r2.x
+  IF    L_d
+    DISCARD
+  L_d:
+  ENDIF
+L_else:
+ELSE   L_end
+  MOVI  r6, #3
+  DDY   r6.y, r3.y
+L_end:
+ENDIF
+MAD    r7, r3, r6.x, r6.yyyy
+STOZ   r3.y
+STO    r7
+END

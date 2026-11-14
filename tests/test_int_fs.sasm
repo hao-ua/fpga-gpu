@@ -1,0 +1,16 @@
+// FS integer ALU: IADD/ISUB/ISLT/ISGE across 16 lanes (4 threads x 4 comps). Build ints via LDP+FTOI.
+// param idx 2 = 1.0 ; idx 6 = 2.0 (broadcast to all threads)
+LDP  r1, 2
+FTOI r1, r1        // int 1
+LDP  r3, 6
+FTOI r3, r3        // int 2
+IADD r10, r1, r3   // 3
+ISUB r11, r3, r1   // 1
+ISUB r4,  r1, r3   // -1
+ISLT r12, r1, r3   // 1.0
+ISGE r13, r1, r3   // 0.0
+ISLT r14, r3, r1   // 0.0
+ISGE r15, r3, r1   // 1.0
+ISLT r16, r4, r1   // 1.0 (signed)
+ISGE r17, r4, r1   // 0.0 (signed)
+END

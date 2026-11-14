@@ -1,0 +1,5 @@
+LDV r1, 0
+STO 0, r1
+LDV r2, 1
+STV 0, r2
+END

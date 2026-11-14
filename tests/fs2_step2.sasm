@@ -1,0 +1,43 @@
+// fs2_step2 — the scalar core's basic paths: LDP / LDV (built-ins) / MOVI / MOV with
+// swizzles and modifiers, the madd path (ADD SUB MUL MAD, DDX / DDY inside the quads), the compare path (MIN MAX
+// SET), the 1-cycle path (SEL, IADD ISUB ISLT ISGE ISEQ ISNE), write masks in both spellings, RAW chains back to
+// back (scoreboard), WAW on one register, STO with a swizzle. Golden: python3 tools/isa64.py fs2 tests/fs2_step2.sasm
+LDV    r1, 8                         // gl_FragCoord per lane
+LDV    r2, 9.wzyx
+LDV    r3.xy, 10.yx
+LDP    r4, 0
+LDP    r5.yw, 3.zx
+MOVI   r6.x, #1.5
+MOVI   r6.y, #-0.25
+MOVI   r6.zw, #0x3f0000
+MOV    r7, r1.wzyx
+MOV.yw r8, -r1.x
+MOV    r8.xz, !r6.y
+ADD    r9, r1, r4
+SUB    r10.xyz, r9.yzw, -r6
+MUL    r11, r1.x, r2
+MAD    r12, -r1.yzwx, !r4, -!r6.x
+MAD    r12.w, r12.x, r12.y, r12.z   // RAW on the madd result, dest = a source (legal: w read nowhere earlier)
+ADD    r13, r12, r12.yxwz
+MIN    r14.xy, r1.xy, r2.yx
+MAX    r14.zw, r1.zw, r2.wz
+SET    SGE, r15, r1.yxwz, r2
+SET    SLT, r15.x, r1.x, r2.x
+SEL    r16, r15.x, r1.wzyx, r2.y
+MOVI   r17.x, #3
+MOVI   r17.y, #5
+IADD   r17.z, r17.x, r17.y
+ISUB   r17.w, r17.z, r17.y
+ISLT   r18.x, r17.x, r17.y
+ISGE   r18.y, r17.x, r17.y
+ISEQ   r18.z, r17.x, r17.x
+ISNE   r18.w, r17.x, r17.w
+DDX    r19, r1
+DDY    r20.xy, r1.yx
+ADD    r21, r19, r20.yyyy
+MUL    r21, r21, r21                 // WAW / RAW on the same register, back to back
+ADD    r21.x, r21.y, r21.z
+MOV    r22, r21
+ADD    r22, r22, r11
+STO    r22.wzyx
+END

@@ -1,0 +1,60 @@
+// test_fsctx — program of tb_fs_ctx (quad contexts in flight): every unit class, three TEX (implicit, BIAS and LOD
+// modes, one dependent on the first texels), divergent IF / ELSE with DDX / DDY, a loop with BREAK, DISCARD and
+// gl_FragDepth. All results fold into out_color / STOZ, so a wrong lane or context shows in the outputs. tb_fs_ctx
+// compares a multi-context core with a single-context one on the same inputs (the SIMT reference has no TEX).
+LDV   r1, 0
+LDV   r2, 1
+LDV   r3, 2
+LDP   r4, 0
+LDP   r5, 1
+TEX   r6, r1, #1
+MAD   r7, r1, r2, r3
+DP4   r8, r1, r2
+RCP   r9, r2
+TEX   r10, r2, #2, BIAS
+SIN   r11, r1
+FTOI  r12, r3
+IMUL  r13, r12, r12
+IDIV  r14, r13, r12
+ISUB  r15, r13, r14        // (ISUB, not an IOP function: board B has none)
+ITOF  r16, r15
+ADD   r17, r6, r7          // first use of the texels
+MUL   r17, r17, r10
+TEX   r18, r17, #3, LOD    // coordinate from the texels
+SETP  SLT, r1, r2
+IF    L_else
+ADD   r19, r9, r11
+DDX   r20, r7
+L_else:
+ELSE  L_end
+SUB   r19, r9, r11
+DDY   r20, r7
+L_end:
+ENDIF
+MOV   r21, r4
+LOOP  6
+MAD   r21, r21, r5, r8
+SETP  SLT, r3, r21
+BREAK
+ENDL
+EXP2  r22, r9
+LOG2  r23, !r2
+RSQRT r24, !r3
+COS   r25, r2
+IADD  r26, r12, r13
+ISLT  r27, r12, r14
+SEL   r28, r27, r19, r20
+MAD   r29, r18, r16, r17
+MAD   r29, r29, r22, r23
+MAD   r29, r29, r24, r25
+ADD   r29, r29, r26
+ADD   r29, r29, r28
+ADD   r29, r29, r21
+SETP  SLT, r2, r4
+IF    L_d
+DISCARD
+L_d:
+ENDIF
+STOZ  r19
+STO   0, r29
+END

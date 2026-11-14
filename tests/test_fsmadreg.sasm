@@ -1,0 +1,25 @@
+// test_fsmadreg — fragment core (SIMT): MAD with the addend in any register (r8..r31 via ins[3:2]), per-pixel
+// operands, src1 modifier, write mask, inside a divergent IF; plus r0..r7 (unchanged encoding).
+// varying 0/1 per thread/component; param 4 = 1.5, param 6 = 2.0, param 1 = 0.75
+LDV   r1, 0            // per pixel
+LDV   r9, 1            // per pixel (addend r9)
+LDP   r2, 4            // 1.5
+LDP   r20, 6           // 2.0 (addend r20)
+LDP   r31, 1           // 0.75 (addend r31)
+MAD   r10, r1, r2, r9
+MAD   r11, r1, -r2, r20    // src1 modifier
+MAD   r12, r1, r1, r31
+MAD   r3, r1, r2, r9       // destination below r8, addend above
+MAD   r13, r10, r11, r3    // addend r0..r7
+MOV   r14, r20
+MAD.xz r14, r1, r2, r31    // write mask
+SETP  SLT, r1, r2          // per thread x.x < 1.5 -> divergence
+IF    L_else
+MAD   r15, r10, r2, r31
+L_else:
+ELSE  L_end
+MAD   r15, r11, r2, r9
+L_end:
+ENDIF
+STO   0, r13
+END

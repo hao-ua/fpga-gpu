@@ -1,0 +1,56 @@
+# Vivado scratch
+*.jou
+*.log
+*.pb
+*.wdb
+*.str
+.Xil/
+xsim.dir/
+xelab.*
+xvlog.*
+webtalk*
+clockInfo.txt
+.xsim_work/
+hs_err_pid*.dmp
+tight_setup_hold_pins.txt
+# everything generated: the MIG IP, FP24 tables, goldens, simulation work directories, bitstreams, build reports
+# (regenerate: README.md "One-time setup")
+tools/gen/
+
+# editor / python junk
+*.swp
+__pycache__/
+*.pyc
+
+# Windows library build outputs (host/win/build.ps1)
+host/win/build/
+
+# Local only, not pushed: assistant settings and notes, working documents, remote-host scripts, board bring-up and
+# timing-analysis helpers. The repository documentation is README.md, ARCHITECTURE.md, FEATURES.md and PERF_TESTS.md.
+.claude/
+CLAUDE.md
+MEMORY.md
+NEXT_SESSION.md
+docs/
+scripts/
+bringup/blink*
+bringup/boards.local.tcl
+bringup/gen/
+bringup/build_blink.tcl
+bringup/tb_blink.sv
+ip/mig_7series_0/mig_7series_0.veo
+tools/c16_check.py
+tools/census_group.ps1
+tools/dcp_paths.tcl
+tools/fail_paths.tcl
+tools/frame_diff.py
+tools/frame_spikes.py
+tools/glslc64_check.py
+tools/hw_*.sh
+tools/link_place_report.tcl
+tools/path_detail.tcl
+tools/place_only.tcl
+tools/refresh_hw.tcl
+tools/slack_census.tcl
+tools/sweep_*.ps1
+tools/synth_*.tcl

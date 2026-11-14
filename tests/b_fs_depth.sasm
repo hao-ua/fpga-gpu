@@ -1,0 +1,7 @@
+// b_fs_depth ? board B frame bench: gl_FragDepth = varying 1 .x (no early depth for this draw), colour = varying 0
+// STOZ last, of the only component in flight: the warp retires into the core's output latch while it is in X2 (tests/fs2_stoz_last.sasm)
+LDV   r1, 0
+LDV   r2.x, 1
+STO   0, r1
+STOZ  r2
+END

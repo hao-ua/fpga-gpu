@@ -1,0 +1,4 @@
+// fs_mv — output varying #7 (verifies all 8 slots carried + indexing)
+LDV r1, 7
+STO 0, r1
+END

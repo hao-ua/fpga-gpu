@@ -1,0 +1,8 @@
+// b_fs_tex1m — b_fs_tex1 as the compilers emit it (LDV write masks, the TEX .xy coordinate set): one 2D sampler at
+// varying 0 times varying 1 — OpenArena's single-texture surfaces.
+LDV   r1.xy, 0
+TEX   r2, r1, #0, .xy
+LDV   r3, 1
+MUL   r4, r2, r3
+STO   0, r4
+END

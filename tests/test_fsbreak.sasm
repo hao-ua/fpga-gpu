@@ -1,0 +1,40 @@
+LDP r1 0
+LDP r2 1
+LDP r3 2
+MOV r4 r1
+MOV r5 r1
+MOV r6 r2
+LOOP 4096
+SET SEQ r7 r6 r1
+SETP SNE r7 r1
+IF Lelse1
+ADD r7 r5 r2
+MOV r5 r7
+Lelse1:
+ELSE Lend2
+Lend2:
+ENDIF
+MOV r6 r1
+SET SLT r7 r5 r3
+SET SEQ r8 r7 r1
+SETP SNE r8 r1
+BREAK
+LDV r7 0
+SET SGE r8 r5 r7
+SETP SNE r8 r1
+IF Lelse3
+SETP SNE r2 r1
+BREAK
+Lelse3:
+ELSE Lend4
+Lend4:
+ENDIF
+ADD r7 r4 r2
+MOV r4 r7
+ENDL
+MOV.x r3 r4
+MOV.y r3 r1
+MOV.z r3 r1
+MOV.w r3 r2
+STO 0 r3
+END

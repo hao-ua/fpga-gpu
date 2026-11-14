@@ -1,0 +1,37 @@
+// fs2_exp2lim — EXP2 where its argument is beyond the unit's fixed-point range, and pow at zero. float_sfu
+// keeps the integer part of EXP2's argument in EXP_W + 4 bits: a larger one must not wrap (2^-1100 = +inf, 2^-2040 = 256)
+// and an infinity must not be shifted out whole (2^-inf = 1.0, so pow(0, y) = EXP2(y * LOG2 0) = 1: a specular term
+// pow(max(dot(n, h), 0.0), 64.0) would light pixels white). The limits are exact (0, +inf), so this program needs
+// no tolerance for them; the in-range EXP2s beside them keep the regular path honest (+TOL_8 as every SFU program).
+// Golden: python3 tools/isa64.py fs2 tests/fs2_exp2lim.sasm
+LDV    r1, 8
+MOVI   r2, #0                        // 0.0
+MOVI   r3, #64.0
+LOG2   r4, r2                        // -inf
+MUL    r5, r3, r4                    // -inf
+EXP2   r6, r5                        // pow(0, 64) = 0
+MOVI   r7.x, #-1100.0
+MOVI   r7.y, #-2040.0
+MOVI   r7.z, #-1023.5
+MOVI   r7.w, #-1024.0
+EXP2   r8, r7                        // 0 0 0 0
+MOVI   r9.x, #1100.0
+MOVI   r9.y, #2040.0
+MOVI   r9.z, #1023.0
+MOVI   r9.w, #70000.0
+EXP2   r10, r9                       // +inf +inf +inf +inf
+MOVI   r11.x, #-3.5
+MOVI   r11.y, #5.25
+MOVI   r11.z, #-61.0
+MOVI   r11.w, #0.5
+EXP2   r12, r11                      // in range
+MUL    r13.x, r1.x, r6.x             // the limits meet ordinary work: x * 0
+ADD    r13.y, r8.y, r12.y
+MIN    r13.z, r10.z, r12.w           // min(+inf, 2^0.5)
+MAD    r13.w, r8.w, r1.y, r12.x
+LOG2   r14.x, r13.x                  // log2(0) again, from a computed zero
+MUL    r14.y, r14.x, r3.x
+EXP2   r14.z, r14.y                  // 0
+ADD    r15, r13, r14.z
+STO    r15
+END

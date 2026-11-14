@@ -1,0 +1,10 @@
+// fs2_stoz_last — STOZ directly before END, of the last component to land (so nothing keeps the warp from finishing at once):
+// the warp retires into the output latch two cycles after the STOZ's issue, while the STOZ is in X2, so the latch's "the
+// program wrote gl_FragDepth" and the depth row must both still be right (found reviewing the output latch: a flag set
+// in X2 was sampled too early, and no program ended this way).
+// Golden: python3 tools/isa64.py fs2 tests/fs2_stoz_last.sasm
+LDV    r1, 0
+LDV    r2, 1
+STO    r1
+STOZ   r2.w
+END

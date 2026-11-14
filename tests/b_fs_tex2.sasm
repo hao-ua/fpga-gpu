@@ -1,0 +1,10 @@
+// b_fs_tex2 — board B frame bench (tb_b_render): the shape of OpenArena's world
+// shader, two 2D samplers (0 at varying 0, 1 at varying 1, implicit LOD) multiplied. Used with BR_PROG0=b_fs_tex2
+// BR_TEX2D=1 (b_ref.py frame), which makes sampler 1 a 2D texture.
+LDV   r1, 0
+TEX   r2, r1, #0
+LDV   r3, 1
+TEX   r4, r3, #1
+MUL   r5, r2, r4
+STO   0, r5
+END

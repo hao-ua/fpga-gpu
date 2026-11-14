@@ -1,0 +1,35 @@
+// vs2_ldpx — run-time uniform indexing (LDPX; the 64-bit vertex core only, no 32-bit twin): the per-lane gather,
+// the mod-256 wrap, a negative index, value and index swizzles, masks, the hazards on the index register and on the
+// 2-cycle result, LDPX interleaved with 1-cycle loads (tb_vs2 WARPS_4 interleaves four warps on top).
+LDV r1, 0            // attribute 0: lane- and component-dependent values 0.25 .. 3.25
+MOVI r2, #100
+MUL r3, r1, r2       // 25 .. 325: indices spread over the 256 slots, some wrapping
+FTOI r4, r3          // int indices per lane and component
+LDPX r5, 0, r4.x     // params[idx.x mod 256]
+MOV r6, r5           // the scoreboard holds this read until the 2-cycle write lands
+LDP r7, 9            // a 1-cycle-path load right behind an LDPX (their write slots are reserved 2 + lat apart)
+MOVI r8, #1.0
+LDPX r8.xz, 7.wzyx, r4.y   // a masked LDPX: y and w keep the 1.0
+LDPX r9, 250, r4.z   // 250 + idx wraps
+LDPX r10, 3, r4      // identity index swizzle: component c indexes with idx[c]
+MOVI r11.x, #3.0
+MOV r11.y, -r11.x
+FTOI r12.x, r11.y    // a negative index: 5 - 3 = slot 2
+LDPX r13, 5, r12.x
+FTOI r14, r5         // the gathered value as the next index (a dependent LDPX chain)
+LDPX r15, 1, r14.y
+ADD r16, r15, r8
+LDPX r17.y, 0, r4.w
+IADD r18, r4, r4     // index arithmetic in the int representation (2 idx)
+LDPX r19, 2, r18.x
+ADD r20, r7, r13
+STO r5
+STV 0, r6
+STV 1, r8
+STV 2, r9
+STV 3, r10
+STV 4, r20
+STV 5, r16
+STV 6, r17
+STV 7, r19
+END

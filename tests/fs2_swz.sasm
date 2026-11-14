@@ -1,0 +1,39 @@
+// fs2_swz — 64-bit ISA: every operand form the 32-bit ISA could not express. Swizzles on all
+// three sources (full, splat, short), modifiers on every source of MAD, write masks on the destination (both
+// spellings), MOVI literals, DP3 / DP4 over swizzled components into partial masks, LDP / LDV with a swizzle, SEL /
+// SET / SETP / TEX / STO / STOZ with swizzled sources, integer ops and conversions on single components.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_swz.sasm (tb_fs2 compares the GPRs, out_color, out_depth, kill).
+LDV    r1, 8
+LDV    r2, 9.wzyx
+LDP    r3, 2.yyxx
+MOVI   r4.x, #1.5
+MOVI   r4.y, #-0.25
+MOVI   r4.zw, #0x3f0000              // 1.0 raw
+MOV    r5, r1.wzyx
+MOV.yw r6, r1.x                      // mnemonic-suffix write mask, splat source
+MAD    r7.xyz, -r1.yzw, !r2.x, -!r3
+DP4    r8.x, r1, r2.yxwz
+DP3    r8.yz, r1.zzz, r2.w
+DP4    r8.w, -r5, r5
+ADD    r9.xw, r1.w, r2.x
+SUB    r9.yz, r5.zy, r1.yz
+MUL    r10, r4.x, r1
+MIN    r11.xy, r1.xy, r2.yx
+MAX    r11.zw, r1.zw, r2.wz
+SET    SGE, r12, r1.yxwz, r2
+SETP   SLT, r1.w, r2.x
+SEL    r13, r12.x, r1.wzyx, r2.yyyy
+FTOI   r14.x, r1.z
+IADD   r14.y, r14.x, r14.x
+IMUL   r14.z, r14.y, r14.x           // (IMUL, not an IOP function: board B has none)
+ITOF   r15.xy, r14.yz
+TEX    r16, r1.yxzw, #1
+TEX    r17.xy, r5, #2, BIAS
+RSQRT  r18.x, !r1.y
+SIN    r18.y, r1.x
+TRUNC  r18.zw, r4.yy
+DDX    r19, r7.yzxw
+RCP    r20.w, r1.w
+STOZ   r1.yxzw
+STO    r13.wzyx
+END

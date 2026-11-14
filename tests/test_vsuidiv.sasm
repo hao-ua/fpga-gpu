@@ -1,0 +1,32 @@
+// test_vsuidiv — vertex core integer extras: IMUL chains, IMOD / UDIV / UMOD (incl. % 0 and negative operands), FTOU /
+// UTOF; per-component values via write masks. (No IOP functions: board A has none — no compiler of the GL <= 2.0 era
+// emits them; an IOP opcode kills the warp.)
+// params (i%7)*.25+.5: idx2 1.0, idx6 2.0 ; varyings (i%5)*.5+.25: idx4 2.25
+LDP  r1, 6
+FTOI r1, r1            // 2
+LDP  r2, 2
+FTOI r2, r2            // 1
+IADD r3, r1, r1        // 4
+IMUL r4, r3, r3        // 16
+IMUL r5, r4, r3        // 64
+IADD r6, r5, r2        // 65
+ISUB r7, r2, r6        // -64
+ISUB.y r7, r6, r1      // y = 63
+ISUB.z r7, r2, r4      // z = -15
+MOV.w  r7, r3          // w = 4          r7 = (-64, 63, -15, 4)
+IADD r8, r1, r2        // 3
+IMUL r10, r7, r8       // (-192, 189, -45, 12)
+IMUL r11, r10, r7      // back-to-back IMULs through the quarter-rate unit
+IMUL.xz r12, r11, r2   // a masked IMUL
+IDIV r13, r7, r8       // (-21, 21, -5, 1)
+IMOD r25, r7, r8       // sign of the dividend
+UDIV r26, r7, r8
+UMOD r27, r7, r8
+ISUB r28, r1, r1       // 0
+IMOD r29, r7, r28      // x % 0 = x
+UDIV r30, r7, r28      // unsigned x / 0 = all ones
+IDIV r14, r10, r7      // 3 (every component)
+LDV  r9, 4             // 2.25
+FTOU r31, r9           // 2
+UTOF r9, r7            // -64 as unsigned -> 2^24 - 64
+END

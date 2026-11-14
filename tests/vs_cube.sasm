@@ -1,0 +1,65 @@
+// vs_cube — GPU vertex transform + flat diffuse lighting (for the rotating-cube demo).
+// Position is OBJECT space (varin0); the GPU does the full MVP transform here. Per-face normal
+// and light come in as UNIFORMS (no host vertex pre-transform). Flat (per-face) Gouraud-free shading.
+//
+// Uniforms (params):
+//   0..3   MVP rows (row-major): clip.i = dot4(row_i, pos)
+//   4..7   basis ex(1,0,0,0) ey ez ew  (to assemble a vec4 from broadcast dot scalars)
+//   16     face normal (object space)            (set per face draw)
+//   17..19 model-rotation rows 0,1,2 (3x3 upper-left, in vec4)
+//   20     light direction (world space)
+//   21     ambient (broadcast a,a,a,a)
+//   22     diffuse (broadcast)
+//   23     zero    (broadcast)
+//
+// in: varin0 = position(obj, w=1), varin1 = base colour
+// out: out_pos = clip ; varyings 0..7 = lit colour
+
+LDV  r1, 0          // position (object)
+LDV  r2, 1          // base colour
+LDP  r4, 0          // mvp row0
+LDP  r5, 1          // mvp row1
+LDP  r6, 2          // mvp row2
+LDP  r7, 3          // mvp row3
+DP4  r8,  r4, r1    // clip.x (broadcast)
+DP4  r9,  r5, r1    // clip.y
+DP4  r10, r6, r1    // clip.z
+DP4  r11, r7, r1    // clip.w
+LDP  r12, 4         // ex = (1,0,0,0)
+LDP  r13, 5         // ey
+LDP  r14, 6         // ez
+LDP  r15, 7         // ew
+MUL  r3, r8,  r12   // (clip.x,0,0,0)
+MAD  r3, r9,  r13, r3
+MAD  r3, r10, r14, r3
+MAD  r3, r11, r15, r3   // r3 = clip = (x,y,z,w)
+STO  0, r3
+
+// ---- flat lighting: nw = modelRot * faceNormal ; diff = max(0, nw . light) ----
+LDP  r16, 16         // face normal (object)
+LDP  r17, 17         // model rot row0
+LDP  r18, 18        // model rot row1
+LDP  r19, 19        // model rot row2
+DP3  r20, r17, r16  // nw.x
+DP3  r21, r18, r16  // nw.y
+DP3  r22, r19, r16  // nw.z
+MUL  r3, r20, r12   // assemble nw = (nwx,nwy,nwz,0)  (reuse r3, basis ex/ey/ez)
+MAD  r3, r21, r13, r3
+MAD  r3, r22, r14, r3
+LDP  r17, 20        // light (world)
+DP3  r18, r3, r17   // diff (broadcast)
+LDP  r0, 23         // zero
+MAX  r18, r18, r0   // max(diff, 0)
+LDP  r4, 21         // ambient (broadcast)
+LDP  r5, 22         // diffuse (broadcast)
+MAD  r6, r18, r5, r4    // sh = diff*diffuse + ambient
+MUL  r2, r2, r6     // lit = colour * sh
+STV  0, r2
+STV  1, r2
+STV  2, r2
+STV  3, r2
+STV  4, r2
+STV  5, r2
+STV  6, r2
+STV  7, r2
+END

@@ -1,0 +1,46 @@
+// fs2_clamp — CLAMP rd, x, lo, hi = MIN(MAX(x, lo), hi) in ONE micro-op per component (shader_core_fs2 XCLAMP,
+// float_cmp3). Lanes below, inside and above the bounds, swizzles, scalar bounds, modifiers on all three
+// operands, lo above hi (the formula's answer: hi), the infinities as values and as bounds, a clamp of x between x and x;
+// beside MAX then MIN on the same operands with SET SNE between them (0 in every lane: the same bits); its result used
+// at once, a CLAMP over an earlier write of its target, a CLAMP under a lane mask. Exact: no tolerance.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_clamp.sasm
+LDV    r1, 8                         // per lane and component, 0.25 .. 3.25
+LDP    r2, 2                         // 1.0
+LDP    r3, 6                         // 2.0
+MOVI   r4.x, #0.5
+MOVI   r4.y, #1.5
+MOVI   r4.z, #2.5
+MOVI   r4.w, #-1.0
+CLAMP  r5, r1, r2, r3
+CLAMP  r6.xz, r1.zx, r4.x, r4.y
+CLAMP  r7, -r1, -r3, -r2             // into [-2, -1]
+CLAMP  r8, r1, r3, r2                // lo > hi: MIN(MAX(x, 2), 1) = 1
+CLAMP  r9, !r4, r2, r3               // of constants: |x| into [1, 2]
+MAX    r10, r1, r2
+MIN    r11, r10, r3
+SET    SNE, r12, r5, r11             // 0: CLAMP = MAX, MIN
+MAX    r20, -r1, -r3
+MIN    r21, r20, -r2
+SET    SNE, r22, r7, r21             // 0, with the modifiers
+MOVI   r13.x, #0
+MOVI   r13.y, #0x7f0000              // +inf
+MOVI   r13.z, #0xff0000              // -inf
+MOVI   r13.w, #3.0
+CLAMP  r14, r13, r2, r3              // 0 -> 1, +inf -> 2, -inf -> 1, 3 -> 2
+CLAMP  r15, r1, r13.z, r13.y         // between -inf and +inf: x
+CLAMP  r16, r1, r1, r1               // x
+MUL    r17, r5, r6.x
+CLAMP  r17.yw, r17, r4.x, r4.z       // over the MUL's .y / .w, its own earlier values as x
+MOVI   r18, #0
+SETP   SLT, r1.x, r4.y
+IF     Lskip
+CLAMP  r18, r1, r4.x, r4.y           // the lanes with x below 1.5 only
+Lskip:
+ENDIF
+ADD    r19, r5, r7
+ADD    r19, r19, r14
+MAD    r19, r17, r15, r19
+ADD    r19.xz, r19, r6
+ADD    r19, r19, r18
+STO    r19
+END

@@ -1,0 +1,48 @@
+// fs2_ldvw — the LDV wavefront on the scalar core (shader_core_fs2 header): every shape of write mask (first /
+// last component alone, gaps, three components), swizzled, so "the lambda1 phase ends here", the component's acc1 entry and
+// the last lambda1 step's landing are all exercised; DP3 / DP4 directly before and after an LDV (they share acc1 entry 0 and
+// the warp's one acc1 ready bit); an LDV over a register an LDV is still writing; LDV as a TEX coordinate.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_ldvw.sasm
+LDV    r1, 0
+LDV    r2, 1
+LDV    r3, 2
+LDV    r4, 3
+LDV    r5, 4
+LDV    r6, 5
+LDV    r7, 6
+LDV    r8, 7
+LDV    r1.x, 7
+LDV    r1.y, 6.w
+LDV    r2.z, 5.x
+LDV    r2.w, 4
+LDV    r3.xz, 3.yx
+LDV    r4.yw, 2.zw
+LDV    r5.xyw, 1.wzy
+LDV    r6.yzw, 0
+LDV    r7.xw, 1.yy
+DP4    r9, r1, r2
+LDV    r10, 2.wzyx
+DP3    r11.xy, r10, r3
+LDV    r12, 7
+LDV    r12.w, 3
+DP4    r13.zw, r12, r4
+LDV    r14.xz, 4
+MOV    r14.yw, r13.zw
+LDV    r14.xyz, 5
+TEX    r15, r14, #1
+LDV    r16, 6
+ADD    r17, r1, r2
+ADD    r17, r17, r3
+ADD    r17, r17, r4
+ADD    r17, r17, r5
+ADD    r17, r17, r6
+ADD    r17, r17, r7
+ADD    r17, r17, r8
+MAD    r17, r9, r10, r17
+ADD    r17, r17, r11.xyxy
+ADD    r17, r17, r13.zwzw
+ADD    r17, r17, r14
+ADD    r17, r17, r15
+ADD    r17, r17, r16
+STO    r17
+END

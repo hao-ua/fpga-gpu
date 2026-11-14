@@ -1,0 +1,35 @@
+// test_brp — verifies the VS BRP predicated branch: the "branch-if-false" flag is ins[25] (the unused rd
+// field), apart from the target's imm bits. Covers all 4 cases; the critical one is case1: BRP F TAKEN to a
+// bit[2]==0 target (A=8), which must jump to 8, not 12 (8|4).
+// Results r10..r13 = [0,1,0,1]: taken paths skip the override, not-taken paths run it.
+LDP   r1, 2            // 0 : 1.0
+LDP   r2, 0            // 1 : 0.5
+SUB   r3, r1, r1       // 2 : 0.0
+// ---- case1: BRP F, pred FALSE -> TAKEN, target A=8 (bit2 clear) ----
+MOV   r10, r3          // 3 : default 0
+SETP  SLT, r1, r2      // 4 : 1.0<0.5 = false -> pred=0
+BRP   A, F             // 5 : taken -> jump A
+MOV   r10, r1          // 6 : skipped (r10 stays 0)
+NOP                   // 7
+A:
+// ---- case2: BRP F, pred TRUE -> NOT taken -> fall through ----
+MOV   r11, r3          // 8 : default 0
+SETP  SLT, r2, r1      // 9 : 0.5<1.0 = true -> pred=1
+BRP   B, F             // 10: not taken
+MOV   r11, r1          // 11: executed -> r11=1.0
+B:
+// ---- case3: BRP (no F), pred TRUE -> TAKEN, target C ----
+MOV   r12, r3          // 12: default 0
+SETP  SLT, r2, r1      // 13: true -> pred=1
+BRP   C                // 14: branch-if-true -> taken -> jump C
+MOV   r12, r1          // 15: skipped (r12 stays 0)
+NOP                   // 16
+C:
+// ---- case4: BRP (no F), pred FALSE -> NOT taken -> fall through ----
+MOV   r13, r3          // 17: default 0
+SETP  SLT, r1, r2      // 18: false -> pred=0
+BRP   D                // 19: not taken
+MOV   r13, r1          // 20: executed -> r13=1.0
+D:
+STO   0, r10           // 21
+END                   // 22

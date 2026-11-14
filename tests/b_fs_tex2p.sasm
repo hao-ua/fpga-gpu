@@ -1,0 +1,9 @@
+// b_fs_tex2p — b_fs_tex2m with both coordinates in one varying, as the link packs them (Appendix A.7 in the fewest rows):
+// one LDV of row 0, the lightmap's TEX reads its .zw through the source swizzle. b_ref.py frame gives
+// row 0's zw what b_fs_tex2m's row 1 holds, so the two frames sample the same texels.
+LDV   r1, 0
+TEX   r2, r1, #0, .xy
+TEX   r4, r1.zwww, #1, .xy
+MUL   r5, r2, r4
+STO   0, r5
+END

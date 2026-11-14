@@ -1,0 +1,41 @@
+// test_fsround — fragment core (SIMT, 4 pixels): float -> float rounding TRUNC / FLR / CEIL / RNDE (per-pixel
+// values, halves, |x| < 1, |x| >= 2^16, source modifiers, write masks) and SEL (per-lane select, third register
+// above r7, write masks, inside a divergent IF / ELSE).
+// varying 0 per thread/component: ((p+1)*0.5 + c*0.125) % 3 + 0.25 ; param 4 = 1.5, param 6 = 2.0
+LDV   r1, 0            // x in [0.25, 3.25), multiples of 1/8
+LDP   r2, 4            // 1.5
+LDP   r12, 6           // 2.0
+SUB   r3, r1, r2       // x - 1.5: negative and positive fractions
+ADD   r4, r3, r3       // 2(x - 1.5): halves and quarters
+TRUNC r5, r4
+FLR   r6, r4
+CEIL  r7, r4
+RNDE  r8, r4
+FLR   r9, -r4          // source modifier
+RNDE.xz r10, !r4       // abs + write mask
+EXP2  r13, r12         // 4
+MUL   r13, r13, r13    // 16
+MUL   r13, r13, r13    // 256
+MUL   r13, r13, r13    // 65536
+MUL   r14, r4, r13     // mostly |x| >= 2^16 (pass through), some below
+FLR   r15, r14
+CEIL  r16, r14
+MUL   r17, r14, r13    // ~2^33: beyond FTOI's 24-bit range
+CEIL  r18, r17
+SUB   r20, r2, r2      // 0.0
+SET   SLT, r19, r3, r20   // x < 1.5 per lane
+SEL   r21, r19, r5, r6
+SEL   r22, r19, r8, r16   // third register r16 (> r7: uses ins[3:2])
+SEL.yw r22, r19, r15, r9
+MOV   r24, r20
+SETP  SLT, r1, r2      // per thread: x.x < 1.5 -> divergence
+IF    L_else
+SEL   r24, r19, r18, r7
+L_else:
+ELSE  L_end
+SEL.xy r24, r19, r7, r18
+L_end:
+ENDIF
+SEL   r23, r20, r5, r7    // zero condition -> r7
+STO   0, r21
+END

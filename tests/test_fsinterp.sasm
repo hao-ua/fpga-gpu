@@ -1,0 +1,45 @@
+// test_fsinterp — LDV interpolation (shader_core_fs INTERP), program of tb_fs_interp: every user
+// varying 0..7, LDV back-to-back and right after a TEX, under a divergent IF / ELSE (partial active masks), inside a
+// loop (the same LDV repeated), WAW on an LDV destination, the built-ins 8 / 9 / 10 (read from varin), DDX / DDY of
+// interpolated values (of registers every thread wrote: in divergent code the other threads' values are undefined), STOZ. tb_fs_interp runs it on the INTERP core and a lowered copy (each LDV = its two MADs over
+// varin slots, tools/b_ref.py fsi) on a plain core; registers r28..r31 belong to the lowering.
+LDV   r1, 0
+LDV   r2, 1
+LDV   r3, 8
+TEX   r4, r1, #1
+LDV   r5, 2
+MAD   r6, r1, r2, r5
+LDV   r7, 7
+LDV   r8, 3
+SETP  SLT, r1, r2
+IF    L_else
+LDV   r8, 3
+ADD   r8, r8, r4
+DDX   r9, r6
+L_else:
+ELSE  L_end
+LDV   r8, 4
+MUL   r8, r8, r3
+DDY   r9, r5
+L_end:
+ENDIF
+LOOP  3
+LDV   r10, 5
+ADD   r6, r6, r10
+ENDL
+LDV   r6, 6
+LDV   r6, 6
+ADD   r11, r6, r7
+ADD   r11, r11, r8
+ADD   r11, r11, r9
+MUL   r11, r11, r4
+LDV   r12, 9
+LDV   r13, 10
+MAD   r11, r12, r13, r11
+LDV   r14, 0
+LDV   r15, 0
+SUB   r14, r14, r15
+ADD   r11, r11, r14
+STOZ  r2
+STO   0, r11
+END

@@ -1,0 +1,12 @@
+// test_fsdiscard — discard for the threads where r1.x < r2.x (threads 0,1).
+// Verifies killed threads keep old color (0) at STO and out_kill exposes the mask.
+LDV   r1, 0
+LDV   r2, 1
+MOV   r5, r1          // color = r1 (per-thread)
+SETP  SLT, r1, r2     // pred = r1.x < r2.x  -> threads 0,1 true
+IF    L_end
+DISCARD               // kill threads 0,1
+L_end:
+ENDIF
+STO   0, r5           // writes only non-killed threads (2,3)
+END

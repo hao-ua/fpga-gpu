@@ -1,0 +1,13 @@
+// vs_mv — pass clip position; broadcast input color to all 8 vec4 varyings.
+LDV r1, 0      // varin0 = clip position
+STO 0, r1      // out_pos
+LDV r2, 1      // varin1 = color
+STV 0, r2
+STV 1, r2
+STV 2, r2
+STV 3, r2
+STV 4, r2
+STV 5, r2
+STV 6, r2
+STV 7, r2
+END

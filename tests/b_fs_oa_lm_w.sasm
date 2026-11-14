@@ -1,0 +1,10 @@
+// OpenArena's fixed-function fragment programs and their constant-colour variants,
+// rows as b_ref.py's BR_UVSCREEN lays them out (varying 0 = both texture coordinates packed, varying 1 = the colour)
+// 'lm' with a constant WHITE colour
+LDV   r1, 0
+TEX   r2, r1, #0, .xy
+TEX   r3, r1.zwww, #1, .xy
+MUL   r1.xyz, r2, r3
+MOV   r1.w, r2.w
+STO   0, r1
+END

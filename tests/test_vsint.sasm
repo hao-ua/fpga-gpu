@@ -1,0 +1,16 @@
+// VS integer ALU: IADD/ISUB/ISLT/ISGE (2's-comp, latency 1). Build int constants via LDP+FTOI.
+// param idx 2 = (2%7)*.25+.5 = 1.0 ; idx 6 = (6%7)*.25+.5 = 2.0
+LDP  r1, 2
+FTOI r1, r1        // int 1
+LDP  r3, 6
+FTOI r3, r3        // int 2
+IADD r10, r1, r3   // 1+2 = 3
+ISUB r11, r3, r1   // 2-1 = 1
+ISUB r4,  r1, r3   // 1-2 = -1 (negative wrap)
+ISLT r12, r1, r3   // 1 <  2 -> 1.0
+ISGE r13, r1, r3   // 1 >= 2 -> 0.0
+ISLT r14, r3, r1   // 2 <  1 -> 0.0
+ISGE r15, r3, r1   // 2 >= 1 -> 1.0
+ISLT r16, r4, r1   // -1 <  1 -> 1.0 (signed)
+ISGE r17, r4, r1   // -1 >= 1 -> 0.0 (signed)
+END

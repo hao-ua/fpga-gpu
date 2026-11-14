@@ -1,0 +1,19 @@
+// test_vsarb — stresses the single-write-port GPR arbitration: interleaves
+// DP4 (lat 9), MUL/MAD (lat 6) and RCP/RSQRT (SFU, variable) so multiple
+// results contend for the same writeback cycle. Results are timing-independent,
+// so the golden is unchanged by any arbitration stalls -> verifies correctness.
+LDP   r1, 0
+LDP   r2, 1
+DP4   r10, r1, r2      // lat 9
+MUL   r11, r1, r2      // lat 6 (issued +1 -> WB +7)
+MUL   r12, r1, r2      // lat 6 (issued +2 -> WB +8)
+MUL   r13, r1, r2      // lat 6 (issued +3 -> WB +9 collides with DP4)
+MAD   r14, r1, r2, r1  // lat 6 (issued +4 -> WB +10)
+RCP   r15, r1          // SFU
+RSQRT r16, r2          // SFU (waits for r15 buffer drain)
+MUL   r17, r1, r1      // lat 6
+DP4   r18, r2, r1      // lat 9
+ADD   r19, r10, r11    // depends on dot + madd results
+MUL   r20, r17, r18
+STO   0, r19
+END

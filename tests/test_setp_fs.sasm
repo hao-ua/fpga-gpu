@@ -1,0 +1,77 @@
+// test_setp_fs — exercises ALL SETP CMP sub-ops (SLT/SGE/SEQ/SNE) on the FS/SIMT core via SETP+IF.
+// Each sub-op (ins[7:4]) must give its own comparison, not SLT's.
+// params (main_fs() fixed, broadcast): p0=0.5 p2=1.0 p7=0.5. Results r10..r17 = 1.0 (true)/0.0 (false).
+LDP   r1, 0            // a  = 0.5
+LDP   r2, 2            // b  = 1.0  (true-marker)
+LDP   r3, 7            // c  = 0.5  (== a)
+SUB   r4, r1, r1       // zero = 0.0 (false-marker)
+
+// ---- a<b : 0.5 vs 1.0  -> SLT=1 SGE=0 SEQ=0 SNE=1 ----
+MOV   r10, r4
+SETP  SLT, r1, r2
+IF    La1e
+MOV   r10, r2
+La1e:
+ELSE  La1x
+La1x:
+ENDIF
+MOV   r11, r4
+SETP  SGE, r1, r2
+IF    La2e
+MOV   r11, r2
+La2e:
+ELSE  La2x
+La2x:
+ENDIF
+MOV   r12, r4
+SETP  SEQ, r1, r2
+IF    La3e
+MOV   r12, r2
+La3e:
+ELSE  La3x
+La3x:
+ENDIF
+MOV   r13, r4
+SETP  SNE, r1, r2
+IF    La4e
+MOV   r13, r2
+La4e:
+ELSE  La4x
+La4x:
+ENDIF
+
+// ---- a==c : 0.5 vs 0.5  -> SLT=0 SGE=1 SEQ=1 SNE=0 ----
+MOV   r14, r4
+SETP  SLT, r1, r3
+IF    Lb1e
+MOV   r14, r2
+Lb1e:
+ELSE  Lb1x
+Lb1x:
+ENDIF
+MOV   r15, r4
+SETP  SGE, r1, r3
+IF    Lb2e
+MOV   r15, r2
+Lb2e:
+ELSE  Lb2x
+Lb2x:
+ENDIF
+MOV   r16, r4
+SETP  SEQ, r1, r3
+IF    Lb3e
+MOV   r16, r2
+Lb3e:
+ELSE  Lb3x
+Lb3x:
+ENDIF
+MOV   r17, r4
+SETP  SNE, r1, r3
+IF    Lb4e
+MOV   r17, r2
+Lb4e:
+ELSE  Lb4x
+Lb4x:
+ENDIF
+STO   0, r10
+END

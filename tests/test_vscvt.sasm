@@ -1,0 +1,13 @@
+// test_vscvt — FTOI (float->int trunc) / ITOF (int->float) round trips.
+LDP   r1, 6        // 2.0
+FTOI  r2, r1       // 2
+ITOF  r3, r2       // 2.0
+LDP   r4, 5        // 1.75
+MUL   r5, r4, r4   // 3.0625
+FTOI  r6, r5       // 3 (trunc)
+ITOF  r7, r6       // 3.0
+LDP   r8, 4        // 1.5
+FTOI  r9, r8       // 1
+ITOF  r10, r9      // 1.0
+STO   0, r3
+END

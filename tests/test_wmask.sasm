@@ -1,0 +1,21 @@
+// test_wmask — verifies the write-mask + source-modifier ISA extension against shader_ref.
+// params are splats: p0=0.5, p1=0.75, p2=1.0. Results STV'd to varyings 0..4 for the tb to read.
+LDP  r1, 0          // (.5,.5,.5,.5)
+LDP  r2, 1          // (.75,...)
+LDP  r3, 2          // (1.,...)
+SUB  r0, r1, r1     // 0.0  (zero reg)
+MOV  r5, r1         // (.5,.5,.5,.5)
+MOV.y r5, r2        // (.5,.75,.5,.5)   <- write-mask y
+MOV.z r5, r3        // (.5,.75,1.,.5)   <- write-mask z
+STV  0, r5
+ADD  r6, -r1, r2    // -.5+.75 = .25    <- src0 negate
+STV  1, r6
+MAX  r7, r1, -r2    // max(.5,-.75)=.5  <- src1 negate
+STV  2, r7
+MUL  r10, r1, -r1   // -.25
+MAX  r11, !r10, r0  // max(|-.25|,0)=.25 <- src0 abs
+STV  3, r11
+MOV  r8, r3         // init r8 = (1,1,1,1)
+ADD.xy r8, r1, r2   // xy=1.25 ; zw PRESERVED = 1.0  <- mask preserves unmasked comps
+STV  4, r8
+END

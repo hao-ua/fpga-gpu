@@ -1,0 +1,7 @@
+// OpenArena's fixed-function fragment programs and their constant-colour variants,
+// rows as b_ref.py's BR_UVSCREEN lays them out (varying 0 = both texture coordinates packed, varying 1 = the colour)
+// 'mod' with a constant WHITE colour: the texel as it is
+LDV   r1.xy, 0
+TEX   r2, r1, #0, .xy
+STO   0, r2
+END

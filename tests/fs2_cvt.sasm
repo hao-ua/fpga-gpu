@@ -1,0 +1,27 @@
+// fs2_cvt — the quarter-rate convert units: FTOI ITOF FTOU UTOF TRUNC FLR CEIL RNDE on swizzled single components
+// and vec4s, negative / large / half values, two in flight, the ops' results feeding each other and integer ops
+// (exact; the integer representation stays in the component). Golden: python3 tools/isa64.py fs2 tests/fs2_cvt.sasm
+LDV    r1, 8
+MOVI   r2.x, #-2.5
+MOVI   r2.y, #3.5
+MOVI   r2.z, #1234567.0
+MOVI   r2.w, #-0.4
+FTOI   r3, r2
+ITOF   r4, r3.wzyx
+FTOU   r5.xy, r2.yx
+UTOF   r6, r5.x
+TRUNC  r7, r2
+FLR    r8, r2.yxwz
+CEIL   r9, r2
+RNDE   r10, r2
+FTOI   r11.x, r1.x
+IADD   r11.y, r11.x, r3.y
+ITOF   r12.xy, r11.xy
+ADD    r13, r7, r8
+ADD    r13, r13, r9
+ADD    r13, r13, r10
+MAD    r14, r4, r12.x, r13
+FLR    r14.w, r14.x                  // RAW on the madd result, WAW on r14
+ADD    r15, r14, r6
+STO    r15.yzwx
+END

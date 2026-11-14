@@ -1,0 +1,35 @@
+// test_vsimul — vertex core integer ALU: IMUL (low 24 bits, wrap), IDIV (toward zero, x/0 = -1, -2^23/-1 = -2^23),
+// ISEQ / ISNE, mixed with the 1-cycle integer slot; IMUL results feeding IDIV, back-to-back IDIVs, a write mask.
+// params (i%7)*.25+.5: idx2 1.0, idx6 2.0
+LDP  r1, 6             // 2.0
+FTOI r1, r1            // 2
+LDP  r2, 2             // 1.0
+FTOI r2, r2            // 1
+ISUB r3, r2, r1        // -1
+IMUL r4, r1, r1        // 4
+IMUL r5, r4, r4        // 16
+IMUL r6, r5, r5        // 256
+IMUL r7, r6, r5        // 4096
+IMUL r8, r7, r7        // 2^24 -> wraps to 0
+IMUL r9, r7, r6        // 2^20
+IMUL r10, r9, r4       // 2^22
+IMUL r11, r10, r1      // 2^23 -> -2^23
+IDIV r12, r11, r3      // -2^23 / -1 = -2^23
+IMUL r13, r6, r3       // -256
+IADD r14, r4, r1       // 6
+IADD r14, r14, r2      // 7
+IDIV r15, r13, r14     // -256 / 7 = -36 (toward zero)
+IDIV r16, r14, r1      // 7 / 2 = 3
+IDIV r17, r3, r1       // -1 / 2 = 0
+ISUB r18, r1, r1       // 0
+IDIV r19, r14, r18     // 7 / 0 = -1
+IDIV r20, r18, r14     // 0 / 7 = 0
+IADD r22, r1, r2       // 3
+ISEQ r21, r16, r22     // 3 == 3 -> 1.0
+ISNE r23, r16, r22     // 0.0
+ISEQ r24, r11, r12     // -2^23 == -2^23 -> 1.0
+ISNE r25, r8, r18      // 0 != 0 -> 0.0
+MOV  r26, r2
+IMUL.xz r26, r14, r3   // write mask: x, z = -7 ; y, w keep 1
+ITOF r27, r15          // -36.0
+END

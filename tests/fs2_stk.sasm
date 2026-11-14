@@ -1,0 +1,39 @@
+// fs2_stk — a stack violation: the 9th nested IF overflows the 8-deep
+// reconvergence stack. The instruction does not issue; the warp is killed (kill 0xFFFF), out_err is set, the core's
+// err_stack sticks, and the warp retires with whatever it wrote before (r2 = 8, no STO). Assembled with --deep.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_stk.sasm --deep
+LDV    r1, 8
+MOVI   r2, #0
+MOVI   r3.x, #1
+SETP   SLT, r1.x, r1.w               // true for every lane (x < w = 1 is false... use y)
+SETP   SGE, r1.w, r1.w               // true for every lane
+IF L1
+ADD r2, r2, r3.x
+IF L1
+ADD r2, r2, r3.x
+IF L1
+ADD r2, r2, r3.x
+IF L1
+ADD r2, r2, r3.x
+IF L1
+ADD r2, r2, r3.x
+IF L1
+ADD r2, r2, r3.x
+IF L1
+ADD r2, r2, r3.x
+IF L1
+ADD r2, r2, r3.x
+IF L1                                // the 9th: violation
+ADD r2, r2, r3.x
+L1:
+ENDIF
+ENDIF
+ENDIF
+ENDIF
+ENDIF
+ENDIF
+ENDIF
+ENDIF
+ENDIF
+STO    r2
+END

@@ -1,0 +1,15 @@
+// b_fs_sk_at — B4 scan test (tb_b_render, BR_SKIPTEST=1): an alpha test — DISCARD where the texel's alpha is below
+// uniform 2 .x. The predicate differs in an uncovered pixel, but nothing written under the IF reaches another pixel:
+// the scan must ALLOW the sample skip.
+LDV   r1, 0
+TEX   r2, r1, #0
+LDP   r3, 2
+SETP  SLT, r2.w, r3.x
+IF    L_k
+DISCARD
+L_k:
+ENDIF
+LDV   r5, 1
+MUL   r4, r2, r5
+STO   0, r4
+END

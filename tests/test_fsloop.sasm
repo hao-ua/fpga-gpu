@@ -1,0 +1,20 @@
+// test_fsloop — divergent loop with CONT + BREAK (SIMT).
+// Each thread: accumulate r4 += r1 every iteration. While r4 < per-thread CONT
+// threshold (r2), CONT (skip the r5 update). Once past, accumulate r5; BREAK
+// when r4 exceeds per-thread BREAK threshold (r3). Per-thread thresholds ->
+// threads continue/break at different iterations (divergent loop control).
+LDP   r1, 1           // increment (broadcast)
+LDV   r2, 0           // per-thread CONT threshold
+LDV   r3, 1           // per-thread BREAK threshold
+SUB   r4, r1, r1      // r4 = 0  (accumulator, all iterations)
+SUB   r5, r1, r1      // r5 = 0  (counts post-CONT iterations)
+LOOP  8
+ADD   r4, r4, r1      // r4 += r1  (every iteration)
+SETP  SLT, r4, r2     // pred = r4 < CONT-threshold
+CONT                  // those threads skip the rest of this iteration
+ADD   r5, r5, r1      // r5 += r1  (only past the CONT threshold)
+SETP  SLT, r3, r4     // pred = BREAK-threshold < r4
+BREAK                 // those threads exit the loop
+ENDL
+STO   0, r5
+END

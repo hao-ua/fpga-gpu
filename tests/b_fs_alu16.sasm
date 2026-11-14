@@ -1,0 +1,23 @@
+// b_fs_alu16 — fb_bench's alu_16 shape for board B's frame bench (b_ref.py frame with BR_PROG0=b_fs_alu16): a varying,
+// two uniforms and 16 chained vec4 multiply-adds (v = v * uA + uB), each depending on the one before
+LDV   r1, 0
+LDP   r2, 1
+LDP   r3, 2
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+MAD   r1, r1, r2, r3
+STO   0, r1
+END

@@ -1,0 +1,32 @@
+// fs2_int — the integer paths: IMUL (quarter rate on the 4-lane integer unit, buffered results), the
+// divider (IDIV IMOD UDIV UMOD, 4 rounds of 4 lanes, one in flight, x / 0 cases) and the 1-cycle slot, mixed so
+// buffered and scheduled results interleave; swizzles on the integer sources. Board B has no IOP
+// functions (IAND .. UGE): no compiler of the GL <= 2.0 era can emit them; an IOP kills the warp.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_int.sasm
+LDV    r1, 8
+FTOI   r2, r1                        // per-lane integers from gl_FragCoord
+MOVI   r12, #0                       // r12.yzw are summed below without being written
+MOVI   r3.x, #7
+MOVI   r3.y, #-3
+MOVI   r3.z, #0
+MOVI   r3.w, #100000
+FTOI   r3, r3
+IMUL   r9, r2, r3.xyxy
+IMUL   r9.w, r9.x, r3.x              // RAW on the buffered IMUL result
+IDIV   r10, r3.wwww, r2.xyzw
+IMOD   r11.xy, r3.w, r2.xy
+UDIV   r11.z, r3.w, r3.z             // x / 0 = all ones
+UMOD   r11.w, r3.w, r3.z             // x % 0 = x
+IDIV   r12.x, r3.y, r3.z             // x / 0 = -1
+IMUL   r7, r10, r3.yyyy              // RAW on a divider result, then two IMULs in flight
+IMUL   r8, r9, r2
+IADD   r13, r9, r10
+IADD   r13, r13, r11
+IADD   r13, r13, r7
+ISUB   r13, r13, r8
+IADD   r13.x, r13.x, r12.x
+ISEQ   r14.x, r13.x, r13.y
+ISNE   r14.y, r13.x, r13.y
+ITOF   r15, r13
+STO    r15
+END

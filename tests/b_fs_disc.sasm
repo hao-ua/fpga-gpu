@@ -1,0 +1,12 @@
+// b_fs_disc ? board B frame bench: DISCARD where varying 0 .x < uniform 2 .x, divergent
+LDV   r1, 0
+LDP   r2, 2
+SETP  SLT, r1, r2
+IF    L_k
+DISCARD
+L_k:
+ENDIF
+LDV   r3, 2
+ADD   r4, r1, r3
+STO   0, r4
+END

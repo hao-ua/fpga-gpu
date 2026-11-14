@@ -1,0 +1,58 @@
+// fs2_xsfu — the SFU's result times an operand in ONE micro-op per component (shader_core_fs2 XSFU):
+// SQRT rd, x (= RSQRT, MUL, SEL), RCPM rd, x, y = y * RCP(x) (the assembler's DIV rd, y, x; = RCP, MUL) and RSQM rd, x, y
+// = y * RSQRT(x) (= RSQRT, MUL). Scalars and whole vec4s, modifiers, swizzles, zeros of both signs, a zero numerator and
+// a zero denominator; each beside the sequence it replaces on the same operands with SET SNE between them, which must
+// read 0 in every lane (the same bits); in order behind the units' plain ops, results used at once, a later write over
+// an earlier one (WAW). No SQRT of a negative here: the reference's RSQRT of one is +inf, the unit's a NaN (as in
+// fs2_sfu). Golden: python3 tools/isa64.py fs2 tests/fs2_xsfu.sasm --exact-rcp; tb_fs2 with +TOL_8.
+LDV    r1, 8                         // per lane and component, 0.25 .. 3.25
+LDP    r2, 1                         // 0.75
+LDP    r3, 3                         // 1.25
+MOVI   r4.x, #0                      // +0
+MOVI   r4.y, #0x800000               // -0
+MOVI   r4.z, #-2.25
+MOVI   r4.w, #1.0e-9
+// SQRT
+SQRT   r5.x, r1.x
+SQRT   r6, r1
+SQRT   r7, !r4                       // of |x|: 0, 0, 1.5, a small one
+SQRT   r8, r4.xyww                   // +0 stays +0, -0 stays -0 (SEL's rule: a zero x is the result)
+RSQRT  r9, r1
+MUL    r10, r1, r9
+SEL    r11, r1, r10, r1
+SET    SNE, r12, r6, r11             // 0: SQRT = RSQRT, MUL, SEL
+// RCPM / DIV
+RCPM   r13, r1, r2                   // r2 / r1
+DIV    r14, r2, r1                   // the same through the alias
+DIV    r15.xy, -r1.zw, !r3.xy        // modifiers on both, swizzles
+RCP    r16, r1
+MUL    r17, r2, r16
+SET    SNE, r18, r13, r17            // 0: RCPM = RCP, MUL
+SET    SNE, r18.zw, r13.xyxy, r14.xyxy   // 0: DIV is RCPM
+DIV    r19, r4, r1                   // 0 / x = +0 for both zeros (MUL's rule), -2.25 / x, a small one / x
+DIV    r20.x, r1.x, r4.x             // x / 0 = +inf
+// the sign of a zero quotient, made visible: -0 / x is +0 (MUL's rule), so its reciprocal is +inf — by DIV and by RCP, MUL
+DIV    r29.x, r4.y, r1.x
+RCP    r29.y, r29.x                  // +inf (a -0 would give -inf)
+RCP    r30.x, r1.x
+MUL    r30.y, r4.y, r30.x
+RCP    r30.z, r30.y                  // +inf
+// RSQM: a normalisation in three micro-ops instead of four
+DP3    r21.x, r1, r1
+RSQM   r22.xyz, r21.x, r1
+RSQRT  r23.x, r21.x
+MUL    r24.xyz, r1, r23.x
+SET    SNE, r25.xyz, r22, r24        // 0: RSQM = RSQRT, MUL
+// in the unit's stream with its plain ops; buffered results as operands; WAW
+RCP    r26, r1
+SQRT   r26.yw, r1.xz                 // over the RCP's .y / .w while that may still be in flight
+EXP2   r27.x, r2.x
+DIV    r27.y, r27.x, r1.y            // its numerator is a buffered EXP2 result
+LOG2   r27.z, r6.z                   // a SQRT result as the next op's argument
+SQRT   r27.w, r27.y                  // a DIV result as a SQRT's
+ADD    r28, r26, r27
+ADD    r28, r28, r5.x
+MAD    r28, r13, r19, r28
+ADD    r28.xyz, r28, r22
+STO    r28
+END

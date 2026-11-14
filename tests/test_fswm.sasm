@@ -1,0 +1,14 @@
+// test_fswm — FS/SIMT write-mask + source modifiers (all threads active, broadcast params)
+LDP  r1, 0
+LDP  r2, 1
+LDP  r3, 2
+SUB  r0, r1, r1
+MOV  r5, r1
+MOV.y r5, r2
+MOV.z r5, r3        // r5 = (p0,p1,p2,p0)   write-mask
+ADD  r6, -r1, r2    // -p0+p1              src0 neg
+MAX  r7, r1, -r2    // max(p0,-p1)         src1 neg
+MOV  r4, r3
+ADD.xy r4, r1, r2   // xy=p0+p1 ; zw=p2    write-mask preserve
+STO  0, r5
+END

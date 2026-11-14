@@ -1,0 +1,30 @@
+// test_fsuidiv — fragment core (SIMT) integer extras with per-lane operands: IMOD / UDIV / UMOD (zero divisor
+// lanes, negative operands), FTOU / UTOF, a UDIV and a UMOD inside a divergent IF / ELSE. (No IOP functions:
+// board B has none — no compiler of the GL <= 2.0 era emits them.)
+// varying 0 per thread/component: ((p+1)*0.5 + c*0.125) % 3 + 0.25 ; param 4 = 1.5, param 6 = 2.0
+LDV  r1, 0
+LDP  r2, 6             // 2.0
+MUL  r3, r1, r2
+MUL  r3, r3, r2        // 4x in [1, 13)
+FTOI r4, r3            // ints 1..12 per lane
+LDP  r5, 4             // 1.5
+MUL  r6, r5, r2
+MUL  r6, r6, r2        // 6.0
+FTOI r6, r6            // 6
+ISUB r7, r4, r6        // ints -5..6, zero in some lanes
+IMOD r22, r4, r7       // some lanes % 0 -> x
+UDIV r23, r4, r7
+UMOD r24, r7, r6
+FTOU r25, r1
+UTOF r26, r7
+SETP SLT, r1, r5       // per thread x.x < 1.5 -> divergence
+IF   L_else
+UDIV r27, r7, r6
+L_else:
+ELSE L_end
+UMOD r27, r4, r6
+L_end:
+ENDIF
+ITOF r28, r22
+STO  0, r28
+END

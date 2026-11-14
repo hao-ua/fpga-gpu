@@ -1,0 +1,36 @@
+// av_vs — the vertex program of tb_a_vertex (tools/a_vtx_ref.py): MVP from uniforms 0..3, colour and uv through, a
+// per-vertex branch on the position, a product of the normal; only exact units (no SFU: the reference models RSQRT /
+// LOG2 / EXP2 approximately). Varyings written: 0, 1, 2, 5 (varmask 0x27).
+LDV  r1, 0              // position (vec4)
+LDV  r2, 1              // colour (vec4)
+LDV  r3, 2              // uv (vec2 -> z, w = 0, 1)
+LDV  r4, 3              // normal (vec3 -> w = 1)
+LDP  r5, 0
+LDP  r6, 1
+LDP  r7, 2
+LDP  r8, 3
+DP4  r9.x, r5, r1
+DP4  r9.y, r6, r1
+DP4  r9.z, r7, r1
+DP4  r9.w, r8, r1
+STO  r9
+MOVI r10.x, #0.5
+SETP SLT, r1.x, r10.x
+IF   L1
+MUL  r2.xyz, r2, r10.x  // x < 0.5: dim the colour
+L1:
+ELSE L2
+ADD  r2.w, r2.w, r10.x  // else: brighten the alpha
+L2:
+ENDIF
+MOVI r12.x, #20.0       // gl_PointSize = 2 + 20 * colour.x (Q10 points; unused by other primitives)
+MUL  r12.x, r2.x, r12.x
+MOVI r13.x, #2.0
+ADD  r12.x, r12.x, r13.x
+STO  1, r12.xxxx
+STV  0, r2
+STV  1, r3
+MUL  r11, r4, r4.yzxw
+STV  2, r11
+STV  5, r1.wzyx
+END

@@ -1,0 +1,18 @@
+// test_madreg — vertex core: MAD with the addend in any register (r8..r31 need ins[3:2], the 5-bit third
+// register field), with a src1 modifier and a write mask; also r0..r7 (unchanged encoding).
+// params (i%7)*.25+.5: idx1 .75, idx2 1.0, idx4 1.5, idx6 2.0 ; varyings (i%5)*.5+.25: idx2 1.25, idx3 1.75
+LDP   r1, 4            // 1.5
+LDP   r2, 6            // 2.0
+LDV   r8, 2            // 1.25  (addend in r8)
+LDV   r15, 3           // 1.75  (addend in r15)
+LDP   r31, 1           // 0.75  (addend in r31)
+LDP   r5, 2            // 1.0   (addend in r5)
+MAD   r10, r1, r2, r8      // 1.5*2 + 1.25 = 4.25
+MAD   r11, r1, r2, r15     // 1.5*2 + 1.75 = 4.75
+MAD   r12, r1, -r2, r31    // 1.5*-2 + 0.75 = -2.25 (src1 modifier)
+MAD   r13, r1, r2, r5      // 1.5*2 + 1.0 = 4.0 (addend r0..r7)
+MOV   r14, r5
+MAD.yw r14, r2, r2, r31    // y,w = 4.75 ; x,z keep 1.0
+MAD   r17, r10, r11, r12   // 4.25*4.75 - 2.25 (addend r12)
+MAD   r18, r17, r1, r17    // addend == source register
+END

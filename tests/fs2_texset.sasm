@@ -1,0 +1,45 @@
+// fs2_texset — TEX coordinate sets of every size and shape on the scalar core (TEX2: one micro-op per
+// coordinate pair x y / z w, the odd component through read copy 1): one coordinate, two (a pair, across pairs), three, four; with
+// swizzles, with the coordinates still in flight when the TEX reaches the head (RAW on both reads of one micro-op),
+// into a register whose x / y are being written (WAW through both hazard bits), into its own coordinate register,
+// with a partial write mask, in BIAS / LOD modes (the bias in .w = the second micro-op of a 3-set).
+// Golden: python3 tools/isa64.py fs2 tests/fs2_texset.sasm   (the texture unit = isa64.tex_model = tb_fs2's tmu_model2)
+LDV    r1, 0
+LDV    r2, 1
+LDV    r3, 8
+MOVI   r4, #0.75
+TEX    r5, r1, #0, .x             // one coordinate: a micro-op with no second read
+TEX    r6, r1, #1, .xy            // the 2D set: one micro-op
+TEX    r7, r1, #2, .xw            // two, across the pairs: x alone, then w alone
+TEX    r8, r2, #3, .zw            // the upper pair: one micro-op
+TEX    r9, r2, #4, BIAS, .xyw     // three: x y, then w alone
+TEX    r10, r2, #5, .xyz          // three: x y, then z alone
+TEX    r11, r1, #6, LOD, .yzw     // three: y alone (odd, copy 1), then z w
+TEX    r12, r1.wzyx, #7, .xy      // swizzled: reads rs0.w and rs0.z
+TEX    r13, r2.yyxw, #8, .xzw     // swizzled, three with a gap: x alone, then z w
+MUL    r14, r1, r2                // the coordinates are in flight when the TEX reaches the head ...
+TEX    r15, r14, #9, .xy          // ... RAW on both reads of its one micro-op
+MAD    r16, r1, r2, r4.x          // x y z w being written ...
+TEX    r16, r2, #10, .xy          // ... WAW on rd.x and rd.y of the same micro-op (and r16 = texels, not the MAD)
+ADD    r17.xy, r1, r2
+TEX    r17, r17, #11, .xy         // destination = coordinate register, coordinates in flight
+MOVI   r18, #2.5
+TEX    r18.yw, r3, #12, .xy       // partial mask: x, z keep 2.5; rd.y is written, rd.x is not
+TEX    r19.x, r3.yxzw, #13, .xyz  // one component written, three coordinates
+TEX    r20, r3, #14               // the legacy encoding: all four (two micro-ops)
+ADD    r21, r5, r6
+ADD    r21, r21, r7
+ADD    r21, r21, r8
+ADD    r21, r21, r9
+ADD    r21, r21, r10
+ADD    r21, r21, r11
+ADD    r21, r21, r12
+ADD    r21, r21, r13
+ADD    r21, r21, r15
+ADD    r21, r21, r16
+ADD    r21, r21, r17
+ADD    r21, r21, r18
+ADD    r21, r21, r19.x
+ADD    r21, r21, r20
+STO    r21
+END

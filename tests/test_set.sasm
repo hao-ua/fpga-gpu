@@ -1,0 +1,15 @@
+// test_set — exercises the SET instruction (exact GPR-writing compare) on the VS core, all 4 sub-ops x
+// both outcomes. params (main() fixed): p0=0.5 p2=1.0 p7=0.5. r10..r17 = 1.0/0.0.
+LDP   r1, 0            // a = 0.5
+LDP   r2, 2            // b = 1.0
+LDP   r3, 7            // c = 0.5 (== a)
+SET   SLT, r10, r1, r2 // 0.5<1.0 = 1
+SET   SGE, r11, r1, r2 // 0
+SET   SEQ, r12, r1, r2 // 0
+SET   SNE, r13, r1, r2 // 1
+SET   SLT, r14, r1, r3 // 0.5<0.5 = 0
+SET   SGE, r15, r1, r3 // 1
+SET   SEQ, r16, r1, r3 // 1
+SET   SNE, r17, r1, r3 // 0
+STO   0, r10
+END

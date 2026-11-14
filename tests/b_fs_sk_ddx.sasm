@@ -1,0 +1,11 @@
+// b_fs_sk_ddx — B4 scan test (tb_b_render, BR_SKIPTEST=1): the derivatives of a texel — a covered pixel's DDX / DDY
+// reads its neighbour's texel, covered or not. The scan must REFUSE the sample skip for this program.
+LDV   r1, 0
+TEX   r2, r1, #0
+DDX   r3, r2
+DDY   r5, r2
+LDV   r6, 1
+MAD   r4, r3, r6, r2
+ADD   r4, r4, r5
+STO   0, r4
+END

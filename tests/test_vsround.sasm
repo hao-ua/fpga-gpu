@@ -1,0 +1,46 @@
+// test_vsround — vertex core: float -> float rounding TRUNC / FLR / CEIL / RNDE (fractions, halves, |x| < 1,
+// |x| >= 2^16 which must pass through, source modifiers, write masks) and SEL (per-lane select, third register
+// above r7, write mask, zero condition).
+// params (i%7)*.25+.5: idx4 1.5, idx6 2.0 ; varyings (i%5)*.5+.25: idx0 .25, idx1 .75, idx2 1.25, idx3 1.75
+LDP   r1, 4            // 1.5
+LDP   r2, 6            // 2.0
+LDV   r3, 0            // 0.25
+LDV   r4, 3            // 1.75
+LDV   r6, 2            // 1.25
+LDV   r19, 1           // 0.75
+SUB   r5, r3, r1       // -1.25
+MOV.y r5, r4           // 1.75
+ADD.z r5, r6, r6       // 2.5
+SUB.w r5, r3, r2       // -1.75      r5 = (-1.25, 1.75, 2.5, -1.75)
+TRUNC r10, r5
+FLR   r11, r5
+CEIL  r12, r5
+RNDE  r13, r5
+FLR   r14, -r5         // source modifier: floor(-x)
+ADD   r7, r5, r5       // (-2.5, 3.5, 5, -3.5): halves
+RNDE  r15, r7          // half to even: (-2, 4, 5, -4)
+RNDE.yw r30, !r7       // abs + write mask
+EXP2  r8, r2           // 4
+MUL   r8, r8, r8       // 16
+MUL   r8, r8, r8       // 256
+MUL   r8, r8, r8       // 65536
+MUL   r9, r7, r8       // |x| >= 2^16: integers already, must pass through
+FLR   r16, r9
+CEIL  r17, r9
+MUL   r28, r9, r8      // ~2^34: far beyond the 24-bit integer range of FTOI
+FLR   r29, r28
+SUB   r18, r3, r19     // -0.5
+MOV.y r18, r3          // 0.25
+MOV.z r18, r19         // 0.75
+MOV.w r18, -r3         // -0.25      r18 = (-0.5, 0.25, 0.75, -0.25)
+FLR   r20, r18
+CEIL  r21, r18
+RNDE  r22, r18
+TRUNC r23, r18
+SET   SLT, r24, r5, r3 // (1, 0, 0, 1)
+SEL   r25, r24, r10, r11
+SEL   r26, r24, r20, r9
+SEL.xz r27, r24, r22, r16     // third register r16 (> r7: uses ins[3:2])
+SUB   r31, r1, r1      // 0.0
+SEL   r24, r31, r10, r12      // zero condition -> r12
+END

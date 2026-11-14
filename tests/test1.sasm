@@ -1,0 +1,28 @@
+// test1 — exercises params, varyings, ALU (madd/mul/min/max/dp), a counted
+// loop, and a predicated branch. Independent ops of different latency overlap
+// (OoO completion); dependent ops (loop accumulate) stall on RAW.
+LDP   r1, 3            // r1 = param[3]  = 1.25
+LDP   r2, 5            // r2 = param[5]  = 1.75
+LDV   r3, 1            // r3 = varying[1]= 0.75
+MUL   r4, r1, r2       // 2.1875   (madd lat6)
+MIN   r5, r1, r2       // 1.25     (cmp  lat1, completes before r4 -> OoO)
+MAX   r6, r1, r2       // 1.75
+ADD   r7, r4, r3       // 2.9375   (RAW on r4 -> stalls)
+SUB   r8, r1, r2       // -0.5
+MAD   r9, r1, r2, r3   // 2.9375
+DP4   r10, r1, r2      // 8.75
+DP3   r11, r1, r2      // 6.5625
+MOV   r12, r1          // 1.25
+MOV   r13, r1          // loop accumulator
+LOOP  3
+ADD   r13, r13, r1     // r13 += r1  (RAW each iter)
+ENDL                  // -> r13 = 5.0
+SETP  SLT, r1, r2      // pred = (1.25 < 1.75) = 1
+BRP   elsx, F          // branch if pred false -> not taken
+MOV   r14, r1          // r14 = 1.25
+BRA   endx
+elsx:
+MOV   r14, r2
+endx:
+STO   0, r10           // out_pos = r10 = 8.75
+END

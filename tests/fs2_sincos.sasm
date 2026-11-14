@@ -1,0 +1,21 @@
+// fs2_sincos — SIN / COS through the quarter-rate sincos units (bit-exact: the reference is the RTL's table model):
+// single components, vec4s, two in flight, modifiers, the small-angle and zero cases, results into madds and STO.
+// Golden: python3 tools/isa64.py fs2 tests/fs2_sincos.sasm
+LDV    r1, 8
+MOVI   r2.x, #0.0
+MOVI   r2.y, #0.001
+MOVI   r2.z, #1.5707963
+MOVI   r2.w, #-3.1415927
+SIN    r3, r1
+COS    r4, r1.yxwz
+SIN    r5.x, r2.z
+COS    r5.y, -r2.w
+SIN    r5.zw, r2.xy
+MUL    r6, r3, r4                    // waits for both buffered results
+SIN    r7, r2
+COS    r8, r2
+MAD    r9, r7, r8, r6
+SIN    r9.w, r9.x                    // WAW / RAW on the madd result
+ADD    r10, r9, r5
+STO    r10
+END

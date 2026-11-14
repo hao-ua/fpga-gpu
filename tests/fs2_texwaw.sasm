@@ -1,0 +1,55 @@
+// fs2_texwaw — a TEX with a 2D coordinate set (.xy) into a register whose OTHER components (z, w) still have a write
+// in flight: the TEX writes all four, so every later read of rd.z / rd.w must see the texel. Earlier writers: a
+// multiply-add, a quarter-rate unit's buffered result, another TEX (back to back, and in the other arm of an IF /
+// ELSE). The reads take z / w FIRST (a read of x would wait for the texel and hide the fault).
+// (The core checks an earlier writer of rd for all four components, not only those of the coordinate set: otherwise the
+// first writer's landing would clear the TEX's pending mark. shader_core_fs2 hzr; a bench assertion watches the rule.)
+// Golden: python3 tools/isa64.py fs2 tests/fs2_texwaw.sasm
+LDV    r1, 0
+LDV    r2, 1
+LDV    r3, 8
+MOVI   r4, #0.75
+MOVI   r6, #0.5
+MAD    r6.zw, r1, r2, r1          // z w in flight (the multiply-add's latency) ...
+TEX    r6, r1, #1, .xy            // ... when the TEX reaches the head: x, y are not being written
+MOV    r7.zw, r6                  // must read the texels
+MOV    r7.xy, r6
+MOVI   r8, #0.25
+RCP    r8.w, r1.x                 // a buffered result in flight
+TEX    r8, r2, #2, .xy
+MOV    r9.w, r8.w
+MOV    r9.xyz, r8
+TEX    r10, r1, #3, .xy           // two TEX into one register, back to back
+TEX    r10, r2, #4, .xy
+MOV    r11.wz, r10.wz
+MOV    r11.xy, r10
+SETP   SLT, r3.x, r4.x            // gl_FragCoord.x differs per pixel: divergence inside every quad
+IF     L_else
+  TEX  r12, r1, #5, .xy
+L_else:
+ELSE   L_end
+  TEX  r12, r2, #6, .xy           // the other arm's TEX into the same register
+L_end:
+ENDIF
+MOV    r13.zw, r12
+MOV    r13.xy, r12
+MAD    r14, r1, r2, r4.x          // all four in flight, then a TEX that writes z, w only
+TEX    r14.zw, r2, #7, .xy
+MOV    r15.zw, r14
+MOV    r15.xy, r14
+MAD    r17.yzw, r1, r2, r4.x      // a one-coordinate set: its (repeated) second micro-op carries the fourth check
+TEX    r17, r1, #8, .x
+MOV    r18.wzy, r17
+MOV    r18.x, r17
+MAD    r19, r2, r1, r4.x          // the set's first component is w: the first micro-op checks x y z
+TEX    r19, r1, #9, .zw
+MOV    r20.xy, r19
+MOV    r20.zw, r19
+ADD    r16, r7, r9
+ADD    r16, r16, r18
+ADD    r16, r16, r20
+ADD    r16, r16, r11
+ADD    r16, r16, r13
+ADD    r16, r16, r15
+STO    r16
+END

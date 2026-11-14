@@ -1,0 +1,22 @@
+// test_fs — SIMT divergence. 4 threads; per-thread varyings make threads 0,1
+// take the IF-then path and threads 2,3 the ELSE path. Verifies per-thread
+// masked writeback + reconvergence, plus a uniform counted loop and DP4.
+LDP   r1, 2           // uniform (broadcast to all threads)
+LDV   r2, 0           // per-thread
+LDV   r3, 1           // per-thread
+MUL   r4, r2, r3
+SETP  SLT, r2, r3     // pred[t] = (r2.x < r3.x) per thread  -> threads 0,1 true
+IF    L_else          // then = active & pred
+ADD   r5, r2, r3      //   then-threads: r5 = r2 + r3
+L_else:
+ELSE  L_end
+MUL   r5, r2, r3      //   else-threads: r5 = r2 * r3
+L_end:
+ENDIF                 // reconverge -> amask back to 0xF
+DP4   r6, r2, r3      // per-thread dot
+MOV   r7, r1          // uniform loop accumulate
+LOOP  2
+ADD   r7, r7, r1      // r7 = r1 + 2*r1 = 3*r1
+ENDL
+STO   0, r5           // out_color = r5
+END

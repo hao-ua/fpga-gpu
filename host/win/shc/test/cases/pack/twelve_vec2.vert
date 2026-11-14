@@ -1,0 +1,27 @@
+attribute vec4 a0;
+varying vec2 v0;
+varying vec2 v1;
+varying vec2 v2;
+varying vec2 v3;
+varying vec2 v4;
+varying vec2 v5;
+varying vec2 v6;
+varying vec2 v7;
+varying vec2 v8;
+varying vec2 v9;
+varying vec2 v10;
+varying vec2 v11;
+void main() { gl_Position = a0;
+  v0 = vec2(0.0, 0.5);
+  v1 = vec2(1.0, 1.5);
+  v2 = vec2(2.0, 2.5);
+  v3 = vec2(3.0, 3.5);
+  v4 = vec2(4.0, 4.5);
+  v5 = vec2(5.0, 5.5);
+  v6 = vec2(6.0, 6.5);
+  v7 = vec2(7.0, 7.5);
+  v8 = vec2(8.0, 8.5);
+  v9 = vec2(9.0, 9.5);
+  v10 = vec2(10.0, 10.5);
+  v11 = vec2(11.0, 11.5);
+}

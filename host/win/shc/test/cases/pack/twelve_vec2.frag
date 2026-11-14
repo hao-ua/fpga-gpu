@@ -1,0 +1,27 @@
+precision mediump float;
+varying vec2 v0;
+varying vec2 v1;
+varying vec2 v2;
+varying vec2 v3;
+varying vec2 v4;
+varying vec2 v5;
+varying vec2 v6;
+varying vec2 v7;
+varying vec2 v8;
+varying vec2 v9;
+varying vec2 v10;
+varying vec2 v11;
+void main() { vec2 s = vec2(0.0);
+  s += v0 * 1.0;
+  s += v1 * 2.0;
+  s += v2 * 3.0;
+  s += v3 * 4.0;
+  s += v4 * 5.0;
+  s += v5 * 6.0;
+  s += v6 * 7.0;
+  s += v7 * 8.0;
+  s += v8 * 9.0;
+  s += v9 * 10.0;
+  s += v10 * 11.0;
+  s += v11 * 12.0;
+  gl_FragColor = vec4(s, v3.y, v11.x); }

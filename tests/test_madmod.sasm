@@ -1,0 +1,9 @@
+// test_madmod — MAD src1 source-modifier (negate/abs) on the VS core. params: p0=0.5 p2=1.0 p7=0.5.
+LDP   r1, 0            // 0.5
+LDP   r2, 2            // 1.0
+LDP   r3, 7            // 0.5
+MAD   r10, r1, r2, r3  // 0.5*1.0 + 0.5 = 1.0   (plain MAD)
+MAD   r11, r1, -r2, r3 // 0.5*(-1.0)+ 0.5 = 0.0 (negate src1)
+MAD   r12, r1, r2, r3  // (dup for a 3rd check slot)
+STO   0, r10
+END

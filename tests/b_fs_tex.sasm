@@ -1,0 +1,12 @@
+// b_fs_tex ? board B frame bench (tb_b_render): 2D texture (sampler 0) at varying 0, implicit LOD, times varying 1;
+// a second fetch with LOD bias (sampler 0, bias from varying 1 .w) added
+LDV   r1, 0
+TEX   r2, r1, #0
+LDV   r3, 1
+MUL   r4, r2, r3
+MOV   r5, r1
+MAD   r5, r3, r3, r5
+TEX   r6, r5, #0, BIAS
+ADD   r4, r4, r6
+STO   0, r4
+END

@@ -74,7 +74,7 @@ enum {
     G2_ST_LD_FILLS, G2_ST_LD_FILL_PERR, G2_ST_LD_PERRS, G2_ST_LINK_DROPS, G2_ST_LINK_FRM_TRN, G2_ST_B_LINK_CRC_PAR, G2_ST_B_LINK_INFO,
     G2_ST_B_IMAGES, G2_ST_B_PIXELS,
     G2_ST_B_LD_HIST, G2_ST_B_LD_LAST_ERR, G2_ST_B_LINK_PARMAP, G2_ST_B_XOFF, G2_ST_B_RETX, G2_ST_B_DISC, G2_ST_B_CMD_PKTS, G2_ST_B_RX_WORDS,
-    G2_ST_A_XOFF, G2_ST_A_NAKS_TO, G2_ST_A_RX_WORDS, G2_ST_RESERVED,
+    G2_ST_A_XOFF, G2_ST_A_NAKS_TO, G2_ST_A_RX_WORDS, G2_ST_IP,       /* layout 11: board A's IPv4 address in use, 0 = none yet */
     G2_ST_CR_SENT, G2_ST_CR_CONSUMED, G2_ST_CR_WAIT, G2_ST_CUR_SENT_SYNC, G2_ST_B_CB_TAKEN, G2_ST_B_CUR_PAL, G2_ST_B_CURCMD_XOPS,
     G2_ST_B_X_PIXELS,
     G2_ST_GEOM_BUSY_TRIS, G2_ST_GEOM_ERR, G2_ST_RENDER_QUADS, G2_ST_RS_PKTS_INFLIGHT,
@@ -91,6 +91,9 @@ enum {
 };
 #define G2_B_FLAG_MODE(f)      (((f) >> 4) & 7u)     /* decode_b_flags: the video mode */
 #define G2_B_FLAG_XOPS(f)      (((f) >> 28) & 3u)    /* board B's fragment core: bit 0 SQRT / RCPM / RSQM, bit 1 CLAMP (0 on B builds without them): g2sc_set_target */
+/* the units a core lacks, STATUS flags bits 30 / 31 (0 on every build that has them): bit 0 the integer divider, bit 1 SIN / COS — g2sc_set_absent */
+#define G2_A_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board A's flags (G2_ST_FLAGS): the vertex core */
+#define G2_B_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board B's flags (G2_ST_B_FLAGS): the fragment core */
 #define G2_LINK_B_ALIVE(f)     ((f) & 1u)            /* decode_link_flags */
 #define G2_LINK_TRAINED(f)     (((f) >> 2) & 1u)
 

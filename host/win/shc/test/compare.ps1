@@ -1,8 +1,9 @@
 # compare.ps1 — the C compiler against the Python one (tools/glslc.py, the specification): every shader, every word, x64 and x86.
-#   powershell -File host/win/shc/test/compare.ps1 [-Extra dir,dir] [-Arch x64,x86] [-Unread mask] [-Strict] [-Xops n]
+#   powershell -File host/win/shc/test/compare.ps1 [-Extra dir,dir] [-Arch x64,x86] [-Unread mask] [-Strict] [-Xops n] [-Noops n]
 # Extra directories add shaders (.vert / .frag), e.g. the fixed-function programs dumped by the GL library. Unread compiles the vertex shaders as g2sc_compile_vs does.
 # Xops: board B's fragment-core operations (g2sc_set_target / glslc xops): 1 SQRT / RCPM / RSQM, 2 CLAMP, 3 both.
-param([string[]]$Extra = @(), [string[]]$Arch = @('x64', 'x86'), [int]$Unread = 0, [switch]$Strict, [int]$Xops = 0)
+# Noops: the units both stages' cores lack (g2sc_set_absent / glslc noops): 1 the integer divider, 2 SIN / COS, 3 both.
+param([string[]]$Extra = @(), [string[]]$Arch = @('x64', 'x86'), [int]$Unread = 0, [switch]$Strict, [int]$Xops = 0, [int]$Noops = 0)
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path "$PSScriptRoot\..\..\..\..").Path
 $Arch = @($Arch | ForEach-Object { $_ -split ',' })
@@ -20,7 +21,7 @@ $list = @($rel | ForEach-Object { ToWsl $_ })
 [IO.File]::WriteAllText("$out\files.txt", ($list -join "`n") + "`n")
 $wlist = ToWsl "$out\files.txt"
 $wrepo = ToWsl $repo
-$opt = @(if ($Xops) { '--xops', "$Xops" }) + @(if ($Unread) { '--unread', "$Unread" }) + @(if ($Strict) { '--strict' })
+$opt = @(if ($Xops) { '--xops', "$Xops" }) + @(if ($Noops) { '--noops', "$Noops" }) + @(if ($Unread) { '--unread', "$Unread" }) + @(if ($Strict) { '--strict' })
 wsl -e bash -lc "cd '$wrepo' && xargs -d '\n' -a '$wlist' python3 -I host/win/shc/test/oracle.py $opt > '$(ToWsl "$out\py.txt")'"
 if ($LASTEXITCODE -ne 0) { throw 'the Python oracle failed' }
 

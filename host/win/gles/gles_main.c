@@ -243,6 +243,8 @@ static int dev_up(void)
         S.mode = g2_mode_of_flags(st[G2_ST_B_FLAGS]);
         g2sc_set_target(G2_B_FLAG_XOPS(st[G2_ST_B_FLAGS]));    /* the fragment-core operations this board B has: the compiler emits them */
         if (g2sc_target()) g2e_log("gles: board B runs SQRT / RCPM / RSQM %s, CLAMP %s", g2sc_target() & 1 ? "yes" : "no", g2sc_target() & 2 ? "yes" : "no");
+        g2sc_set_absent(G2_A_FLAG_ABSENT(st[G2_ST_FLAGS]), G2_B_FLAG_ABSENT(st[G2_ST_B_FLAGS]));     /* the units the cores lack: the compiler replaces their ops */
+        if (g2sc_absent(G2SC_VS) | g2sc_absent(G2SC_FS)) g2e_log("gles: units absent (1 integer divider, 2 SIN / COS): vertex core %u, fragment core %u", g2sc_absent(G2SC_VS), g2sc_absent(G2SC_FS));
     }
     S.mode_w = G2_MODE_W[S.mode]; S.mode_h = G2_MODE_H[S.mode];
     return 0;

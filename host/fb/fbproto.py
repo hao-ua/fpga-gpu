@@ -251,7 +251,9 @@ def decode_flags(f):
             "fdx": (f >> 4) & 1, "mdio_init": (f >> 5) & 1, "host": (f >> 6) & 1, "b_present": (f >> 7) & 1,
             "tap": (f >> 8) & 31, "rxdly": (f >> 13) & 1, "adv1000": (f >> 14) & 1, "phyad": (f >> 16) & 31,
             # layout 11: the DHCP client
-            "dhcp": (f >> 21) & 15, "ip_valid": (f >> 25) & 1, "ip_leased": (f >> 26) & 1}
+            "dhcp": (f >> 21) & 15, "ip_valid": (f >> 25) & 1, "ip_leased": (f >> 26) & 1,
+            # the vertex core lacks the integer divider / SIN / COS (glslc noops for the vertex stage: (f >> 30) & 3)
+            "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}
 
 
 def format_ip(st):
@@ -268,7 +270,9 @@ def decode_b_flags(f):
     return {"calib": f & 1, "mmcm_locked": (f >> 1) & 1, "video": (f >> 2) & 1, "mode_busy": (f >> 3) & 1,
             "mode": (f >> 4) & 7, "image_shown": (f >> 7) & 1, "fill_done": (f >> 8) & 1, "lock_fail": (f >> 11) & 1,
             "cp_busy": (f >> 12) & 1, "cur_img": (f >> 16) & 1023, "render_busy": (f >> 26) & 1,
-            "fs_stack_err": (f >> 27) & 1, "xsfu": (f >> 28) & 1, "xclamp": (f >> 29) & 1}
+            "fs_stack_err": (f >> 27) & 1, "xsfu": (f >> 28) & 1, "xclamp": (f >> 29) & 1,
+            # the fragment core lacks the integer divider / SIN / COS (glslc noops for the fragment stage: (f >> 30) & 3)
+            "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}
 
 
 def decode_link_flags(f):

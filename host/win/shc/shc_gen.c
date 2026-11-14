@@ -1471,8 +1471,91 @@ static Val *bi_powv(Cg *c, Val *x, Val *y)
     return un(c, "EXP2", t);
 }
 
-static Val *bi_sin(Cg *c, Val *x) { return un(c, "SIN", x); }
-static Val *bi_cos(Cg *c, Val *x) { return un(c, "COS", x); }
+/* sin / cos without the SIN / COS unit (h->noops bit 1, glslc._sincos_lowered: its comment has the numbers): whole turns off in three parts (Cody-Waite),
+ * the phase in quarter turns clamped to [-3, 3], folded to [-1, 1] by the triangle, then the odd polynomial. 17 instructions. */
+static const double SIN_K2PI = 83443.0 / 131072.0;                                  /* 2/pi in FP24 */
+static const double SIN_W[3] = { 25.0 / 4.0, 17.0 / 512.0, -76527.0 / 4294967296.0 };          /* C1 + C2 + C3 = 2pi */
+static const double SIN_C[4] = { 102943.0 / 65536.0, -84661.0 / 131072.0, 20837.0 / 262144.0, -18297.0 / 4194304.0 };   /* c1, c3, c5, c7 */
+static Val *sincos_lowered(Cg *c, Val *x, int cos)
+{
+    const char *ty;
+    Val *u, *k4, *off, *f, *r, *w1, *w2, *w3, *k, *a, *one, *three, *two, *b, *cc, *s, *s2, *c1, *c3, *c5, *c7, *p, *y;
+    x = asf(c, x);
+    ty = TY(c, x);
+    u = alloc(c, ty);
+    k4 = kf(c, SIN_K2PI / 4.0);
+    off = kf(c, cos ? 0.75 : 0.5);
+    emit(c, "MAD r%d r%d r%d r%d", u->u.r.n, N(c, x), k4->u.r.n, off->u.r.n);
+    f = un(c, "FLR", u);
+    r = alloc(c, ty);
+    w1 = kf(c, SIN_W[0]); w2 = kf(c, SIN_W[1]); w3 = kf(c, SIN_W[2]);
+    emit(c, "MAD r%d r%d -r%d r%d", r->u.r.n, f->u.r.n, w1->u.r.n, N(c, x));
+    emit(c, "MAD r%d r%d -r%d r%d", r->u.r.n, f->u.r.n, w2->u.r.n, r->u.r.n);
+    emit(c, "MAD r%d r%d -r%d r%d", r->u.r.n, f->u.r.n, w3->u.r.n, r->u.r.n);
+    k = kf(c, SIN_K2PI);
+    a = alloc(c, ty);
+    if (cos) { one = kf(c, 1.0); emit(c, "MAD r%d r%d r%d r%d", a->u.r.n, r->u.r.n, k->u.r.n, one->u.r.n); }
+    else emit(c, "MUL r%d r%d r%d", a->u.r.n, r->u.r.n, k->u.r.n);
+    three = kf(c, 3.0); two = kf(c, 2.0);
+    emit(c, "MIN r%d r%d r%d", a->u.r.n, a->u.r.n, three->u.r.n);
+    emit(c, "MAX r%d r%d -r%d", a->u.r.n, a->u.r.n, three->u.r.n);
+    b = alloc(c, ty); emit(c, "SUB r%d r%d r%d", b->u.r.n, two->u.r.n, a->u.r.n);
+    cc = alloc(c, ty); emit(c, "SUB r%d -r%d r%d", cc->u.r.n, two->u.r.n, a->u.r.n);
+    s = alloc(c, ty);
+    emit(c, "MIN r%d r%d r%d", s->u.r.n, a->u.r.n, b->u.r.n);
+    emit(c, "MAX r%d r%d r%d", s->u.r.n, s->u.r.n, cc->u.r.n);
+    s2 = alloc(c, ty); emit(c, "MUL r%d r%d r%d", s2->u.r.n, s->u.r.n, s->u.r.n);
+    c1 = kf(c, SIN_C[0]); c3 = kf(c, SIN_C[1]); c5 = kf(c, SIN_C[2]); c7 = kf(c, SIN_C[3]);
+    p = alloc(c, ty);
+    emit(c, "MAD r%d r%d r%d r%d", p->u.r.n, s2->u.r.n, c7->u.r.n, c5->u.r.n);
+    emit(c, "MAD r%d r%d r%d r%d", p->u.r.n, p->u.r.n, s2->u.r.n, c3->u.r.n);
+    emit(c, "MAD r%d r%d r%d r%d", p->u.r.n, p->u.r.n, s2->u.r.n, c1->u.r.n);
+    y = alloc(c, ty); emit(c, "MUL r%d r%d r%d", y->u.r.n, p->u.r.n, s->u.r.n);
+    return y;
+}
+
+static Val *bi_sin(Cg *c, Val *x) { return (c->h->noops & 2) ? sincos_lowered(c, x, 0) : un(c, "SIN", x); }
+static Val *bi_cos(Cg *c, Val *x) { return (c->h->noops & 2) ? sincos_lowered(c, x, 1) : un(c, "COS", x); }
+
+/* a / b truncated toward zero without the divider (h->noops bit 0, glslc._idiv_lowered): registers an, bn of type ty (int, or ivecN in int representation).
+ * Two float estimates of |a| / |b| with the exact remainder after each, one correction each way, then the sign. 28 instructions, exact over the 24-bit range. */
+static Val *idiv_lowered(Cg *c, int an, int bn, const char *ty)
+{
+    const char *fty = !strcmp(ty, "int") ? "float" : ty[4] == '2' ? "vec2" : ty[4] == '3' ? "vec3" : "vec4";
+    Val *A, *B, *fa, *fb, *rb, *t, *q, *p, *r, *fq, *t2, *d, *k, *m, *s;
+    A = alloc(c, ty); emit(c, "IABS r%d r%d", A->u.r.n, an);
+    B = alloc(c, ty); emit(c, "IABS r%d r%d", B->u.r.n, bn);
+    fa = alloc(c, fty); emit(c, "UTOF r%d r%d", fa->u.r.n, A->u.r.n);
+    fb = alloc(c, fty); emit(c, "UTOF r%d r%d", fb->u.r.n, B->u.r.n);
+    rb = alloc(c, fty); emit(c, "RCP r%d r%d", rb->u.r.n, fb->u.r.n);
+    t = alloc(c, fty); emit(c, "MUL r%d r%d r%d", t->u.r.n, fa->u.r.n, rb->u.r.n);
+    q = alloc(c, ty); emit(c, "FTOU r%d r%d", q->u.r.n, t->u.r.n);
+    p = alloc(c, ty); emit(c, "IMUL r%d r%d r%d", p->u.r.n, q->u.r.n, B->u.r.n);
+    r = alloc(c, ty); emit(c, "ISUB r%d r%d r%d", r->u.r.n, A->u.r.n, p->u.r.n);
+    fq = alloc(c, fty); emit(c, "ITOF r%d r%d", fq->u.r.n, r->u.r.n);
+    t2 = alloc(c, fty);
+    emit(c, "MUL r%d r%d r%d", t2->u.r.n, fq->u.r.n, rb->u.r.n);
+    emit(c, "FLR r%d r%d", t2->u.r.n, t2->u.r.n);
+    d = alloc(c, ty); emit(c, "FTOI r%d r%d", d->u.r.n, t2->u.r.n);
+    emit(c, "IADD r%d r%d r%d", q->u.r.n, q->u.r.n, d->u.r.n);
+    emit(c, "IMUL r%d r%d r%d", p->u.r.n, d->u.r.n, B->u.r.n);
+    emit(c, "ISUB r%d r%d r%d", r->u.r.n, r->u.r.n, p->u.r.n);
+    k = asi_lit(c, 23.0);
+    m = alloc(c, ty); emit(c, "ISHR r%d r%d r%d", m->u.r.n, r->u.r.n, k->u.r.n);
+    emit(c, "IADD r%d r%d r%d", q->u.r.n, q->u.r.n, m->u.r.n);
+    emit(c, "IAND r%d r%d r%d", m->u.r.n, m->u.r.n, B->u.r.n);
+    emit(c, "IADD r%d r%d r%d", r->u.r.n, r->u.r.n, m->u.r.n);
+    emit(c, "ISUB r%d r%d r%d", m->u.r.n, r->u.r.n, B->u.r.n);
+    emit(c, "ISHR r%d r%d r%d", m->u.r.n, m->u.r.n, k->u.r.n);
+    emit(c, "INOT r%d r%d", m->u.r.n, m->u.r.n);
+    emit(c, "ISUB r%d r%d r%d", q->u.r.n, q->u.r.n, m->u.r.n);
+    s = alloc(c, ty);
+    emit(c, "IXOR r%d r%d r%d", s->u.r.n, an, bn);
+    emit(c, "ISHR r%d r%d r%d", s->u.r.n, s->u.r.n, k->u.r.n);
+    emit(c, "IXOR r%d r%d r%d", q->u.r.n, q->u.r.n, s->u.r.n);
+    emit(c, "ISUB r%d r%d r%d", q->u.r.n, q->u.r.n, s->u.r.n);
+    return q;
+}
 
 static Val *atan1(Cg *c, Val *x)
 {
@@ -2451,6 +2534,10 @@ static Val *binop_(Cg *c, const char *op, Node *ea, Node *eb)
         if (!bi && eb->kind == N_NUM && is_integer(eb->num)) { b = asi_lit(c, eb->num); bi = 1; }
         if (!ai && ea->kind == N_NUM && is_integer(ea->num)) { a = asi_lit(c, ea->num); ai = 1; }
         if (ai && bi) {
+            if (div && (c->h->noops & 1)) {
+                int an = N(c, a), bn = N(c, b);
+                return idiv_lowered(c, an, bn, "int");
+            }
             r = alloc(c, "int");
             emit(c, "%s r%d r%d r%d", div ? "IDIV" : "IMUL", r->u.r.n, N(c, a), N(c, b));
             return r;
@@ -2473,7 +2560,8 @@ static Val *binop_(Cg *c, const char *op, Node *ea, Node *eb)
         r = alloc(c, t);
         emit(c, "FTOI r%d r%d", x->u.r.n, N(c, a));
         emit(c, "FTOI r%d r%d", y->u.r.n, N(c, b));
-        emit(c, "IDIV r%d r%d r%d", q->u.r.n, x->u.r.n, y->u.r.n);
+        if (c->h->noops & 1) q = idiv_lowered(c, x->u.r.n, y->u.r.n, t);
+        else emit(c, "IDIV r%d r%d r%d", q->u.r.n, x->u.r.n, y->u.r.n);
         emit(c, "ITOF r%d r%d", r->u.r.n, q->u.r.n);
         return r;
     }

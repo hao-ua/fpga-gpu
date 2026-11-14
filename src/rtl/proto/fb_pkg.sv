@@ -66,7 +66,9 @@ package fb_pkg;
                                                       // counters from a_geom (101-113) + the dispatcher's idle and D_GWAIT
                                                       // cycles (114, 115) — board_a_core / a_geom list them;
                                                       // layout 11: word 75 = the IPv4 address in use, word 3
-                                                      // (flags) bits 21-26 = DHCP state, address valid, leased
+                                                      // (flags) bits 21-26 = DHCP state, address valid, leased;
+                                                      // flags bits 30 / 31 (A's and B's): the core lacks the
+                                                      // integer divider / SIN / COS (0 on these boards)
 
     // board link packets: header word {type, seq (stamped by the
     // link ARQ layer), len = payload words}

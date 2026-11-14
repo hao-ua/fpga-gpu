@@ -1079,6 +1079,7 @@ class Codegen:
         self.label_n=0
         self.isa64=False         # True: the 64-bit swizzling ISA (per-operand swizzles, SEL, IDIV, FLR / CEIL, TEX modes)
         self.xops=0              # board B's fragment-core operations (STATUS b_flags bits 28 / 29 >> 28): 1 SQRT / RCPM / RSQM, 2 CLAMP; fragment stage only
+        self.hw_idiv=True        # False: the core has no integer divider (noops bit 0): int / is _idiv_lowered
         self.svregs=set()        # virtual registers holding a SCALAR (lane-uniform) value: packed one per component on isa64
         self.vs_tex=False        # a vertex program samples a texture
         self.umap=None           # Appendix A.7, a program over the limits: uniform slot -> row * 4 + lane
@@ -1753,6 +1754,7 @@ class Compiler(Codegen):
             if not bi and eb[0]=='num' and float(eb[1]).is_integer(): b=self._asi_lit(eb[1]); bi=True
             if not ai and ea[0]=='num' and float(ea[1]).is_integer(): a=self._asi_lit(ea[1]); ai=True
             if ai and bi:
+                if op=='/' and not self.hw_idiv: r=self._idiv_lowered(a, b, 'int'); self.freer(a); self.freer(b); return r
                 r=self.alloc('int'); self.emit('IDIV' if op=='/' else 'IMUL', f'r{r.n}', f'r{a.n}', f'r{b.n}'); self.freer(a); self.freer(b); return r
         if (ai or bi) and op in ('+','-','<','>','<=','>=','==','!='):
             if not bi and eb[0]=='num' and float(eb[1]).is_integer(): b=self._asi_lit(eb[1]); bi=True
@@ -1767,7 +1769,9 @@ class Compiler(Codegen):
         if op=='/' and self.isa64 and (a.ty[:4]=='ivec' or b.ty[:4]=='ivec'):      # an int vector's lanes are floats; / truncates
             t=a.ty if a.ty[:4]=='ivec' else b.ty; x=self.alloc(t); y=self.alloc(t); q=self.alloc(t); r=self.alloc(t)
             self.emit('FTOI', f'r{x.n}', f'r{a.n}'); self.emit('FTOI', f'r{y.n}', f'r{b.n}')
-            self.emit('IDIV', f'r{q.n}', f'r{x.n}', f'r{y.n}'); self.emit('ITOF', f'r{r.n}', f'r{q.n}'); return r
+            if not self.hw_idiv: q=self._idiv_lowered(x, y, t)
+            else: self.emit('IDIV', f'r{q.n}', f'r{x.n}', f'r{y.n}')
+            self.emit('ITOF', f'r{r.n}', f'r{q.n}'); return r
         rt = a.ty if ncomp(a.ty)>=ncomp(b.ty) else b.ty
         r=self.alloc(rt)
         if op=='+': self.emit('ADD', f'r{r.n}', f'r{a.n}', f'r{b.n}')
@@ -2125,10 +2129,73 @@ class Compiler(Codegen):
     def bi_pow(self,x,y): l=self._un('LOG2',x); t=self.alloc(x.ty); self.emit('MUL', f'r{t.n}', f'r{y.n}', f'r{l.n}'); r=self._un('EXP2',t); self.freer(l); self.freer(t); return r
     # HW sin/cos: the float_sfu quarter-wave LUT (ISA op SIN=40/COS=41) takes the angle in RADIANS and does
     # the /2pi range-reduction + quadrant fold internally, so a whole trig call is ONE SFU op (vs ~18 for the
-    # software Taylor). Elementwise across the vec lanes, exactly like RCP/RSQRT/EXP2. hw_sincos=False falls
-    # back to _poly_sin for bitstreams built without the SIN_MEM LUT.
-    def bi_sin(self,x): return self._un('SIN', x) if getattr(self,'hw_sincos',True) else self._poly_sin(x, cos=False)
-    def bi_cos(self,x): return self._un('COS', x) if getattr(self,'hw_sincos',True) else self._poly_sin(x, cos=True)
+    # software Taylor). Elementwise across the vec lanes, exactly like RCP/RSQRT/EXP2. hw_sincos=False (a core without the
+    # unit, noops bit 1): _sincos_lowered on isa64, the Taylor _poly_sin on the 32-bit ISA.
+    def bi_sin(self,x): return self._un('SIN', x) if getattr(self,'hw_sincos',True) else self._sincos_lowered(x, cos=False) if self.isa64 else self._poly_sin(x, cos=False)
+    def bi_cos(self,x): return self._un('COS', x) if getattr(self,'hw_sincos',True) else self._sincos_lowered(x, cos=True) if self.isa64 else self._poly_sin(x, cos=True)
+    # sin / cos without the SIN / COS unit (isa64, noops bit 1), 17 instructions. f = floor(x / 2pi + 1/2) whole turns (cos:
+    # + 3/4) come off in three parts, r = x - f C1 - f C2 - f C3 (C1, C2 short, so f C1 and f C2 are exact for |f| < 2^12:
+    # |x| < 25000), then the phase in quarter turns a = r * 2/pi (cos: + 1), in [-2, 2] up to a floor off by one at a turn's
+    # edge; the clamp to [-3, 3] only matters for huge |x|, whose phase is noise in FP24. The triangle
+    # s = max(min(a, 2 - a), -2 - a) folds [-3, 3] to [-1, 1] (exact) with sin(pi a / 2) = sin(pi s / 2); then
+    # P(s) = s (c1 + s2 (c3 + s2 (c5 + s2 c7))). The coefficients are FP24 values chosen so that, evaluated as here, P(1) = 1
+    # exactly, P(s) <= 1 for every FP24 s, and |P(s) - sin(pi s / 2)| <= 2.2e-5 on [0, 1] (relative 7e-6 for small s). So
+    # sin(0) = 0 and cos(0) = 1 exactly, |result| <= 1, and up to |x| = 1e4 the error is <= 4e-5 (sin) / 7e-5 (cos).
+    _K2PI = 83443 / 2**17                          # 2/pi in FP24 (1/2pi is the same / 4)
+    _SINW = (25 / 2**2, 17 / 2**9, -76527 / 2**32)                                # C1 + C2 + C3 = 2pi
+    _SINC = (102943 / 2**16, -84661 / 2**17, 20837 / 2**18, -18297 / 2**22)     # c1, c3, c5, c7
+    def _sincos_lowered(self, x, cos):
+        x=self._asf(x); ty=x.ty
+        u=self.alloc(ty); self.emit('MAD', f'r{u.n}', f'r{x.n}', f'r{self.kf(self._K2PI / 4).n}', f'r{self.kf(0.75 if cos else 0.5).n}')
+        f=self._un('FLR', u)
+        r=self.alloc(ty); w1,w2,w3=(self.kf(v) for v in self._SINW)
+        self.emit('MAD', f'r{r.n}', f'r{f.n}', f'-r{w1.n}', f'r{x.n}')
+        self.emit('MAD', f'r{r.n}', f'r{f.n}', f'-r{w2.n}', f'r{r.n}'); self.emit('MAD', f'r{r.n}', f'r{f.n}', f'-r{w3.n}', f'r{r.n}')
+        k=self.kf(self._K2PI); a=self.alloc(ty)
+        if cos: self.emit('MAD', f'r{a.n}', f'r{r.n}', f'r{k.n}', f'r{self.kf(1.0).n}')
+        else: self.emit('MUL', f'r{a.n}', f'r{r.n}', f'r{k.n}')
+        three=self.kf(3.0); two=self.kf(2.0)
+        self.emit('MIN', f'r{a.n}', f'r{a.n}', f'r{three.n}'); self.emit('MAX', f'r{a.n}', f'r{a.n}', f'-r{three.n}')
+        b=self.alloc(ty); self.emit('SUB', f'r{b.n}', f'r{two.n}', f'r{a.n}')
+        c=self.alloc(ty); self.emit('SUB', f'r{c.n}', f'-r{two.n}', f'r{a.n}')
+        s=self.alloc(ty); self.emit('MIN', f'r{s.n}', f'r{a.n}', f'r{b.n}'); self.emit('MAX', f'r{s.n}', f'r{s.n}', f'r{c.n}')
+        s2=self.alloc(ty); self.emit('MUL', f'r{s2.n}', f'r{s.n}', f'r{s.n}')
+        c1,c3,c5,c7=(self.kf(v) for v in self._SINC)
+        p=self.alloc(ty); self.emit('MAD', f'r{p.n}', f'r{s2.n}', f'r{c7.n}', f'r{c5.n}')
+        self.emit('MAD', f'r{p.n}', f'r{p.n}', f'r{s2.n}', f'r{c3.n}'); self.emit('MAD', f'r{p.n}', f'r{p.n}', f'r{s2.n}', f'r{c1.n}')
+        y=self.alloc(ty); self.emit('MUL', f'r{y.n}', f'r{p.n}', f'r{s.n}')
+        for z in (u,f,r,a,b,c,s,s2,p): self.freer(z)
+        return y
+    # a / b truncated toward zero, 24-bit two's complement ints (type ty: int, or ivecN in int representation), without the
+    # divider (noops bit 0), 28 instructions, exact over the whole range: an estimate of |a| / |b| through RCP(|b|), the exact
+    # remainder, a second estimate from it (floored), then one correction each way and the sign (as IDIV). b = 0 gives some
+    # finite value (IDIV's -1 is not kept: GLSL leaves x / 0 undefined).
+    def _idiv_lowered(self, a, b, ty):
+        fty='float' if ty=='int' else 'vec'+ty[-1]
+        A=self.alloc(ty); self.emit('IABS', f'r{A.n}', f'r{a.n}')
+        B=self.alloc(ty); self.emit('IABS', f'r{B.n}', f'r{b.n}')
+        fa=self.alloc(fty); self.emit('UTOF', f'r{fa.n}', f'r{A.n}')
+        fb=self.alloc(fty); self.emit('UTOF', f'r{fb.n}', f'r{B.n}')
+        rb=self.alloc(fty); self.emit('RCP', f'r{rb.n}', f'r{fb.n}')
+        t=self.alloc(fty); self.emit('MUL', f'r{t.n}', f'r{fa.n}', f'r{rb.n}')
+        q=self.alloc(ty); self.emit('FTOU', f'r{q.n}', f'r{t.n}')                       # floor(|a| / |b|) within a few
+        p=self.alloc(ty); self.emit('IMUL', f'r{p.n}', f'r{q.n}', f'r{B.n}')
+        r=self.alloc(ty); self.emit('ISUB', f'r{r.n}', f'r{A.n}', f'r{p.n}')            # its remainder, exact
+        fq=self.alloc(fty); self.emit('ITOF', f'r{fq.n}', f'r{r.n}')
+        t2=self.alloc(fty); self.emit('MUL', f'r{t2.n}', f'r{fq.n}', f'r{rb.n}'); self.emit('FLR', f'r{t2.n}', f'r{t2.n}')
+        d=self.alloc(ty); self.emit('FTOI', f'r{d.n}', f'r{t2.n}')
+        self.emit('IADD', f'r{q.n}', f'r{q.n}', f'r{d.n}')
+        self.emit('IMUL', f'r{p.n}', f'r{d.n}', f'r{B.n}'); self.emit('ISUB', f'r{r.n}', f'r{r.n}', f'r{p.n}')    # remainder in [0, 1.02 |b|)
+        k=self._asi_lit(23)
+        m=self.alloc(ty); self.emit('ISHR', f'r{m.n}', f'r{r.n}', f'r{k.n}')            # -1 if r < 0
+        self.emit('IADD', f'r{q.n}', f'r{q.n}', f'r{m.n}')
+        self.emit('IAND', f'r{m.n}', f'r{m.n}', f'r{B.n}'); self.emit('IADD', f'r{r.n}', f'r{r.n}', f'r{m.n}')
+        self.emit('ISUB', f'r{m.n}', f'r{r.n}', f'r{B.n}'); self.emit('ISHR', f'r{m.n}', f'r{m.n}', f'r{k.n}')
+        self.emit('INOT', f'r{m.n}', f'r{m.n}'); self.emit('ISUB', f'r{q.n}', f'r{q.n}', f'r{m.n}')     # +1 if r >= |b|
+        s=self.alloc(ty); self.emit('IXOR', f'r{s.n}', f'r{a.n}', f'r{b.n}'); self.emit('ISHR', f'r{s.n}', f'r{s.n}', f'r{k.n}')
+        self.emit('IXOR', f'r{q.n}', f'r{q.n}', f'r{s.n}'); self.emit('ISUB', f'r{q.n}', f'r{q.n}', f'r{s.n}')   # negated if the signs differ
+        for z in (A,B,fa,fb,rb,t,p,r,fq,t2,d,k,m,s): self.freer(z)
+        return q
     def _poly_sin(self, x, cos):
         # sin/cos via range reduction to [-pi,pi] + a 7th-order Taylor. Transcendental precision is
         # implementation-defined in ES2, so this is an approximation (good to ~1e-3 for typical angles).
@@ -2959,7 +3026,8 @@ _ALU_DST = {'ADD','SUB','MUL','MAD','MIN','MAX','DP3','DP4','MOV','RCP','RSQRT',
             'FTOI','ITOF','IADD','ISUB','ISLT','ISGE','DDX','DDY','LDP','LDV','LDPX','TEX',
             'SEL','IDIV','FLR','CEIL','TRUNC','RNDE','SIN','COS',
             'ISEQ','ISNE','IMUL','IMOD','UDIV','UMOD','FTOU','UTOF','MOVI',
-            'SQRT','RCPM','RSQM','CLAMP'}   # ops whose toks[1] is a GPR dest
+            'SQRT','RCPM','RSQM','CLAMP',
+            'IAND','IOR','IXOR','INOT','ISHL','ISHR','USHR','IMIN','IMAX','UMIN','UMAX','IABS','INEG','ISIGN','ULT','UGE'}   # ops whose toks[1] is a GPR dest (the IOP functions: _idiv_lowered)
 _SIDE = {'STO','STV','STOZ','DISCARD','SETP','IF','ELSE','ENDIF','BRA','BRP','LOOP','ENDL','END','BREAK','CONT','NOP'}
 
 def _dst(toks):
@@ -3982,7 +4050,7 @@ def _mad_fuse(lines, isa64):
     return lines
 
 # --------------- top-level program build ---------------
-def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0):
+def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, noops=0):
     # Auto-fallback: if a shader exceeds the 31-register file with the default (constant-pinning) allocation,
     # retry with constant rematerialization (fresh LDP per use) — trades a few more instructions for far lower
     # register pressure, letting heavy shaders (e.g. the Seascape) compile transparently through g.program().
@@ -3994,24 +4062,28 @@ def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True,
     # pack: Appendix A.7, for a program that does not fit one row a variable: {'umap': uniform slot -> row * 4 + lane, 'urows': the rows they take, 'vmap': the same of a varying slot, -1 = dropped}.
     # xops: board B's fragment-core operations, as its STATUS b_flags bits 28 / 29 say (>> 28): 1 SQRT (length, distance, sqrt) and RCPM / RSQM (an RCP or
     # RSQRT feeding one scalar MUL), 2 CLAMP. Bit for bit the code they replace; a fragment program only (the vertex core has none), isa64 only.
+    # noops: the units this stage's core lacks, as its STATUS flags bits 30 / 31 say (>> 30; board A's for the vertex stage, board
+    # B's b_flags for the fragment stage): 1 the integer divider (int / becomes _idiv_lowered), 2 SIN / COS (_sincos_lowered); isa64.
     # A spill retries first without the loop-invariant hoist (licm: what it takes out of a loop stays live across all of it, so a long
     # program can need more registers with it than without), then with the constants rematerialized, without the hoist either: never a
     # refusal that the code before the hoist did not have.
     if not remat_consts:
         for hoist in (True, False):
             try:
-                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist)
+                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist, noops=noops)
             except CompileError as e:
                 if 'register spill' not in str(e): raise
-    return _compile_stage(src, stage, optimize, remat_consts=True, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=False)
+    return _compile_stage(src, stage, optimize, remat_consts=True, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=False, noops=noops)
 
-def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True):
+def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True, noops=0):
     exts=set()
     src=preprocess(src, stage, exts, strict)     # #define / #ifdef / #if ... + comment stripping
     toks=lex(src, exts); parser=Parser(toks, strict); ast=parser.parse()
     sem=Sema(stage, parser, exts, strict); sem.run(ast)
     c=Compiler(stage); c.remat_consts=remat_consts; c.hw_sincos=hw_sincos; c.isa64=isa64; c.callmap=sem.callmap; c.ints=sem.ints
     c.xops=xops&3 if isa64 and stage=='fs' else 0
+    if isa64 and noops&1: c.hw_idiv=False
+    if isa64 and noops&2: c.hw_sincos=False
     if pack: c.umap=pack.get('umap'); c.vmap=pack.get('vmap'); c.depth_units=pack.get('depth',0)
     # pass 0: register struct type definitions (needed to size struct uniforms below)
     for d in parser.hoisted+ast:

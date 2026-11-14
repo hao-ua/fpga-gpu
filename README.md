@@ -148,12 +148,14 @@ C:\AMDDesignTools\2026.1\Vivado\bin\vivado.bat -mode batch -nojournal -source to
 
 - **Board-level and system benches:**
   `powershell -File tools/sim_a.ps1 -Test <name> [-Fast] [-Tag _x] [-Plusargs A,B]`.
-  - Names: `mem`, `eth`, `board_a`, `board_b`, `b3d`, `two`, `two3d`, `img_write`, `img_xfer`, `scan`, `video_mmcm`,
-    `disp_post`, `credit`.
+  - Names: `mem`, `eth`, `dhcp`, `board_a`, `board_b`, `b3d`, `two`, `two3d`, `img_write`, `img_xfer`, `scan`,
+    `video_mmcm`, `disp_post`, `credit`.
   - Example: `-Test two3d -Plusargs SEED_11 -Fast`, the whole chain from the host to the HDMI pixels, about 25 min.
 - **Block benches:** `powershell -File tools/sim_gpu.ps1 -Test tb_<name> [-Extra …] [-Plusargs …]`.
   - Seed lists: `tools/run_a_seeds.ps1 -Test tb_a_cmd -Seeds 1,2,3` (also `tb_a_vertex`, `tb_a_geom`, `tb_a_render`).
   - The shader cores over every test program: `tools/run_vs2.ps1 -All`, `tools/run_fs2.ps1 -All`.
+  - The compilers' replacements for a core without the integer divider or SIN / COS: `python3 tools/lower_check.py`
+    (`--rtl` writes the `tb_vs2` / `tb_fs2` golden sets of `tests/lower_*`).
   - Other runners: `tools/run_tmu24_seeds.ps1`, `tools/run_b_frames.ps1`, `tools/sim_link.ps1` (one link bench at a time).
   - `tools/run_gpu_suite.ps1 -Benches a,b` runs a list of benches.
 - **Long-stream stress of board A's geometry:** `tools/a_stress_gen.py` (streams) with `tb_a_stress` (see its header).

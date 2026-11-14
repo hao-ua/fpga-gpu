@@ -271,7 +271,9 @@ module board_a_core #(
     end
     localparam int RING = 1 << RING_LOG2;
     wire [RING_LOG2:0] q_free = RING - q_used;
-    wire [31:0] flags = {5'h0, ip_leased, ip_valid, dhcp_state, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok,
+    // bits 31 / 30: the vertex core lacks SIN / COS / the integer divider (the libraries' compilers then replace those ops);
+    // this core has both, so 0
+    wire [31:0] flags = {2'b00, 3'h0, ip_leased, ip_valid, dhcp_state, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok,
                          host_valid, mdio_init_done, duplex, speed, link_up, calib_done};
     wire [31:0] sw [0:STATUS_WORDS-1];
     assign sw[0]  = STATUS_LAYOUT;

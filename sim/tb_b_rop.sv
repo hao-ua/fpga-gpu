@@ -40,7 +40,22 @@ module tb_b_rop;
     // frag_addr_n (the ROP's early hazard check) names next cycle's address as b_render's does
     localparam int FAW = $clog2(((64 + 1) / 2) * NL);
     wire [FAW-1:0] fa = FAW'((int'(fy) - int'(band_y0)) * ((WID + 1) / 2) + (int'(fx) >> 1));
-    b_rop #(.CW(CW), .MAXW(64), .NLINES(NL), .NLMAX(NL), .SAMPLES(1)) dut (.clk, .rst, .width(11'(WID)), .nl(4'(NL)), .band_y0, .fmt,
+    // TB_B2B: the batch queue and the next fragment's position; frag_addr_n = the next one's cell when this one is taken
+    int qx [0:31], qy [0:31], nb = 0; reg [1:0] qpv [0:31]; reg [103:0] qc [0:31]; reg [51:0] qsa [0:31]; reg [47:0] qz [0:31];
+    bit qf [0:31];
+    reg signed [CW-1:0] nfx = 0, nfy = 0;
+    wire [FAW-1:0] fa_nx = FAW'((int'(nfy) - int'(band_y0)) * ((WID + 1) / 2) + (int'(nfx) >> 1));
+`ifdef TB_B2B
+    wire [FAW-1:0] fa_n = (frag_valid && frag_ready) ? fa_nx : fa;
+`else
+    wire [FAW-1:0] fa_n = fa;
+`endif
+`ifdef TB_BLEND1
+    localparam bit BLEND1 = 1'b1;                   // one blend unit shared by the pair's pixels
+`else
+    localparam bit BLEND1 = 1'b0;
+`endif
+    b_rop #(.CW(CW), .MAXW(64), .NLINES(NL), .NLMAX(NL), .SAMPLES(1), .BLEND1(BLEND1)) dut (.clk, .rst, .width(11'(WID)), .nl(4'(NL)), .band_y0, .fmt,
         .color_base(BASE), .bursts_per_line(bpl), .ds_en, .ds_base(DBASE), .ds_bpl(11'(WID / 8)),
         .band_start, .band_flush_req, .band_flush_done, .band_busy, .band_run,
         .flush_busy, .rmw_idle, .next_ok(1'b1), .next_y0(band_y0 + 11'(NL)), .pl_rdy(), .pl_rdy_y0(), .pf_clear(1'b0),
@@ -57,7 +72,7 @@ module tb_b_rop;
         .lr_en, .lr_addr, .lr_rdy, .lr_rd_valid, .lr_rd_data,
         .frag_valid, .frag_pv(fpv), .frag_x(fx), .frag_y(fy), .frag_c16(fc), .frag_sa(fsa), .frag_z(fz), .frag_scov(2'b11), .frag_front(ffront),
         .frag_ready, .w_en, .w_addr, .w_data, .w_mask, .w_wren, .w_wend, .w_rdy, .w_wdf_rdy,
-        .pk_en(1'b0), .pk_next(1'b0), .pk_x('0), .pk_y('0), .pk_z(), .frag_addr(fa), .frag_addr_n(fa), .pk_addr('0),
+        .pk_en(1'b0), .pk_next(1'b0), .pk_x('0), .pk_y('0), .pk_z(), .frag_addr(fa), .frag_addr_n(fa_n), .pk_addr('0),
         .dbg_st(), .dbg_fst(), .dbg_pst());
 
     // ---- DDR model: 32-bit words, writes of whole bursts, reads in order after 3..9 cycles ----
@@ -281,6 +296,31 @@ module tb_b_rop;
 `else
                     for (int n = 0; n < ((empty_odd && b[0]) ? 0 : 30); n++) begin
 `endif
+`ifdef TB_B2B
+                        // back to back: the batch's fragments first, then offered one per cycle (valid stays up; the next
+                        // one's address on frag_addr_n in the cycle the current one is taken, as b_render does)
+                        if (n == 0) nb = 0;
+                        qx[nb] = (($urandom % 3 == 0) ? $urandom % 4 : $urandom % WID) & ~1;
+                        qy[nb] = y0 + $urandom % NL;
+                        qpv[nb] = 2'($urandom % 3) + 2'd1;
+                        qc[nb] = {rcol(), rcol()}; qsa[nb] = {ralpha(), ralpha()};
+                        qz[nb] = {(($urandom % 3 == 0) ? 24'h800000 : 24'($urandom)), (($urandom % 3 == 0) ? 24'h800000 : 24'($urandom))};
+                        qf[nb] = $urandom % 2;
+                        nb++;
+                        if (n == 29) begin
+                            for (int i = 0; i < nb; i++) begin
+                                fpv = qpv[i]; fx = qx[i]; fy = qy[i]; fc = qc[i]; fsa = qsa[i]; fz = qz[i]; ffront = qf[i];
+                                if (i + 1 < nb) begin nfx = qx[i+1]; nfy = qy[i+1]; end else begin nfx = qx[i]; nfy = qy[i]; end
+                                if (i == 0) begin @(negedge clk); frag_valid = 1; end
+                                #1;
+                                while (!frag_ready) begin @(negedge clk); #1; end
+                                if (qpv[i][0]) begin model_frag(qx[i], qy[i], y0, qc[i][51:0], qsa[i][25:0], qz[i][23:0], qf[i]); nfr++; end
+                                if (qpv[i][1]) begin model_frag(qx[i] + 1, qy[i], y0, qc[i][103:52], qsa[i][51:26], qz[i][47:24], qf[i]); nfr++; end
+                                @(negedge clk);                          // taken at the posedge in between
+                            end
+                            frag_valid = 0;
+                        end
+`else
                         // a pixel pair (a quad row): even x, often the same pixels; one, the other or both pixels present
                         int x = (($urandom % 3 == 0) ? $urandom % 4 : $urandom % WID) & ~1;
                         int y = y0 + $urandom % NL;
@@ -297,6 +337,7 @@ module tb_b_rop;
                         if (pv[0]) begin model_frag(x, y, y0, c0, sa0, z0, front); nfr++; end
                         if (pv[1]) begin model_frag(x + 1, y, y0, c1, sa1, z1, front); nfr++; end
                         if ($urandom % 3 == 0) repeat ($urandom % 3) @(negedge clk);
+`endif
                     end
                 end
                 band_flush_req = 1;

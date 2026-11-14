@@ -26,7 +26,7 @@
 // (two groups read per line, the writer repeats the first). RMW pipeline: accept (port A read) -> v0 (destination on rd_a,
 // blend starts) -> v1 (stencil / depth decision) -> v2..v5 -> v6 (port A write of the merged cell, blend result
 // ready; pixel_blend_b has 6 stages). Accept waits while v6 writes and while the cell is
-// in flight in v0..v5.
+// in flight in v0..v5 (BLEND1: one blend unit for both pixels, the write in v7, in flight v0..v6).
 // MSAA (SAMPLES = 4): per-sample depth / stencil / blend lanes, box resolve at the flush.
 // Timing: the band load and the preload issue their DDR bursts from row products kept in
 // registers (y x bursts per line, + bpl per line) — no multiply in the issue cycle; the bank selects are one-hot copies.
@@ -48,7 +48,11 @@ module b_rop #(
     // 8-line bands
     parameter int CELLS  = ((MAXW + 1) / 2) * NLINES,
     parameter int SAMPLES = 1,
-    parameter bit BBUF_BLOCKS = 1'b0              // 1: band-buffer banks as explicit 1k x 36 RAMB36 blocks (bb_bank: 30 instead
+    // 1: one pixel_blend_b per sample shared by the pair's two pixels (pixel 0 in v0's cycle, pixel 1 in v1's), the
+    // cell written in v7 instead of v6; a pair with pixel 1 present takes the blend in the next cycle too, so no
+    // fragment is accepted right behind it. Port A takes a read and a write per pair anyway: the same steady rate.
+    parameter bit BLEND1 = 1'b0,
+    parameter bit BBUF_BLOCKS = 1'b0             // 1: band-buffer banks as explicit 1k x 36 RAMB36 blocks (bb_bank: 30 instead
                                                   // of 54 RAMB36 at MAXW 1280, but +≈ 1 k LUT of block-select muxes — measured
                                                   // out of context: 5 770 vs 4 8xx LUT); 0: Vivado's inferred mapping
 )(
@@ -364,18 +368,24 @@ module b_rop #(
                                ld_cell(ld_x,        ld_row, unpack(ld_data, ld_px,  fmt), ld_dsw)};
 
     // ---- RMW pipeline: accept -> v0 .. v6 (write) ----
-    reg v0, v1, v2, v3, v4, v5, v6;
-    reg [AW-1:0] s0_addr, s1_addr, s2_addr, s3_addr, s4_addr, s5_addr, s6_addr;
+    reg v0, v1, v2, v3, v4, v5, v6, v7;
+    reg [AW-1:0] s0_addr, s1_addr, s2_addr, s3_addr, s4_addr, s5_addr, s6_addr, s7_addr;
+    // BLEND1: the write stage is v7 (else v6); pixel 1's blend inputs ride along to v1
+    wire          vw      = BLEND1 ? v7 : v6;
+    wire [AW-1:0] sw_addr = BLEND1 ? s7_addr : s6_addr;
+    reg           s0_p1, s1_p1;                                 // pixel 1 present (BLEND1: the blend's second cycle)
+    reg [51:0]    s1_c16; reg [25:0] s1_sa; reg [3:0] s1_t;
     // lanes NL2 = 2 x NS: lane p*NS + s = pixel p of the pair, sample s (the cell is pixel-major: lane l at [l*CELLW +: CELLW])
     reg [DW-1:0] s0_fz [0:NL2-1], s1_fz [0:NL2-1], s2_fz [0:NL2-1], s3_fz [0:NL2-1], s4_fz [0:NL2-1], s5_fz [0:NL2-1], s6_fz [0:NL2-1];
     reg [NL2-1:0] s0_scov, s1_scov;               // a pixel not present / outside the scissor has no covered samples
     reg [51:0]   s0_c16 [0:1]; reg [25:0] s0_sa [0:1];
     reg [3:0]    s0_t [0:1];
     reg          s0_ff, s1_ff;
-    reg [NL2-1:0] s2_cw, s3_cw, s4_cw, s5_cw, s6_cw;
-    reg [7:0]    s2_sten [0:NL2-1], s3_sten [0:NL2-1], s4_sten [0:NL2-1], s5_sten [0:NL2-1], s6_sten [0:NL2-1];
-    reg [DW-1:0] s2_keepz [0:NL2-1], s3_keepz [0:NL2-1], s4_keepz [0:NL2-1], s5_keepz [0:NL2-1], s6_keepz [0:NL2-1];
-    reg [31:0]   s2_keepc [0:NL2-1], s3_keepc [0:NL2-1], s4_keepc [0:NL2-1], s5_keepc [0:NL2-1], s6_keepc [0:NL2-1];
+    reg [NL2-1:0] s2_cw, s3_cw, s4_cw, s5_cw, s6_cw, s7_cw;
+    reg [7:0]    s2_sten [0:NL2-1], s3_sten [0:NL2-1], s4_sten [0:NL2-1], s5_sten [0:NL2-1], s6_sten [0:NL2-1], s7_sten [0:NL2-1];
+    reg [DW-1:0] s2_keepz [0:NL2-1], s3_keepz [0:NL2-1], s4_keepz [0:NL2-1], s5_keepz [0:NL2-1], s6_keepz [0:NL2-1], s7_keepz [0:NL2-1];
+    reg [31:0]   s2_keepc [0:NL2-1], s3_keepc [0:NL2-1], s4_keepc [0:NL2-1], s5_keepc [0:NL2-1], s6_keepc [0:NL2-1], s7_keepc [0:NL2-1];
+    reg [DW-1:0] s7_fz [0:NL2-1];
     reg [P2W-1:0] rd_eff_r;
     wire signed [CW-1:0] frag_x1 = frag_x + 1'b1;
     wire in_sc_y = (frag_y>=sc_y0 && frag_y<sc_y1);
@@ -389,10 +399,11 @@ module b_rop #(
     always @(posedge clk) begin
         if (rst) haz_r <= 1'b0;
         else haz_r <= (accept_pipe && (frag_addr_n==frag_addr)) || (v0 && (frag_addr_n==s0_addr)) || (v1 && (frag_addr_n==s1_addr)) ||
-                      (v2 && (frag_addr_n==s2_addr)) || (v3 && (frag_addr_n==s3_addr)) || (v4 && (frag_addr_n==s4_addr));
+                      (v2 && (frag_addr_n==s2_addr)) || (v3 && (frag_addr_n==s3_addr)) || (v4 && (frag_addr_n==s4_addr)) ||
+                      (BLEND1 && v5 && (frag_addr_n==s5_addr));
     end
     wire haz = haz_r;
-    wire accept_ok = ~v6 & ~we_a & ~haz;
+    wire accept_ok = ~vw & ~we_a & ~haz & ~(BLEND1 & v0 & s0_p1);
     assign frag_ready = (st==S_RUN) & ((pv_eff != 2'b00) ? accept_ok : 1'b1);
     assign accept_pipe = (st==S_RUN) & frag_valid & (pv_eff != 2'b00) & accept_ok;
     // synthesis translate_off
@@ -409,9 +420,9 @@ module b_rop #(
     // synthesis translate_on
     assign band_busy  = (st!=S_IDLE) & (st!=S_RUN);
     assign band_run   = (st==S_RUN);
-    wire pipe_empty   = ~v0 & ~v1 & ~v2 & ~v3 & ~v4 & ~v5 & ~v6;
+    wire pipe_empty   = ~v0 & ~v1 & ~v2 & ~v3 & ~v4 & ~v5 & ~v6 & ~v7;
     assign rmw_idle   = pipe_empty & ~we_a;
-    assign ren_addr = accept_pipe ? frag_addr : (v6 ? s6_addr : addr_a);
+    assign ren_addr = accept_pipe ? frag_addr : (vw ? sw_addr : addr_a);
 
     wire [2:0] sfn  = s1_ff ? stencil_func   : stencil_func_back;
     wire [7:0] sref = s1_ff ? stencil_ref    : stencil_ref_back;
@@ -439,16 +450,36 @@ module b_rop #(
         wire [7:0] sten_new = stencil_en ? ((sop_raw & swm)|(rd_sten & ~swm)) : rd_sten;
         assign cw_s[gs]       = s1_scov[gs] & spass & dpass;
         assign new_sten_s[gs] = s1_scov[gs] ? sten_new : rd_sten;
-        pixel_blend_b u_pb (.clk, .fmt, .src_c16(s0_c16[GP]), .src_alpha(s0_sa[GP]), .dst_color(rd_color), .blend_c16, .blend_ca,
-            .enable(blend_en), .src_factor(blend_src_factor), .dst_factor(blend_dst_factor),
-            .src_factor_a(blend_src_factor_a), .dst_factor_a(blend_dst_factor_a),
-            .op(blend_op), .op_a(blend_op_a), .mask(color_mask), .dith(s0_t[GP]), .final_color(blend_final_s[gs]));
-        assign pipe_wr_word[gs*CELLW +: CELLW] = { s6_sten[gs],
-                                                   (s6_cw[gs] & depth_mask) ? s6_fz[gs] : s6_keepz[gs],
-                                                   s6_cw[gs] ? blend_final_s[gs] : s6_keepc[gs] };
+        if (!BLEND1) begin : PB2
+            pixel_blend_b u_pb (.clk, .fmt, .src_c16(s0_c16[GP]), .src_alpha(s0_sa[GP]), .dst_color(rd_color), .blend_c16, .blend_ca,
+                .enable(blend_en), .src_factor(blend_src_factor), .dst_factor(blend_dst_factor),
+                .src_factor_a(blend_src_factor_a), .dst_factor_a(blend_dst_factor_a),
+                .op(blend_op), .op_a(blend_op_a), .mask(color_mask), .dith(s0_t[GP]), .final_color(blend_final_s[gs]));
+            assign pipe_wr_word[gs*CELLW +: CELLW] = { s6_sten[gs],
+                                                       (s6_cw[gs] & depth_mask) ? s6_fz[gs] : s6_keepz[gs],
+                                                       s6_cw[gs] ? blend_final_s[gs] : s6_keepc[gs] };
+        end else begin : PB1
+            // sample s's unit (lane gs < NS): pixel 0 in v0's cycle (destination live on rd_eff), pixel 1 in v1's when the
+            // pair in v1 has it (its destination in rd_eff_r); results 6 cycles later: pixel 0's held one cycle for v7
+            if (gs < NS) begin : U
+                wire p1 = v1 & s1_p1;
+                wire [31:0] bf;
+                pixel_blend_b u_pb (.clk, .fmt, .src_c16(p1 ? s1_c16 : s0_c16[0]), .src_alpha(p1 ? s1_sa : s0_sa[0]),
+                    .dst_color(p1 ? rd_eff_r[(NS+gs)*CELLW +: 32] : rd_color), .blend_c16, .blend_ca,
+                    .enable(blend_en), .src_factor(blend_src_factor), .dst_factor(blend_dst_factor),
+                    .src_factor_a(blend_src_factor_a), .dst_factor_a(blend_dst_factor_a),
+                    .op(blend_op), .op_a(blend_op_a), .mask(color_mask), .dith(p1 ? s1_t : s0_t[0]), .final_color(bf));
+                reg [31:0] bf0;                                      // pixel 0's result, in v7
+                always @(posedge clk) if (v6) bf0 <= bf;
+                assign blend_final_s[gs] = bf0; assign blend_final_s[NS+gs] = bf;
+            end
+            assign pipe_wr_word[gs*CELLW +: CELLW] = { s7_sten[gs],
+                                                       (s7_cw[gs] & depth_mask) ? s7_fz[gs] : s7_keepz[gs],
+                                                       s7_cw[gs] ? blend_final_s[gs] : s7_keepc[gs] };
+        end
     end endgenerate
-    assign ren_we    = we_a | v6;
-    assign ren_wdata = v6 ? pipe_wr_word : wr_a;
+    assign ren_we    = we_a | vw;
+    assign ren_wdata = vw ? pipe_wr_word : wr_a;
 
     // ---- flush: the band (bank fbk) is read one cell (a pixel pair) per cycle (port A) and packed into one
     //      of two group accumulators (a group = the pixels of one colour burst, 8 or 16); the writer issues each full
@@ -497,7 +528,7 @@ module b_rop #(
     always @(posedge clk) begin
         if (rst) begin st<=S_IDLE; pst<=PL_IDLE; rbk<=2'd0; fbk<=2'd1; pbk<=2'd2;
                        rbk1<=3'b001; fbk1<=3'b010; pbk1<=3'b100;
-                       v0<=1'b0; v1<=1'b0; v2<=1'b0; v3<=1'b0; v4<=1'b0; v5<=1'b0; v6<=1'b0;
+                       v0<=1'b0; v1<=1'b0; v2<=1'b0; v3<=1'b0; v4<=1'b0; v5<=1'b0; v6<=1'b0; v7<=1'b0;
                        pk_run<=1'b0; sh1_v<=1'b0; sh2_v<=1'b0; ia<=1'b0; pa<=1'b0; wa<=1'b0; acc_full[0]<=1'b0; acc_full[1]<=1'b0;
                        ws<=W_IDLE; fwi<=2'd0; band_fast<=1'b0; touched<=1'b0; fl_const<=1'b0;
                        we_a<=0; pl_we<=0; w_en<=0; w_wren<=0; w_wend<=0;
@@ -569,7 +600,7 @@ module b_rop #(
             v0 <= accept_pipe;
             if (accept_pipe) begin
                 touched <= 1'b1;
-                s0_addr<=frag_addr; s0_ff<=frag_front; s0_x<=frag_x; s0_y<=frag_y;
+                s0_addr<=frag_addr; s0_ff<=frag_front; s0_x<=frag_x; s0_y<=frag_y; s0_p1<=pv_eff[1];
                 for (int p = 0; p < 2; p++) begin
                     s0_c16[p]<=frag_c16[p*52 +: 52]; s0_sa[p]<=frag_sa[p*26 +: 26];
                     s0_t[p]<=dither_en ? bayer(frag_y[1:0], {frag_x[1], 1'(p)}) : 4'd0;   // (x + p)[1:0] of the even x
@@ -579,6 +610,7 @@ module b_rop #(
             v1 <= v0;
             if (v0) begin
                 rd_eff_r<=rd_eff; s1_addr<=s0_addr; s1_scov<=s0_scov; s1_ff<=s0_ff;
+                s1_p1<=s0_p1; s1_c16<=s0_c16[1]; s1_sa<=s0_sa[1]; s1_t<=s0_t[1];
                 for (k=0;k<NL2;k=k+1) s1_fz[k]<=s0_fz[k];
             end
             v2 <= v1;
@@ -589,14 +621,14 @@ module b_rop #(
                     s2_keepz[k]<=rd_eff_r[k*CELLW+32 +: DW]; s2_keepc[k]<=rd_eff_r[k*CELLW +: 32];
                 end
             end
-            v3 <= v2; v4 <= v3; v5 <= v4; v6 <= v5;
-            s3_addr<=s2_addr; s4_addr<=s3_addr; s5_addr<=s4_addr; s6_addr<=s5_addr;
-            s3_cw<=s2_cw; s4_cw<=s3_cw; s5_cw<=s4_cw; s6_cw<=s5_cw;
+            v3 <= v2; v4 <= v3; v5 <= v4; v6 <= v5; v7 <= BLEND1 & v6;
+            s3_addr<=s2_addr; s4_addr<=s3_addr; s5_addr<=s4_addr; s6_addr<=s5_addr; s7_addr<=s6_addr;
+            s3_cw<=s2_cw; s4_cw<=s3_cw; s5_cw<=s4_cw; s6_cw<=s5_cw; s7_cw<=s6_cw;
             for (k=0;k<NL2;k=k+1) begin
-                s3_sten[k]<=s2_sten[k]; s4_sten[k]<=s3_sten[k]; s5_sten[k]<=s4_sten[k]; s6_sten[k]<=s5_sten[k];
-                s3_fz[k]<=s2_fz[k]; s4_fz[k]<=s3_fz[k]; s5_fz[k]<=s4_fz[k]; s6_fz[k]<=s5_fz[k];
-                s3_keepz[k]<=s2_keepz[k]; s4_keepz[k]<=s3_keepz[k]; s5_keepz[k]<=s4_keepz[k]; s6_keepz[k]<=s5_keepz[k];
-                s3_keepc[k]<=s2_keepc[k]; s4_keepc[k]<=s3_keepc[k]; s5_keepc[k]<=s4_keepc[k]; s6_keepc[k]<=s5_keepc[k];
+                s3_sten[k]<=s2_sten[k]; s4_sten[k]<=s3_sten[k]; s5_sten[k]<=s4_sten[k]; s6_sten[k]<=s5_sten[k]; s7_sten[k]<=s6_sten[k];
+                s3_fz[k]<=s2_fz[k]; s4_fz[k]<=s3_fz[k]; s5_fz[k]<=s4_fz[k]; s6_fz[k]<=s5_fz[k]; s7_fz[k]<=s6_fz[k];
+                s3_keepz[k]<=s2_keepz[k]; s4_keepz[k]<=s3_keepz[k]; s5_keepz[k]<=s4_keepz[k]; s6_keepz[k]<=s5_keepz[k]; s7_keepz[k]<=s6_keepz[k];
+                s3_keepc[k]<=s2_keepc[k]; s4_keepc[k]<=s3_keepc[k]; s5_keepc[k]<=s4_keepc[k]; s6_keepc[k]<=s5_keepc[k]; s7_keepc[k]<=s6_keepc[k];
             end
             // ===== FLUSH (background, bank fbk): packer =====
             // issue: one cell (pixel pair) per cycle; a group's first pair waits for its accumulator (the one the writer

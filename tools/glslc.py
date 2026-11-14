@@ -2167,34 +2167,37 @@ class Compiler(Codegen):
         for z in (u,f,r,a,b,c,s,s2,p): self.freer(z)
         return y
     # a / b truncated toward zero, 24-bit two's complement ints (type ty: int, or ivecN in int representation), without the
-    # divider (noops bit 0), 28 instructions, exact over the whole range: an estimate of |a| / |b| through RCP(|b|), the exact
-    # remainder, a second estimate from it (floored), then one correction each way and the sign (as IDIV). b = 0 gives some
-    # finite value (IDIV's -1 is not kept: GLSL leaves x / 0 undefined).
+    # divider (noops bit 0) and with only the integer ops the cores have (no IOP), 27 instructions, exact over the whole range:
+    # |a| and |b| by compare and select; an estimate of |a| / |b| through RCP(|b|) and its exact remainder; a second estimate
+    # from the remainder, floored after taking 1/2 off, which leaves the remainder in (0, 2 |b|); one correction (q + 1 when
+    # r - |b| >= 0, a signed compare that holds for |b| = 2^23 too); the sign by an exact select (as IDIV: -2^23 / -1 wraps).
+    # b = 0 gives some finite value (IDIV's -1 is not kept: GLSL leaves x / 0 undefined).
     def _idiv_lowered(self, a, b, ty):
         fty='float' if ty=='int' else 'vec'+ty[-1]
-        A=self.alloc(ty); self.emit('IABS', f'r{A.n}', f'r{a.n}')
-        B=self.alloc(ty); self.emit('IABS', f'r{B.n}', f'r{b.n}')
-        fa=self.alloc(fty); self.emit('UTOF', f'r{fa.n}', f'r{A.n}')
+        z=self.zeroreg()                                                                # 0.0, whose bits are the int 0
+        na=self.alloc(fty); self.emit('ISLT', f'r{na.n}', f'r{a.n}', f'r{z.n}')
+        nb=self.alloc(fty); self.emit('ISLT', f'r{nb.n}', f'r{b.n}', f'r{z.n}')
+        A=self.alloc(ty); self.emit('ISUB', f'r{A.n}', f'r{z.n}', f'r{a.n}'); self.emit('SEL', f'r{A.n}', f'r{na.n}', f'r{A.n}', f'r{a.n}')
+        B=self.alloc(ty); self.emit('ISUB', f'r{B.n}', f'r{z.n}', f'r{b.n}'); self.emit('SEL', f'r{B.n}', f'r{nb.n}', f'r{B.n}', f'r{b.n}')
+        fa=self.alloc(fty); self.emit('UTOF', f'r{fa.n}', f'r{A.n}')                    # |a| (-2^23 reads 2^23 unsigned)
         fb=self.alloc(fty); self.emit('UTOF', f'r{fb.n}', f'r{B.n}')
         rb=self.alloc(fty); self.emit('RCP', f'r{rb.n}', f'r{fb.n}')
         t=self.alloc(fty); self.emit('MUL', f'r{t.n}', f'r{fa.n}', f'r{rb.n}')
-        q=self.alloc(ty); self.emit('FTOU', f'r{q.n}', f'r{t.n}')                       # floor(|a| / |b|) within a few
+        q=self.alloc(ty); self.emit('FTOU', f'r{q.n}', f'r{t.n}')                       # floor(|a| / |b|) within a few hundred
         p=self.alloc(ty); self.emit('IMUL', f'r{p.n}', f'r{q.n}', f'r{B.n}')
         r=self.alloc(ty); self.emit('ISUB', f'r{r.n}', f'r{A.n}', f'r{p.n}')            # its remainder, exact
         fq=self.alloc(fty); self.emit('ITOF', f'r{fq.n}', f'r{r.n}')
-        t2=self.alloc(fty); self.emit('MUL', f'r{t2.n}', f'r{fq.n}', f'r{rb.n}'); self.emit('FLR', f'r{t2.n}', f'r{t2.n}')
+        half=self.kf(0.5)
+        t2=self.alloc(fty); self.emit('MAD', f'r{t2.n}', f'r{fq.n}', f'r{rb.n}', f'-r{half.n}'); self.emit('FLR', f'r{t2.n}', f'r{t2.n}')
         d=self.alloc(ty); self.emit('FTOI', f'r{d.n}', f'r{t2.n}')
         self.emit('IADD', f'r{q.n}', f'r{q.n}', f'r{d.n}')
-        self.emit('IMUL', f'r{p.n}', f'r{d.n}', f'r{B.n}'); self.emit('ISUB', f'r{r.n}', f'r{r.n}', f'r{p.n}')    # remainder in [0, 1.02 |b|)
-        k=self._asi_lit(23)
-        m=self.alloc(ty); self.emit('ISHR', f'r{m.n}', f'r{r.n}', f'r{k.n}')            # -1 if r < 0
-        self.emit('IADD', f'r{q.n}', f'r{q.n}', f'r{m.n}')
-        self.emit('IAND', f'r{m.n}', f'r{m.n}', f'r{B.n}'); self.emit('IADD', f'r{r.n}', f'r{r.n}', f'r{m.n}')
-        self.emit('ISUB', f'r{m.n}', f'r{r.n}', f'r{B.n}'); self.emit('ISHR', f'r{m.n}', f'r{m.n}', f'r{k.n}')
-        self.emit('INOT', f'r{m.n}', f'r{m.n}'); self.emit('ISUB', f'r{q.n}', f'r{q.n}', f'r{m.n}')     # +1 if r >= |b|
-        s=self.alloc(ty); self.emit('IXOR', f'r{s.n}', f'r{a.n}', f'r{b.n}'); self.emit('ISHR', f'r{s.n}', f'r{s.n}', f'r{k.n}')
-        self.emit('IXOR', f'r{q.n}', f'r{q.n}', f'r{s.n}'); self.emit('ISUB', f'r{q.n}', f'r{q.n}', f'r{s.n}')   # negated if the signs differ
-        for z in (A,B,fa,fb,rb,t,p,r,fq,t2,d,k,m,s): self.freer(z)
+        self.emit('IMUL', f'r{p.n}', f'r{d.n}', f'r{B.n}'); self.emit('ISUB', f'r{r.n}', f'r{r.n}', f'r{p.n}')    # remainder in (0, 2 |b|)
+        self.emit('ISUB', f'r{r.n}', f'r{r.n}', f'r{B.n}')
+        c=self.alloc(fty); self.emit('ISGE', f'r{c.n}', f'r{r.n}', f'r{z.n}')           # 1.0 if the remainder is |b| or more
+        self.emit('FTOI', f'r{d.n}', f'r{c.n}'); self.emit('IADD', f'r{q.n}', f'r{q.n}', f'r{d.n}')
+        s=self.alloc(fty); self.emit('SET', 'SNE', f'r{s.n}', f'r{na.n}', f'r{nb.n}')    # 1.0 if the signs differ
+        self.emit('ISUB', f'r{p.n}', f'r{z.n}', f'r{q.n}'); self.emit('SEL', f'r{q.n}', f'r{s.n}', f'r{p.n}', f'r{q.n}')
+        for x in (na,nb,A,B,fa,fb,rb,t,p,r,fq,t2,d,c,s): self.freer(x)
         return q
     def _poly_sin(self, x, cos):
         # sin/cos via range reduction to [-pi,pi] + a 7th-order Taylor. Transcendental precision is
@@ -3026,8 +3029,7 @@ _ALU_DST = {'ADD','SUB','MUL','MAD','MIN','MAX','DP3','DP4','MOV','RCP','RSQRT',
             'FTOI','ITOF','IADD','ISUB','ISLT','ISGE','DDX','DDY','LDP','LDV','LDPX','TEX',
             'SEL','IDIV','FLR','CEIL','TRUNC','RNDE','SIN','COS',
             'ISEQ','ISNE','IMUL','IMOD','UDIV','UMOD','FTOU','UTOF','MOVI',
-            'SQRT','RCPM','RSQM','CLAMP',
-            'IAND','IOR','IXOR','INOT','ISHL','ISHR','USHR','IMIN','IMAX','UMIN','UMAX','IABS','INEG','ISIGN','ULT','UGE'}   # ops whose toks[1] is a GPR dest (the IOP functions: _idiv_lowered)
+            'SQRT','RCPM','RSQM','CLAMP'}   # ops whose toks[1] is a GPR dest
 _SIDE = {'STO','STV','STOZ','DISCARD','SETP','IF','ELSE','ENDIF','BRA','BRP','LOOP','ENDL','END','BREAK','CONT','NOP'}
 
 def _dst(toks):

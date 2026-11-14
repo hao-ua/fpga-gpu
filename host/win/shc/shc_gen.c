@@ -1517,14 +1517,22 @@ static Val *sincos_lowered(Cg *c, Val *x, int cos)
 static Val *bi_sin(Cg *c, Val *x) { return (c->h->noops & 2) ? sincos_lowered(c, x, 0) : un(c, "SIN", x); }
 static Val *bi_cos(Cg *c, Val *x) { return (c->h->noops & 2) ? sincos_lowered(c, x, 1) : un(c, "COS", x); }
 
-/* a / b truncated toward zero without the divider (h->noops bit 0, glslc._idiv_lowered): registers an, bn of type ty (int, or ivecN in int representation).
- * Two float estimates of |a| / |b| with the exact remainder after each, one correction each way, then the sign. 28 instructions, exact over the 24-bit range. */
+/* a / b truncated toward zero without the divider (h->noops bit 0, glslc._idiv_lowered: its comment has the reasoning): registers an, bn of type ty (int, or
+ * ivecN in int representation), with only the integer ops the cores have (no IOP). |a|, |b| by compare and select, two float estimates with the exact remainder
+ * after each (the second floored after taking 1/2 off), one correction, the sign by a select. 27 instructions, exact over the 24-bit range. */
 static Val *idiv_lowered(Cg *c, int an, int bn, const char *ty)
 {
     const char *fty = !strcmp(ty, "int") ? "float" : ty[4] == '2' ? "vec2" : ty[4] == '3' ? "vec3" : "vec4";
-    Val *A, *B, *fa, *fb, *rb, *t, *q, *p, *r, *fq, *t2, *d, *k, *m, *s;
-    A = alloc(c, ty); emit(c, "IABS r%d r%d", A->u.r.n, an);
-    B = alloc(c, ty); emit(c, "IABS r%d r%d", B->u.r.n, bn);
+    Val *z, *na, *nb, *A, *B, *fa, *fb, *rb, *t, *q, *p, *r, *fq, *half, *t2, *d, *cc, *s;
+    z = zeroreg(c);
+    na = alloc(c, fty); emit(c, "ISLT r%d r%d r%d", na->u.r.n, an, z->u.r.n);
+    nb = alloc(c, fty); emit(c, "ISLT r%d r%d r%d", nb->u.r.n, bn, z->u.r.n);
+    A = alloc(c, ty);
+    emit(c, "ISUB r%d r%d r%d", A->u.r.n, z->u.r.n, an);
+    emit(c, "SEL r%d r%d r%d r%d", A->u.r.n, na->u.r.n, A->u.r.n, an);
+    B = alloc(c, ty);
+    emit(c, "ISUB r%d r%d r%d", B->u.r.n, z->u.r.n, bn);
+    emit(c, "SEL r%d r%d r%d r%d", B->u.r.n, nb->u.r.n, B->u.r.n, bn);
     fa = alloc(c, fty); emit(c, "UTOF r%d r%d", fa->u.r.n, A->u.r.n);
     fb = alloc(c, fty); emit(c, "UTOF r%d r%d", fb->u.r.n, B->u.r.n);
     rb = alloc(c, fty); emit(c, "RCP r%d r%d", rb->u.r.n, fb->u.r.n);
@@ -1533,27 +1541,21 @@ static Val *idiv_lowered(Cg *c, int an, int bn, const char *ty)
     p = alloc(c, ty); emit(c, "IMUL r%d r%d r%d", p->u.r.n, q->u.r.n, B->u.r.n);
     r = alloc(c, ty); emit(c, "ISUB r%d r%d r%d", r->u.r.n, A->u.r.n, p->u.r.n);
     fq = alloc(c, fty); emit(c, "ITOF r%d r%d", fq->u.r.n, r->u.r.n);
+    half = kf(c, 0.5);
     t2 = alloc(c, fty);
-    emit(c, "MUL r%d r%d r%d", t2->u.r.n, fq->u.r.n, rb->u.r.n);
+    emit(c, "MAD r%d r%d r%d -r%d", t2->u.r.n, fq->u.r.n, rb->u.r.n, half->u.r.n);
     emit(c, "FLR r%d r%d", t2->u.r.n, t2->u.r.n);
     d = alloc(c, ty); emit(c, "FTOI r%d r%d", d->u.r.n, t2->u.r.n);
     emit(c, "IADD r%d r%d r%d", q->u.r.n, q->u.r.n, d->u.r.n);
     emit(c, "IMUL r%d r%d r%d", p->u.r.n, d->u.r.n, B->u.r.n);
     emit(c, "ISUB r%d r%d r%d", r->u.r.n, r->u.r.n, p->u.r.n);
-    k = asi_lit(c, 23.0);
-    m = alloc(c, ty); emit(c, "ISHR r%d r%d r%d", m->u.r.n, r->u.r.n, k->u.r.n);
-    emit(c, "IADD r%d r%d r%d", q->u.r.n, q->u.r.n, m->u.r.n);
-    emit(c, "IAND r%d r%d r%d", m->u.r.n, m->u.r.n, B->u.r.n);
-    emit(c, "IADD r%d r%d r%d", r->u.r.n, r->u.r.n, m->u.r.n);
-    emit(c, "ISUB r%d r%d r%d", m->u.r.n, r->u.r.n, B->u.r.n);
-    emit(c, "ISHR r%d r%d r%d", m->u.r.n, m->u.r.n, k->u.r.n);
-    emit(c, "INOT r%d r%d", m->u.r.n, m->u.r.n);
-    emit(c, "ISUB r%d r%d r%d", q->u.r.n, q->u.r.n, m->u.r.n);
-    s = alloc(c, ty);
-    emit(c, "IXOR r%d r%d r%d", s->u.r.n, an, bn);
-    emit(c, "ISHR r%d r%d r%d", s->u.r.n, s->u.r.n, k->u.r.n);
-    emit(c, "IXOR r%d r%d r%d", q->u.r.n, q->u.r.n, s->u.r.n);
-    emit(c, "ISUB r%d r%d r%d", q->u.r.n, q->u.r.n, s->u.r.n);
+    emit(c, "ISUB r%d r%d r%d", r->u.r.n, r->u.r.n, B->u.r.n);
+    cc = alloc(c, fty); emit(c, "ISGE r%d r%d r%d", cc->u.r.n, r->u.r.n, z->u.r.n);
+    emit(c, "FTOI r%d r%d", d->u.r.n, cc->u.r.n);
+    emit(c, "IADD r%d r%d r%d", q->u.r.n, q->u.r.n, d->u.r.n);
+    s = alloc(c, fty); emit(c, "SET SNE r%d r%d r%d", s->u.r.n, na->u.r.n, nb->u.r.n);
+    emit(c, "ISUB r%d r%d r%d", p->u.r.n, z->u.r.n, q->u.r.n);
+    emit(c, "SEL r%d r%d r%d r%d", q->u.r.n, s->u.r.n, p->u.r.n, q->u.r.n);
     return q;
 }
 

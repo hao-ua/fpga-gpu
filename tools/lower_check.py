@@ -55,6 +55,9 @@ def count(r, *ops):
     return sum(1 for l in r['sasm'].splitlines() if l.split() and l.split()[0].split('.')[0] in ops)
 
 
+NOT_IN_CORES = tuple(isa64.IOP_FN)          # the shader cores have no IOP: an IOP kills the warp (isa64 runs it all the same)
+
+
 def run_vs(r, words, attrs):
     """attrs: {attribute name: [vec4 of floats or bits per lane]} for up to 16 vertices -> FSResult"""
     inp = isa64.default_vs_inputs()
@@ -117,6 +120,8 @@ def idiv_check(n):
     r0, w0 = compiled(IDIV_VS, 'vs', 0)
     r1, w1 = compiled(IDIV_VS, 'vs', 1)
     assert count(r1, 'IDIV') == 0 and count(r0, 'IDIV') == 2
+    if count(r1, *NOT_IN_CORES):
+        print("int /: the lowered program uses IOP, which the cores do not have"); return False
     o = r1['varyings']['o'][0]
     rng = random.Random(5)
     edge = sorted({s * ((1 << k) + d) for k in range(24) for d in (-1, 0, 1) for s in (1, -1)} | {0, 3, 7, 10, 1000, 65535})
@@ -159,7 +164,7 @@ def programs_check(rtl):
         src = open(os.path.join(TESTS, fn)).read()
         r0 = glslc.compile_stage(src, stage, isa64=True, forward=True)
         r3 = glslc.compile_stage(src, stage, isa64=True, forward=True, noops=3)
-        left = count(r3, 'IDIV', 'SIN', 'COS')
+        left = count(r3, 'IDIV', 'SIN', 'COS') + count(r3, *NOT_IN_CORES)
         name = os.path.splitext(fn)[0] + ('_vlow' if stage == 'vs' else '_flow')
         path = os.path.join(isa64.GEN, name + '.sasm')
         with open(path, 'w') as f: f.write(r3['sasm'] + '\n')
@@ -181,7 +186,7 @@ def programs_check(rtl):
         idiv_only = 'sin' not in src and 'cos' not in src
         good = left == 0 and not res3.err and (diff == 0 if idiv_only else diff < 1e-3)
         ok &= good
-        print("%s %-18s %4d -> %4d instructions, IDIV / SIN / COS left %d, outputs equal %d / %d, largest difference %.2e"
+        print("%s %-18s %4d -> %4d instructions, IDIV / SIN / COS / IOP left %d, outputs equal %d / %d, largest difference %.2e"
               % ('ok  ' if good else 'FAIL', fn, len(w0), len(w3), left, same, len(outs), diff))
         if rtl:                              # the golden set with the lowered program's constants in the parameters
             orig = isa64.default_vs_inputs if stage == 'vs' else isa64.default_fs_inputs

@@ -173,7 +173,8 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 - It emits SQRT / RCPM / RSQM only on a board B that reports them.
 - A core built without the integer divider or without SIN / COS reports it in STATUS (flags bits 30 / 31; both boards'
   cores have the units). The compiler then replaces the ops:
-  - int `/`: 28 instructions through RCP and integer ops, exact over the whole 24-bit range;
+  - int `/`: 27 instructions through RCP, the integer add / subtract / multiply / compares and SEL (the cores have no
+    IOP), exact over the whole 24-bit range;
   - `sin` / `cos`: 17 instructions, a three-part reduction and a polynomial. sin(0) = 0 and cos(0) = 1 exactly, and
     |result| ≤ 1. Up to |x| = 10⁴ the error is at most 4e-5 (sin) / 7e-5 (cos); the unit's is 4e-6.
   - `python3 tools/lower_check.py` checks both on the ISA simulator.

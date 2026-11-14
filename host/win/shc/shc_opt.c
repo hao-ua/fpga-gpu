@@ -13,9 +13,7 @@ enum {
     OP_SEL, OP_IDIV, OP_FLR, OP_CEIL, OP_TRUNC, OP_RNDE, OP_SIN, OP_COS,
     OP_ISEQ, OP_ISNE, OP_IMUL, OP_IMOD, OP_UDIV, OP_UMOD, OP_FTOU, OP_UTOF, OP_MOVI,
     OP_STO, OP_STV, OP_STOZ, OP_DISCARD, OP_SETP, OP_IF, OP_ELSE, OP_ENDIF, OP_BRA, OP_BRP, OP_LOOP, OP_ENDL,
-    OP_END, OP_BREAK, OP_CONT, OP_NOP, OP_SET, OP_SQRT, OP_RCPM, OP_RSQM, OP_CLAMP,
-    OP_IAND, OP_IOR, OP_IXOR, OP_INOT, OP_ISHL, OP_ISHR, OP_USHR, OP_IMIN, OP_IMAX, OP_UMIN, OP_UMAX, OP_IABS, OP_INEG, OP_ISIGN, OP_ULT, OP_UGE,
-    OP_COUNT
+    OP_END, OP_BREAK, OP_CONT, OP_NOP, OP_SET, OP_SQRT, OP_RCPM, OP_RSQM, OP_CLAMP, OP_COUNT
 };
 
 static const struct { const char *name; int flags; } OPT[OP_COUNT] = {
@@ -29,9 +27,7 @@ static const struct { const char *name; int flags; } OPT[OP_COUNT] = {
     {"IF",F_SIDE | F_CTRL},{"ELSE",F_SIDE | F_CTRL},{"ENDIF",F_SIDE | F_CTRL},{"BRA",F_SIDE | F_CTRL},{"BRP",F_SIDE | F_CTRL},
     {"LOOP",F_SIDE | F_CTRL},{"ENDL",F_SIDE | F_CTRL},{"END",F_SIDE | F_CTRL},
     {"BREAK",F_SIDE},{"CONT",F_SIDE},{"NOP",F_SIDE},{"SET",0},
-    {"SQRT",F_ALU},{"RCPM",F_ALU},{"RSQM",F_ALU},{"CLAMP",F_ALU},   /* board B's fragment core, xops (glslc._ALU_DST) */
-    {"IAND",F_ALU},{"IOR",F_ALU},{"IXOR",F_ALU},{"INOT",F_ALU},{"ISHL",F_ALU},{"ISHR",F_ALU},{"USHR",F_ALU},{"IMIN",F_ALU},   /* the IOP functions (idiv_lowered) */
-    {"IMAX",F_ALU},{"UMIN",F_ALU},{"UMAX",F_ALU},{"IABS",F_ALU},{"INEG",F_ALU},{"ISIGN",F_ALU},{"ULT",F_ALU},{"UGE",F_ALU}
+    {"SQRT",F_ALU},{"RCPM",F_ALU},{"RSQM",F_ALU},{"CLAMP",F_ALU}    /* board B's fragment core, xops (glslc._ALU_DST) */
 };
 
 static int op_of(const char *base, size_t n)

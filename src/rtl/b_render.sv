@@ -1084,6 +1084,8 @@ module b_render #(
     ls_t ls;
     wire [3:0] qh = qf_rp[3:0];
     reg [LQB-1:0] lq; reg [1:0] lrow; reg [5:0] lf_idle;              // lq: the warp's quad being added (< FQ)
+    wire [LQB-1:0] lqi = (FQ > 1) ? lq : '0;                          // lq as a select index (one quad a warp: 0, so the
+                                                                        // never-taken lq != 0 writes stay inside the vectors)
     wire seq_wait = (ms == M_TSWAIT) || (ms == M_TRIQS) || (ms == M_DSWAIT) || (ms == M_BAND) || (ms == M_FEND);
     wire qpath_empty = !pi_run && (qs_infl == 5'd0) && (qf_cnt == 5'd0);
     wire lf_force = (lq != '0) && ((qpath_empty && seq_wait) || (lf_idle == 6'd32));
@@ -1200,11 +1202,11 @@ module b_render #(
                     if (lrow == 2'd3) begin
                         mw_q[{mw_wp, lq}] <= {qf_slot[qh], qf_front[qh], qf_d24[qh], qf_ts[qh], qf_cov[qh], qf_qy[qh], qf_qx[qh]};
                         mw_w[mw_wp] <= {qf_bank[qh], lq};
-                        fs_in_tslot[lq*TSW +: TSW] <= qf_ts[qh];
+                        fs_in_tslot[lqi*TSW +: TSW] <= qf_ts[qh];
                         if (lq == '0) begin fs_in_active <= FS_NL'(4'hF); fs_in_front <= FQ'(qf_front[qh]); end
-                        else begin fs_in_active[lq*4 +: 4] <= 4'hF; fs_in_front[lq] <= qf_front[qh]; end
+                        else begin fs_in_active[lqi*4 +: 4] <= 4'hF; fs_in_front[lqi] <= qf_front[qh]; end
                         // TEX_SKIP: the quad's texels are used in its covered pixels only, when its program allows it
-                        fs_in_tmask[lq*4 +: 4] <= (TEX_SKIP && tsk[qf_bank[qh]]) ? qf_cov[qh] : 4'hF;
+                        fs_in_tmask[lqi*4 +: 4] <= (TEX_SKIP && tsk[qf_bank[qh]]) ? qf_cov[qh] : 4'hF;
                         qf_rp <= qf_rp + 5'd1; qf_ezv[qh] <= 1'b0; c_quads <= c_quads + 1;
                         // the warp is full: L_FAST starts it with this row (the launch reads the registers written here
                         // one cycle later, beside the row's write into the slot it launches); else through L_GO
@@ -1279,6 +1281,7 @@ module b_render #(
     typedef enum logic [1:0] {B_IDLE, B_ROW, B_HAND} bs_t;
     bs_t bs;
     reg [MWW-1:0] rq; reg [LQB-1:0] bqi; reg [1:0] brow; reg [VW-1:0] rb_col; reg [4*W-1:0] rb_dep;
+    wire [LQB-1:0] bqx = (FQ > 1) ? bqi : '0;                         // bqi as a select index (as lqi)
     wire [LQB:0] mw_rw = mw_w[rq];                                     // {bank, last quad} of warp rq
     reg bl; reg [VW-1:0] bq_col; reg [4*W-1:0] bq_dep; reg bq_dw; reg [3:0] bq_kill;
     reg [11:0] bq_qx, bq_qy; reg [3:0] bq_cov; reg [95:0] bq_d24; reg bq_front, bq_bank; reg [TSW-1:0] bq_ts; reg [1:0] bq_slot;
@@ -1366,7 +1369,7 @@ module b_render #(
                     for (int p = 0; p < 4; p++) begin
                         bq_col[p*TW + 2*W +: W] <= fs_out_row[p*W +: W]; bq_col[p*TW + 3*W +: W] <= fs_out_row2[p*W +: W];
                     end
-                bq_kill <= fs_out_kill[bqi*4 +: 4];
+                bq_kill <= fs_out_kill[bqx*4 +: 4];
                 {bq_slot, bq_front, bq_d24, bq_ts, bq_cov, bq_qy, bq_qx} <= mw_q[{rq, bqi}]; bq_bank <= mw_rw[LQB];
                 if (bqi == mw_rw[LQB-1:0]) begin fs_ack <= 1'b1; rq <= (rq == MWW'(FS_NWARP)) ? '0 : rq + 1'b1; bs <= B_IDLE; end
                 else begin bqi <= bqi + LQB'(1); brow <= 2'd0; bs <= B_ROW; end

@@ -71,6 +71,18 @@ only what the hardware can do exactly, or what the PC can do exactly beside it; 
   - outputs gl_Position, gl_PointSize and 16 varyings (B takes 8);
   - no texture, derivative or discard instructions, so no vertex textures.
 
+### Host link (board A)
+- **Ethernet:** RGMII at 1000 or 100 Mbit/s, full duplex, MTU 1500. ARP, ICMP echo, and UDP to port 5000 with Go-Back-N
+  retransmission.
+- **IPv4 address by DHCP (RFC 2131):**
+  - A DISCOVER on every link-up, under the host name `fpga-gpu`.
+  - ARP probes before a leased address is used (RFC 5227); a conflict sends a DECLINE.
+  - Renewal at T1, rebinding at T2; a NAK or the lease's end drops the address.
+  - With no lease 10 s after the link comes up: 192.168.1.10, the fixed address of earlier builds. DHCP goes on in the
+    background, and a later lease replaces it.
+- **STATUS** reports the address in use, whether it is a lease, and the DHCP state (word 75, flags bits 21–26).
+- No mDNS: the host reaches the board by its address, or by a router's DNS name for its DHCP host name (`GPU2_IP`).
+
 ### 2D and display (board B)
 - **Image operations:** READ, FILL and COPY_IMAGE.
   - They convert between RGBA8 and RGB565 and copy 8-bit palette images.
@@ -185,7 +197,7 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 |---|---|---|
 | OpenArena | OpenGL | plays; timedemo at the game's default settings 28.6 fps at 640×480, 21.1 at 800×600 (A 148 / B 142) |
 | Need for Speed: Hot Pursuit 2 | Direct3D 8 | races run, 22–36 fps at 800×600 (A 147 / B 142); far-depth flicker fixed |
-| Half-Life | OpenGL 1.x | about 60 fps at 640×480; the flashed board A can hang on the first mission's tram ride (fixed in the RTL, not yet in the flash) |
+| Half-Life | OpenGL 1.x | about 60 fps at 640×480; the hang on the first mission's tram ride is fixed in the RTL and in the flashed board A (A 149 and later), not yet replayed in the game |
 | Heroes Chronicles (Heroes III engine) | DirectDraw | menus and play at 800×600×16 |
 | Heroes of Might and Magic IV | DirectDraw | 1024×768×16, native video mode |
 | Contraption Maker | OpenGL ES | menus correct, 5.4 fps at 1280×800 |

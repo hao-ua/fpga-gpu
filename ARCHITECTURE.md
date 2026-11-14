@@ -218,7 +218,7 @@ texture unit.
 
   | build | timing (setup / hold) | LUT | FF | slices | BRAM tiles | DSP |
   |---|---|---|---|---|---|---|
-  | A 147 | +0.007 / +0.026 ns | 86 536 (64.7 %) | 74 823 | 30 755 (91.9 %) | 230.5 (63.2 %) | 209 |
+  | A 151 | +0.005 / +0.020 ns | 88 277 (66.0 %) | 76 683 | 30 965 (92.6 %) | 231.5 (63.4 %) | 209 |
   | B 142 | +0.016 / +0.030 ns | 103 771 (77.6 %) | 74 633 | 32 010 (95.7 %) | 291 (79.7 %) | 311 |
 
   At these slice counts about three quarters of a failing path's delay is routing, and board B has almost no timing

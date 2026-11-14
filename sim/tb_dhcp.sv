@@ -5,7 +5,7 @@
 //     192.168.1.10 after it (ARP, UDP 5000).
 //   B (100M, link bounced) OFFERs with a wrong xid / chaddr ignored, OFFER -> REQUEST -> ACK, three ARP probes
 //     (fallback address still answered meanwhile), two announcements, then the lease answers ARP / ICMP / UDP and is
-//     the replies' source; the fallback address no longer answers.
+//     the replies' source; the fallback address stops answering.
 //   C renewal at T1 (unicast to the server), ACK with T1 / T2 options, silent renewal, rebinding at T2 (broadcast),
 //     the lease's end drops the address, DISCOVER, fallback address 10 s later.
 //   D (1000M, bounced) unicast OFFER with option overload (file + sname), NAK -> new DISCOVER after 1-2 s,

@@ -74,11 +74,25 @@ module tb_board_b3d;
         .app_wdf_end(bend), .app_rdy(brdy), .app_wdf_rdy(bwrdy), .app_rd_data(brd), .app_rd_data_valid(brv),
         .errors(mig_err), .n_wr(n_wr), .n_rd(n_rd));
     wire hdmi_clk_p, hdmi_clk_n; wire [2:0] hdmi_data_p, hdmi_data_n; wire [1:0] ledB; wire [24*32-1:0] bstat;
+    // the fragment core's lanes per warp: 16; -d TB_LANES8 / TB_LANES4: 8 / 4. -d TB_ONEB: the one-board design's
+    // fragment core (board_ab_core's B3D_* values: 4 warps, 4 TEX live, 2 quarter-rate micro-ops in flight per class,
+    // 8 triangle slots, no SQRT / RCPM / RSQM, SIN / COS or integer divider, the SFU tables shared by pairs of units)
+`ifdef TB_LANES4
+    localparam int TB_FSNL = 4;
+`elsif TB_LANES8
+    localparam int TB_FSNL = 8;
+`else
+    localparam int TB_FSNL = 16;
+`endif
     board_b_core #(.BUILD_ID(32'd79), .DEFAULT_MODE(5), .SIM_MODE4(1'b1), .IMG_SET(1), .DEBOUNCE(100),
                    .LONG_PRESS(5000), .LOCK_TIMEOUT(200_000), .MS_CYCLES(1000), .JTAG(1'b0),
                    .LINK_MHZ(100), .LINK_GUARD(3000), .LINK_MMCM_RST(20_000), .LINK_IDLE_TO(200_000), .LINK_TRAIN_WORDS(256),
                    .LINK_RETRY(20_000), .LINK_RELOCK(50_000), .LINK_RWIN(200_000), .LSTAT_CYCLES(10_000),
-                   .LINK_SIM_SHIFTER(1'b1), .B3D_NLINES(4), .B3D_MAXW(1280)) dut (   // the board's MAXW: 8-line bands up to 640 wide need its band buffer
+`ifdef TB_ONEB
+                   .B3D_NWARP(4), .B3D_TEXQ(4), .B3D_QRINF(2), .B3D_NTS(8), .B3D_XSFU(1'b0), .B3D_SINCOS(1'b0),
+                   .B3D_INT_DIV(1'b0), .B3D_SFU_TAB2(1'b1),
+`endif
+                   .B3D_NL(TB_FSNL), .LINK_SIM_SHIFTER(1'b1), .B3D_NLINES(4), .B3D_MAXW(1280)) dut (   // the board's MAXW: 8-line bands up to 640 wide need its band buffer
         .clk_sys(clkB), .rst_sys(rstB), .calib_done(calB), .clk200(clk200B), .key1_n(1'b1),
         .dbg_cmd_valid(1'b0), .dbg_cmd(64'h0),
         .app_en(ben), .app_cmd(bcmd), .app_addr(baddr), .app_wdf_data(bwd), .app_wdf_mask(bmask),

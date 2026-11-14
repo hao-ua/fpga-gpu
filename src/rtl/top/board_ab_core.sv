@@ -39,7 +39,20 @@ module board_ab_core #(
     parameter int    B3D_NWARP      = 4,
     // both shader cores' SFU tables shared by pairs of units (block RAM for nothing, bit-identical)
     parameter bit    SFU_TAB2       = 1'b1,
-    parameter int    B3D_NTS        = 16,
+    // both shader cores' integer dividers: none (the compilers lower integer division to float ops; STATUS says so)
+    parameter bit    INT_DIV        = 1'b0,
+    // both shader cores' SIN / COS units: none (the compilers lower sin / cos to a range reduction and a polynomial;
+    // STATUS says so: board A's flags bit 30, board B's bit 31)
+    parameter bit    SINCOS         = 1'b0,
+    // the fragment core's optional work-savers and queues, smaller than the two boards': SQRT / RCPM / RSQM as one
+    // micro-op off (STATUS flags bit 28 clear: the compilers emit RSQRT + MUL etc.), 2 quarter-rate micro-ops in flight
+    // per class, 4 TEX instructions live, 8 triangle slots
+    parameter bit    B3D_XSFU       = 1'b0,
+    parameter int    B3D_QRINF      = 2,
+    parameter int    B3D_TEXQ       = 4,
+    parameter int    B3D_NTS        = 8,
+    // board A's geometry profile counters (STATUS words 101-113 read 0)
+    parameter bit    GEOM_PROF      = 1'b0,
     parameter bit    BRINGUP        = 1'b0,
     parameter bit    SIM_MODE4      = 1'b0,
     parameter int    RO_AW          = 6,                // the shared arbiter's read-owner FIFO: 2**RO_AW reads in flight
@@ -111,8 +124,9 @@ module board_ab_core #(
                    .RING_LOG2(RING_LOG2), .MDIO_RST_MS(MDIO_RST_MS), .MDIO_WAIT_MS(MDIO_WAIT_MS), .MDIO_POLL_US(MDIO_POLL_US),
                    .STATUS_PERIOD(STATUS_PERIOD), .TRIAL_CYCLES(TRIAL_CYCLES), .PHY_TRIAL_CYCLES(PHY_TRIAL_CYCLES),
                    .SNAP_CYCLES(SNAP_CYCLES), .JTAG_STATUS(JTAG_STATUS), .KEEPALIVE(KEEPALIVE), .B_ALIVE(B_ALIVE),
-                   .RENDER_TIMEOUT(RENDER_TIMEOUT), .VS_SFU_TAB2(SFU_TAB2), .EXT_ARB(1'b1), .EXT_LINK(1'b1), .REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W),
-                   .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .VS_NWARP(VS_NWARP), .BAND8_MAXW(BAND8_MAXW)) u_a (
+                   .RENDER_TIMEOUT(RENDER_TIMEOUT), .VS_SFU_TAB2(SFU_TAB2), .VS_INT_DIV(INT_DIV), .VS_SINCOS(SINCOS), .EXT_ARB(1'b1), .EXT_LINK(1'b1), .REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W),
+                   .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .VS_NWARP(VS_NWARP), .BAND8_MAXW(BAND8_MAXW),
+                   .GEOM_PROF(GEOM_PROF), .JTAG_LEAN(1'b1)) u_a (
         .clk_sys, .rst_sys, .calib_done, .clk_idelay(clk200),
         .rgmii_rxc, .rgmii_rx_ctl, .rgmii_rxd, .rgmii_txc, .rgmii_tx_ctl, .rgmii_txd,
         .phy_rstn, .mdc, .mdio_o, .mdio_oe, .mdio_i,
@@ -131,7 +145,8 @@ module board_ab_core #(
                    .LOCK_TIMEOUT(LOCK_TIMEOUT), .MS_CYCLES(MS_CYCLES), .LSTAT_CYCLES(LSTAT_CYCLES),
                    .B3D_NLINES(B3D_NLINES), .B3D_MAXW(B3D_MAXW), .B3D_CELLS(B3D_CELLS), .B3D_NWARP(B3D_NWARP),
                    .B3D_NTS(B3D_NTS), .B3D_NLMAX(B3D_NLMAX), .B3D_BAND8_MAXW(BAND8_MAXW), .DISP_MAXW(DISP_MAXW),
-                   .DISP_LB_LINES(DISP_LB_LINES), .B3D_SFU_TAB2(SFU_TAB2), .EXT_ARB(1'b1), .EXT_LINK(1'b1)) u_b (
+                   .DISP_LB_LINES(DISP_LB_LINES), .B3D_SFU_TAB2(SFU_TAB2), .B3D_INT_DIV(INT_DIV), .B3D_SINCOS(SINCOS), .B3D_XSFU(B3D_XSFU),
+                   .B3D_QRINF(B3D_QRINF), .B3D_TEXQ(B3D_TEXQ), .EXT_ARB(1'b1), .EXT_LINK(1'b1)) u_b (
         .clk_sys, .rst_sys, .calib_done, .clk200, .key1_n, .dbg_cmd_valid, .dbg_cmd,
         .app_en(), .app_cmd(), .app_addr(), .app_wdf_data(), .app_wdf_mask(), .app_wdf_wren(), .app_wdf_end(),
         .app_rdy(1'b0), .app_wdf_rdy(1'b0), .app_rd_data_valid(1'b0), .app_rd_data(256'd0),

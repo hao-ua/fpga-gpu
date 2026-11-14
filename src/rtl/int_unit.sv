@@ -20,7 +20,9 @@ module int_unit #(
     parameter int NL = 16,
     parameter int W  = 24,
     parameter [W-1:0] ONE = '0,                       // the lane format's 1.0 (compare results)
-    parameter int DSEQ = 1                            // division rounds per job (jobs of DSEQ x NL lanes)
+    parameter int DSEQ = 1,                           // division rounds per job (jobs of DSEQ x NL lanes)
+    parameter bit HAS_DIV = 1'b1                      // 0: no divider (div_ready high, v_div never: the core does not issue
+                                                      //    IDIV / IMOD / UDIV / UMOD then); synthesis drops its logic
 )(
     input  wire              clk, rst,
     input  wire [NL*W-1:0]   a, b,
@@ -168,9 +170,9 @@ module int_unit #(
     end
     wire [NL*W-1:0] da = (DSEQ > 1) ? dba[dr] : a, db = (DSEQ > 1) ? dbb[dr] : b;   // the round's operands
     wire dstart = (DSEQ > 1) ? rgo : div_valid;                // a round starts
-    assign div_ready = (DSEQ > 1) ? ~(cap | run | outp) : (ph == 2'd0);
-    assign v_div = (DSEQ > 1) ? vo : vd_i;
-    assign y_div = (DSEQ > 1) ? yo : yd_i;
+    assign div_ready = !HAS_DIV ? 1'b1 : (DSEQ > 1) ? ~(cap | run | outp) : (ph == 2'd0);
+    assign v_div = HAS_DIV & ((DSEQ > 1) ? vo : vd_i);
+    assign y_div = !HAS_DIV ? '0 : (DSEQ > 1) ? yo : yd_i;
     wire start = dstart & (ph == 2'd0);
     wire uns   = (DSEQ > 1) ? mode[1] : div_mode[1];           // UDIV / UMOD: operands as unsigned
     always @(posedge clk) if ((DSEQ > 1) ? cap_start : start) mode <= div_mode;

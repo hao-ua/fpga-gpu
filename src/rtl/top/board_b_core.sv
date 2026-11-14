@@ -65,6 +65,8 @@ module board_b_core
     parameter bit    B3D_F2_DUAL    = 1'b0,
     parameter bit    B3D_TC_PF      = 1'b0,
     parameter int    B3D_NTS        = 16,            // fragment-core triangle slots (b_render NTS)
+    parameter int    B3D_TEXQ       = 8,             // TEX instructions live at once (b_render FS_TEXQ: with 2, multi-texture
+                                                     // shaders run about 8 cycles per quad per sample)
     // TEX_SKIP: uncovered pixels of a quad unsampled where the program allows; TEX_W2: two texture-result writers in the
     // fragment core; FS_PRE: the program fetch ahead of the launch, off — b_render FS_PRE 0 folds its logic away
     parameter bit    B3D_TEX_SKIP   = 1'b1,
@@ -78,7 +80,9 @@ module board_b_core
     // scanout: the widest mode and the line buffer's lines (disp_b MAXW / LB_LINES; wider modes are refused)
     parameter int    DISP_MAXW      = 1280,
     parameter int    DISP_LB_LINES  = 16,
-    parameter bit    B3D_SFU_TAB2   = 1'b0           // the fragment core's SFU tables shared by pairs of units (bit-identical)
+    parameter bit    B3D_SFU_TAB2   = 1'b0,          // the fragment core's SFU tables shared by pairs of units (bit-identical)
+    parameter bit    B3D_INT_DIV    = 1'b1,          // the fragment core's integer divider; 0: none (STATUS flags bit 30 set)
+    parameter bit    B3D_SINCOS     = 1'b1           // the fragment core's SIN / COS units; 0: none (STATUS flags bit 31 set)
 )(
     input  wire         clk_sys, rst_sys, calib_done,
     input  wire         clk200,                  // 200 MHz (BUFG) for the video and link MMCMs
@@ -280,10 +284,8 @@ module board_b_core
     wire [255:0] rd_perf; wire rd_ferr;             // the last frame's cycle counters / stack violation
     wire [31:0] rd_tjobs, rd_tast, rd_thit, rd_tmiss;   // the texture unit's cumulative counters: status words 18-21
     wire [24*32-1:0] rd_prof;                           // the render engine's cumulative profile counters (b_render hwprof): JTAG words 24-47
-    // FS_TEXQ stays b_render's default (no override here: with 2 live TEXes multi-texture shaders run about 8 cycles per
-    // quad per sample)
-    b_render #(.NLINES(B3D_NLINES), .NLMAX(B3D_NLMAX), .BAND8_MAXW(B3D_BAND8_MAXW), .MAXW(B3D_MAXW), .CELLS(B3D_CELLS), .NTS(B3D_NTS),
-               .FS_SFU_TAB2(B3D_SFU_TAB2), .FS_NWARP(B3D_NWARP), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
+    b_render #(.NLINES(B3D_NLINES), .NLMAX(B3D_NLMAX), .BAND8_MAXW(B3D_BAND8_MAXW), .MAXW(B3D_MAXW), .CELLS(B3D_CELLS), .NTS(B3D_NTS), .FS_TEXQ(B3D_TEXQ),
+               .FS_SFU_TAB2(B3D_SFU_TAB2), .FS_INT_DIV(B3D_INT_DIV), .FS_SINCOS(B3D_SINCOS), .FS_NWARP(B3D_NWARP), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
                .TEX_SKIP(B3D_TEX_SKIP), .TEX_W2(B3D_TEX_W2), .FS_PRE(B3D_FS_PRE), .FS_XSFU(B3D_XSFU), .FS_XCLAMP(B3D_XCLAMP), .FS_QRINF(B3D_QRINF)) u_render (.clk(clk_sys), .rst(rst_ddr),
         .rs_valid, .rs_valid2, .rs_data, .rs_data2, .rs_ready, .rs_take2, .go(rd_go), .discard(rd_discard), .abort(rs_abort), .rt_base(rd_rt_base), .rt_bpl(rd_rt_bpl), .rt_width(rd_rt_width),
         .rt_height(rd_rt_height), .rt_fmt(rd_rt_fmt), .depth16(rd_depth16), .ds_en(rd_ds_en), .ds_base(rd_ds_base), .ds_bpl(rd_ds_bpl),
@@ -463,8 +465,9 @@ module board_b_core
     // [25:16] = image table entry on screen (presented tag: harness = index, command processor = handle); [26] 3D render
     // engine busy, [27] a fragment-program stack violation since reset (3D); [28] the fragment core has SQRT / RCPM / RSQM,
     // [29] it has CLAMP (constants of the build; 0 on a board B built without them — a program with those opcodes
-    // there issues them as no-ops)
-    wire [31:0] flags = {2'h0, B3D_XCLAMP, B3D_XSFU, rd_err_stack, rd_busy, cur_tag[9:0], 3'h0, cp_busy, lock_fail, key_down, x_busy, fill_done, cur_valid, cur_mode,
+    // there issues them as no-ops); [30] it has NO integer divider (IDIV / IMOD / UDIV / UMOD stop the warp; 0 on builds
+    // with one)
+    wire [31:0] flags = {~B3D_SINCOS, ~B3D_INT_DIV, B3D_XCLAMP, B3D_XSFU, rd_err_stack, rd_busy, cur_tag[9:0], 3'h0, cp_busy, lock_fail, key_down, x_busy, fill_done, cur_valid, cur_mode,
                          mode_busy, video_on, mmcm_locked, calib_done};
     wire [31:0] lflags = {l_eye, l_phase, 8'h0, 1'b0, l_guard_fail, l_tx_enabled, l_training, l_far_up, l_trained,
                           l_lock, 1'b0};

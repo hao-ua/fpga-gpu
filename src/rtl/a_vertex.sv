@@ -17,6 +17,8 @@ module a_vertex #(
     parameter int EXP_W = 7, MAN_W = 16,
     parameter int NWARP = 4,
     parameter bit SFU_TAB2 = 1'b0,              // the vertex core's SFU tables shared by pairs of units (shader_core_vs2 SFU_TAB2)
+    parameter bit INT_DIV = 1'b1,               // the vertex core's integer divider (shader_core_vs2 INT_DIV)
+    parameter bit SINCOS = 1'b1,                // the vertex core's SIN / COS units (shader_core_vs2 SINCOS)
     parameter int NSLOT = 16,                    // result slots (>= the core's warps + the assembler's held references + the forming warp)
     parameter int NVEC = 8,
     parameter int NATTR = 16, NPARAM = 256, IRAM_DEPTH = 4096
@@ -127,7 +129,7 @@ module a_vertex #(
         end
     end
     shader_core_vs2 #(.EXP_W(EXP_W), .MAN_W(MAN_W), .NWARP(NWARP), .NPARAM(NPARAM), .NATTR(NATTR), .IRAM_DEPTH(IRAM_DEPTH),
-                      .SFU_TAB2(SFU_TAB2)) u_core (
+                      .SFU_TAB2(SFU_TAB2), .INT_DIV(INT_DIV), .SINCOS(SINCOS)) u_core (
         .clk, .rst, .iram_we, .iram_waddr, .iram_wdata, .param_we(cp_rd3), .param_bank(cbank), .param_idx(cp_idx3), .param_data(cp_q3),
         .va_we, .va_lane, .va_idx, .va_data, .in_ready, .in_warp, .in_start, .in_bank, .in_active, .busy_warps,
         .out_valid(c_out_valid), .out_ack(c_out_ack), .out_sel(c_out_sel), .out_row(c_out_row), .out_err(c_err),

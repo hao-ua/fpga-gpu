@@ -53,6 +53,10 @@ module shader_core_vs2 #(
                                                 //    12 in the vertex core, as in the fragment core
     parameter bit SFU_TAB2 = 1'b0,              // 1: the four SFUs' tables in two sfu_tab2 (units 0 + 1, 2 + 3: one dual-port copy per
                                                 //    pair instead of one each): block RAM for nothing, bit-identical
+    parameter bit INT_DIV = 1'b1,               // the integer divider (IDIV / IMOD / UDIV / UMOD); 0: none, those opcodes stop the
+                                                //    warp as an IOP does (C_BAD) — the compiler lowers integer division to float ops
+    parameter bit SINCOS = 1'b1,                // the SIN / COS units; 0: none, SIN / COS stop the warp (C_BAD) — the compiler
+                                                //    lowers them to a range reduction and a polynomial
     parameter     RCP_MEM = "tools/gen/fp24_rcp_seed.mem", RSQRT_MEM = "tools/gen/fp24_rsqrt_seed.mem",
                   LOG2_MEM = "tools/gen/fp24_log2_lut.mem", EXP2_MEM = "tools/gen/fp24_exp2_lut.mem",
                   SIN_MEM = "tools/gen/fp24_sin_lut.mem"
@@ -186,7 +190,7 @@ module shader_core_vs2 #(
         // IOP (bit operations, shifts, integer min / max / abs / sign, unsigned compares): not in the hardware (no
         // language of the GL <= 2.0 era can express them, glslc never emits them); an
         // IOP at the head kills its warp like a stack violation (C_BAD)
-        decode_cls[C_BAD] = (op == IOP); decode_cls[C_IMUL] = (op == IMUL); decode_cls[C_IDIV] = is_idiv(op);
+        decode_cls[C_BAD] = (op == IOP) || (!INT_DIV && is_idiv(op)) || (!SINCOS && is_sc(op)); decode_cls[C_IMUL] = (op == IMUL); decode_cls[C_IDIV] = is_idiv(op);
         // IMUL and the divider are quarter-rate classes (4 lanes x 4 cycles on the 4-lane integer unit)
         decode_cls[C_QR] = is_sfu(op)||is_sc(op)||is_cvt(op)||(op == IMUL)||is_idiv(op);
         decode_cls[C_IF] = (op == IFOP); decode_cls[C_ELSE] = (op == ELSEOP); decode_cls[C_ENDIF] = (op == ENDIFOP);
@@ -834,8 +838,12 @@ module shader_core_vs2 #(
             .out_valid(u_sfu_ov[gu]), .result(u_sfu_y[gu]),
             .t_rcp_a(tr_a[gu]), .t_rsq_a(ts_a[gu]), .t_log_i(tl_i[gu]), .t_exp_i(te_i[gu]),
             .t_rcp_q(tr_q[gu]), .t_rsq_q(ts_q[gu]), .t_la(tla[gu]), .t_lb(tlb[gu]), .t_ea(tea[gu]), .t_eb(teb[gu]));
-        sincos_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .KSIN(10), .SIN_MEM(SIN_MEM)) u_sc (
-            .clk, .rst, .in_valid(qr_run & qr_cls[1]), .op(qr_cos), .x(ux[gu]), .out_valid(u_sc_ov[gu]), .result(u_sc_y[gu]));
+        if (SINCOS) begin : SC
+            sincos_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .KSIN(10), .SIN_MEM(SIN_MEM)) u_sc (
+                .clk, .rst, .in_valid(qr_run & qr_cls[1]), .op(qr_cos), .x(ux[gu]), .out_valid(u_sc_ov[gu]), .result(u_sc_y[gu]));
+        end else begin : NSC                                        // no SIN / COS issues (C_BAD)
+            assign u_sc_ov[gu] = 1'b0; assign u_sc_y[gu] = '0;
+        end
         // convert: FTOI / FTOU through one signed W+1-bit converter clamped after, ITOF / UTOF sign- / zero-extended,
         // TRUNC FLR CEIL RNDE through float_round (as alu_cluster)
         wire [W:0] fr; wire [W-1:0] i2f_o, rnd_o;
@@ -854,7 +862,7 @@ module shader_core_vs2 #(
     // the integer unit: IMUL (one DSP per lane, latency 3) and the divider on the 4 quarter-rate lanes (as in the
     // fragment core), their results buffered like the SFU's. The divider takes a warp's 16 lanes as 4 rounds (DSEQ,
     // ≈ 108 cycles, one in flight) and returns them as 4 cycles of 4 lanes. The unit's IOP section is tied off.
-    int_unit #(.NL(4), .W(W), .ONE(ONE1), .DSEQ(4)) u_int4 (.clk, .rst, .a(int4_a), .b(int4_b),
+    int_unit #(.NL(4), .W(W), .ONE(ONE1), .DSEQ(4), .HAS_DIV(INT_DIV)) u_int4 (.clk, .rst, .a(int4_a), .b(int4_b),
         .mul_valid(qr_run & qr_cls[3]), .v_mul(int4_vm), .y_mul(int4_ym),
         .div_valid(qr_run & qr_cls[4]), .div_mode(qr_divmode), .div_ready(idiv_ready), .v_div(v_div), .y_div(y_div4),
         .iop_valid(1'b0), .iop_fn(4'd0), .v_iop(), .y_iop());

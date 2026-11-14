@@ -18,9 +18,12 @@ module a_geom #(
     parameter [28:0] REC_BASE = 29'h1000000, BINLIST_BASE = 29'h5000000,   // bank 0: records at 64 MB, bin lists at 320 MB
     parameter [28:0] REC_BANK_W = 29'h2000000, POOL_W = 29'h800000,        // 128 MB of records (2^18), 32 MB of bin lists (2^22) per bank
     parameter int    NPROF = 13,                                            // profile counters (STATUS layout 10, words 101-113)
+    parameter bit    PROF  = 1'b1,                                          // 0: no profile counters (those words read 0)
     parameter int    BAND8_MAXW = 1024,                                     // targets up to this wide get 8-row bands, wider ones 4
                                                                             // (board B's b_render BAND8_MAXW; 0: 4-row bands always)
-    parameter bit    VS_SFU_TAB2 = 1'b0                                     // the vertex core's SFU tables shared by pairs of units
+    parameter bit    VS_SFU_TAB2 = 1'b0,                                    // the vertex core's SFU tables shared by pairs of units
+    parameter bit    VS_INT_DIV  = 1'b1,                                    // the vertex core's integer divider
+    parameter bit    VS_SINCOS   = 1'b1                                     // the vertex core's SIN / COS units
 )(
     input  wire        clk, rst,
     // command port
@@ -142,7 +145,7 @@ module a_geom #(
     end
     assign g_draw_ok = dr_ok & ~sf_full;
     assign g_copy_busy = copy_busy;
-    a_vertex #(.NVEC(NVEC), .NSLOT(NSLOT), .NWARP(NWARP), .SFU_TAB2(VS_SFU_TAB2)) u_vtx (.clk, .rst,
+    a_vertex #(.NVEC(NVEC), .NSLOT(NSLOT), .NWARP(NWARP), .SFU_TAB2(VS_SFU_TAB2), .INT_DIV(VS_INT_DIV), .SINCOS(VS_SINCOS)) u_vtx (.clk, .rst,
         .iram_we, .iram_waddr, .iram_wdata, .param_we(g_param_we), .param_idx(g_param_idx), .param_data(g_param_data),
         .ad_we(g_ad_we), .ad_idx(g_ad_idx), .ad_en(g_ad_en), .ad_type(g_ad_type), .ad_norm(g_ad_norm), .ad_base(g_ad_base), .ad_size(g_ad_size),
         .ad_stride(g_ad_stride), .ad_off(g_ad_off),
@@ -236,7 +239,7 @@ module a_geom #(
         end
     end
     generate for (genvar pi = 0; pi < NPROF; pi++) begin : g_prof
-        assign prof[pi*32 +: 32] = pc[pi];
+        assign prof[pi*32 +: 32] = PROF ? pc[pi] : 32'd0;          // PROF 0: the words read 0, the counters are dropped
     end endgenerate
     wire _unused = &{1'b0, vo_first, push_did[12]};
 endmodule

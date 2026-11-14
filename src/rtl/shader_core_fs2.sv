@@ -112,6 +112,10 @@ module shader_core_fs2 #(
                                                 // shift on a DSP48 each (float_addsub DSP_ALIGN): LUTs for DSPs, bit-identical
     parameter bit SFU_TAB2 = 1'b0,              // 1: the four SFUs' tables in two sfu_tab2 (units 0 + 1, 2 + 3: one dual-port copy per
                                                 // pair instead of one each): block RAM for nothing, bit-identical
+    parameter bit INT_DIV = 1'b1,               // the integer divider (IDIV / IMOD / UDIV / UMOD); 0: none, those opcodes kill the
+                                                // warp as an IOP does (C_BAD) — the compiler lowers integer division to float ops
+    parameter bit SINCOS = 1'b1,                // the SIN / COS units; 0: none, SIN / COS kill the warp (C_BAD) — the compiler
+                                                // lowers them to a range reduction and a polynomial
     parameter     RCP_MEM = "tools/gen/fp24_rcp_seed.mem", RSQRT_MEM = "tools/gen/fp24_rsqrt_seed.mem",
                   LOG2_MEM = "tools/gen/fp24_log2_lut.mem", EXP2_MEM = "tools/gen/fp24_exp2_lut.mem",
                   SIN_MEM = "tools/gen/fp24_sin_lut.mem"
@@ -247,7 +251,8 @@ module shader_core_fs2 #(
     function automatic is_cmp (input [6:0] op); is_cmp  = (op==MIN)||(op==MAX)||(op==SET)||(XCLAMP && (op==CLAMP)); endfunction
     function automatic is_xsf (input [6:0] op); is_xsf  = XSFU && ((op==SQRT)||(op==RCPM)||(op==RSQM)); endfunction   // the unit's result times an operand
     function automatic is_xbad(input [6:0] op);        // the additions' opcodes in a core built without them
-        is_xbad = (!XSFU && ((op==SQRT)||(op==RCPM)||(op==RSQM))) || (!XCLAMP && (op==CLAMP));
+        is_xbad = (!XSFU && ((op==SQRT)||(op==RCPM)||(op==RSQM))) || (!XCLAMP && (op==CLAMP)) ||
+                  (!INT_DIV && ((op==IDIV)||(op==IMOD)||(op==UDIV)||(op==UMOD))) || (!SINCOS && ((op==SIN)||(op==COS)));
     endfunction
     function automatic is_int (input [6:0] op); is_int  = (op==IADD)||(op==ISUB)||(op==ISLT)||(op==ISGE)||(op==ISEQ)||(op==ISNE); endfunction
     function automatic is_one (input [6:0] op, input [63:0] w);  // the 1-cycle path (LDV: built-ins only)
@@ -1483,8 +1488,12 @@ module shader_core_fs2 #(
         end else begin : NXM
             assign u_sfu_y[gu] = su_y; assign u_sfu_ov[gu] = su_ov;
         end
-        sincos_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .KSIN(10), .SIN_MEM(SIN_MEM)) u_sc (
-            .clk, .rst(rst_q), .in_valid(qr_run & qr_cls[1]), .op(qr_cos), .x(ux[gu]), .out_valid(u_sc_ov[gu]), .result(u_sc_y[gu]));
+        if (SINCOS) begin : SC
+            sincos_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .KSIN(10), .SIN_MEM(SIN_MEM)) u_sc (
+                .clk, .rst(rst_q), .in_valid(qr_run & qr_cls[1]), .op(qr_cos), .x(ux[gu]), .out_valid(u_sc_ov[gu]), .result(u_sc_y[gu]));
+        end else begin : NSC                                        // no SIN / COS issues (C_BAD)
+            assign u_sc_ov[gu] = 1'b0; assign u_sc_y[gu] = '0;
+        end
         // convert: FTOI / FTOU through one signed W+1-bit converter clamped after, ITOF / UTOF sign- / zero-extended,
         // TRUNC FLR CEIL RNDE through float_round (as alu_cluster)
         wire [W:0] fr; wire [W-1:0] i2f_o, rnd_o;
@@ -1503,7 +1512,7 @@ module shader_core_fs2 #(
     // the integer unit: IMUL (one DSP per lane, latency 3) and the divider on the 4 quarter-rate lanes.
     // The divider takes a warp's 16 lanes as 4 rounds (DSEQ, ≈ 108
     // cycles, one in flight) and returns them as 4 cycles of 4 lanes. The unit's IOP section is tied off.
-    int_unit #(.NL(4), .W(W), .ONE(ONE1), .DSEQ(4)) u_int4 (.clk, .rst(rst_q), .a(int4_a), .b(int4_b),
+    int_unit #(.NL(4), .W(W), .ONE(ONE1), .DSEQ(4), .HAS_DIV(INT_DIV)) u_int4 (.clk, .rst(rst_q), .a(int4_a), .b(int4_b),
         .mul_valid(qr_run & qr_cls[3]), .v_mul(int4_vm), .y_mul(int4_ym),
         .div_valid(qr_run & qr_cls[4]), .div_mode(qr_divmode), .div_ready(idiv_ready), .v_div(v_div), .y_div(y_div4),
         .iop_valid(1'b0), .iop_fn(4'd0), .v_iop(), .y_iop());

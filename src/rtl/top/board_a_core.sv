@@ -22,6 +22,7 @@ module board_a_core #(
     parameter int    PHY_TRIAL_CYCLES = 8 * CLK_HZ,         // 8 s
     parameter int    SNAP_CYCLES    = CLK_HZ / 1000,        // 1 ms
     parameter bit    JTAG_STATUS    = 1'b1,
+    parameter bit    JTAG_LEAN      = 1'b0,                 // the JTAG frame read out bit by bit from the snapshot (link_status_jtag LEAN)
     // board link (simulation shortens the start-up times)
     parameter int    LINK_MHZ       = 100,
     parameter int    LINK_GUARD     = 10_000_000,
@@ -50,7 +51,12 @@ module board_a_core #(
     // get 4; it must be board B's b_render BAND8_MAXW; 0 = 4-row bands always)
     parameter int    VS_NWARP       = 4,
     parameter int    BAND8_MAXW     = 1024,
-    parameter bit    VS_SFU_TAB2    = 1'b0          // the vertex core's SFU tables shared by pairs of units (bit-identical)
+    parameter bit    VS_SFU_TAB2    = 1'b0,         // the vertex core's SFU tables shared by pairs of units (bit-identical)
+    parameter bit    VS_INT_DIV     = 1'b1,         // the vertex core's integer divider; 0: none (STATUS flags bit 31 set: the
+                                                    // compiler lowers integer division to float ops)
+    parameter bit    VS_SINCOS      = 1'b1,         // the vertex core's SIN / COS units; 0: none (STATUS flags bit 30 set: the
+                                                    // compiler lowers sin / cos to a range reduction and a polynomial)
+    parameter bit    GEOM_PROF      = 1'b1          // the geometry stage's profile counters (STATUS words 101-113; 0: they read 0)
 )(
     input  wire         clk_sys, rst_sys, calib_done, clk_idelay,
     // Ethernet PHY
@@ -235,7 +241,7 @@ module board_a_core #(
     wire [6:0]  g_st_lw; wire [19:0] g_tri_count;
     wire [31:0] g_c_vis; wire [13*32-1:0] g_prof;
     a_geom #(.REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W), .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .NWARP(VS_NWARP),
-             .BAND8_MAXW(BAND8_MAXW), .VS_SFU_TAB2(VS_SFU_TAB2)) u_geom (.clk(clk_sys), .rst(rst_ddr),
+             .BAND8_MAXW(BAND8_MAXW), .VS_SFU_TAB2(VS_SFU_TAB2), .VS_INT_DIV(VS_INT_DIV), .VS_SINCOS(VS_SINCOS), .PROF(GEOM_PROF)) u_geom (.clk(clk_sys), .rst(rst_ddr),
         .g_frame(g_frame), .g_frame_done(g_frame_done), .g_rbusy(g_rbusy), .g_fb_ok(g_fb_ok), .g_draw_ok(g_draw_ok), .g_copy_busy(g_copy_busy),
         .g_ld_start(g_ld_start), .g_ld_addr(g_ld_addr), .g_ld_len(g_ld_len), .g_ld_done(g_ld_done),
         .g_param_we(g_param_we), .g_param_idx(g_param_idx), .g_param_data(g_param_data),
@@ -337,7 +343,9 @@ module board_a_core #(
     end
     localparam int RING = 1 << RING_LOG2;
     wire [RING_LOG2:0] q_free = RING - q_used;
-    wire [31:0] flags = {11'h0, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok, host_valid, mdio_init_done,
+    // bit 31: the vertex core has no integer divider (IDIV / IMOD / UDIV / UMOD stop the warp; 0 on builds with one);
+    // bit 30: the vertex core has no SIN / COS units (SIN / COS stop the warp)
+    wire [31:0] flags = {~VS_INT_DIV, ~VS_SINCOS, 9'h0, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok, host_valid, mdio_init_done,
                          duplex, speed, link_up, calib_done};
     wire [31:0] sw [0:STATUS_WORDS-1];
     assign sw[0]  = STATUS_LAYOUT;
@@ -457,7 +465,7 @@ module board_a_core #(
 
     generate if (JTAG_STATUS) begin : g_jtag
         // JTAG USER1 frame: {seq, status_vec (MSB = word STATUS_WORDS-1), seq, A5}, see tools/a_status_jtag.tcl
-        link_status_jtag #(.FW(STATUS_WORDS * 32), .SNAP_CYCLES(1_000_000)) u_jtag (
+        link_status_jtag #(.FW(STATUS_WORDS * 32), .SNAP_CYCLES(1_000_000), .LEAN(JTAG_LEAN)) u_jtag (
             .clk(clk_sys), .rst(rst_s), .fields(status_vec));
     end endgenerate
 

@@ -29,6 +29,15 @@
 //     Op 21 (the 32-bit vertex core's BRP) is not an instruction of this core — a scalar branch cannot serve 16 vertices
 //     whose predicates disagree; the compilers emit IF / ELSE for both shader stages on the 64-bit ISA. It and the
 //     FS-only opcodes decode as NOPs (the assembler rejects them in a vertex program).
+// SHALLOW_RAM: the style of the shallow, wide attribute store — block RAM, or LUTs in the one-board build (ONE_CHIP),
+// where block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module shader_core_vs2 #(
     parameter int EXP_W = 7,
@@ -42,6 +51,8 @@ module shader_core_vs2 #(
                                                 //    straight into the squaring DSP cascade is too slow at 120 MHz)
     parameter bit SFU_SPLIT6 = 1'b1,            // 1: float_sfu's round add in its own stage (latency 11); both on: SFU latency
                                                 //    12 in the vertex core, as in the fragment core
+    parameter bit SFU_TAB2 = 1'b0,              // 1: the four SFUs' tables in two sfu_tab2 (units 0 + 1, 2 + 3: one dual-port copy per
+                                                //    pair instead of one each): block RAM for nothing, bit-identical
     parameter     RCP_MEM = "tools/gen/fp24_rcp_seed.mem", RSQRT_MEM = "tools/gen/fp24_rsqrt_seed.mem",
                   LOG2_MEM = "tools/gen/fp24_log2_lut.mem", EXP2_MEM = "tools/gen/fp24_exp2_lut.mem",
                   SIN_MEM = "tools/gen/fp24_sin_lut.mem"
@@ -235,7 +246,7 @@ module shader_core_vs2 #(
     wire [16*TW-1:0] aq;                                            // every lane's attribute vec4 (X2)
     genvar gl, gk;
     generate for (gl = 0; gl < 16; gl = gl + 1) begin : AL
-        (* ram_style="block" *) reg [TW-1:0] am [0:NWARP*NATTR-1];
+        (* ram_style=`SHALLOW_RAM *) reg [TW-1:0] am [0:NWARP*NATTR-1];
         reg [TW-1:0] q;
         always @(posedge clk) begin
             if (va_we && va_lane == 4'(gl)) am[{ap, va_idx}] <= va_data;
@@ -794,14 +805,35 @@ module shader_core_vs2 #(
     wire [4*W-1:0] int4_a, int4_b, int4_ym, y_div4; wire int4_vm;
     reg [2:0] cv_d1, cv_d2;                                         // convert: the op travels with its results
     always @(posedge clk) begin cv_d1 <= qr_cvtop; cv_d2 <= cv_d1; end
+    // the SFUs' tables: inside each unit, or (SFU_TAB2) one sfu_tab2 per pair of units
+    localparam int SK = (EXP_W >= 7) ? 12 : 8, SKL = (EXP_W >= 7) ? 11 : 8;
+    wire [SK-1:0] tr_a [0:3], ts_a [0:3]; wire [SKL-1:0] tl_i [0:3], te_i [0:3];
+    wire [MAN_W+1:0] tr_q [0:3], ts_q [0:3]; wire [23:0] tla [0:3], tlb [0:3], tea [0:3], teb [0:3];
+    generate if (SFU_TAB2) begin : g_tab
+        for (genvar gp = 0; gp < 2; gp++) begin : TP
+            sfu_tab2 #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(SK), .KLOG(SKL), .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM),
+                       .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM)) u_tab (.clk,
+                .rcp_a0(tr_a[2*gp]), .rcp_a1(tr_a[2*gp+1]), .rsq_a0(ts_a[2*gp]), .rsq_a1(ts_a[2*gp+1]),
+                .log_i0(tl_i[2*gp]), .log_i1(tl_i[2*gp+1]), .exp_i0(te_i[2*gp]), .exp_i1(te_i[2*gp+1]),
+                .rcp_q0(tr_q[2*gp]), .rcp_q1(tr_q[2*gp+1]), .rsq_q0(ts_q[2*gp]), .rsq_q1(ts_q[2*gp+1]),
+                .la0(tla[2*gp]), .lb0(tlb[2*gp]), .la1(tla[2*gp+1]), .lb1(tlb[2*gp+1]),
+                .ea0(tea[2*gp]), .eb0(teb[2*gp]), .ea1(tea[2*gp+1]), .eb1(teb[2*gp+1]));
+        end
+    end else begin : g_ntab
+        for (genvar gq = 0; gq < 4; gq++) begin : TZ
+            assign {tr_q[gq], ts_q[gq], tla[gq], tlb[gq], tea[gq], teb[gq]} = '0;
+        end
+    end endgenerate
     genvar gu;
     generate for (gu = 0; gu < 4; gu = gu + 1) begin : QU
         assign ux[gu]  = qr_x [(4*gu + qr_i)*W +: W];
         assign ux2[gu] = qr_x2[(4*gu + qr_i)*W +: W];
-        float_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(EXP_W >= 7 ? 12 : 8), .KLOG(EXP_W >= 7 ? 11 : 8), .SPLIT6(SFU_SPLIT6), .SPLIT1B(SFU_SPLIT1B),
-            .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM), .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM)) u_sfu (
+        float_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(SK), .KLOG(SKL), .SPLIT6(SFU_SPLIT6), .SPLIT1B(SFU_SPLIT1B),
+            .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM), .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM), .TAB_EXT(SFU_TAB2)) u_sfu (
             .clk, .rst, .in_valid(qr_run & qr_cls[0]), .op({1'b0, qr_sfuop}), .x(ux[gu]),
-            .out_valid(u_sfu_ov[gu]), .result(u_sfu_y[gu]));
+            .out_valid(u_sfu_ov[gu]), .result(u_sfu_y[gu]),
+            .t_rcp_a(tr_a[gu]), .t_rsq_a(ts_a[gu]), .t_log_i(tl_i[gu]), .t_exp_i(te_i[gu]),
+            .t_rcp_q(tr_q[gu]), .t_rsq_q(ts_q[gu]), .t_la(tla[gu]), .t_lb(tlb[gu]), .t_ea(tea[gu]), .t_eb(teb[gu]));
         sincos_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .KSIN(10), .SIN_MEM(SIN_MEM)) u_sc (
             .clk, .rst, .in_valid(qr_run & qr_cls[1]), .op(qr_cos), .x(ux[gu]), .out_valid(u_sc_ov[gu]), .result(u_sc_y[gu]));
         // convert: FTOI / FTOU through one signed W+1-bit converter clamped after, ITOF / UTOF sign- / zero-extended,

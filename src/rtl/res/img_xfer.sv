@@ -18,6 +18,15 @@
 // ha0 = sw % (2 * dw); likewise v. Storage format codes: 0 RGBA8 (word 0xRRGGBBAA), 1 RGB565 ({R5, G6, B5}), 2 P8
 // (palette index; copied / filled / read as raw values only). `busy` falls after every write was accepted by the
 // arbiter and every READ word was taken.
+// SHALLOW_RAM: the style of the shallow, wide FIFOs (u_df, u_bf) — block RAM, or LUTs in the one-board build
+// (ONE_CHIP), where block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module img_xfer #(
     parameter int RB_LOG2 = 12                    // row buffer half: 2**RB_LOG2 pixels (4096 = the widest image)
@@ -272,7 +281,7 @@ module img_xfer #(
     assign r_addr = {1'b0, rd_bi, 3'b000};
     wire        iss = r_en && r_rdy;
     wire        df_v; wire [255:0] df_d; wire df_pop;
-    sfifo #(.W(256), .AW(4), .RAM_STYLE("block")) u_df (.clk(clk), .rst(rst), .wen(r_valid), .wdata(rd_data),      // block RAM (172 LUT as LUTRAM; same cycles)
+    sfifo #(.W(256), .AW(4), .RAM_STYLE(`SHALLOW_RAM)) u_df (.clk(clk), .rst(rst), .wen(r_valid), .wdata(rd_data),  // 172 LUT as LUTRAM; same cycles
         .full(), .count(), .ren(df_pop), .rdata(df_d), .rvalid(df_v));
     wire [4:0]  ppb_m1 = (rbl == 2'd2) ? 5'd7 : (rbl == 2'd1) ? 5'd15 : 5'd31;
     wire        up_emit = rd_act && up_left != 0 && df_v;
@@ -402,7 +411,7 @@ module img_xfer #(
     // ---------------- stage F: burst assembly (COPY / FILL) ----------------
     reg          bf_wen; reg [312:0] bf_wd;
     wire         bf_v; wire [312:0] bf_d; wire [5:0] bf_cnt; wire bf_pop;
-    sfifo #(.W(313), .AW(4), .RAM_STYLE("block")) u_bf (.clk(clk), .rst(rst), .wen(bf_wen), .wdata(bf_wd),      // block RAM (210 LUT as LUTRAM; same cycles)
+    sfifo #(.W(313), .AW(4), .RAM_STYLE(`SHALLOW_RAM)) u_bf (.clk(clk), .rst(rst), .wen(bf_wen), .wdata(bf_wd),  // 210 LUT as LUTRAM; same cycles
         .full(), .count(bf_cnt), .ren(bf_pop), .rdata(bf_d), .rvalid(bf_v));
     reg  [255:0] bur_d;
     reg  [31:0]  bur_be;

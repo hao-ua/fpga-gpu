@@ -29,6 +29,15 @@
 // Descriptor: desc_* is read combinationally for desc_idx (the request F1 takes); filt = {mag, mip[1:0], min}
 // (mip 0 none, 1 nearest, 2 linear); wrap 0 REPEAT, 1 CLAMP_TO_EDGE, 2 MIRRORED_REPEAT; fmt 0 RGBA8, 1 RGBA4444,
 // 2 RGBA5551, 3 RGB565; base and offsets in 32-bit words; 16-bit texels two per word (low half first).
+// SHALLOW_RAM: the style of the shallow, wide burst buffers (bm) — block RAM, or LUTs in the one-board build
+// (ONE_CHIP), where block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module tmu24 #(
     parameter int EXP_W = 7,
@@ -979,7 +988,7 @@ module tmu24 #(
     wire fl_rdy = jf_ne & (jq_inc | (bd_v[jq_e[0]] & bd_v[jq_e[1]] & bd_v[jq_e[2]] & bd_v[jq_e[3]])) & ~(jq_res & lp_n[jq_cl]);
     reg [255:0] bq [0:3];
     generate for (gc = 0; gc < 4; gc++) begin : RFC
-        (* ram_style="block" *) reg [255:0] bm [0:15];
+        (* ram_style=`SHALLOW_RAM *) reg [255:0] bm [0:15];
         always @(posedge clk) begin
             if (lu_done) bm[fo_e[fo_h]] <= lu_data;
             if (fl_rdy) bq[gc] <= bm[jq_e[gc]];

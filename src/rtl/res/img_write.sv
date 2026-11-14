@@ -17,6 +17,15 @@
 // x * bpp multiples of bpp).
 // `busy` falls only after every write command and data beat has been accepted by the arbiter (MIG strict
 // ordering then makes the data visible to any later read), as in xfer_lin.
+// SHALLOW_RAM: the style of the shallow, wide FIFO (u_bf) — block RAM, or LUTs in the one-board build (ONE_CHIP), where
+// block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module img_write (
     input  wire         clk, rst,
@@ -128,7 +137,7 @@ module img_write (
     // burst FIFO {burst index, mask (1 = byte not written), data}
     reg          bf_wen; reg [312:0] bf_wd;
     wire         bf_v; wire [312:0] bf_d; wire [5:0] bf_cnt; wire bf_pop;
-    sfifo #(.W(313), .AW(4), .RAM_STYLE("block")) u_bf (.clk(clk), .rst(rst), .wen(bf_wen), .wdata(bf_wd),      // block RAM (210 LUT as LUTRAM; same cycles)
+    sfifo #(.W(313), .AW(4), .RAM_STYLE(`SHALLOW_RAM)) u_bf (.clk(clk), .rst(rst), .wen(bf_wen), .wdata(bf_wd),  // 210 LUT as LUTRAM; same cycles
         .full(), .count(bf_cnt), .ren(bf_pop), .rdata(bf_d), .rvalid(bf_v));
     assign go = (bf_cnt < 6'd13);               // up to 2 pushes in flight behind the check
 

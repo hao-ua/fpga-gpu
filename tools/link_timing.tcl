@@ -19,10 +19,10 @@ if {$role eq "A"} {
     set rx_clk_port {jm1[20]}; set rx_data_ports [lane_ports $fwd_data]
 }
 # The link transmit MMCM (link_clk, fed by the BUFG'd 200 MHz) is derived from sys_clk: give its outputs names
-create_generated_clock -name link_l0   [get_pins -hierarchical -filter {NAME =~ *u_lclk/u_mmcm/CLKOUT0}]
-create_generated_clock -name link_l90  [get_pins -hierarchical -filter {NAME =~ *u_lclk/u_mmcm/CLKOUT1}]
-create_generated_clock -name link_l270 [get_pins -hierarchical -filter {NAME =~ *u_lclk/u_mmcm/CLKOUT3}]
-create_generated_clock -name link_lfb  [get_pins -hierarchical -filter {NAME =~ *u_lclk/u_mmcm/CLKFBOUT}]
+create_generated_clock -name link_l0   [get_pins -hierarchical -filter {NAME =~ *u_lclk/*u_mmcm/CLKOUT0}]
+create_generated_clock -name link_l90  [get_pins -hierarchical -filter {NAME =~ *u_lclk/*u_mmcm/CLKOUT1}]
+create_generated_clock -name link_l270 [get_pins -hierarchical -filter {NAME =~ *u_lclk/*u_mmcm/CLKOUT3}]
+create_generated_clock -name link_lfb  [get_pins -hierarchical -filter {NAME =~ *u_lclk/*u_mmcm/CLKFBOUT}]
 # forwarded clock out of the TX lane LCLK pin
 create_generated_clock -name lclk_fwd -source [get_pins -hierarchical -filter {NAME =~ *u_phy_tx/u_oddr_clk/C}] \
     -divide_by 1 [get_ports $tx_clk_port]

@@ -10,6 +10,15 @@
 // Byte order: stream byte k of a word is bits [8k+7:8k]; DDR byte address order matches app data lanes.
 // `busy` falls only after every write command and data beat has been accepted by the arbiter (MIG
 // strict ordering then makes the data visible to any later read).
+// SHALLOW_RAM: the style of the shallow, wide FIFOs (u_bf, u_st) — block RAM, or LUTs in the one-board build
+// (ONE_CHIP), where block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module xfer_lin #(
     parameter int RD_AW = 5,                  // read staging FIFO depth 2**RD_AW bursts
@@ -73,7 +82,7 @@ module xfer_lin #(
     // ---------------- burst FIFO (write side) ----------------
     reg          bf_wen; reg [287:0] bf_wd;
     wire         bf_v; wire [287:0] bf_d; wire [5:0] bf_cnt; wire bf_pop;
-    sfifo #(.W(288), .AW(4), .RAM_STYLE("block")) u_bf (.clk(clk), .rst(rst), .wen(bf_wen), .wdata(bf_wd),      // block RAM (192 LUT as LUTRAM on each board; same cycles)
+    sfifo #(.W(288), .AW(4), .RAM_STYLE(`SHALLOW_RAM)) u_bf (.clk(clk), .rst(rst), .wen(bf_wen), .wdata(bf_wd),  // 192 LUT as LUTRAM; same cycles
         .full(), .count(bf_cnt), .ren(bf_pop), .rdata(bf_d), .rvalid(bf_v));
     wire bf_room = (bf_cnt < 6'd14);
 
@@ -99,7 +108,7 @@ module xfer_lin #(
     always @(posedge clk) rd_room <= (st_cnt + outstanding) < ((1 << RD_AW) - 1);
     assign r_en   = rd_phase && (rd_cmd != nb) && rd_room;
     assign r_addr = {1'b0, b0 + rd_cmd, 3'b000};
-    sfifo #(.W(256), .AW(RD_AW)) u_st (.clk(clk), .rst(rst), .wen(r_valid), .wdata(rdata), .full(),
+    sfifo #(.W(256), .AW(RD_AW), .RAM_STYLE(`SHALLOW_RAM)) u_st (.clk(clk), .rst(rst), .wen(r_valid), .wdata(rdata), .full(),
         .count(st_cnt), .ren(st_pop), .rdata(st_d), .rvalid(st_v));
 
     // ---------------- write align + pack state ----------------

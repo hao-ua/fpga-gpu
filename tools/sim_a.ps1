@@ -52,7 +52,7 @@ $rtl = @(
   "src\rtl\display_line_buffer.sv", "src\rtl\display_out.sv",
   "src\rtl\disp\video_mmcm.sv", "src\rtl\disp\scan_reader.sv", "src\rtl\disp\disp_post.sv", "src\rtl\disp\disp_out_b.sv",
   "src\rtl\disp\disp_ctl_b.sv", "src\rtl\disp\disp_b.sv",
-  "src\rtl\top\b_bringup.sv", "src\rtl\top\board_b_core.sv",
+  "src\rtl\top\b_bringup.sv", "src\rtl\top\board_b_core.sv", "src\rtl\top\board_ab_core.sv",
   # board link
   "src\rtl\proto\link_a_port.sv", "src\rtl\proto\link_b_port.sv", "src\rtl\proto\fb_cmd_b.sv",
   "src\rtl\common\uart_tx.sv", "sim\link_rx_shifter_sim.sv",
@@ -60,7 +60,7 @@ $rtl = @(
   "src\rtl\b_render.sv", "src\rtl\b_rop.sv", "src\rtl\pixel_blend_b.sv", "src\rtl\quad_setup.sv", "src\rtl\shader_core_fs2.sv",
   "src\rtl\alu_cluster.sv", "src\rtl\float_addsub.sv", "src\rtl\float_cmp.sv", "src\rtl\float_cmp3.sv", "src\rtl\float_cvt_f2i.sv",
   "src\rtl\float_cvt_i2f.sv", "src\rtl\float_dot4_sum.sv", "src\rtl\float_madd.sv", "src\rtl\float_mul.sv",
-  "src\rtl\float_round.sv", "src\rtl\float_sfu.sv", "src\rtl\int_unit.sv", "src\rtl\sincos_sfu.sv", "src\rtl\vec4_sfu.sv",
+  "src\rtl\float_round.sv", "src\rtl\float_sfu.sv", "src\rtl\sfu_tab2.sv", "src\rtl\int_unit.sv", "src\rtl\sincos_sfu.sv", "src\rtl\vec4_sfu.sv",
   "src\rtl\vec4_sincos.sv", "src\rtl\tmu24.sv", "src\rtl\cube_rcp.sv", "src\rtl\tex_cache.sv"
 ) | ForEach-Object { Join-Path $root $_ } | Where-Object { Test-Path $_ }
 $rtl = @(@($rtl) + @(Get-ChildItem (Join-Path $root "src\rtl\link\*.sv") | ForEach-Object { $_.FullName }) | Select-Object -Unique)
@@ -84,6 +84,8 @@ switch ($Test) {
   "credit"    { $top = "tb_link_credit"; $tb = @("sim\tb_link_credit.sv") }
   "b3d"       { $top = "tb_board_b3d"; $tb = @("sim\mig_app_model.sv", "sim\tmds_capture.sv", "sim\tb_board_b3d.sv") }
   "two3d"     { $top = "tb_two_boards3d"; $tb = @("sim\mig_app_model.sv", "sim\rgmii_phy_model.sv", "sim\tmds_capture.sv", "sim\tb_two_boards3d.sv") }
+  "ab_elab"   { $top = "board_ab_core"; $tb = @() }      # the one-chip core alone: compiles and elaborates (no stimulus)
+  "one3d"     { $top = "tb_one_board3d"; $tb = @("sim\mig_app_model.sv", "sim\rgmii_phy_model.sv", "sim\tb_one_board3d.sv") }   # tb_two_boards3d on board_ab_core
   default   { Write-Output "unknown test $Test"; exit 1 }
 }
 $tbf = @($tb | ForEach-Object { Join-Path $root $_ })
@@ -104,6 +106,7 @@ if (-not $NoCompile) {
   if ($err -or $rc -ne 0) { $err | ForEach-Object { $_.Line }; Write-Output "ELAB_FAIL (exit $rc)"; exit 1 }
   Write-Output "COMPILE_ELAB_OK $top"
 }
+if ($Test -eq "ab_elab") { exit 0 }     # nothing to run without a bench
 $xargs = @("${top}_snap", "-R")
 if ($Plusargs -ne "") { foreach ($p in $Plusargs -split ',') { $xargs += @("-testplusarg", $p) } }   # "A,B" -> +A +B
-& "$viv\xsim.bat" @xargs 2>&1 | Select-String -Pattern "ERROR|WARNING: .*MIG|TB_PASS|TB_FAIL|FAIL|ok:|: PASS|INFO_TB|DIAG|TRACE|MON @|tb_two_boards3d|Fatal|failed" | ForEach-Object { $_.Line }
+& "$viv\xsim.bat" @xargs 2>&1 | Select-String -Pattern "ERROR|WARNING: .*MIG|TB_PASS|TB_FAIL|FAIL|ok:|: PASS|INFO_TB|DIAG|TRACE|MON @|tb_two_boards3d|tb_one_board3d|Fatal|failed" | ForEach-Object { $_.Line }

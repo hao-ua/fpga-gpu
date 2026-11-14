@@ -110,6 +110,8 @@ module shader_core_fs2 #(
     parameter bit PROF = 1'b0,                  // the profile events (prof_ev) for the board's cycle counters (b_render PROF)
     parameter bit ADD_DSP = 1'b0,               // the lanes' adders (the multiply-add's and LDV_MODE 2's second one) do their alignment
                                                 // shift on a DSP48 each (float_addsub DSP_ALIGN): LUTs for DSPs, bit-identical
+    parameter bit SFU_TAB2 = 1'b0,              // 1: the four SFUs' tables in two sfu_tab2 (units 0 + 1, 2 + 3: one dual-port copy per
+                                                // pair instead of one each): block RAM for nothing, bit-identical
     parameter     RCP_MEM = "tools/gen/fp24_rcp_seed.mem", RSQRT_MEM = "tools/gen/fp24_rsqrt_seed.mem",
                   LOG2_MEM = "tools/gen/fp24_log2_lut.mem", EXP2_MEM = "tools/gen/fp24_exp2_lut.mem",
                   SIN_MEM = "tools/gen/fp24_sin_lut.mem"
@@ -1408,15 +1410,36 @@ module shader_core_fs2 #(
     wire [4*W-1:0] int4_a, int4_b, int4_ym, y_div4; wire int4_vm;
     reg [2:0] cv_d1, cv_d2;                                         // convert: the op travels with its results
     always @(posedge clk) begin cv_d1 <= qr_cvtop; cv_d2 <= cv_d1; end
+    // the SFUs' tables: inside each unit, or (SFU_TAB2) one sfu_tab2 per pair of units
+    localparam int SK = (EXP_W >= 7) ? 12 : 8, SKL = (EXP_W >= 7) ? 11 : 8;
+    wire [SK-1:0] tr_a [0:3], ts_a [0:3]; wire [SKL-1:0] tl_i [0:3], te_i [0:3];
+    wire [MAN_W+1:0] tr_q [0:3], ts_q [0:3]; wire [23:0] tla [0:3], tlb [0:3], tea [0:3], teb [0:3];
+    generate if (SFU_TAB2) begin : g_tab
+        for (genvar gp = 0; gp < 2; gp++) begin : TP
+            sfu_tab2 #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(SK), .KLOG(SKL), .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM),
+                       .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM)) u_tab (.clk,
+                .rcp_a0(tr_a[2*gp]), .rcp_a1(tr_a[2*gp+1]), .rsq_a0(ts_a[2*gp]), .rsq_a1(ts_a[2*gp+1]),
+                .log_i0(tl_i[2*gp]), .log_i1(tl_i[2*gp+1]), .exp_i0(te_i[2*gp]), .exp_i1(te_i[2*gp+1]),
+                .rcp_q0(tr_q[2*gp]), .rcp_q1(tr_q[2*gp+1]), .rsq_q0(ts_q[2*gp]), .rsq_q1(ts_q[2*gp+1]),
+                .la0(tla[2*gp]), .lb0(tlb[2*gp]), .la1(tla[2*gp+1]), .lb1(tlb[2*gp+1]),
+                .ea0(tea[2*gp]), .eb0(teb[2*gp]), .ea1(tea[2*gp+1]), .eb1(teb[2*gp+1]));
+        end
+    end else begin : g_ntab
+        for (genvar gq = 0; gq < 4; gq++) begin : TZ
+            assign {tr_q[gq], ts_q[gq], tla[gq], tlb[gq], tea[gq], teb[gq]} = '0;
+        end
+    end endgenerate
     genvar gu;
     generate for (gu = 0; gu < 4; gu = gu + 1) begin : QU
         assign ux[gu]  = qr_x [(4*gu + qr_i)*W +: W];
         assign ux2[gu] = qr_x2[(4*gu + qr_i)*W +: W];
         wire su_ov; wire [W-1:0] su_y;                              // the unit's own result
-        float_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(EXP_W >= 7 ? 12 : 8), .KLOG(EXP_W >= 7 ? 11 : 8), .SPLIT6(1'b1), .SPLIT1B(1'b1),   // SPLIT1B: splits the rsqrt seed RAM -> squaring DSPs path (timing at 120 MHz)
-            .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM), .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM)) u_sfu (
+        float_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(SK), .KLOG(SKL), .SPLIT6(1'b1), .SPLIT1B(1'b1),   // SPLIT1B: splits the rsqrt seed RAM -> squaring DSPs path (timing at 120 MHz)
+            .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM), .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM), .TAB_EXT(SFU_TAB2)) u_sfu (
             .clk, .rst(rst_q), .in_valid(qr_run & qr_cls[0]), .op({1'b0, qr_sfuop}), .x(ux[gu]),
-            .out_valid(su_ov), .result(su_y));
+            .out_valid(su_ov), .result(su_y),
+            .t_rcp_a(tr_a[gu]), .t_rsq_a(ts_a[gu]), .t_log_i(tl_i[gu]), .t_exp_i(te_i[gu]),
+            .t_rcp_q(tr_q[gu]), .t_rsq_q(ts_q[gu]), .t_la(tla[gu]), .t_lb(tlb[gu]), .t_ea(tea[gu]), .t_eb(teb[gu]));
         // XSFU: the result times an operand. The operand and the two flags travel beside the unit (SL = its latency with
         // SPLIT1B and SPLIT6, checked below); a multiplier takes both; beside it the unit's result, the operand and the
         // flags wait its 3 cycles, and the stage hands on the unit's result (a plain RCP / RSQRT / LOG2 / EXP2), the

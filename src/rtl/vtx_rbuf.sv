@@ -1,7 +1,7 @@
 // vtx_rbuf — the vertex result buffer of board A's front end (a_vertex.sv). Finished warps leave
 //   the vertex core in launch order; this block copies each one's rows — gl_Position and the varyings the fragment
 //   shader reads (varmask) — out of the core's output store (out_sel, one row per cycle, the row registered) into a
-//   LANE-BANKED store: per lane one block RAM per component, addressed by {result slot, vec4 index} (index 0..7 = varying,
+//   LANE-BANKED store: per lane one block RAM of vec4s, addressed by {result slot, vec4 index} (index 0..7 = varying,
 //   8 = gl_Position, 9 = the gl_PointSize row when ps_en: a POINTS draw), so a row of 16 lanes is written in one
 //   cycle and the assembler reads any vertex's vec4 in one.
 //   NSLOT result slots: the feed allocates them in order (alloc clears the slot's done flag), the launch order maps the
@@ -92,21 +92,24 @@ module vtx_rbuf #(
             lq_cnt <= lq_cnt + (LW+1)'(launch) - (LW+1)'(c_last);
         end
     end
-    // ---- the lane banks: per lane, per component a block RAM {slot, vidx}
+    // ---- the lane banks: per lane one block RAM of vec4s {slot, vidx}, a component written per cycle through its bytes'
+    //      write enables (W / 8 bytes a component), the vec4 read whole
+    if (W % 8 != 0) $error("vtx_rbuf: W must be a multiple of 8 (byte write enables)");
+    localparam int CB = W / 8;
     reg [3:0] rl_q;
     always @(posedge clk) rl_q <= rd_lane;
     wire [4*W-1:0] lane_q [0:15];
-    genvar gl, gc;
+    genvar gl;
     generate for (gl = 0; gl < 16; gl = gl + 1) begin : BL
-        for (gc = 0; gc < 4; gc = gc + 1) begin : BC
-            (* ram_style="block" *) reg [W-1:0] m [0:(1 << AW)-1];
-            reg [W-1:0] q;
-            always @(posedge clk) begin
-                if (w_v && w_comp == 2'(gc)) m[w_addr] <= out_row[gl*W +: W];
-                q <= m[{rd_slot, rd_vidx}];
-            end
-            assign lane_q[gl][gc*W +: W] = q;
+        (* ram_style="block" *) reg [4*W-1:0] m [0:(1 << AW)-1];
+        reg [4*W-1:0] q;
+        wire [4*W-1:0] wd = {4{out_row[gl*W +: W]}};
+        always @(posedge clk) begin
+            for (int k = 0; k < 4 * CB; k++)
+                if (w_v && w_comp == 2'(k / CB)) m[w_addr][k*8 +: 8] <= wd[k*8 +: 8];
+            q <= m[{rd_slot, rd_vidx}];
         end
+        assign lane_q[gl] = q;
     end endgenerate
     assign rd_data = lane_q[rl_q];
 endmodule

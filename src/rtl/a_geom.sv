@@ -17,7 +17,10 @@ module a_geom #(
     parameter int NBANDS = 512, BANDW = 10, IDX_W = 20, DID_W = 12, PTR_W = 23, COUNT_W = 20,
     parameter [28:0] REC_BASE = 29'h1000000, BINLIST_BASE = 29'h5000000,   // bank 0: records at 64 MB, bin lists at 320 MB
     parameter [28:0] REC_BANK_W = 29'h2000000, POOL_W = 29'h800000,        // 128 MB of records (2^18), 32 MB of bin lists (2^22) per bank
-    parameter int    NPROF = 13                                             // profile counters (STATUS layout 10, words 101-113)
+    parameter int    NPROF = 13,                                            // profile counters (STATUS layout 10, words 101-113)
+    parameter int    BAND8_MAXW = 1024,                                     // targets up to this wide get 8-row bands, wider ones 4
+                                                                            // (board B's b_render BAND8_MAXW; 0: 4-row bands always)
+    parameter bit    VS_SFU_TAB2 = 1'b0                                     // the vertex core's SFU tables shared by pairs of units
 )(
     input  wire        clk, rst,
     // command port
@@ -139,7 +142,7 @@ module a_geom #(
     end
     assign g_draw_ok = dr_ok & ~sf_full;
     assign g_copy_busy = copy_busy;
-    a_vertex #(.NVEC(NVEC), .NSLOT(NSLOT), .NWARP(NWARP)) u_vtx (.clk, .rst,
+    a_vertex #(.NVEC(NVEC), .NSLOT(NSLOT), .NWARP(NWARP), .SFU_TAB2(VS_SFU_TAB2)) u_vtx (.clk, .rst,
         .iram_we, .iram_waddr, .iram_wdata, .param_we(g_param_we), .param_idx(g_param_idx), .param_data(g_param_data),
         .ad_we(g_ad_we), .ad_idx(g_ad_idx), .ad_en(g_ad_en), .ad_type(g_ad_type), .ad_norm(g_ad_norm), .ad_base(g_ad_base), .ad_size(g_ad_size),
         .ad_stride(g_ad_stride), .ad_off(g_ad_off),
@@ -165,7 +168,7 @@ module a_geom #(
     // ---- setup and records
     wire s_busy, push_valid, push_ready; wire [IDX_W-1:0] push_tri; wire [12:0] push_did; wire [BANDW-1:0] push_lo, push_hi; wire [3:0] push_nb;
     a_setup #(.NVEC(NVEC), .BANDW(BANDW), .IDX_W(IDX_W), .DID_W(13), .REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W),
-              .REC_ENTRIES(int'(REC_BANK_W >> 7))) u_set (.clk, .rst, .frame_start(g_frame), .bank(gbank_c),   // 128 words per record
+              .REC_ENTRIES(int'(REC_BANK_W >> 7)), .BAND8_MAXW(BAND8_MAXW)) u_set (.clk, .rst, .frame_start(g_frame), .bank(gbank_c),   // 128 words per record
         .vo_valid, .vo_ready, .vo_pos, .vo_var, .vo_psize, .vo_prim,
         .vo_la, .pa_req, .pa_req_first, .pa_grant, .pa_valid, .pa_pos, .pa_first,
         .sxs_i(sf_head[0 +: W]), .sxo_i(sf_head[W +: W]), .sys_i(sf_head[2*W +: W]), .syo_i(sf_head[3*W +: W]), .zs_i(sf_head[4*W +: W]), .zo_i(sf_head[5*W +: W]),
@@ -193,7 +196,7 @@ module a_geom #(
     assign g_frame_done = clearing & b_clear_done;
     // ---- the render side: band walk over the bins, the rasterizer, the render stream
     a_render #(.NL(4), .BANDW(BANDW), .IDX_W(IDX_W), .DID_W(DID_W), .PTR_W(PTR_W), .COUNT_W(COUNT_W), .REC_BASE(REC_BASE), .BINLIST_BASE(BINLIST_BASE),
-               .REC_BANK_W(REC_BANK_W), .POOL_W(POOL_W))
+               .REC_BANK_W(REC_BANK_W), .POOL_W(POOL_W), .BAND8_MAXW(BAND8_MAXW))
       u_rn (.clk, .rst, .go(g_render), .go_bank(gbank), .abort(g_abort), .abort_soft(g_abort_soft), .done(g_render_done), .busy(rn_busy), .scr_w, .scr_h,
         .c_vis,
         .q_bank, .q_band, .q_head, .q_count,

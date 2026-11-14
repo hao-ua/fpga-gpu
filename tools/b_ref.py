@@ -541,7 +541,11 @@ def gen_fsi(prog):
 # one frame: random triangles of several draws are rasterized here (A's job: coverage at pixel centres, quads of the
 # bands, the barycentrics mu0..mu2 per pixel), and rendered with the bit-exact models: quad setup, LDV interpolation,
 # shader_ref's SIMT core at FP24, the b_rop rules.
-B_REC_BASE, B_DS_BASE, B_PROG_BASE, B_RT_BASE = 0x0, 0x0200_0000, 0x0400_0000, 0x0800_0000   # word addresses
+# word addresses. Everything from the buckets up lies in the one-board design's B heap (448 MB - 1 GB: buckets 448 MB,
+# programs 464 MB, the target 512 MB, textures 576 MB, the depth-stencil image 640 MB), so the same files serve the two
+# boards' benches (B's own memory) and the one-board ones (board A's regions end at 256 MB, its buffers from 384 MB).
+# The buckets and programs stay below B_RT_BASE (the MEM_WRITE lists below start at B_RT_BASE)
+B_REC_BASE, B_DS_BASE, B_PROG_BASE, B_RT_BASE = 0x0, 0x0700_0000, 0x0740_0000, 0x0800_0000
 B_TEX_BASE = 0x0900_0000
 
 

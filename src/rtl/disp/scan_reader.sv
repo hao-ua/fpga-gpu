@@ -19,6 +19,15 @@
 // fills black up to the mode width and releases the slot. Issued-but-undrained bursts never exceed the
 // in-flight FIFO (2**IB_AW), so returned data always has room. A frame restart (vsync or run start) flushes
 // both FIFOs and discards the reads still outstanding.
+// SHALLOW_RAM: the style of the shallow, wide burst FIFO (u_ib) — block RAM, or LUTs in the one-board build (ONE_CHIP),
+// where block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module scan_reader #(
     parameter int IB_AW = 4,                 // in-flight bursts: 2**IB_AW
@@ -125,7 +134,7 @@ module scan_reader #(
     // in-flight data FIFO
     wire        ib_v; wire [255:0] ib_d; reg ib_pop; wire [IB_AW+1:0] ib_cnt;
     wire        ib_push = r_valid && (disc == 8'd0) && !restart;
-    sfifo #(.W(256), .AW(IB_AW), .RAM_STYLE("block")) u_ib (.clk(clk), .rst(rst | restart),      // block RAM: 16 x 256 in LUTRAM costs 172 LUT; same cycles
+    sfifo #(.W(256), .AW(IB_AW), .RAM_STYLE(`SHALLOW_RAM)) u_ib (.clk(clk), .rst(rst | restart),  // 16 x 256 in LUTRAM: 172 LUT; same cycles
         .wen(ib_push), .wdata(rd_data), .full(), .count(ib_cnt), .ren(ib_pop), .rdata(ib_d), .rvalid(ib_v));
 
     assign idle = (ist == I_STOP) && (n_out == 8'd0);

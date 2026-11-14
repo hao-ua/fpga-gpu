@@ -2,6 +2,7 @@
 # Run from the repo root (log goes to tools/gen with the date/time in the name):
 #   vivado -mode batch -nojournal -source tools/build_board.tcl -log tools/gen/build_board_A_<datetime>.log -tclargs A [IDELAY_DEFAULT] [RXDLY_DEFAULT]
 #   vivado -mode batch -nojournal -source tools/build_board.tcl -log tools/gen/build_board_B_<datetime>.log -tclargs B
+#   vivado -mode batch -nojournal -source tools/build_board.tcl -log tools/gen/build_board_S_<datetime>.log -tclargs S
 # A: defaults tap 19 with the PHY RX delay on = measured centre of the 1000 Mbit/s receive window on board A
 #    (host/fb/eth_rx_sweep.py).
 # B: DDR3 + HDMI scanout in five modes + bring-up harness. The video-mode ROM
@@ -11,7 +12,10 @@
 set role [lindex $argv 0]
 set idly [expr {[llength $argv] > 1 ? [lindex $argv 1] : 19}]
 set rxd  [expr {[llength $argv] > 2 ? [lindex $argv 2] : 1}]
-if {$role ne "A" && $role ne "B"} { puts "usage: -tclargs A [IDELAY_DEFAULT] [RXDLY_DEFAULT] | B"; exit 1 }
+# S: both halves on one board (board_ab_top: one MIG, the link inside the chip); IDELAY_DEFAULT / RXDLY_DEFAULT as for A.
+# B3D_NWARP / B3D_NLINES / B3D_CELLS / B3D_NLMAX / BAND8_MAXW / VS_NWARP (env) override the configuration's defaults
+# (board_ab_top)
+if {$role ne "A" && $role ne "B" && $role ne "S"} { puts "usage: -tclargs A [IDELAY_DEFAULT] [RXDLY_DEFAULT] | B | S [IDELAY_DEFAULT] [RXDLY_DEFAULT]"; exit 1 }
 set part xc7a200tfbg484-2
 set_param general.maxThreads 8
 # SYNTH_THREADS (env, default 8): general.maxThreads during synth_design only — synthesis starts one helper process per
@@ -38,7 +42,7 @@ if {[file exists $bid_file]} { set fh [open $bid_file r]; catch {set bid [expr {
 incr bid
 set fh [open $bid_file w]; puts $fh $bid; close $fh
 set tag "board_${role}_b${bid}"
-if {$role eq "A"} { puts "=== BUILD $tag IDELAY_DEFAULT=$idly RXDLY_DEFAULT=$rxd ===" } else { puts "=== BUILD $tag ===" }
+if {$role ne "B"} { puts "=== BUILD $tag IDELAY_DEFAULT=$idly RXDLY_DEFAULT=$rxd ===" } else { puts "=== BUILD $tag ===" }
 
 set mig_xci tools/gen/ip/mig_7series_0/mig_7series_0.xci
 # OC_MHZ (env, default 100): clk_sys / the DDR rate (8 x). 100 = the generated MIG IP. Anything else (e.g. 110 = 880 MT/s)
@@ -59,9 +63,7 @@ set octag [expr {$oc == 100 ? "" : "_oc$oc"}]
 set tag "${tag}${octag}"                                            ;# e.g. board_A_b<N>_oc120: the outputs say what they are
 # board link: link_core and its blocks, on both roles
 set link_rtl [lsearch -all -inline -not [glob src/rtl/link/*.sv] *link_test_*]
-
-if {$role eq "A"} {
-    set rtl [list \
+set rtl_a [list \
       src/rtl/net/net_pkg.sv src/rtl/proto/fb_pkg.sv \
       src/rtl/net/rst_sync.sv src/rtl/net/afifo_bram.sv src/rtl/mem/sfifo.sv \
       src/rtl/net/eth_rgmii_rx.sv src/rtl/net/eth_mac_rx.sv src/rtl/net/eth_net_rx.sv src/rtl/net/eth_tx.sv \
@@ -73,21 +75,9 @@ if {$role eq "A"} {
       src/rtl/shader_core_vs2.sv src/rtl/attr_conv.sv src/rtl/vtx_feed.sv src/rtl/vtx_rbuf.sv src/rtl/vtx_asm.sv src/rtl/a_vertex.sv \
       src/rtl/clip_near.sv src/rtl/vtx_setup2.sv src/rtl/zq_tri.sv src/rtl/zq_lane.sv src/rtl/a_setup.sv src/rtl/tri_binner2.sv src/rtl/a_render.sv src/rtl/a_geom.sv \
       src/rtl/float_addsub.sv src/rtl/float_cmp.sv src/rtl/float_cvt_f2i.sv src/rtl/float_cvt_i2f.sv src/rtl/float_madd.sv \
-      src/rtl/float_mul.sv src/rtl/float_round.sv src/rtl/float_sfu.sv src/rtl/int_unit.sv src/rtl/sincos_sfu.sv \
-      src/rtl/top/board_a_core.sv src/rtl/top/board_a_top.sv]
-    read_verilog -sv [concat $rtl $link_rtl]
-    read_xdc src/constrs/board_a.xdc
-    read_xdc src/constrs/link_board.xdc
-    set_param general.maxThreads $synth_threads
-    synth_design -top board_a_top -part $part -include_dirs src/rtl/link -generic BUILD_ID=$bid -generic IDELAY_DEFAULT=$idly -generic RXDLY_DEFAULT=$rxd -generic OC_MHZ=$oc
-    set_param general.maxThreads 8
-    source tools/link_timing.tcl
-    # JTAG status register clock (BSCANE2 DRCK), asynchronous to everything else
-    create_clock -name jtag_drck -period 33.333 [get_pins -hierarchical -filter {NAME =~ *u_jtag/u_bscan/DRCK}]
-    set_clock_groups -asynchronous -group [get_clocks jtag_drck] -group [get_clocks -include_generated_clocks sys_clk] -group [get_clocks eth_rxc]
-    set_clock_groups -asynchronous -group [get_clocks eth_rxc] -group [get_clocks -include_generated_clocks lclk_rx]
-} else {
-    set rtl [list \
+      src/rtl/float_mul.sv src/rtl/float_round.sv src/rtl/float_sfu.sv src/rtl/sfu_tab2.sv src/rtl/int_unit.sv src/rtl/sincos_sfu.sv \
+      src/rtl/top/board_a_core.sv]
+set rtl_b [list \
       src/rtl/res/img_pkg.sv src/rtl/proto/fb_pkg.sv src/rtl/net/rst_sync.sv src/rtl/mem/sfifo.sv src/rtl/mem/mem_arb.sv \
       src/rtl/res/xfer_lin.sv src/rtl/res/img_table.sv src/rtl/res/img_write.sv src/rtl/res/img_xfer.sv src/rtl/res/img_geom.sv \
       src/rtl/common/udiv.sv \
@@ -101,9 +91,41 @@ if {$role eq "A"} {
       src/rtl/zq_lane.sv src/rtl/b_render.sv src/rtl/b_rop.sv src/rtl/pixel_blend_b.sv src/rtl/quad_setup.sv src/rtl/shader_core_fs2.sv \
       src/rtl/alu_cluster.sv src/rtl/float_addsub.sv src/rtl/float_cmp.sv src/rtl/float_cmp3.sv src/rtl/float_cvt_f2i.sv \
       src/rtl/float_cvt_i2f.sv src/rtl/float_dot4_sum.sv src/rtl/float_madd.sv src/rtl/float_mul.sv \
-      src/rtl/float_round.sv src/rtl/float_sfu.sv src/rtl/int_unit.sv src/rtl/sincos_sfu.sv src/rtl/vec4_sfu.sv \
+      src/rtl/float_round.sv src/rtl/float_sfu.sv src/rtl/sfu_tab2.sv src/rtl/int_unit.sv src/rtl/sincos_sfu.sv src/rtl/vec4_sfu.sv \
       src/rtl/vec4_sincos.sv src/rtl/tmu24.sv src/rtl/cube_rcp.sv src/rtl/tex_cache.sv \
-      src/rtl/top/board_b_core.sv src/rtl/top/board_b_top.sv]
+      src/rtl/top/board_b_core.sv]
+
+if {$role eq "S"} {
+    # both file lists once each (img_pkg first: the B list's packages ahead of the modules that import them)
+    set rtl [list src/rtl/res/img_pkg.sv]
+    foreach f [concat $rtl_a $rtl_b] { if {[lsearch -exact $rtl $f] < 0} { lappend rtl $f } }
+    lappend rtl src/rtl/top/board_ab_core.sv src/rtl/top/board_ab_top.sv
+    read_verilog -sv [concat $rtl $link_rtl]
+    read_xdc src/constrs/board_ab.xdc
+    set gen [list -generic BUILD_ID=$bid -generic IDELAY_DEFAULT=$idly -generic RXDLY_DEFAULT=$rxd -generic OC_MHZ=$oc]
+    foreach g {B3D_NWARP B3D_NLINES B3D_CELLS B3D_NLMAX BAND8_MAXW VS_NWARP} {
+        if {[info exists ::env($g)]} { lappend gen -generic $g=$::env($g); puts "=== $g=$::env($g) ===" }
+    }
+    set_param general.maxThreads $synth_threads
+    # ONE_CHIP: the shallow, wide memories in LUTs (SHALLOW_RAM in their modules), block RAM being the scarcer resource
+    synth_design -top board_ab_top -part $part -include_dirs {src/rtl/disp src/rtl/link} -verilog_define ONE_CHIP {*}$gen
+    set_param general.maxThreads 8
+    read_xdc src/constrs/board_ab_clocks.xdc
+} elseif {$role eq "A"} {
+    set rtl [concat $rtl_a src/rtl/top/board_a_top.sv]
+    read_verilog -sv [concat $rtl $link_rtl]
+    read_xdc src/constrs/board_a.xdc
+    read_xdc src/constrs/link_board.xdc
+    set_param general.maxThreads $synth_threads
+    synth_design -top board_a_top -part $part -include_dirs src/rtl/link -generic BUILD_ID=$bid -generic IDELAY_DEFAULT=$idly -generic RXDLY_DEFAULT=$rxd -generic OC_MHZ=$oc
+    set_param general.maxThreads 8
+    source tools/link_timing.tcl
+    # JTAG status register clock (BSCANE2 DRCK), asynchronous to everything else
+    create_clock -name jtag_drck -period 33.333 [get_pins -hierarchical -filter {NAME =~ *u_jtag/u_bscan/DRCK}]
+    set_clock_groups -asynchronous -group [get_clocks jtag_drck] -group [get_clocks -include_generated_clocks sys_clk] -group [get_clocks eth_rxc]
+    set_clock_groups -asynchronous -group [get_clocks eth_rxc] -group [get_clocks -include_generated_clocks lclk_rx]
+} else {
+    set rtl [concat $rtl_b src/rtl/top/board_b_top.sv]
     # (the FP24 SFU / sin tables this reads by $readmemh are checked at the top, for both boards)
     read_verilog -sv [concat $rtl $link_rtl]
     read_xdc src/constrs/board_b.xdc
@@ -136,7 +158,7 @@ if {[info exists ::env(SYNTH_ONLY)]} { puts "SYNTH_ONLY_DONE $tag"; exit 0 }
 # east): spread the placement and push timing. A with the 3D path (high slice use,
 # routing-dominated failing paths in the vertex core) gets the same treatment. Directives can be overridden with
 # PLACE_DIRECTIVE / ROUTE_DIRECTIVE; PHYS_OPT=Default for a quick flow.
-set big [expr {$role eq "B" || $role eq "A"}]
+set big [expr {$role eq "B" || $role eq "A" || $role eq "S"}]
 # AltSpreadLogic_high is the default for BOTH boards: at 93-94 % slices the directives differ mostly by placement
 # variance, so the RTL fixes of the failing path families are what closes timing, not the directive. PLACE_DIRECTIVE overrides.
 set place_dir [expr {[info exists ::env(PLACE_DIRECTIVE)] ? $::env(PLACE_DIRECTIVE) : ($big ? "AltSpreadLogic_high" : "Default")}]
@@ -144,8 +166,8 @@ set route_dir [expr {[info exists ::env(ROUTE_DIRECTIVE)] ? $::env(ROUTE_DIRECTI
 set po_dir [expr {[info exists ::env(PHYS_OPT)] ? $::env(PHYS_OPT) : ($big ? "AggressiveExplore" : "Default")}]
 # Board B: opt_design ExploreWithRemap and a fanout-replication phys_opt pass right after
 # placement (high-fanout nets routed across the die fail timing otherwise). OPT_DIRECTIVE / PHYS_OPT_FANOUT=0|1 override.
-set opt_dir [expr {[info exists ::env(OPT_DIRECTIVE)] ? $::env(OPT_DIRECTIVE) : ($role eq "B" ? "ExploreWithRemap" : "Default")}]
-set po_fan [expr {[info exists ::env(PHYS_OPT_FANOUT)] ? $::env(PHYS_OPT_FANOUT) : ($role eq "B" ? 1 : 0)}]
+set opt_dir [expr {[info exists ::env(OPT_DIRECTIVE)] ? $::env(OPT_DIRECTIVE) : ($role ne "A" ? "ExploreWithRemap" : "Default")}]
+set po_fan [expr {[info exists ::env(PHYS_OPT_FANOUT)] ? $::env(PHYS_OPT_FANOUT) : ($role ne "A" ? 1 : 0)}]
 puts "=== opt_design -directive $opt_dir, place_design -directive $place_dir, phys_opt_design -directive [expr {$po_fan ? "AggressiveFanoutOpt + " : ""}]$po_dir, route_design -directive $route_dir ==="
 opt_design -directive $opt_dir
 # board B: a Pblock around tmu24's A stage (tools/b_floorplan.tcl; B_PBLOCK=0 turns it off)
@@ -171,15 +193,18 @@ report_utilization    -hierarchical -hierarchical_depth 4 -file tools/gen/${tag}
 report_io             -file tools/gen/${tag}_io.txt
 report_clock_utilization -file tools/gen/${tag}_clocks.txt
 report_clock_interaction -file tools/gen/${tag}_clock_interaction.txt
-if {$role eq "A"} {
+if {$role ne "B"} {
     report_timing -group [get_clocks eth_rxc] -delay_type max -max_paths 20 -file tools/gen/${tag}_eth_paths.txt
     # RGMII receive capture at the default IDELAY tap: worst setup and hold paths from the pins
     report_timing -from [get_ports {rgmii_rx_ctl rgmii_rxd[*]}] -delay_type max -max_paths 4 -file tools/gen/${tag}_rgmii_rx_setup.txt
     report_timing -from [get_ports {rgmii_rx_ctl rgmii_rxd[*]}] -delay_type min -max_paths 4 -file tools/gen/${tag}_rgmii_rx_hold.txt
-} else {
+}
+if {$role ne "A"} {
     report_timing -group [get_clocks {vid_pix vid_ser}] -delay_type max -max_paths 20 -file tools/gen/${tag}_video_paths.txt
 }
-report_timing -group [get_clocks {link_l0 link_l90 link_l270}] -delay_type max -max_paths 10 -file tools/gen/${tag}_link_paths.txt
+if {$role ne "S"} {
+    report_timing -group [get_clocks {link_l0 link_l90 link_l270}] -delay_type max -max_paths 10 -file tools/gen/${tag}_link_paths.txt
+}
 set wns [get_property SLACK [get_timing_paths -delay_type max]]
 set whs [get_property SLACK [get_timing_paths -delay_type min]]
 puts "TIMING WNS=$wns WHS=$whs"

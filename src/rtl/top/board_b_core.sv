@@ -46,6 +46,8 @@ module board_b_core
     parameter int    B3D_NLINES     = 4,
     parameter int    B3D_MAXW       = 1280,          // widest render target (1280 x 800 is the largest mode)
     parameter int    B3D_CELLS      = 4096,          // band-buffer cells per bank: 8-line bands up to 1024 wide
+    parameter int    B3D_NLMAX      = 8,             // band rows of targets up to B3D_BAND8_MAXW wide (b_render NLMAX / BAND8_MAXW;
+    parameter int    B3D_BAND8_MAXW = 1024,          // board A's BAND8_MAXW must be the same; 0 = B3D_NLINES-row bands always)
     parameter bit    VOL3D          = 1'b0,          // hardware 3D textures (tmu24 / fb_cmd_b): off on the board (slice room)
     // optional fragment-core operations (b_render FS_XSFU / FS_XCLAMP). STATUS flags bits 28 / 29 report them, so a
     // driver knows what the board's programs may contain
@@ -67,7 +69,16 @@ module board_b_core
     // fragment core; FS_PRE: the program fetch ahead of the launch, off — b_render FS_PRE 0 folds its logic away
     parameter bit    B3D_TEX_SKIP   = 1'b1,
     parameter bit    B3D_TEX_W2     = 1'b1,
-    parameter bit    B3D_FS_PRE     = 1'b0
+    parameter bit    B3D_FS_PRE     = 1'b0,
+    // one-chip board (board_ab_core): EXT_ARB 1 = the memory ports go out (xr_* / xw_*) to one arbiter shared with board A's
+    // core and app_* stay idle; EXT_LINK 1 = link_b_port's link side goes out (xl_*) to link_loop and the board link is idle
+    // (both instances stay, their outputs unused)
+    parameter bit    EXT_ARB        = 1'b0,
+    parameter bit    EXT_LINK       = 1'b0,
+    // scanout: the widest mode and the line buffer's lines (disp_b MAXW / LB_LINES; wider modes are refused)
+    parameter int    DISP_MAXW      = 1280,
+    parameter int    DISP_LB_LINES  = 16,
+    parameter bit    B3D_SFU_TAB2   = 1'b0           // the fragment core's SFU tables shared by pairs of units (bit-identical)
 )(
     input  wire         clk_sys, rst_sys, calib_done,
     input  wire         clk200,                  // 200 MHz (BUFG) for the video and link MMCMs
@@ -90,7 +101,28 @@ module board_b_core
     // board link headers
     inout  wire [31:0]  jm1, jm2,
     output wire [1:0]   led,
-    output wire [B_STATUS_WORDS*32-1:0] status_vec
+    output wire [B_STATUS_WORDS*32-1:0] status_vec,
+    // EXT_ARB: the arbiter's ports (R0 scanout, R1 READ / COPY, R2 xfer_lin, R3 band load, R4 TMU, R5 buckets / programs;
+    // W0 WRITE_IMAGE, W1 xfer_lin, W2 FILL / COPY, W3 band flush), mem_arb's contract; R0 must be the shared arbiter's
+    // MUST_RUN port
+    output wire [5:0]       xr_en,
+    output wire [6*29-1:0]  xr_addr,
+    input  wire [5:0]       xr_rdy, xr_valid,
+    input  wire [255:0]     xrd_data,
+    output wire [3:0]       xw_req, xw_en, xw_wren, xw_wend,
+    output wire [4*29-1:0]  xw_addr,
+    output wire [4*256-1:0] xw_data,
+    output wire [4*32-1:0]  xw_mask,
+    input  wire [3:0]       xw_rdy, xw_wdf_rdy,
+    // EXT_LINK: link_b_port's side of the link, link_core's user contract
+    output wire             xl_tx_valid,
+    output wire [63:0]      xl_tx_data,
+    output wire             xl_tx_cnt2, xl_tx_last,
+    input  wire             xl_tx_ready,
+    input  wire             xl_rx_valid,
+    input  wire [63:0]      xl_rx_data,
+    input  wire             xl_rx_cnt2, xl_rx_last, xl_rx_hdr,
+    output wire             xl_rx_ready
 );
     import fb_pkg::*;
     localparam [31:0] B_STATUS_LAYOUT = 32'hB000_0004;   // 4: the JTAG frame carries 24 more words, 24-47 = b_render's hwprof (the link STATUS and status_vec are unchanged)
@@ -110,13 +142,32 @@ module board_b_core
     wire [5:0] r_en, r_rdy, r_valid; wire [173:0] r_addr; wire [255:0] rd_data;
     wire [3:0] w_req, w_en, w_wren, w_wend, w_rdy, w_wdf_rdy; wire [115:0] w_addr;
     wire [1023:0] w_data; wire [127:0] w_mask;
+    wire [5:0] m_r_rdy, m_r_valid; wire [255:0] m_rd_data; wire [3:0] m_w_rdy, m_w_wdf_rdy;
+    wire m_app_en, m_app_wdf_wren, m_app_wdf_end; wire [2:0] m_app_cmd; wire [28:0] m_app_addr;
+    wire [255:0] m_app_wdf_data; wire [31:0] m_app_wdf_mask;
     mem_arb #(.NR(6), .NW(4), .RO_AW(5), .RO_RESERVE(4), .MUST_RUN(6'b000001)) u_arb (
-        .clk(clk_sys), .rst(rst_ddr), .r_en(r_en), .r_addr(r_addr), .r_rdy(r_rdy), .r_valid(r_valid), .rd_data(rd_data),
+        .clk(clk_sys), .rst(rst_ddr), .r_en(r_en), .r_addr(r_addr), .r_rdy(m_r_rdy), .r_valid(m_r_valid), .rd_data(m_rd_data),
         .w_req(w_req), .w_en(w_en), .w_addr(w_addr), .w_data(w_data), .w_mask(w_mask), .w_wren(w_wren),
-        .w_wend(w_wend), .w_rdy(w_rdy), .w_wdf_rdy(w_wdf_rdy),
-        .app_en(app_en), .app_cmd(app_cmd), .app_addr(app_addr), .app_wdf_data(app_wdf_data),
-        .app_wdf_mask(app_wdf_mask), .app_wdf_wren(app_wdf_wren), .app_wdf_end(app_wdf_end),
+        .w_wend(w_wend), .w_rdy(m_w_rdy), .w_wdf_rdy(m_w_wdf_rdy),
+        .app_en(m_app_en), .app_cmd(m_app_cmd), .app_addr(m_app_addr), .app_wdf_data(m_app_wdf_data),
+        .app_wdf_mask(m_app_wdf_mask), .app_wdf_wren(m_app_wdf_wren), .app_wdf_end(m_app_wdf_end),
         .app_rdy(app_rdy), .app_wdf_rdy(app_wdf_rdy), .app_rd_data_valid(app_rd_data_valid), .app_rd_data(app_rd_data));
+    // EXT_ARB: the ports go to the shared arbiter instead; u_arb's outputs are then unused (and synthesis drops it)
+    assign r_rdy   = EXT_ARB ? xr_rdy     : m_r_rdy;
+    assign r_valid = EXT_ARB ? xr_valid   : m_r_valid;
+    assign rd_data = EXT_ARB ? xrd_data   : m_rd_data;
+    assign w_rdy   = EXT_ARB ? xw_rdy     : m_w_rdy;
+    assign w_wdf_rdy = EXT_ARB ? xw_wdf_rdy : m_w_wdf_rdy;
+    assign app_en       = EXT_ARB ? 1'b0 : m_app_en;
+    assign app_cmd      = EXT_ARB ? 3'd0 : m_app_cmd;
+    assign app_addr     = EXT_ARB ? 29'd0 : m_app_addr;
+    assign app_wdf_data = EXT_ARB ? 256'd0 : m_app_wdf_data;
+    assign app_wdf_mask = EXT_ARB ? 32'd0 : m_app_wdf_mask;
+    assign app_wdf_wren = EXT_ARB ? 1'b0 : m_app_wdf_wren;
+    assign app_wdf_end  = EXT_ARB ? 1'b0 : m_app_wdf_end;
+    assign xr_en = r_en; assign xr_addr = r_addr;
+    assign xw_req = w_req; assign xw_en = w_en; assign xw_addr = w_addr; assign xw_data = w_data; assign xw_mask = w_mask;
+    assign xw_wren = w_wren; assign xw_wend = w_wend;
     // W0: WRITE_IMAGE engine
     wire        iw_cv, iw_crdy, iw_dv, iw_drdy, iw_busy; wire [1:0] iw_sf; wire [29:0] iw_row; wire [15:0] iw_pitch;
     wire [12:0] iw_x, iw_w, iw_i0; wire [23:0] iw_npix; wire [7:0] iw_tfmt; wire [31:0] iw_dd, iw_pixels;
@@ -165,7 +216,8 @@ module board_b_core
     wire [29:0] h_pres_base; wire [15:0] h_pres_pitch; wire [12:0] h_pres_w, h_pres_h; wire [31:0] h_pres_tag;
     // the harness starts nothing while the command processor is busy, so the two never request together
     wire        d_cp = c_pres_valid;
-    disp_b #(.DEFAULT_MODE(DEFAULT_MODE), .SIM_MODE4(SIM_MODE4), .LOCK_TIMEOUT(LOCK_TIMEOUT), .MS_CYCLES(MS_CYCLES)) u_disp (
+    disp_b #(.DEFAULT_MODE(DEFAULT_MODE), .SIM_MODE4(SIM_MODE4), .LOCK_TIMEOUT(LOCK_TIMEOUT), .MS_CYCLES(MS_CYCLES),
+             .MAXW(DISP_MAXW), .LB_LINES(DISP_LB_LINES)) u_disp (
         .clk(clk_sys), .rst(rst_ddr), .clkin200(clk200),
         .set_mode(c_set_mode | h_set_mode), .set_mode_id(c_set_mode ? c_set_mode_id : h_set_mode_id),
         .mode_busy(mode_busy), .mode_done(mode_done),
@@ -230,7 +282,8 @@ module board_b_core
     wire [24*32-1:0] rd_prof;                           // the render engine's cumulative profile counters (b_render hwprof): JTAG words 24-47
     // FS_TEXQ stays b_render's default (no override here: with 2 live TEXes multi-texture shaders run about 8 cycles per
     // quad per sample)
-    b_render #(.NLINES(B3D_NLINES), .MAXW(B3D_MAXW), .CELLS(B3D_CELLS), .NTS(B3D_NTS), .FS_NWARP(B3D_NWARP), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
+    b_render #(.NLINES(B3D_NLINES), .NLMAX(B3D_NLMAX), .BAND8_MAXW(B3D_BAND8_MAXW), .MAXW(B3D_MAXW), .CELLS(B3D_CELLS), .NTS(B3D_NTS),
+               .FS_SFU_TAB2(B3D_SFU_TAB2), .FS_NWARP(B3D_NWARP), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
                .TEX_SKIP(B3D_TEX_SKIP), .TEX_W2(B3D_TEX_W2), .FS_PRE(B3D_FS_PRE), .FS_XSFU(B3D_XSFU), .FS_XCLAMP(B3D_XCLAMP), .FS_QRINF(B3D_QRINF)) u_render (.clk(clk_sys), .rst(rst_ddr),
         .rs_valid, .rs_valid2, .rs_data, .rs_data2, .rs_ready, .rs_take2, .go(rd_go), .discard(rd_discard), .abort(rs_abort), .rt_base(rd_rt_base), .rt_bpl(rd_rt_bpl), .rt_width(rd_rt_width),
         .rt_height(rd_rt_height), .rt_fmt(rd_rt_fmt), .depth16(rd_depth16), .ds_en(rd_ds_en), .ds_base(rd_ds_base), .ds_bpl(rd_ds_bpl),
@@ -250,7 +303,7 @@ module board_b_core
 
     // ---------------- board link ----------------
     wire lclk, lclk90, lclk270, rst_lclk, lclk_locked;
-    link_clk #(.LINK_MHZ(LINK_MHZ)) u_lclk (.clk200(clk200), .rst(rst_s), .lclk(lclk), .lclk90(lclk90),
+    link_clk #(.LINK_MHZ(LINK_MHZ), .OFF(EXT_LINK)) u_lclk (.clk200(clk200), .rst(rst_s), .lclk(lclk), .lclk90(lclk90),
         .lclk270(lclk270), .rst_lclk(rst_lclk), .locked(lclk_locked));
     wire        l_tx_valid, l_tx_cnt2, l_tx_last, l_tx_ready, l_rx_valid, l_rx_cnt2, l_rx_last, l_rx_hdr, l_rx_ready;
     wire [63:0] l_tx_data, l_rx_data;
@@ -259,20 +312,37 @@ module board_b_core
     wire [31:0] l_xoff, l_tx_pkts, l_rx_words, l_rx_pkts, l_par, l_crc, l_seq, l_frm, l_drops, l_parmap, l_retx, l_disc;
     wire [8*32-1:0] l_diag;
     reg  [31:0] linkctl;
+    // link_core's own outputs; with EXT_LINK the link side is xl_* and the link reads as up and trained, its counters 0
+    wire        lc_tx_ready, lc_rx_valid, lc_rx_cnt2, lc_rx_last, lc_rx_hdr; wire [63:0] lc_rx_data;
+    wire        lc_lock, lc_trained, lc_rx_clk_ok, lc_far_up, lc_training, lc_guard_fail, lc_tx_enabled;
+    wire [7:0]  lc_eye, lc_phase, lc_train_cnt;
+    wire [31:0] lc_xoff, lc_tx_pkts, lc_rx_words, lc_rx_pkts, lc_par, lc_crc, lc_seq, lc_frm, lc_drops, lc_parmap, lc_retx, lc_disc;
+    wire [8*32-1:0] lc_diag;
     link_core #(.ROLE("B"), .LINK_MHZ(LINK_MHZ), .MMCM_RST_CYCLES(LINK_MMCM_RST), .GUARD_CYCLES(LINK_GUARD),
                 .IDLE_TIMEOUT(LINK_IDLE_TO), .TRAIN_WORDS(LINK_TRAIN_WORDS), .RETRY_CYCLES(LINK_RETRY),
-                .RELOCK_CYCLES(LINK_RELOCK), .RETRAIN_WINDOW(LINK_RWIN), .SIM_SHIFTER(LINK_SIM_SHIFTER)) u_link (
+                .RELOCK_CYCLES(LINK_RELOCK), .RETRAIN_WINDOW(LINK_RWIN), .SIM_SHIFTER(LINK_SIM_SHIFTER), .OFF(EXT_LINK)) u_link (
         .clk(clk_sys), .rst(rst_s), .lclk(lclk), .lclk90(lclk90), .lclk270(lclk270), .rst_lclk(rst_lclk),
         .fill_en(linkctl[0]),
-        .tx_valid(l_tx_valid), .tx_data(l_tx_data), .tx_cnt2(l_tx_cnt2), .tx_last(l_tx_last), .tx_ready(l_tx_ready),
-        .rx_valid(l_rx_valid), .rx_data(l_rx_data), .rx_cnt2(l_rx_cnt2), .rx_last(l_rx_last), .rx_hdr(l_rx_hdr),
-        .rx_ready(l_rx_ready), .pkt_done(), .pkt_ok(),
-        .lock(l_lock), .trained(l_trained), .rx_clk_ok(l_rx_clk_ok), .far_up(l_far_up), .training(l_training),
-        .guard_fail(l_guard_fail), .tx_enabled(l_tx_enabled), .xoff_events(l_xoff),
-        .eye_width(l_eye), .phase(l_phase), .train_cnt(l_train_cnt),
-        .tx_pkts(l_tx_pkts), .rx_words(l_rx_words), .rx_pkts(l_rx_pkts), .par_errs(l_par), .crc_errs(l_crc),
-        .seq_errs(l_seq), .frm_errs(l_frm), .lock_drops(l_drops), .par_map(l_parmap), .retx(l_retx), .disc(l_disc),
-        .diag(l_diag), .jm1(jm1), .jm2(jm2));
+        .tx_valid(l_tx_valid & ~EXT_LINK), .tx_data(l_tx_data), .tx_cnt2(l_tx_cnt2), .tx_last(l_tx_last), .tx_ready(lc_tx_ready),
+        .rx_valid(lc_rx_valid), .rx_data(lc_rx_data), .rx_cnt2(lc_rx_cnt2), .rx_last(lc_rx_last), .rx_hdr(lc_rx_hdr),
+        .rx_ready(l_rx_ready & ~EXT_LINK), .pkt_done(), .pkt_ok(),
+        .lock(lc_lock), .trained(lc_trained), .rx_clk_ok(lc_rx_clk_ok), .far_up(lc_far_up), .training(lc_training),
+        .guard_fail(lc_guard_fail), .tx_enabled(lc_tx_enabled), .xoff_events(lc_xoff),
+        .eye_width(lc_eye), .phase(lc_phase), .train_cnt(lc_train_cnt),
+        .tx_pkts(lc_tx_pkts), .rx_words(lc_rx_words), .rx_pkts(lc_rx_pkts), .par_errs(lc_par), .crc_errs(lc_crc),
+        .seq_errs(lc_seq), .frm_errs(lc_frm), .lock_drops(lc_drops), .par_map(lc_parmap), .retx(lc_retx), .disc(lc_disc),
+        .diag(lc_diag), .jm1(jm1), .jm2(jm2));
+    assign l_tx_ready = EXT_LINK ? xl_tx_ready : lc_tx_ready;
+    assign {l_rx_valid, l_rx_data, l_rx_cnt2, l_rx_last, l_rx_hdr} = EXT_LINK ? {xl_rx_valid, xl_rx_data, xl_rx_cnt2, xl_rx_last, xl_rx_hdr}
+                                                                             : {lc_rx_valid, lc_rx_data, lc_rx_cnt2, lc_rx_last, lc_rx_hdr};
+    assign {l_lock, l_trained, l_rx_clk_ok, l_far_up, l_training, l_guard_fail, l_tx_enabled} =
+           EXT_LINK ? 7'b111_1001 : {lc_lock, lc_trained, lc_rx_clk_ok, lc_far_up, lc_training, lc_guard_fail, lc_tx_enabled};
+    assign {l_eye, l_phase, l_train_cnt} = EXT_LINK ? 24'd0 : {lc_eye, lc_phase, lc_train_cnt};
+    assign {l_xoff, l_tx_pkts, l_rx_words, l_rx_pkts, l_par, l_crc, l_seq, l_frm, l_drops, l_parmap, l_retx, l_disc} = EXT_LINK ? 384'd0 :
+           {lc_xoff, lc_tx_pkts, lc_rx_words, lc_rx_pkts, lc_par, lc_crc, lc_seq, lc_frm, lc_drops, lc_parmap, lc_retx, lc_disc};
+    assign l_diag = EXT_LINK ? '0 : lc_diag;
+    assign xl_tx_valid = l_tx_valid; assign xl_tx_data = l_tx_data; assign xl_tx_cnt2 = l_tx_cnt2; assign xl_tx_last = l_tx_last;
+    assign xl_rx_ready = l_rx_ready;
     wire        cw_valid, cw_first, cw_last, cw_ready, cw_old, ev_valid, ev_ready, lrd_req, lrd_valid, lrd_ready;
     wire [31:0] cw_data, c_cmd_pkts, c_lunk, lrd_data, c_cur_pkts, cb_consumed; wire [159:0] ev_data; wire [15:0] lrd_words;
     wire [B_LSTAT_WORDS*32-1:0] lstat;

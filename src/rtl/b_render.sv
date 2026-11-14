@@ -94,6 +94,7 @@ module b_render #(
     // the core's TEX write ordering (hzr) does not depend on them
     parameter int    FS_QRINF = 4,                 // the fragment core's quarter-rate micro-ops in flight per class (shader_core_fs2
                                                    // QR_INF; 4: a trig-heavy shader does not wait for its class)
+    parameter bit    FS_SFU_TAB2 = 1'b0,          // the fragment core's SFU tables shared by pairs of units (shader_core_fs2 SFU_TAB2)
     parameter bit    FS_XSFU  = 1'b1,             // the fragment core's SQRT / RCPM / RSQM: the SFU's result times an operand, one
                                                    // micro-op (shader_core_fs2 XSFU)
     parameter bit    FS_XCLAMP = 1'b0,             // the fragment core's CLAMP: MIN(MAX(x, lo), hi) in one micro-op (XCLAMP); off
@@ -366,7 +367,7 @@ module b_render #(
     wire        tx_req, tx_ready, tx_res_v; wire [4:0] tx_samp; wire [1:0] tx_mode; wire [8*W-1:0] tx_uv, tx_zw;
     wire [VW-1:0] tx_res;
     wire [21:0] fs_pev; wire [1:0] tm_pev;                   // profile events of the core and the texture unit
-    shader_core_fs2 #(.PROF(PROF), .EXP_W(7), .MAN_W(16), .NWARP(FS_NWARP), .NPARAM(64), .NTS(NTS), .TEXQ(FS_TEXQ), .TEXW2(TEX_W2), .STO2(FS_STO2), .TEX2(FS_TEX2), .LDV_MODE(FS_LDV), .ADD_DSP(FS_ADD_DSP), .XSFU(FS_XSFU), .XCLAMP(FS_XCLAMP), .QR_INF(FS_QRINF)) u_fs (.clk, .rst(rst_q),
+    shader_core_fs2 #(.PROF(PROF), .EXP_W(7), .MAN_W(16), .NWARP(FS_NWARP), .NPARAM(64), .NTS(NTS), .TEXQ(FS_TEXQ), .TEXW2(TEX_W2), .STO2(FS_STO2), .TEX2(FS_TEX2), .LDV_MODE(FS_LDV), .ADD_DSP(FS_ADD_DSP), .XSFU(FS_XSFU), .XCLAMP(FS_XCLAMP), .QR_INF(FS_QRINF), .SFU_TAB2(FS_SFU_TAB2)) u_fs (.clk, .rst(rst_q),
         .iram_we(ld_iram_we), .iram_waddr({ld_bank, ld_iram_addr}), .iram_wdata(ld_iram_data),
         .param_we(ld_par_we), .param_idx({ld_bank, ld_par_idx}), .param_data(ld_par_data),
         .vw_we(fs_vw_we), .vw_row(fs_vw_row), .vw_quad(fs_vw_quad), .vw_data(fs_vw_data),

@@ -35,6 +35,15 @@
 // from (or drops, when the primitive is still current). Visits (band markers, primitives, the end) queue 16 deep; a
 // primitive's header lands in its slot of the queue when it returns, and the rasterizer takes a visit once it has. Up to
 // 30 reads are in flight.
+// SHALLOW_RAM: the style of the shallow, wide bin-list queue (bq) — block RAM, or LUTs in the one-board build (ONE_CHIP),
+// where block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module a_render #(
     parameter int NL = 4, BANDW = 10, IDX_W = 20, DID_W = 12, PTR_W = 23, COUNT_W = 16,
@@ -129,7 +138,7 @@ module a_render #(
     // keeps about 6 visits of look-ahead); `bres` = slots reserved for bursts issued, not landed
     // (block RAM rather than 8 192 bits of LUTRAM; the one read is registered into tb, so the RAM's output
     // register is tb itself, loaded in W_TRIW. bq_cnt != 0 keeps the read address off the write address.)
-    (* ram_style = "block" *) reg [255:0] bq [0:31];
+    (* ram_style = `SHALLOW_RAM *) reg [255:0] bq [0:31];
     reg  [5:0]  bq_w, bq_r; reg [5:0] bres;
     wire [5:0]  bq_cnt = bq_w - bq_r;
     wire [6:0]  bq_free = 7'd32 - 7'(bq_cnt) - 7'(bres);

@@ -18,6 +18,15 @@
 //   one float_mul, one reciprocal, one integer -> float converter. The record is written to A's DDR at REC_BASE + id *
 //   128 words (512 B per id, as B's record store) through a mem_arb write port, and {id, draw id, band range} is pushed
 //   to tri_binner; bands are NL rows.
+// SHALLOW_RAM: the style of the shallow, wide record buffer (rmem) — block RAM, or LUTs in the one-board build
+// (ONE_CHIP), where block RAM is the scarcer resource; the behaviour is the same
+`ifndef SHALLOW_RAM
+`ifdef ONE_CHIP
+`define SHALLOW_RAM "distributed"
+`else
+`define SHALLOW_RAM "block"
+`endif
+`endif
 `default_nettype none
 module a_setup #(
     parameter int EXP_W = 7, MAN_W = 16,
@@ -256,7 +265,7 @@ module a_setup #(
     //      block 0's first words and stay) follows a row per cycle; the slopes (words 18 / 19) ride in registers until then.
     //      The read port feeds w_data a row per beat. (In flip-flops with per-word writes the two buffers would cost
     //      ≈ 4 k FF + 6 k LUT.)
-    (* ram_style = "block" *) reg [255:0] rmem [0:31];
+    (* ram_style = `SHALLOW_RAM *) reg [255:0] rmem [0:31];
     reg blkq_v = 1'b0, blkq_ph = 1'b0, blkq_buf = 1'b0; reg [3:0] blkq_k = 4'd0; reg [319:0] blkq_d;   // the block queue: one block, two rows
     reg [3:0] hw_pend = 4'd0;                                                                         // the header writer: rows still to write
     reg bk_go, b_slp_ok;                                                                              // the hand-off pulse; the slopes have landed

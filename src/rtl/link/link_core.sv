@@ -46,7 +46,10 @@ module link_core #(
     parameter int ARQ_ACK_EVERY  = 4,
     parameter int ARQ_ACK_TO     = 200,
     parameter int ARQ_NAK_HOLD   = 2000,
-    parameter bit SIM_SHIFTER  = 1'b0
+    parameter bit SIM_SHIFTER  = 1'b0,
+    parameter bit OFF          = 1'b0         // 1: no lanes at all (the one-board design, link_loop instead): no PHY, buffers,
+                                              // FIFOs or MMCM; the user side idle (tx_ready, rx_valid low), every status 0,
+                                              // jm1 / jm2 undriven
 )(
     input  wire        clk, rst,
     input  wire        lclk, lclk90, lclk270, rst_lclk,
@@ -129,7 +132,16 @@ module link_core #(
     end
 
     generate
-    if (ROLE == "A") begin : g_a
+    if (OFF) begin : g_off
+        assign tx_ready = 1'b0;
+        assign {rx_valid, rx_data, rx_cnt2, rx_last, rx_hdr, pkt_done, pkt_ok} = '0;
+        assign {lclk_rx, rx_locked, rx_xoff_raw, rx_up_raw, lclk_sense, trained_i, lock_i, err_drop, rx_pop} = '0;
+        assign {rewinds_l, timeouts_l, disc_c, naks_c, tx_pkts_l, tx_training_l, rxf_count} = '0;
+        assign {eye_width, phase, train_cnt} = '0;
+        assign {rx_words, rx_pkts, par_errs, crc_errs, seq_errs, frm_errs, lock_drops, par_map} = '0;
+        assign {a_ack_stb, a_ack_nak, a_ack_seq, a_ctl_stb, a_ctl_nak, a_ctl_seq} = '0;
+        for (genvar k = 0; k < 8; k++) begin : g_dz assign dg[k] = 32'd0; end
+    end else if (ROLE == "A") begin : g_a
         // ---------------- TX: forward lane (64-bit beats) ----------------
         wire txf_full, txf_empty, txf_ren; wire [65:0] txf_rdata;
         assign tx_ready = ~txf_full;

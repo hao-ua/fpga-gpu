@@ -17,7 +17,10 @@ module float_sfu #(
                                                   //    (the vertex core's SFU_SPLIT1B); the setup / clip units keep 0
     parameter bit SPLIT6 = 1'b0,                  // 1: the round add in its own stage (latency 11) — the fragment core;
                                                   //    the vertex core passes SFU_SPLIT6
-    parameter     RCP_MEM="", RSQRT_MEM="", LOG2_MEM="", EXP2_MEM=""
+    parameter     RCP_MEM="", RSQRT_MEM="", LOG2_MEM="", EXP2_MEM="",
+    parameter bit TAB_EXT = 1'b0                  // 1: the four tables are outside (sfu_tab2, shared by two units): the S1 addresses
+                                                  //    go out on t_*_a / t_*_i, the registered words come back on t_*_q / t_l* /
+                                                  //    t_e* one cycle later, as the tables' own reads here (same results)
 )(
     input  wire                 clk,
     input  wire                 rst,
@@ -25,24 +28,18 @@ module float_sfu #(
     input  wire [2:0]           op,             // 0 RCP 1 RSQRT 2 LOG2 3 EXP2
     input  wire [EXP_W+MAN_W:0] x,
     output reg                  out_valid,
-    output reg  [EXP_W+MAN_W:0] result
+    output reg  [EXP_W+MAN_W:0] result,
+    // TAB_EXT: the table requests (S1 addresses) and their words; unused otherwise
+    output wire [K-1:0]         t_rcp_a, t_rsq_a,
+    output wire [KLOG-1:0]      t_log_i, t_exp_i,
+    input  wire [MAN_W+1:0]     t_rcp_q, t_rsq_q,
+    input  wire [23:0]          t_la, t_lb, t_ea, t_eb
 );
     localparam int W=1+EXP_W+MAN_W, SIG=MAN_W+1, BIAS=(1<<(EXP_W-1))-1,
                    INF_E=(1<<EXP_W)-1, SW=MAN_W+2, LFW=24, FW=MAN_W+10, FRAC=MAN_W+8;
     localparam int PW=2*FW+6;
     localparam [W-1:0] QNAN={1'b0,{EXP_W{1'b1}},1'b1,{(MAN_W-1){1'b0}}};
     localparam int EXW = EXP_W+4;                 // signed exponent working width
-
-    (* rom_style="block" *) reg [SW-1:0]  rcp_seed   [0:(1<<K)-1];
-    (* rom_style="block" *) reg [SW-1:0]  rsqrt_seed [0:(1<<K)-1];
-    (* rom_style="block" *) reg [LFW-1:0] log2_lut   [0:(1<<KLOG)];
-    (* rom_style="block" *) reg [LFW-1:0] exp2_lut   [0:(1<<KLOG)];
-    initial begin
-        if(RCP_MEM!="")  $readmemh(RCP_MEM,rcp_seed);
-        if(RSQRT_MEM!="")$readmemh(RSQRT_MEM,rsqrt_seed);
-        if(LOG2_MEM!="") $readmemh(LOG2_MEM,log2_lut);
-        if(EXP2_MEM!="") $readmemh(EXP2_MEM,exp2_lut);
-    end
 
     // ===== S0: input register =====
     reg v0; reg [2:0] op0; reg [W-1:0] x0;
@@ -77,9 +74,9 @@ module float_sfu #(
     // ROM->BRAM: register the RAW seed reads (clean `rd <= rom[addr]` = a BRAM output register),
     // then apply the CONSTANT zero-pad + left-shift COMBINATIONALLY (wire-only), so the seed ROMs map to block
     // RAM instead of a fabric LUT-mux tree (an inline pad/shift in the read defeats rom_style="block").
-    reg  [SW-1:0]  rcp_rd, rsqrt_rd;              // (r_Yr0 / rs_Ys0, the padded seeds, are formed after the optional S1b stage)
-    reg [LFW-1:0] l_la,l_lb; reg [MAN_W-KLOG-1:0] l_lo;
-    reg signed [EXW-1:0] x_ipart; reg [LFW-1:0] e_ea,e_eb; reg [FRAC-KLOG-1:0] e_lo;
+    wire [SW-1:0]  rcp_rd, rsqrt_rd;              // (r_Yr0 / rs_Ys0, the padded seeds, are formed after the optional S1b stage)
+    wire [LFW-1:0] l_la,l_lb; reg [MAN_W-KLOG-1:0] l_lo;
+    reg signed [EXW-1:0] x_ipart; wire [LFW-1:0] e_ea,e_eb; reg [FRAC-KLOG-1:0] e_lo;
     // exp2 float->fixed (combinational here)
     wire signed [EXW-1:0] esh=$signed(e)-MAN_W+FRAC;
     wire [SIG+FRAC+EXP_W:0] xext={{(FRAC+EXP_W){1'b0}},sig};
@@ -98,17 +95,43 @@ module float_sfu #(
         nr1<=n_near; nU1<=n_U;
         v1<=v0; op1<=op0; s1<=s_x; z1<=x_zero; i1<=(op0==3'd3) ? x_ebig : x_inf; n1<=x_nan; ng1<=x_neg;
         e1<=e; er1<=$signed(e)>>>1;
-        rcp_rd  <= rcp_seed[mf[MAN_W-1-:K]];                          // raw registered ROM read -> BRAM
         r_Mr <={{(FW+2-SIG){1'b0}},sig}<<(FW-MAN_W);
-        rsqrt_rd<= rsqrt_seed[{elsb,mf[MAN_W-1-:(K-1)]}];             // raw registered ROM read -> BRAM
         rs_base<= elsb ? ({{(FW+3-SIG){1'b0}},sig}<<(FW-MAN_W+1))
                        : ({{(FW+3-SIG){1'b0}},sig}<<(FW-MAN_W));
-        l_la<=log2_lut[mf[MAN_W-1-:KLOG]]; l_lb<=log2_lut[mf[MAN_W-1-:KLOG]+1];
         l_lo<=mf[MAN_W-KLOG-1:0];
         x_ipart<=xfix>>>FRAC;
-        e_ea<=exp2_lut[fpart[FRAC-1-:KLOG]]; e_eb<=exp2_lut[fpart[FRAC-1-:KLOG]+1];
         e_lo<=fpart[FRAC-KLOG-1:0];
     end
+    // the table reads of S1: here (raw registered ROM reads -> block RAM), or outside (TAB_EXT: sfu_tab2 registers them)
+    generate if (TAB_EXT) begin : g_tx
+        assign t_rcp_a = mf[MAN_W-1-:K];
+        assign t_rsq_a = {elsb, mf[MAN_W-1-:(K-1)]};
+        assign t_log_i = mf[MAN_W-1-:KLOG];
+        assign t_exp_i = fpart[FRAC-1-:KLOG];
+        assign rcp_rd = t_rcp_q; assign rsqrt_rd = t_rsq_q;
+        assign l_la = t_la; assign l_lb = t_lb; assign e_ea = t_ea; assign e_eb = t_eb;
+    end else begin : g_ti
+        (* rom_style="block" *) reg [SW-1:0]  rcp_seed   [0:(1<<K)-1];
+        (* rom_style="block" *) reg [SW-1:0]  rsqrt_seed [0:(1<<K)-1];
+        (* rom_style="block" *) reg [LFW-1:0] log2_lut   [0:(1<<KLOG)];
+        (* rom_style="block" *) reg [LFW-1:0] exp2_lut   [0:(1<<KLOG)];
+        initial begin
+            if(RCP_MEM!="")  $readmemh(RCP_MEM,rcp_seed);
+            if(RSQRT_MEM!="")$readmemh(RSQRT_MEM,rsqrt_seed);
+            if(LOG2_MEM!="") $readmemh(LOG2_MEM,log2_lut);
+            if(EXP2_MEM!="") $readmemh(EXP2_MEM,exp2_lut);
+        end
+        reg [SW-1:0] rcp_r, rsqrt_r; reg [LFW-1:0] la_r, lb_r, ea_r, eb_r;
+        always @(posedge clk) begin
+            rcp_r   <= rcp_seed[mf[MAN_W-1-:K]];
+            rsqrt_r <= rsqrt_seed[{elsb,mf[MAN_W-1-:(K-1)]}];
+            la_r <= log2_lut[mf[MAN_W-1-:KLOG]]; lb_r <= log2_lut[mf[MAN_W-1-:KLOG]+1];
+            ea_r <= exp2_lut[fpart[FRAC-1-:KLOG]]; eb_r <= exp2_lut[fpart[FRAC-1-:KLOG]+1];
+        end
+        assign rcp_rd = rcp_r; assign rsqrt_rd = rsqrt_r;
+        assign l_la = la_r; assign l_lb = lb_r; assign e_ea = ea_r; assign e_eb = eb_r;
+        assign {t_rcp_a, t_rsq_a, t_log_i, t_exp_i} = '0;
+    end endgenerate
 
     // ===== S1b (SPLIT1B only): every S1 output registered once more. Without it the rsqrt seed's block RAM read
     //       (rsqrt_rd) feeds the S2 squaring — two cascaded DSP48s — directly: 5.5 ns of logic to the second DSP's

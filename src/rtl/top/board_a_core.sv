@@ -35,7 +35,22 @@ module board_a_core #(
     parameter int    B_ALIVE        = CLK_HZ / 100,        // 10 ms
     parameter int    B_WAIT         = CLK_HZ / 10,         // 100 ms: a B command waits this long for the board link
     parameter int    RENDER_TIMEOUT = 3 * CLK_HZ,          // 3 s: a FLUSH's frame B has not finished by then is aborted
-    parameter bit    LINK_SIM_SHIFTER = 1'b0
+    parameter bit    LINK_SIM_SHIFTER = 1'b0,
+    // one-chip board (board_ab_core): EXT_ARB 1 = the memory ports go out (xr_* / xw_*) to one arbiter shared with board B's
+    // core and app_* stay idle; EXT_LINK 1 = link_a_port's link side goes out (xl_*) to link_loop and the board link is idle
+    // (both instances stay, their outputs unused). Then the geometry stage's DDR regions (word addresses): records at REC_BASE
+    // in two banks of REC_BANK_W words, bin lists at BINLIST_BASE in two pools of POOL_W words
+    parameter bit    EXT_ARB        = 1'b0,
+    parameter bit    EXT_LINK       = 1'b0,
+    parameter [28:0] REC_BASE       = 29'h1000000,
+    parameter [28:0] REC_BANK_W     = 29'h2000000,
+    parameter [28:0] BINLIST_BASE   = 29'h5000000,
+    parameter [28:0] POOL_W         = 29'h800000,
+    // the geometry stage: the vertex core's warps in flight (2..4), and the widest target that gets 8-row bands (wider ones
+    // get 4; it must be board B's b_render BAND8_MAXW; 0 = 4-row bands always)
+    parameter int    VS_NWARP       = 4,
+    parameter int    BAND8_MAXW     = 1024,
+    parameter bit    VS_SFU_TAB2    = 1'b0          // the vertex core's SFU tables shared by pairs of units (bit-identical)
 )(
     input  wire         clk_sys, rst_sys, calib_done, clk_idelay,
     // Ethernet PHY
@@ -56,7 +71,27 @@ module board_a_core #(
     input  wire [255:0] app_rd_data,
     // board link headers
     inout  wire [31:0]  jm1, jm2,
-    output wire [1:0]   led
+    output wire [1:0]   led,
+    // EXT_ARB: the arbiter's ports (R0 ingress ring, R1 transfer engine, R2-R4 geometry; W0 ring, W1 transfer engine,
+    // W2-W3 geometry), mem_arb's contract
+    output wire [4:0]       xr_en,
+    output wire [5*29-1:0]  xr_addr,
+    input  wire [4:0]       xr_rdy, xr_valid,
+    input  wire [255:0]     xrd_data,
+    output wire [3:0]       xw_req, xw_en, xw_wren, xw_wend,
+    output wire [4*29-1:0]  xw_addr,
+    output wire [4*256-1:0] xw_data,
+    output wire [4*32-1:0]  xw_mask,
+    input  wire [3:0]       xw_rdy, xw_wdf_rdy,
+    // EXT_LINK: link_a_port's side of the link, link_core's user contract
+    output wire             xl_tx_valid,
+    output wire [63:0]      xl_tx_data,
+    output wire             xl_tx_cnt2, xl_tx_last,
+    input  wire             xl_tx_ready,
+    input  wire             xl_rx_valid,
+    input  wire [63:0]      xl_rx_data,
+    input  wire             xl_rx_cnt2, xl_rx_last, xl_rx_hdr,
+    output wire             xl_rx_ready
 );
     import fb_pkg::*;
     localparam int RF_AW = 11;
@@ -100,13 +135,32 @@ module board_a_core #(
     wire [4:0] r_en, r_rdy, r_valid; wire [5*29-1:0] r_addr; wire [255:0] rd_data;
     wire [3:0] w_req, w_en, w_wren, w_wend, w_rdy, w_wdf_rdy; wire [4*29-1:0] w_addr;
     wire [4*256-1:0] w_data; wire [4*32-1:0] w_mask;
+    wire [4:0] m_r_rdy, m_r_valid; wire [255:0] m_rd_data; wire [3:0] m_w_rdy, m_w_wdf_rdy;
+    wire m_app_en, m_app_wdf_wren, m_app_wdf_end; wire [2:0] m_app_cmd; wire [28:0] m_app_addr;
+    wire [255:0] m_app_wdf_data; wire [31:0] m_app_wdf_mask;
     mem_arb #(.NR(5), .NW(4), .RO_AW(5), .RO_RESERVE(4), .MUST_RUN(5'b00000)) u_arb (
-        .clk(clk_sys), .rst(rst_ddr), .r_en(r_en), .r_addr(r_addr), .r_rdy(r_rdy), .r_valid(r_valid), .rd_data(rd_data),
+        .clk(clk_sys), .rst(rst_ddr), .r_en(r_en), .r_addr(r_addr), .r_rdy(m_r_rdy), .r_valid(m_r_valid), .rd_data(m_rd_data),
         .w_req(w_req), .w_en(w_en), .w_addr(w_addr), .w_data(w_data), .w_mask(w_mask), .w_wren(w_wren),
-        .w_wend(w_wend), .w_rdy(w_rdy), .w_wdf_rdy(w_wdf_rdy),
-        .app_en(app_en), .app_cmd(app_cmd), .app_addr(app_addr), .app_wdf_data(app_wdf_data),
-        .app_wdf_mask(app_wdf_mask), .app_wdf_wren(app_wdf_wren), .app_wdf_end(app_wdf_end),
+        .w_wend(w_wend), .w_rdy(m_w_rdy), .w_wdf_rdy(m_w_wdf_rdy),
+        .app_en(m_app_en), .app_cmd(m_app_cmd), .app_addr(m_app_addr), .app_wdf_data(m_app_wdf_data),
+        .app_wdf_mask(m_app_wdf_mask), .app_wdf_wren(m_app_wdf_wren), .app_wdf_end(m_app_wdf_end),
         .app_rdy(app_rdy), .app_wdf_rdy(app_wdf_rdy), .app_rd_data_valid(app_rd_data_valid), .app_rd_data(app_rd_data));
+    // EXT_ARB: the ports go to the shared arbiter instead; u_arb's outputs are then unused (and synthesis drops it)
+    assign r_rdy   = EXT_ARB ? xr_rdy     : m_r_rdy;
+    assign r_valid = EXT_ARB ? xr_valid   : m_r_valid;
+    assign rd_data = EXT_ARB ? xrd_data   : m_rd_data;
+    assign w_rdy   = EXT_ARB ? xw_rdy     : m_w_rdy;
+    assign w_wdf_rdy = EXT_ARB ? xw_wdf_rdy : m_w_wdf_rdy;
+    assign app_en       = EXT_ARB ? 1'b0 : m_app_en;
+    assign app_cmd      = EXT_ARB ? 3'd0 : m_app_cmd;
+    assign app_addr     = EXT_ARB ? 29'd0 : m_app_addr;
+    assign app_wdf_data = EXT_ARB ? 256'd0 : m_app_wdf_data;
+    assign app_wdf_mask = EXT_ARB ? 32'd0 : m_app_wdf_mask;
+    assign app_wdf_wren = EXT_ARB ? 1'b0 : m_app_wdf_wren;
+    assign app_wdf_end  = EXT_ARB ? 1'b0 : m_app_wdf_end;
+    assign xr_en = r_en; assign xr_addr = r_addr;
+    assign xw_req = w_req; assign xw_en = w_en; assign xw_addr = w_addr; assign xw_data = w_data; assign xw_mask = w_mask;
+    assign xw_wren = w_wren; assign xw_wend = w_wend;
 
     // ---------------- ingress queue ----------------
     wire         qi_v, qi_rdy, qo_v, qo_rdy; wire [255:0] qi_d, qo_d; wire [RING_LOG2:0] q_used;
@@ -170,8 +224,8 @@ module board_a_core #(
         .g_ad_idx(g_ad_idx), .g_ac_idx(g_ac_idx), .g_ad_en(g_ad_en), .g_ad_type(g_ad_type), .g_ad_norm(g_ad_norm), .g_st_cw(g_st_cw), .g_st_z0(g_st_z0), .g_dr_indexed(g_dr_indexed), .g_dr_u8(g_dr_u8),
         .g_ad_size(g_ad_size), .g_dr_mode(g_dr_mode), .g_ad_stride(g_ad_stride), .g_ad_off(g_ad_off), .g_dr_first(g_dr_first),
         .g_dr_count(g_dr_count), .g_st_cull(g_st_cull), .g_st_lw(g_st_lw), .g_st_did(g_st_did), .g_st_z(g_st_z), .g_st_gb(g_st_gb), .g_st_sc(g_st_sc));
-    // ---------------- the geometry stage (3D on A): two banks of records (64 MB + 128 MB each) and
-    //                  bin lists (320 MB + 32 MB each), the host heap from 384 MB ----------------
+    // ---------------- the geometry stage (3D on A): two banks of records and two pools of bin lists (the defaults: records
+    //                  from 64 MB, 128 MB a bank; bin lists from 320 MB, 32 MB a pool; the host heap from 384 MB) ----------------
     wire        g_busy, g_rbusy, g_fb_ok, g_draw_ok, g_copy_busy, g_frame_done, g_ld_done, g_frame, g_ld_start, g_param_we, g_ad_we, g_ac_we, g_st_we, g_dr_start, g_err_stack;
     wire        g_rec_ovf, g_bin_ovf; wire [47:0] g_st_z, g_st_sc; wire [95:0] g_st_gb;
     wire        g_render, g_render_done, rs_v, rs_r; wire [63:0] rs_d; wire [31:0] g_c_quads, cr_rs_sent, cr_rs_consumed, c_rs_pkts;
@@ -180,7 +234,8 @@ module board_a_core #(
     wire [2:0]  g_ad_size, g_ad_type, g_dr_mode; wire [31:0] g_dr_first, g_dr_count; wire [1:0] g_st_cull; wire [12:0] g_st_did;
     wire [6:0]  g_st_lw; wire [19:0] g_tri_count;
     wire [31:0] g_c_vis; wire [13*32-1:0] g_prof;
-    a_geom #(.REC_BASE(29'h1000000), .REC_BANK_W(29'h2000000), .BINLIST_BASE(29'h5000000), .POOL_W(29'h800000)) u_geom (.clk(clk_sys), .rst(rst_ddr),
+    a_geom #(.REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W), .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .NWARP(VS_NWARP),
+             .BAND8_MAXW(BAND8_MAXW), .VS_SFU_TAB2(VS_SFU_TAB2)) u_geom (.clk(clk_sys), .rst(rst_ddr),
         .g_frame(g_frame), .g_frame_done(g_frame_done), .g_rbusy(g_rbusy), .g_fb_ok(g_fb_ok), .g_draw_ok(g_draw_ok), .g_copy_busy(g_copy_busy),
         .g_ld_start(g_ld_start), .g_ld_addr(g_ld_addr), .g_ld_len(g_ld_len), .g_ld_done(g_ld_done),
         .g_param_we(g_param_we), .g_param_idx(g_param_idx), .g_param_data(g_param_data),
@@ -208,7 +263,7 @@ module board_a_core #(
 
     // ---------------- board link ----------------
     wire lclk, lclk90, lclk270, rst_lclk, lclk_locked;
-    link_clk #(.LINK_MHZ(LINK_MHZ)) u_lclk (.clk200(clk_idelay), .rst(rst_s), .lclk(lclk), .lclk90(lclk90),
+    link_clk #(.LINK_MHZ(LINK_MHZ), .OFF(EXT_LINK)) u_lclk (.clk200(clk_idelay), .rst(rst_s), .lclk(lclk), .lclk90(lclk90),
         .lclk270(lclk270), .rst_lclk(rst_lclk), .locked(lclk_locked));
     wire        l_tx_valid, l_tx_cnt2, l_tx_last, l_tx_ready, l_rx_valid, l_rx_cnt2, l_rx_last, l_rx_hdr, l_rx_ready;
     wire [63:0] l_tx_data, l_rx_data;
@@ -216,20 +271,37 @@ module board_a_core #(
     wire [7:0]  l_eye, l_phase, l_train_cnt;
     wire [31:0] l_xoff, l_tx_pkts, l_rx_words, l_rx_pkts, l_par, l_crc, l_seq, l_frm, l_drops, l_parmap, l_retx, l_disc;
     wire [8*32-1:0] l_diag;
+    // link_core's own outputs; with EXT_LINK the link side is xl_* and the link reads as up and trained, its counters 0
+    wire        lc_tx_ready, lc_rx_valid, lc_rx_cnt2, lc_rx_last, lc_rx_hdr; wire [63:0] lc_rx_data;
+    wire        lc_lock, lc_trained, lc_rx_clk_ok, lc_far_up, lc_training, lc_guard_fail, lc_tx_enabled;
+    wire [7:0]  lc_eye, lc_phase, lc_train_cnt;
+    wire [31:0] lc_xoff, lc_tx_pkts, lc_rx_words, lc_rx_pkts, lc_par, lc_crc, lc_seq, lc_frm, lc_drops, lc_parmap, lc_retx, lc_disc;
+    wire [8*32-1:0] lc_diag;
     link_core #(.ROLE("A"), .LINK_MHZ(LINK_MHZ), .MMCM_RST_CYCLES(LINK_MMCM_RST), .GUARD_CYCLES(LINK_GUARD),
                 .IDLE_TIMEOUT(LINK_IDLE_TO), .TRAIN_WORDS(LINK_TRAIN_WORDS), .RETRY_CYCLES(LINK_RETRY),
-                .RELOCK_CYCLES(LINK_RELOCK), .RETRAIN_WINDOW(LINK_RWIN), .SIM_SHIFTER(LINK_SIM_SHIFTER)) u_link (
+                .RELOCK_CYCLES(LINK_RELOCK), .RETRAIN_WINDOW(LINK_RWIN), .SIM_SHIFTER(LINK_SIM_SHIFTER), .OFF(EXT_LINK)) u_link (
         .clk(clk_sys), .rst(rst_s), .lclk(lclk), .lclk90(lclk90), .lclk270(lclk270), .rst_lclk(rst_lclk),
         .fill_en(linkctl[0]),
-        .tx_valid(l_tx_valid), .tx_data(l_tx_data), .tx_cnt2(l_tx_cnt2), .tx_last(l_tx_last), .tx_ready(l_tx_ready),
-        .rx_valid(l_rx_valid), .rx_data(l_rx_data), .rx_cnt2(l_rx_cnt2), .rx_last(l_rx_last), .rx_hdr(l_rx_hdr),
-        .rx_ready(l_rx_ready), .pkt_done(), .pkt_ok(),
-        .lock(l_lock), .trained(l_trained), .rx_clk_ok(l_rx_clk_ok), .far_up(l_far_up), .training(l_training),
-        .guard_fail(l_guard_fail), .tx_enabled(l_tx_enabled), .xoff_events(l_xoff),
-        .eye_width(l_eye), .phase(l_phase), .train_cnt(l_train_cnt),
-        .tx_pkts(l_tx_pkts), .rx_words(l_rx_words), .rx_pkts(l_rx_pkts), .par_errs(l_par), .crc_errs(l_crc),
-        .seq_errs(l_seq), .frm_errs(l_frm), .lock_drops(l_drops), .par_map(l_parmap), .retx(l_retx), .disc(l_disc),
-        .diag(l_diag), .jm1(jm1), .jm2(jm2));
+        .tx_valid(l_tx_valid & ~EXT_LINK), .tx_data(l_tx_data), .tx_cnt2(l_tx_cnt2), .tx_last(l_tx_last), .tx_ready(lc_tx_ready),
+        .rx_valid(lc_rx_valid), .rx_data(lc_rx_data), .rx_cnt2(lc_rx_cnt2), .rx_last(lc_rx_last), .rx_hdr(lc_rx_hdr),
+        .rx_ready(l_rx_ready & ~EXT_LINK), .pkt_done(), .pkt_ok(),
+        .lock(lc_lock), .trained(lc_trained), .rx_clk_ok(lc_rx_clk_ok), .far_up(lc_far_up), .training(lc_training),
+        .guard_fail(lc_guard_fail), .tx_enabled(lc_tx_enabled), .xoff_events(lc_xoff),
+        .eye_width(lc_eye), .phase(lc_phase), .train_cnt(lc_train_cnt),
+        .tx_pkts(lc_tx_pkts), .rx_words(lc_rx_words), .rx_pkts(lc_rx_pkts), .par_errs(lc_par), .crc_errs(lc_crc),
+        .seq_errs(lc_seq), .frm_errs(lc_frm), .lock_drops(lc_drops), .par_map(lc_parmap), .retx(lc_retx), .disc(lc_disc),
+        .diag(lc_diag), .jm1(jm1), .jm2(jm2));
+    assign l_tx_ready = EXT_LINK ? xl_tx_ready : lc_tx_ready;
+    assign {l_rx_valid, l_rx_data, l_rx_cnt2, l_rx_last, l_rx_hdr} = EXT_LINK ? {xl_rx_valid, xl_rx_data, xl_rx_cnt2, xl_rx_last, xl_rx_hdr}
+                                                                             : {lc_rx_valid, lc_rx_data, lc_rx_cnt2, lc_rx_last, lc_rx_hdr};
+    assign {l_lock, l_trained, l_rx_clk_ok, l_far_up, l_training, l_guard_fail, l_tx_enabled} =
+           EXT_LINK ? 7'b111_1001 : {lc_lock, lc_trained, lc_rx_clk_ok, lc_far_up, lc_training, lc_guard_fail, lc_tx_enabled};
+    assign {l_eye, l_phase, l_train_cnt} = EXT_LINK ? 24'd0 : {lc_eye, lc_phase, lc_train_cnt};
+    assign {l_xoff, l_tx_pkts, l_rx_words, l_rx_pkts, l_par, l_crc, l_seq, l_frm, l_drops, l_parmap, l_retx, l_disc} = EXT_LINK ? 384'd0 :
+           {lc_xoff, lc_tx_pkts, lc_rx_words, lc_rx_pkts, lc_par, lc_crc, lc_seq, lc_frm, lc_drops, lc_parmap, lc_retx, lc_disc};
+    assign l_diag = EXT_LINK ? '0 : lc_diag;
+    assign xl_tx_valid = l_tx_valid; assign xl_tx_data = l_tx_data; assign xl_tx_cnt2 = l_tx_cnt2; assign xl_tx_last = l_tx_last;
+    assign xl_rx_ready = l_rx_ready;
     wire        b_alive; wire [B_LSTAT_WORDS*32-1:0] b_stat; wire [31:0] c_bstat, c_bev, c_bunk, c_brd;
     wire [31:0] cr_sent, cr_consumed, c_cur_sent, c_credit_wait, c_sync, c_rs_wait;
     link_a_port #(.IDLE_CYCLES(KEEPALIVE), .ALIVE_CYCLES(B_ALIVE)) u_lport (

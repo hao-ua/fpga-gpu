@@ -12,7 +12,9 @@ module disp_b #(
     parameter int DEFAULT_MODE = 1,                 // 800x600
     parameter bit SIM_MODE4    = 1'b0,              // accept mode ids 5, 6 (64x48 / 80x40 simulation test modes)
     parameter int LOCK_TIMEOUT = 2_000_000,         // clk cycles
-    parameter int MS_CYCLES    = 100_000            // clk cycles per ms (pixel clock measurement)
+    parameter int MS_CYCLES    = 100_000,           // clk cycles per ms (pixel clock measurement)
+    parameter int MAXW         = 1280,              // the widest mode: the line buffer holds LB_LINES lines of MAXW pixels;
+    parameter int LB_LINES     = 16                 // a mode wider than MAXW is refused (mode_ok 0, as an unknown id)
 )(
     input  wire         clk, rst,                   // clk_sys; rst = DDR-side reset (held until calibration)
     input  wire         clkin200,                   // 200 MHz for the video MMCM
@@ -87,7 +89,10 @@ module disp_b #(
     reg  [97:0] tim;                                // vm_timing() of the running mode
     reg  [4:0]  settle;
     wire        scan_idle;
-    wire        id_ok = (set_mode_id < 3'd5) || (SIM_MODE4 && (set_mode_id == 3'd5 || set_mode_id == 3'd6));
+    wire        id_ok = ((set_mode_id < 3'd5) || (SIM_MODE4 && (set_mode_id == 3'd5 || set_mode_id == 3'd6))) &&
+                        (vm_timing(set_mode_id)[97:86] <= 12'(MAXW));
+    if (vm_timing(3'(DEFAULT_MODE))[97:86] > 12'(MAXW))
+        $error("disp_b: DEFAULT_MODE is wider than MAXW");
     assign mode_busy = (ms != M_IDLE);
     assign video_on  = run;
 
@@ -161,7 +166,7 @@ module disp_b #(
 
     // ---------------- line buffer (16 lines x 1280 px) ----------------
     wire        rd_en, rd_line_done, rd_frame_sync, rd_avail; wire [10:0] rd_idx; wire [31:0] rd_px;
-    display_line_buffer #(.N_LINES(16), .MAX_BURSTS_PER_LINE(160), .MAX_PIXELS_PER_LINE(1280)) u_lb (
+    display_line_buffer #(.N_LINES(LB_LINES), .MAX_BURSTS_PER_LINE((MAXW + 7) / 8), .MAX_PIXELS_PER_LINE(MAXW)) u_lb (
         .wr_clk(clk), .wr_rst(rst), .wr_burst_en(lb_en), .wr_burst_idx(lb_idx), .wr_burst_data(lb_data),
         .wr_line_done(lb_done), .wr_frame_sync(lb_fs), .wr_buf_avail(lb_avail),
         .rd_clk(pix_clk), .rd_rst(px_rst), .rd_pixel_en(rd_en), .rd_pixel_idx(rd_idx), .rd_pixel(rd_px),

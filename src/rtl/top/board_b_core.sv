@@ -58,6 +58,7 @@ module board_b_core
                                                      // a ray-marching shader. In the RTL and the benches, behind this.
     parameter int    B3D_NWARP      = 8,             // fragment-core warps in flight (b_render FS_NWARP; 8 instead of 4 costs
                                                      // about 7.5 k LUT out of context)
+    parameter int    B3D_NL         = 16,            // fragment-core lanes per warp (b_render FS_NL: 16, 8 or 4)
     // slice-room knobs: the TMU's F2 at one pixel per cycle (B3D_F2_DUAL 0: −0.6 k LUT, the texture round trip 35 → 37
     // cycles) and the texture cache's prefetch off (B3D_TC_PF 0: ≈ −0.3 k LUT; the 64 KB capacity gives most of the miss
     // reduction). Both are bit-exact in the benches (tb_tmu24 TB_F2SINGLE / TB_TC_NOPF, the frames with TB_TC_NOPF);
@@ -285,7 +286,7 @@ module board_b_core
     wire [31:0] rd_tjobs, rd_tast, rd_thit, rd_tmiss;   // the texture unit's cumulative counters: status words 18-21
     wire [24*32-1:0] rd_prof;                           // the render engine's cumulative profile counters (b_render hwprof): JTAG words 24-47
     b_render #(.NLINES(B3D_NLINES), .NLMAX(B3D_NLMAX), .BAND8_MAXW(B3D_BAND8_MAXW), .MAXW(B3D_MAXW), .CELLS(B3D_CELLS), .NTS(B3D_NTS), .FS_TEXQ(B3D_TEXQ),
-               .FS_SFU_TAB2(B3D_SFU_TAB2), .FS_INT_DIV(B3D_INT_DIV), .FS_SINCOS(B3D_SINCOS), .FS_NWARP(B3D_NWARP), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
+               .FS_SFU_TAB2(B3D_SFU_TAB2), .FS_INT_DIV(B3D_INT_DIV), .FS_SINCOS(B3D_SINCOS), .FS_NWARP(B3D_NWARP), .FS_NL(B3D_NL), .VOL3D(VOL3D), .F2_DUAL(B3D_F2_DUAL), .TC_PF(B3D_TC_PF),
                .TEX_SKIP(B3D_TEX_SKIP), .TEX_W2(B3D_TEX_W2), .FS_PRE(B3D_FS_PRE), .FS_XSFU(B3D_XSFU), .FS_XCLAMP(B3D_XCLAMP), .FS_QRINF(B3D_QRINF)) u_render (.clk(clk_sys), .rst(rst_ddr),
         .rs_valid, .rs_valid2, .rs_data, .rs_data2, .rs_ready, .rs_take2, .go(rd_go), .discard(rd_discard), .abort(rs_abort), .rt_base(rd_rt_base), .rt_bpl(rd_rt_bpl), .rt_width(rd_rt_width),
         .rt_height(rd_rt_height), .rt_fmt(rd_rt_fmt), .depth16(rd_depth16), .ds_en(rd_ds_en), .ds_base(rd_ds_base), .ds_bpl(rd_ds_bpl),

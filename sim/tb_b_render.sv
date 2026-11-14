@@ -77,9 +77,22 @@ module tb_b_render;
     // 16 fragment-core triangle slots = the board's; -Defines TB_NTS8: 8 slots
 `ifdef TB_NTS8
     localparam int TB_NTS = 8;
+`elsif TB_ONEB
+    localparam int TB_NTS = 8;
 `else
     localparam int TB_NTS = 16;
 `endif
+    // the fragment core's lanes per warp: 16 (4 quads); -Defines TB_LANES8 / TB_LANES4: 8 / 4 (2 / 1 quads a warp)
+`ifdef TB_LANES4
+    localparam int TB_FSNL = 4;
+`elsif TB_LANES8
+    localparam int TB_FSNL = 8;
+`else
+    localparam int TB_FSNL = 16;
+`endif
+    // -Defines TB_ONEB: the one-board design's fragment core (board_ab_core: 4 warps, 4 TEX live, 2 quarter-rate micro-ops
+    // in flight per class, 8 triangle slots, no SQRT / RCPM / RSQM, SIN / COS or integer divider, the SFU tables shared
+    // by pairs of units); pair it with TB_BOARD for the board's texture-unit options
     // CELLS: the board's 4 096 (8-line bands up to 1024 wide); the TB_NL8 what-if needs 640 x 8 = 5 120
 `ifdef TB_FSPRE
     localparam bit TB_PRE = 1'b1;              // -Defines TB_FSPRE: the program fetched ahead of the launch
@@ -126,7 +139,10 @@ module tb_b_render;
 `endif
     // DS_BASE: the draw buckets where tools/b_ref.py's frames put them (B_DS_BASE, inside the one-board design's B heap)
     b_render #(.NLINES(TB_NL), .MAXW(1280), .CELLS((TB_NL == 8) ? 5120 : 4096), .NTS(TB_NTS), .FS_NWARP(TB_FSW), .F2_DUAL(TB_F2D), .TC_PF(TB_TPF), .FS_PRE(TB_PRE),
-               .DS_BASE(29'h0700_0000),
+               .DS_BASE(29'h0700_0000), .FS_NL(TB_FSNL),
+`ifdef TB_ONEB
+               .FS_TEXQ(4), .FS_QRINF(2), .FS_XSFU(1'b0), .FS_SINCOS(1'b0), .FS_INT_DIV(1'b0), .FS_SFU_TAB2(1'b1),
+`endif
                .TEX_SKIP(TB_SKIP), .TEX_W2(TB_W2), .FS_STO2(TB_STO2), .FS_TEX2(TB_TEX2), .FS_LDV(TB_LDV),
 `ifdef TB_ADDDSP
                .FS_ADD_DSP(1'b1),

@@ -1,6 +1,6 @@
 // b_render — board B's render engine: after `go` (FLUSH) it consumes one frame of the render
 // stream and draws it into the render-target image: quad_setup -> early depth -> fragment shader (the scalar
-// core shader_core_fs2: warps of 4 quads, FP24, LDV interpolation) <-> tmu24 -> b_rop, in stream
+// core shader_core_fs2: warps of FS_NL / 4 quads, FP24, LDV interpolation) <-> tmu24 -> b_rop, in stream
 // order; `done` once the frame's FRAME_END is written.
 // Items (64-bit beats {w1, w0}); integer edge values instead of barycentrics;
 // a QUAD is ONE beat and B forms its edge values itself:
@@ -44,7 +44,7 @@
 // stencil off, gl_FragDepth not written (the program holds no STOZ), func not NOTEQUAL unless depth writes are off)
 // and adds the quad to the warp being formed: its launch rows (gl_FragCoord.xy, .zw, gl_PointCoord (mu1, mu2),
 // the weights lambda1, lambda2; two components per pixel; only the weights when the program reads no built-in) are written
-// into the core, its facing bit and triangle slot noted; the warp starts with 4 quads, or earlier when the quad path is
+// into the core, its facing bit and triangle slot noted; the warp starts with FS_NL / 4 quads, or earlier when the quad path is
 // empty and the sequencer waits for quads to finish (slot reuse, a draw change, a band or the frame end) or after 32
 // idle cycles. Finished warps leave in launch order, through the core's output latch, which frees a warp's slot before
 // its rows are read (the per-quad metadata therefore has one warp entry more than the core has slots);
@@ -66,6 +66,8 @@ module b_render #(
                                                    // early queue and the ROP (with 8 the sequencer waits 20 % of an
                                                    // OpenArena-like frame for a slot; the store's block RAM is the same)
     parameter int FS_NWARP = 4,                    // shader_core_fs2 warps in flight
+    parameter int FS_NL    = 16,                   // the fragment core's lanes per warp (shader_core_fs2 NL: 16, 8 or 4 = 4, 2 or
+                                                   // 1 quads a warp)
     parameter int FS_TEXQ  = 8,                    // TEX instructions live at once (with tmu24's 16-deep request queue four warps
                                                    // x two samples live; with 2 the 4-sample full-screen pass is TEX-latency-bound:
                                                    // 46 cycles per quad against an issue ideal of 25)
@@ -175,6 +177,7 @@ module b_render #(
     (* max_fanout = 64 *) reg rst_q = 1'b1;
     always @(posedge clk) rst_q <= rst;
     localparam int TSW = $clog2(NTS);
+    localparam int FQ = FS_NL / 4, LQB = (FQ > 1) ? $clog2(FQ) : 1;   // quads a fragment warp; a quad index's width
     localparam [W-1:0] F_ONE = 24'h3F0000;
 
     // ================================================================ conversions
@@ -352,12 +355,12 @@ module b_render #(
     reg  [4:0]  eq_wp, eq_rp, eq_pp;
     wire [4:0]  eq_cnt = eq_wp - eq_rp;
 
-    // ================================================================ fragment shader (scalar warps of 4 quads) + TMU
+    // ================================================================ fragment shader (scalar warps of FQ quads) + TMU
     wire        fs_in_ready, fs_in_ready_nx, fs_out_valid, fs_idle, fs_tri_ready, fs_out_depthw, fs_out_err; wire [1:0] fs_in_warp;
     reg         fs_start, fs_ack, fs_vw_we; reg [1:0] fs_vw_row, fs_vw_quad; reg [8*W-1:0] fs_vw_data;
     reg         fs_pre;                                      // the warp being formed got its first quad: the core fetches its program ahead
-    reg  [15:0] fs_in_active; reg [3:0] fs_in_front; reg [4*TSW-1:0] fs_in_tslot;
-    reg  [15:0] fs_in_tmask;                                 // the lanes whose texels are used (coverage, or all)
+    reg  [FS_NL-1:0] fs_in_active; reg [FQ-1:0] fs_in_front; reg [FQ*TSW-1:0] fs_in_tslot;
+    reg  [FS_NL-1:0] fs_in_tmask;                            // the lanes whose texels are used (coverage, or all)
     reg  [1:0]  tsk;                                         // the bank's program may leave uncovered pixels unsampled
     reg         tk_start; wire tk_rdy, tk_badn; reg tk_bad;  // ... the scan that decides it (below)
     wire [3:0]  tx_mask; wire tx_cls;
@@ -365,11 +368,11 @@ module b_render #(
     reg         ld_iram_we, ld_par_we; reg [11:0] ld_iram_addr; reg [63:0] ld_iram_data; reg [5:0] ld_par_idx;
     reg  [TW-1:0] ld_par_data; reg ld_wfd, ld_ubi;           // the program being loaded writes gl_FragDepth / reads a built-in
     reg         cur_wbank;                                   // the bank of the warp being formed
-    wire [4:0]  fs_out_sel, fs_out_sel2; wire [4*W-1:0] fs_out_row, fs_out_row2; wire [15:0] fs_out_kill;
+    wire [4:0]  fs_out_sel, fs_out_sel2; wire [4*W-1:0] fs_out_row, fs_out_row2; wire [FS_NL-1:0] fs_out_kill;
     wire        tx_req, tx_ready, tx_res_v; wire [4:0] tx_samp; wire [1:0] tx_mode; wire [8*W-1:0] tx_uv, tx_zw;
     wire [VW-1:0] tx_res;
     wire [21:0] fs_pev; wire [1:0] tm_pev;                   // profile events of the core and the texture unit
-    shader_core_fs2 #(.PROF(PROF), .EXP_W(7), .MAN_W(16), .NWARP(FS_NWARP), .NPARAM(64), .NTS(NTS), .TEXQ(FS_TEXQ), .TEXW2(TEX_W2), .STO2(FS_STO2), .TEX2(FS_TEX2), .LDV_MODE(FS_LDV), .ADD_DSP(FS_ADD_DSP), .XSFU(FS_XSFU), .XCLAMP(FS_XCLAMP), .QR_INF(FS_QRINF), .SFU_TAB2(FS_SFU_TAB2), .INT_DIV(FS_INT_DIV), .SINCOS(FS_SINCOS)) u_fs (.clk, .rst(rst_q),
+    shader_core_fs2 #(.PROF(PROF), .EXP_W(7), .MAN_W(16), .NL(FS_NL), .NWARP(FS_NWARP), .NPARAM(64), .NTS(NTS), .TEXQ(FS_TEXQ), .TEXW2(TEX_W2), .STO2(FS_STO2), .TEX2(FS_TEX2), .LDV_MODE(FS_LDV), .ADD_DSP(FS_ADD_DSP), .XSFU(FS_XSFU), .XCLAMP(FS_XCLAMP), .QR_INF(FS_QRINF), .SFU_TAB2(FS_SFU_TAB2), .INT_DIV(FS_INT_DIV), .SINCOS(FS_SINCOS)) u_fs (.clk, .rst(rst_q),
         .iram_we(ld_iram_we), .iram_waddr({ld_bank, ld_iram_addr}), .iram_wdata(ld_iram_data),
         .param_we(ld_par_we), .param_idx({ld_bank, ld_par_idx}), .param_data(ld_par_data),
         .vw_we(fs_vw_we), .vw_row(fs_vw_row), .vw_quad(fs_vw_quad), .vw_data(fs_vw_data),
@@ -1059,7 +1062,7 @@ module b_render #(
         end
     end
 
-    // ================================================================ launch: early depth, warps of 4 quads, start
+    // ================================================================ launch: early depth, warps of FQ quads, start
     // Two stages over the quad FIFO (no serial steps per quad):
     //   peek stage — runs ahead of the row stage (index qf_pk): the early-depth peeks of a quad's 2 ROWS (pixel pairs)
     //   go out one per cycle, back to back across quads (pk_en is registered here and b_rop registers the
@@ -1070,7 +1073,7 @@ module b_render #(
     //   row stage — a quad whose verdict is in is dropped (one cycle) or joins the warp being formed (quad lq of warp
     //   fs_in_warp): its launch rows go out one per cycle (L_ROW; a program reading no built-in needs only row 3, the
     //   weights), its metadata is noted with the last row, and the next quad's rows follow without a gap when its verdict
-    //   is in. The warp starts (L_GO) with its 4th quad, or earlier — lf_force — when nothing is between the early queue and
+    //   is in. The warp starts (L_GO) with its FQ-th quad, or earlier — lf_force — when nothing is between the early queue and
     //   the warp and the sequencer waits for quads to finish (a triangle slot, a draw change (so quads of two draws never
     //   share a warp), a band or the frame end), or when no quad could join it for 32 cycles (counted with quads in the
     //   FIFO too: a head waiting for the peek of a band two ahead, behind a partial warp of the
@@ -1079,17 +1082,17 @@ module b_render #(
     typedef enum logic [1:0] {L_IDLE, L_ROW, L_GO} ls_t;
     ls_t ls;
     wire [3:0] qh = qf_rp[3:0];
-    reg [1:0] lq, lrow; reg [5:0] lf_idle;
+    reg [LQB-1:0] lq; reg [1:0] lrow; reg [5:0] lf_idle;              // lq: the warp's quad being added (< FQ)
     wire seq_wait = (ms == M_TSWAIT) || (ms == M_TRIQS) || (ms == M_DSWAIT) || (ms == M_BAND) || (ms == M_FEND);
     wire qpath_empty = !pi_run && (qs_infl == 5'd0) && (qf_cnt == 5'd0);
-    wire lf_force = (lq != 2'd0) && ((qpath_empty && seq_wait) || (lf_idle == 6'd32));
+    wire lf_force = (lq != '0) && ((qpath_empty && seq_wait) || (lf_idle == 6'd32));
     // metadata of the launched quads in launch order, its own ring: FS_NWARP + 1 warp entries, because the core's output
     // latch lets a slot's next warp fill while the back end still reads the previous one. One write site and one read
     // site, so LUTRAM ({warp entry, quad}) instead of 2-D register arrays (2 080 FF, 940 LUT).
     // mw_q = {slot, front, depth, triangle slot, coverage, qy, qx}, mw_w = {the warp's draw-state bank, its last quad}
     localparam int MQW = 2 + 1 + 96 + TSW + 4 + 12 + 12;
-    (* ram_style="distributed" *) reg [MQW-1:0] mw_q [0:(FS_NWARP+1)*4-1];
-    (* ram_style="distributed" *) reg [2:0] mw_w [0:FS_NWARP];
+    (* ram_style="distributed" *) reg [MQW-1:0] mw_q [0:((FS_NWARP+1) << LQB)-1];
+    (* ram_style="distributed" *) reg [LQB:0] mw_w [0:FS_NWARP];
     localparam int MWW = $clog2(FS_NWARP + 1);               // the ring pointers' width (3 at FS_NWARP 4; 4 lets a bench run 8 warps)
     reg [MWW-1:0] mw_wp;
     // ---- peek stage (late) and the early queue's peeks ----
@@ -1123,9 +1126,9 @@ module b_render #(
     // the first quad of a warp needs the next warp slot free. L_FAST: in the cycle of fs_start the core's slot pointer
     // still names the warp being started, so the slot after it is asked for (fs_in_ready_nx); a row decided now is
     // written two cycles later, after the launch moved the pointer. (lq != 0 never meets fs_start: it follows lq <= 0.)
-    wire ctx_ok  = L_FAST ? ((lq != 2'd0) || (fs_start ? fs_in_ready_nx : fs_in_ready))
-                          : ((lq != 2'd0 || fs_in_ready) && !fs_start);
-    wire hd_bank = (lq == 2'd0) || (qf_bank[qh] == cur_wbank);   // a warp never mixes draws: the head joins only its own bank's warp
+    wire ctx_ok  = L_FAST ? ((lq != '0) || (fs_start ? fs_in_ready_nx : fs_in_ready))
+                          : ((lq != '0 || fs_in_ready) && !fs_start);
+    wire hd_bank = (lq == '0) || (qf_bank[qh] == cur_wbank);     // a warp never mixes draws: the head joins only its own bank's warp
     wire lw_ctx  = (ls == L_IDLE) && hd_pass && !ctx_ok;    // (profiling) a quad waits for a warp slot
     wire [3:0] qn = qf_rp[3:0] + 4'd1;
     wire nx_pass = (qf_cnt > 5'd1) && qf_ezv[qn] && qf_ez[qn] && (qf_bank[qn] == qf_bank[qh]);   // the quad after the head can follow at once
@@ -1133,12 +1136,12 @@ module b_render #(
     always @(posedge clk) begin
         if (rst_q) begin ls <= L_IDLE; mw_wp <= '0; qf_rp <= 5'd0; qf_pk <= 5'd0; pk_row <= 1'b0; fs_start <= 1'b0; fs_vw_we <= 1'b0; pk_en <= 1'b0; fs_pre <= 1'b0;
                        ev_drop <= 1'b0; pd1_v <= 1'b0; pd2_v <= 1'b0; pd3_v <= 1'b0; pk_acc <= 1'b0; ek_acc <= 1'b0; ek_row <= 1'b0;
-                       c_quads <= 0; c_ezrej <= 0; lq <= 2'd0; lf_idle <= 6'd0; fs_in_active <= 16'd0; fs_in_front <= 4'd0; fs_in_tmask <= 16'hFFFF;
+                       c_quads <= 0; c_ezrej <= 0; lq <= '0; lf_idle <= 6'd0; fs_in_active <= '0; fs_in_front <= '0; fs_in_tmask <= '1;
                        fs_in_tslot <= '0; cur_wbank <= 1'b0; eq_pp <= 5'd0; eq_lv <= '0; eq_vd <= '0;
                        for (int i = 0; i < QFD; i++) begin qf_ez[i] <= 1'b0; qf_ezv[i] <= 1'b0; end end
         else begin
             fs_start <= 1'b0; fs_vw_we <= 1'b0; pk_en <= 1'b0; ev_drop <= 1'b0; pd1_v <= 1'b0; fs_pre <= 1'b0;
-            if (ls == L_IDLE && lq != 2'd0 && !hd_ok) begin if (lf_idle != 6'd32) lf_idle <= lf_idle + 6'd1; end
+            if (ls == L_IDLE && lq != '0 && !hd_ok) begin if (lf_idle != 6'd32) lf_idle <= lf_idle + 6'd1; end
             else lf_idle <= 6'd0;
             // ---- the early queue: bounds in, a new entry ----
             if (zl_v) begin eq_lv[zl_tag] <= 1'b1; eq_zok[zl_tag] <= zl_ok; end
@@ -1179,13 +1182,13 @@ module b_render #(
                     end else if (hd_pass && !hd_bank) ls <= L_GO;        // the head is of another draw: start the warp as it is
                     // a warp's first quad: its bank is known and stays loaded until the warp has gone (its quads are counted in
                     // q_live_b), so the core starts fetching the program now — >= 3 cycles before the start (fs_pre)
-                    else if (hd_pass && ctx_ok) begin lrow <= lrow0; ls <= L_ROW; if (lq == 2'd0) begin cur_wbank <= qf_bank[qh]; fs_pre <= FS_PRE; end end
+                    else if (hd_pass && ctx_ok) begin lrow <= lrow0; ls <= L_ROW; if (lq == '0) begin cur_wbank <= qf_bank[qh]; fs_pre <= FS_PRE; end end
                     else if (!hd_ok && lf_force) ls <= L_GO;
                 end
                 // rows 0..3 of quad lq: gl_FragCoord.xy, .zw, gl_PointCoord (mu1, mu2), the weights {lambda2, lambda1};
                 // with the last row the quad's metadata, then the next quad's rows or the warp start
                 L_ROW: begin
-                    fs_vw_we <= 1'b1; fs_vw_row <= lrow; fs_vw_quad <= lq;
+                    fs_vw_we <= 1'b1; fs_vw_row <= lrow; fs_vw_quad <= 2'(lq);
                     case (lrow)
                         2'd0: for (int p = 0; p < 4; p++) fs_vw_data[p*2*W +: 2*W] <= {qf_fc[qh][48 + p[1]*24 +: 24], qf_fc[qh][p[0]*24 +: 24]};
                         2'd1: for (int p = 0; p < 4; p++) fs_vw_data[p*2*W +: 2*W] <= {qf_fw[qh][p*24 +: 24], qf_fz[qh][p*24 +: 24]};
@@ -1197,20 +1200,20 @@ module b_render #(
                         mw_q[{mw_wp, lq}] <= {qf_slot[qh], qf_front[qh], qf_d24[qh], qf_ts[qh], qf_cov[qh], qf_qy[qh], qf_qx[qh]};
                         mw_w[mw_wp] <= {qf_bank[qh], lq};
                         fs_in_tslot[lq*TSW +: TSW] <= qf_ts[qh];
-                        if (lq == 2'd0) begin fs_in_active <= 16'h000F; fs_in_front <= {3'b0, qf_front[qh]}; end
+                        if (lq == '0) begin fs_in_active <= FS_NL'(4'hF); fs_in_front <= FQ'(qf_front[qh]); end
                         else begin fs_in_active[lq*4 +: 4] <= 4'hF; fs_in_front[lq] <= qf_front[qh]; end
                         // TEX_SKIP: the quad's texels are used in its covered pixels only, when its program allows it
                         fs_in_tmask[lq*4 +: 4] <= (TEX_SKIP && tsk[qf_bank[qh]]) ? qf_cov[qh] : 4'hF;
                         qf_rp <= qf_rp + 5'd1; qf_ezv[qh] <= 1'b0; c_quads <= c_quads + 1;
                         // the warp is full: L_FAST starts it with this row (the launch reads the registers written here
                         // one cycle later, beside the row's write into the slot it launches); else through L_GO
-                        if (lq == 2'd3 && L_FAST) begin
-                            fs_start <= 1'b1; lq <= 2'd0; ls <= L_IDLE; mw_wp <= (mw_wp == MWW'(FS_NWARP)) ? '0 : mw_wp + 1'b1;
-                        end else if (lq == 2'd3) ls <= L_GO;
-                        else begin lq <= lq + 2'd1; if (nx_pass) lrow <= lrow0; else ls <= L_IDLE; end
+                        if (lq == LQB'(FQ-1) && L_FAST) begin
+                            fs_start <= 1'b1; lq <= '0; ls <= L_IDLE; mw_wp <= (mw_wp == MWW'(FS_NWARP)) ? '0 : mw_wp + 1'b1;
+                        end else if (lq == LQB'(FQ-1)) ls <= L_GO;
+                        else begin lq <= lq + LQB'(1); if (nx_pass) lrow <= lrow0; else ls <= L_IDLE; end
                     end
                 end
-                L_GO: begin fs_start <= 1'b1; lq <= 2'd0; ls <= L_IDLE; mw_wp <= (mw_wp == MWW'(FS_NWARP)) ? '0 : mw_wp + 1'b1; end
+                L_GO: begin fs_start <= 1'b1; lq <= '0; ls <= L_IDLE; mw_wp <= (mw_wp == MWW'(FS_NWARP)) ? '0 : mw_wp + 1'b1; end
                 default: ls <= L_IDLE;
             endcase
         end
@@ -1274,12 +1277,12 @@ module b_render #(
     // until ev_fin).
     typedef enum logic [1:0] {B_IDLE, B_ROW, B_HAND} bs_t;
     bs_t bs;
-    reg [MWW-1:0] rq; reg [1:0] bqi, brow; reg [VW-1:0] rb_col; reg [4*W-1:0] rb_dep;
-    wire [2:0] mw_rw = mw_w[rq];                                       // {bank, last quad} of warp rq
+    reg [MWW-1:0] rq; reg [LQB-1:0] bqi; reg [1:0] brow; reg [VW-1:0] rb_col; reg [4*W-1:0] rb_dep;
+    wire [LQB:0] mw_rw = mw_w[rq];                                     // {bank, last quad} of warp rq
     reg bl; reg [VW-1:0] bq_col; reg [4*W-1:0] bq_dep; reg bq_dw; reg [3:0] bq_kill;
     reg [11:0] bq_qx, bq_qy; reg [3:0] bq_cov; reg [95:0] bq_d24; reg bq_front, bq_bank; reg [TSW-1:0] bq_ts; reg [1:0] bq_slot;
-    assign fs_out_sel  = {bqi, brow, 1'b0};
-    assign fs_out_sel2 = {bqi, brow, 1'b1};
+    assign fs_out_sel  = {2'(bqi), brow, 1'b0};
+    assign fs_out_sel2 = {2'(bqi), brow, 1'b1};
     wire bc_adv  = !br_valid || br_ready;
     wire bq_free = !bq_v || (bc_adv && bl);                           // empty, or its last row leaves this cycle
     // BE_NOZ: a warp whose program wrote no gl_FragDepth has no depth row to read — its quads are handed over in the
@@ -1301,7 +1304,7 @@ module b_render #(
         $fatal(1, "b_render: c2_addr %0d differs from the c2 fragment's (%0d, %0d) cell", c2_addr, c2_x, c2_y);
     // synthesis translate_on
     always @(posedge clk) begin
-        if (rst_q) begin rq <= '0; bqi <= 2'd0; brow <= 2'd0; bs <= B_IDLE; bq_v <= 1'b0; fs_ack <= 1'b0; br_valid <= 1'b0;
+        if (rst_q) begin rq <= '0; bqi <= '0; brow <= 2'd0; bs <= B_IDLE; bq_v <= 1'b0; fs_ack <= 1'b0; br_valid <= 1'b0;
                        ev_fin <= 1'b0; c1_v <= 1'b0; c2_v <= 1'b0; bl <= 1'b0; end
         else begin
             fs_ack <= 1'b0; ev_fin <= 1'b0;
@@ -1340,7 +1343,7 @@ module b_render #(
             end
             // ---- rows: two per cycle; the hand-over with the depth row when the pixel stage is free ----
             case (bs)
-                B_IDLE: if (fs_out_valid && !fs_ack) begin bqi <= 2'd0; brow <= 2'd0; bs <= B_ROW; end
+                B_IDLE: if (fs_out_valid && !fs_ack) begin bqi <= '0; brow <= 2'd0; bs <= B_ROW; end
                 B_ROW: begin                                        // out_sel / out_sel2 = {bqi, brow, 0 / 1} this cycle
                     if (brow == 2'd2) begin rb_dep <= fs_out_row; if (!bq_free) bs <= B_HAND; end
                     else begin : RW
@@ -1363,9 +1366,9 @@ module b_render #(
                         bq_col[p*TW + 2*W +: W] <= fs_out_row[p*W +: W]; bq_col[p*TW + 3*W +: W] <= fs_out_row2[p*W +: W];
                     end
                 bq_kill <= fs_out_kill[bqi*4 +: 4];
-                {bq_slot, bq_front, bq_d24, bq_ts, bq_cov, bq_qy, bq_qx} <= mw_q[{rq, bqi}]; bq_bank <= mw_rw[2];
-                if (bqi == mw_rw[1:0]) begin fs_ack <= 1'b1; rq <= (rq == MWW'(FS_NWARP)) ? '0 : rq + 1'b1; bs <= B_IDLE; end
-                else begin bqi <= bqi + 2'd1; brow <= 2'd0; bs <= B_ROW; end
+                {bq_slot, bq_front, bq_d24, bq_ts, bq_cov, bq_qy, bq_qx} <= mw_q[{rq, bqi}]; bq_bank <= mw_rw[LQB];
+                if (bqi == mw_rw[LQB-1:0]) begin fs_ack <= 1'b1; rq <= (rq == MWW'(FS_NWARP)) ? '0 : rq + 1'b1; bs <= B_IDLE; end
+                else begin bqi <= bqi + LQB'(1); brow <= 2'd0; bs <= B_ROW; end
             end
         end
     end

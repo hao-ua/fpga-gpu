@@ -1,13 +1,14 @@
 // shader_core_fs2 — board B's scalar fragment core (ISA: tools/isa64.py).
-//   A warp = 16 lanes = 4 quads (lane l: quad l >> 2, pixel l & 3 = TL TR BL BR); NWARP warps in flight, each with its
-//   own PC / prefetch queue, masks, predicate, stacks, scoreboard and 32 vec4 registers. One instruction = one vec4
-//   operation executed as one MICRO-OP per written component (x, y, z, w order), each micro-op = the same scalar op on
-//   all 16 lanes; a source's swizzle is only an address (component swz_k[c] of register rs_k).
+//   A warp = NL lanes = NL / 4 quads (NL 16, 8 or 4; lane l: quad l >> 2, pixel l & 3 = TL TR BL BR); NWARP warps in
+//   flight, each with its own PC / prefetch queue, masks, predicate, stacks, scoreboard and 32 vec4 registers. One
+//   instruction = one vec4 operation executed as one MICRO-OP per written component (x, y, z, w order), each micro-op =
+//   the same scalar op on all NL lanes; a source's swizzle is only an address (component swz_k[c] of register rs_k).
+//   A lane's result never depends on the lanes of other quads (DDX / DDY stay inside a quad), so NL changes no pixel.
 //   Stages: F prefetch (per-warp queues from the 64-bit iram, the instruction classes decoded at the queue write) |
 //   S select (oldest ready warp; the micro-op's hazards on the per-scalar-register scoreboard, unit and write-slot
 //   availability; control flow; the head micro-op's fields are registered one cycle ahead and a taken branch
 //   flushes the queue one cycle after its issue) | X register addresses {warp, reg, comp} to the three block-RAM copies, params /
-//   varin / triangle-store addresses | X2 operands, routing, dispatch to the units | W one write per cycle (16 lanes x
+//   varin / triangle-store addresses | X2 operands, routing, dispatch to the units | W one write per cycle (NL lanes x
 //   W bits, per-lane enables = the active mask at issue). A fixed-latency ("scheduled") result frees its scalar
 //   register one cycle before its write (a block-RAM read presented in the write's cycle returns the new value); a
 //   buffered result frees it at the write.
@@ -20,7 +21,7 @@
 //   D1 + f0 -> acc1.c steps of all written components back to back, then, once the last one has landed, the lambda2 *
 //   D2 + acc1.c -> rd.c steps back to back (each component's two steps are at least 9 cycles apart, so the components
 //   must not run one after the other), with lambda per lane in built-in row 3 and {f0, D1, D2} per quad in
-//   the triangle store (4 block-RAM copies, one per quad, addressed by the quad's slot). Accumulator steps never touch
+//   the triangle store (one block-RAM copy per quad of the warp, addressed by the quad's slot). Accumulator steps never touch
 //   the write port; the accumulators live in LUTRAM (read in X): acc1 has one entry per {warp, component} for LDV, a DP
 //   uses entry 0.
 //   Built-ins: per lane two LUTRAMs hold the launch rows' two components (gl_FragCoord.xy / .zw, gl_PointCoord, the
@@ -31,26 +32,27 @@
 //   output latch as soon as the latch is free or being freed, which frees its slot at once; its rows stay in the
 //   slot's output store and are read through out_sel ({quad, idx}) as 4 pixels each until out_ack, and the slot's next
 //   warp may run but stalls at its first STO / STOZ until then.
-//   Quarter-rate paths (4 units each, lane 4k+i through unit k in cycle i of a 4-cycle feed, results collected into
-//   one 16-lane write): SFU (RCP RSQRT LOG2 EXP2, 11 + 4 with the SPLIT6 stage), SIN / COS (11 + 4), convert (FTOI ITOF FTOU UTOF TRUNC FLR
-//   CEIL RNDE, 2 + 4), IMUL (3 + 4), the divider (4 rounds of W + 2, one in flight; no IOP unit). One shared
-//   feeder: a quarter-rate micro-op issues every 4th cycle at most, up to
-//   QR_INF in flight per class; results wait in one shared queue of 4 x QR_INF entries
-//   and take free write cycles. The divider (IDIV
-//   IMOD UDIV UMOD, 16 lanes, W + 2 cycles, one in flight) also returns a buffered result.
-//   Control flow (S stage, 16-lane masks, as shader_core_fs): IF / ELSE / ENDIF with the 8-deep reconvergence stack,
+//   Quarter-rate paths (4 units each, lane NC k + i through unit k in cycle i of an NC-cycle feed, NC = NL / 4, results
+//   collected into one NL-lane write; the "+ 4" below is the feed, NC cycles): SFU (RCP RSQRT LOG2 EXP2, 11 + 4 with
+//   the SPLIT6 stage), SIN / COS (11 + 4), convert (FTOI ITOF FTOU UTOF TRUNC FLR CEIL RNDE, 2 + 4), IMUL (3 + 4), the
+//   divider (NC rounds of W + 2, one in flight; no IOP unit). One shared feeder: a quarter-rate micro-op issues every
+//   4th cycle at most (at every NL), up to QR_INF in flight per class; results wait in one shared queue of 4 x QR_INF
+//   entries and take free write cycles. The divider (IDIV
+//   IMOD UDIV UMOD, NL lanes, NC x (W + 2) cycles, one in flight) also returns a buffered result.
+//   Control flow (S stage, NL-lane masks, as shader_core_fs): IF / ELSE / ENDIF with the 8-deep reconvergence stack,
 //   LOOP / ENDL / BREAK / CONT with the 4-deep loop stack (entering, loop and continue masks), BRA, DISCARD into the
 //   kill mask, SETP into the per-lane predicate; a taken branch flushes the warp's prefetch queue. A stack violation
 //   (push on a full / pop on an empty stack) does not issue: the warp is killed, err set, err_stack sticky.
-//   TEX: 4 coordinate micro-ops (k = 0..3 read rs0[swz[k]] of all 16 lanes into the coordinate
+//   TEX: 4 coordinate micro-ops (k = 0..3 read rs0[swz[k]] of all NL lanes into the coordinate
 //   staging, owned by one TEX from its first micro-op to its last request), then one request per quad with an active
 //   lane to the texture unit (tmu24's interface, one per cycle when ready, lanes 4q..4q+3 = pixels TL TR BL BR; a TEX
 //   without active lanes sends nothing); results return in order and are written over 4 cycles (one component row
-//   each) into the result staging (4 LUTRAM quad-blocks x TEXQ entries x 4 components) by the writer of the quad's
+//   each) into the result staging (NL / 4 LUTRAM quad-blocks x TEXQ entries x 4 components) by the writer of the quad's
 //   class (TEXW2: two writers, even / odd quads — a writer takes one result per 4 cycles, tmu24 paces by class; with
-//   one writer every result is 4 cycles after the last). A request carries its quad's sample mask (in_tmask: the
-//   texture unit returns zeros for the other pixels). A complete entry drains through the buffered write
-//   path, one 16-lane write per wm component. Non-blocking: micro-op k checks coordinate k (RAW) and rd.k (WAW);
+//   one writer, and always with one quad per warp, every result is 4 cycles after the last). A request carries its
+//   quad's sample mask (in_tmask: the texture unit returns zeros for the other pixels). A complete entry drains
+//   through the buffered write path, one NL-lane write per wm component. Non-blocking: micro-op k checks coordinate k
+//   (RAW) and rd.k (WAW);
 //   rd.wm is pending from the last micro-op to each component's write (so TEX rd, rd works); TEXQ TEXes live at once
 //   (issued, texels not all written). TEX2: a coordinate micro-op hands TWO coordinates of the set to
 //   the staging (the second through read copy 1, its WAW check through source 2's hazard bit): a 2D lookup is one
@@ -59,6 +61,9 @@
 module shader_core_fs2 #(
     parameter int EXP_W = 7,
     parameter int MAN_W = 16,
+    parameter int NL = 16,                      // lanes per warp: 16, 8 or 4 (NL / 4 quads). The lanes' datapath, register file,
+                                                // operand and result stores, built-in and output stores scale with it; the
+                                                // quarter-rate units stay 4 (fed in NL / 4 cycles), the control logic as it is
     parameter int NWARP = 4,                    // warps in flight (2..4)
     parameter int NPARAM = 64,                  // uniforms (vec4)
     parameter int IRAM_DEPTH = 4096,            // instructions (64-bit words)
@@ -67,6 +72,7 @@ module shader_core_fs2 #(
     parameter int TEXQ = 8,                     // TEX instructions live at once (issued, texels not yet all written; four warps x two live samples)
     parameter bit TEXW2 = 1'b1,                 // two texture-result writers (even / odd quads of a warp:
                                                 // quads with a sample mask return faster than one per 4 cycles); 0 = one
+                                                // (a warp of one quad, NL 4, has one)
     parameter bit TEX2 = 1'b0,                  // a TEX hands a coordinate PAIR per micro-op to the coordinate staging (a 2D lookup: 1
                                                 // micro-op instead of 2; the odd component through read copy 1). 0 = one
                                                 // coordinate each. OFF on the boards: with L_FAST and
@@ -133,7 +139,7 @@ module shader_core_fs2 #(
     // component 0 at [p*2W +: W], 1 at [p*2W+W +: W]): row 0 gl_FragCoord.xy, 1 gl_FragCoord.zw, 2 gl_PointCoord
     // (mu1, mu2), 3 the interpolation weights (lambda1, lambda2); gl_FrontFacing comes with the launch (in_front, one
     // bit per quad). LDV 8 reads rows 0 / 1, LDV 9 = (front ? 1.0 : 0, 0, 0, 0), LDV 10 = (mu1, mu2, 0, 1.0), LDV 11..15
-    // = 0 (the only built-ins of the board-B core; user varyings 0..7 come from the triangle store)
+    // = 0 (the only built-ins of the board-B core; user varyings 0..7 come from the triangle store). vw_quad < NL / 4
     input  wire        vw_we,
     input  wire [1:0]  vw_row, vw_quad,
     input  wire [8*(EXP_W+MAN_W+1)-1:0] vw_data,
@@ -151,15 +157,15 @@ module shader_core_fs2 #(
     output wire [1:0]  in_warp,
     input  wire        in_start,
     input  wire        in_bank,                                      // the warp's program / uniform / sampler bank
-    input  wire [15:0] in_active,
-    input  wire [3:0]  in_front,                                    // gl_FrontFacing of quad q
-    input  wire [4*$clog2(NTS)-1:0] in_tslot,                       // quad q's slot at [q*TSW +: TSW]
+    input  wire [NL-1:0] in_active,
+    input  wire [NL/4-1:0] in_front,                                // gl_FrontFacing of quad q
+    input  wire [NL/4*$clog2(NTS)-1:0] in_tslot,                    // quad q's slot at [q*TSW +: TSW]
     // the lanes whose texels are USED: a TEX request carries its quad's 4 bits
     // as the sample mask (tex_req_mask) and the texture unit returns zeros for the others. The launcher passes a quad's
     // coverage only when the warp's program cannot tell the difference (b_render's program scan: no derivative of,
     // texture coordinate from, or control flow that reaches either through a value derived from a texel), all ones
     // otherwise. The core itself runs every lane.
-    input  wire [15:0] in_tmask = 16'hFFFF,
+    input  wire [NL-1:0] in_tmask = {NL{1'b1}},
     // pre_start (optional; a pulse at least one cycle before the launch, with warp in_warp idle): the launcher has begun
     // to fill warp in_warp with quads of bank pre_bank, so its program fetch starts now and the first instruction is at
     // the queue's head when the launch comes (it hides the 5 cycles between a launch
@@ -169,7 +175,7 @@ module shader_core_fs2 #(
     input  wire        pre_start = 1'b0,
     input  wire        pre_bank = 1'b0,
     // texture unit (tmu24's request / result interface): one quad per request, pixel p's s, t at uv[p*2W +: W] and
-    // [p*2W+W +: W], r, q in zw; the 4 quads of a TEX in order; one quad's 16 texels per res_valid (pixel p, component c
+    // [p*2W+W +: W], r, q in zw; the NL / 4 quads of a TEX in order; one quad's 16 texels per res_valid (pixel p, component c
     // at [(p*4+c)*W +: W]) in request order; results of the same tex_req_cls AT LEAST 4 CYCLES APART (the core writes a
     // result into its staging over 4 cycles of that class's writer; tmu24 paces by the class it was given with the
     // request; a bench assertion checks it)
@@ -183,8 +189,8 @@ module shader_core_fs2 #(
     input  wire        tex_res_valid,
     input  wire [16*(EXP_W+MAN_W+1)-1:0] tex_res_texels,
     // results in launch order: out_valid for the warp in the output latch; its colour and depth are read row by row —
-    // out_sel = {quad[1:0], idx[2:0]} (idx 0..3 = colour component, 4 = gl_FragDepth) selects out_row = the quad's 4
-    // pixels (pixel p at [p*W +: W]); the output store is LUTRAM, so a row is a combinational read. in_ready can rise
+    // out_sel = {quad[1:0], idx[2:0]} (idx 0..3 = colour component, 4 = gl_FragDepth; quad < NL / 4) selects out_row =
+    // the quad's 4 pixels (pixel p at [p*W +: W]); the output store is LUTRAM, so a row is a combinational read. in_ready can rise
     // before the out_ack of the warp that held the slot: a launcher keeps per-warp data of up to NWARP + 1 warps
     output wire        out_valid,
     input  wire        out_ack,
@@ -193,7 +199,7 @@ module shader_core_fs2 #(
     input  wire [4:0]  out_sel2,                        // a second read of the output store (the back
     output wire [4*(EXP_W+MAN_W+1)-1:0] out_row2,       // end reads two rows per cycle)
     output wire        out_depthw,                      // the program wrote gl_FragDepth
-    output wire [15:0] out_kill,
+    output wire [NL-1:0] out_kill,
     output wire        out_err,
     output reg         err_stack,
     output wire        idle,
@@ -203,20 +209,25 @@ module shader_core_fs2 #(
     // leave out the warp that issued in t; a busy warp in none of them has finished (waits to retire) or was killed
     output reg  [21:0] prof_ev
 );
-    localparam int W = 1 + EXP_W + MAN_W, TW = 4*W, LW = 16*W;      // scalar, vec4, one component of 16 lanes
+    localparam int W = 1 + EXP_W + MAN_W, TW = 4*W, LW = NL*W;      // scalar, vec4, one component of NL lanes
+    localparam int NQ = NL / 4;                                     // quads per warp
+    localparam int NC = NL / 4;                                     // feed cycles of a quarter-rate micro-op (4 units: lane
+                                                                    // NC k + i through unit k in feed cycle i)
+    localparam int QTW = 16*W;                                      // one quad's 16 texels
+    if (NL != 16 && NL != 8 && NL != 4) $fatal(1, "shader_core_fs2: NL is 16, 8 or 4");
     // the core's own reset register: one cycle behind the input, replicated by synthesis near its loads
     (* max_fanout = 64 *) reg rst_q = 1'b1;
     always @(posedge clk) rst_q <= rst;
     localparam int AW = $clog2(IRAM_DEPTH), PAW = $clog2(NPARAM), WW = (NWARP > 1) ? $clog2(NWARP) : 1;
     localparam int TSW = $clog2(NTS), TAW = TSW + 5;                 // triangle store address {slot, vidx, comp}
     localparam int GAW = WW + 7;                                    // {warp, reg[4:0], comp[1:0]}
-    localparam int MW = WW + 7 + 16;                                // result meta {warp, scalar address, lanes}
+    localparam int MW = WW + 7 + NL;                                // result meta {warp, scalar address, lanes}
     localparam int TQW = (TEXQ > 1) ? $clog2(TEXQ) : 1, TLW = $clog2(TEXQ + 1);   // TEX entry pointers / live count
-    localparam int TMW = WW + 5 + 4 + 16;                           // TEX meta {warp, rd, wm, lanes}
+    localparam int TMW = WW + 5 + 4 + NL;                           // TEX meta {warp, rd, wm, lanes}
     localparam int ADDSUB_LAT = (MAN_W <= 10) ? 3 : 5, MADD_LAT = 3 + ADDSUB_LAT;
     localparam bit LDV1 = (LDV_MODE != 0), LDVR = (LDV_MODE == 1), LDV2P = (LDV_MODE == 2);   // one issued micro-op / the ring / the second adder
     localparam [W-1:0] ONE1 = (((1 << (EXP_W-1)) - 1) << MAN_W);
-    localparam [LW-1:0] ONEL = {16{ONE1}}, ZEROL = '0;
+    localparam [LW-1:0] ONEL = {NL{ONE1}}, ZEROL = '0;
     // opcodes
     localparam NOP=0,MOV=1,MOVI=2,ADD=3,SUB=4,MUL=5,MAD=6,MIN=7,MAX=8,DP3=9,DP4=10,RCP=11,RSQRT=12,LOG2=13,EXP2=14,
                SETP=15,LDP=16,LDV=17,STV=18,STO=19,BRA=20,STOZ=21,LOOP=22,ENDL=23,IFOP=24,ELSEOP=25,ENDIFOP=26,
@@ -266,7 +277,7 @@ module shader_core_fs2 #(
         is_ctl = (op==IFOP)||(op==ELSEOP)||(op==ENDIFOP)||(op==LOOP)||(op==ENDL)||(op==BREAKOP)||(op==CONTOP)||(op==BRA)||(op==DISCARD);
     endfunction
     function automatic [LW-1:0] applymod(input [LW-1:0] v, input [1:0] m);
-        for (int k = 0; k < 16; k++) begin
+        for (int k = 0; k < NL; k++) begin
             applymod[k*W +: W] = v[k*W +: W];
             if (m == 2'b01) applymod[k*W+W-1] = ~v[k*W+W-1];
             else if (m == 2'b10) applymod[k*W+W-1] = 1'b0;
@@ -277,7 +288,7 @@ module shader_core_fs2 #(
     function automatic [LW-1:0] int_alu(input [LW-1:0] a, input [LW-1:0] b, input [2:0] iop);
         reg [W-1:0] x, z; reg [W:0] d; reg sub, r;
         sub = (iop != 3'd0);
-        for (int k = 0; k < 16; k++) begin
+        for (int k = 0; k < NL; k++) begin
             x = a[k*W +: W]; z = b[k*W +: W];
             d = {x[W-1], x} + ({z[W-1], z} ^ {(W+1){sub}}) + (W+1)'(sub);
             case (iop)
@@ -287,7 +298,11 @@ module shader_core_fs2 #(
         end
     endfunction
     function automatic [LW-1:0] selv(input [LW-1:0] c, input [LW-1:0] a, input [LW-1:0] b);
-        for (int k = 0; k < 16; k++) selv[k*W +: W] = (c[k*W+W-2 -: EXP_W] != 0) ? a[k*W +: W] : b[k*W +: W];
+        for (int k = 0; k < NL; k++) selv[k*W +: W] = (c[k*W+W-2 -: EXP_W] != 0) ? a[k*W +: W] : b[k*W +: W];
+    endfunction
+    // the quads of a lane mask that hold an active lane
+    function automatic [NQ-1:0] qm_of(input [NL-1:0] l);
+        for (int q = 0; q < NQ; q++) qm_of[q] = |l[4*q +: 4];
     endfunction
     // instruction classes, decoded once when a word enters a prefetch queue (the S stage reads registered bits)
     localparam int CLS_W = 32;
@@ -414,7 +429,7 @@ module shader_core_fs2 #(
     // the die (≈ 9 ns of route on 0–1 logic levels from one register) — max_fanout lets synthesis replicate them
     (* max_fanout = 16 *) reg [WW-1:0] ap;
     reg [WW-1:0] rp;                                                // allocate / retire pointers
-    reg         x_valid; (* max_fanout = 32 *) reg [WW-1:0] x_w; reg [63:0] x_ins; reg [1:0] x_rc, x_wc; reg [2:0] x_mk; reg [15:0] x_am, x_sm;
+    reg         x_valid; (* max_fanout = 32 *) reg [WW-1:0] x_w; reg [63:0] x_ins; reg [1:0] x_rc, x_wc; reg [2:0] x_mk; reg [NL-1:0] x_am, x_sm;
     reg         x_first, x_last;                                    // the micro-op is its instruction's first / last
     // a two-component micro-op (STO2's STO, TEX2's TEX: the issuing warp's class bit): read copy 1 fetches rs0's
     // component x_s1c (the micro-op's source-1 address) instead of rs1; x_c2 = a TEX's second coordinate
@@ -424,11 +439,11 @@ module shader_core_fs2 #(
     // for the warp being launched (ap), read in X2 at the registered address; gl_FrontFacing = one bit per quad
     localparam int VAW = WW + 2;
     reg  [VAW-1:0] x2_va; reg x2_vh; reg [1:0] x2_vk;                 // address, component half, kind (0 memory 1 zero 2 one 3 front)
-    reg  [3:0] ffq [0:NWARP-1];
-    (* ram_style = "distributed" *) reg [15:0] tmk [0:NWARP-1];     // the warps' texel-use masks (in_tmask)
+    reg  [NQ-1:0] ffq [0:NWARP-1];
+    (* ram_style = "distributed" *) reg [NL-1:0] tmk [0:NWARP-1];   // the warps' texel-use masks (in_tmask)
     wire [LW-1:0] ve_q, vo_q;
     genvar gq;
-    generate for (gq = 0; gq < 16; gq = gq + 1) begin : VL
+    generate for (gq = 0; gq < NL; gq = gq + 1) begin : VL
         (* ram_style="distributed" *) reg [W-1:0] ve [0:NWARP*4-1];
         (* ram_style="distributed" *) reg [W-1:0] vo [0:NWARP*4-1];
         always @(posedge clk) if (vw_we && vw_quad == 2'(gq >> 2)) begin
@@ -436,8 +451,8 @@ module shader_core_fs2 #(
         end
         assign ve_q[gq*W +: W] = ve[x2_va]; assign vo_q[gq*W +: W] = vo[x2_va];
     end endgenerate
-    // triangle store: entry {slot, vidx, comp} = {D2.c, D1.c, f0.c}; 4 block-RAM copies (one per quad), written by
-    // a 4-cycle component writer, read in X at the quad's slot
+    // triangle store: entry {slot, vidx, comp} = {D2.c, D1.c, f0.c}; one block-RAM copy per quad of the warp, written
+    // by a 4-cycle component writer, read in X at the quad's slot
     reg        tw_run; reg [1:0] tw_c; reg [TSW-1:0] tw_slot; reg [2:0] tw_vidx; reg [3*TW-1:0] tw_data;
     assign tri_ready = ~tw_run;
     always @(posedge clk) begin
@@ -446,9 +461,9 @@ module shader_core_fs2 #(
         else if (tw_run) begin tw_c <= tw_c + 2'd1; if (tw_c == 2'd3) tw_run <= 1'b0; end
     end
     wire [3*W-1:0] tw_entry = {tw_data[2*TW + tw_c*W +: W], tw_data[TW + tw_c*W +: W], tw_data[tw_c*W +: W]};
-    reg  [4*TSW-1:0] ts [0:NWARP-1];                                // the quads' slots per warp
-    wire [3*W-1:0] trd [0:3];
-    generate for (gq = 0; gq < 4; gq = gq + 1) begin : TS
+    reg  [NQ*TSW-1:0] ts [0:NWARP-1];                               // the quads' slots per warp
+    wire [3*W-1:0] trd [0:NQ-1];
+    generate for (gq = 0; gq < NQ; gq = gq + 1) begin : TS
         (* ram_style="block" *) reg [3*W-1:0] tmem [0:NTS*32-1];
         reg [3*W-1:0] q;
         wire [TAW-1:0] raddr = {ts[x_w][gq*TSW +: TSW], x_ins[2:0], swz_c(f_swz(x_ins, 2'd0), x_rc)};
@@ -463,7 +478,7 @@ module shader_core_fs2 #(
     localparam int WBW = 16;                        // write slots ahead
     (* shreg_extract = "no" *) reg [WBW-1:0] wb_busy;  // bit j: a GPR write j cycles from now (from this S cycle); flops, not an SRL
                                                    // (as SRLs, synthesis merges bit 7 with mdl_v and slows q_rp -> wb_busy)
-    reg  x2_valid; reg [WW-1:0] x2_w; reg [1:0] x2_wc; reg [15:0] x2_am, x2_sm; reg [4:0] x2_rd; reg [2:0] x2_mk; reg x2_ll;
+    reg  x2_valid; reg [WW-1:0] x2_w; reg [1:0] x2_wc; reg [NL-1:0] x2_am, x2_sm; reg [4:0] x2_rd; reg [2:0] x2_mk; reg x2_ll;
     reg  x2_madd, x2_cmp, x2_setp, x2_one, x2_sto, x2_stoz, x2_int, x2_sel, x2_ldp, x2_ldv, x2_movi, x2_sub, x2_ddx, x2_ddy;
     reg  x2_qr, x2_sfu, x2_sc, x2_cvt, x2_imul, x2_idiv;
     reg  x2_sfum, x2_sqrt;                          // XSFU: the unit's result is multiplied by an operand / by its own argument (SQRT)
@@ -476,7 +491,7 @@ module shader_core_fs2 #(
     reg  ec_v; reg [WW-1:0] ec_w; reg [6:0] ec_a;  // scoreboard clears: a scheduled result one cycle before its write
     reg  bw_v; reg [WW-1:0] bw_w; reg [6:0] bw_a;  // a buffered result at its write
     reg  [NWARP-1:0] odw;                          // the warp wrote gl_FragDepth (the output store itself: W stage)
-    reg  [15:0] pred [0:NWARP-1]; reg [NWARP-1:0] pred_pend;
+    reg  [NL-1:0] pred [0:NWARP-1]; reg [NWARP-1:0] pred_pend;
     // chain accumulators in LUTRAM (read in X for the X2 operand network, written at a chain step's landing): acc1 per
     // {warp, component} (a DP uses entry 0), acc2 per warp
     // LDV1: acc1 = one DP entry per warp (address = the warp) and above them a ring of RN entries for the LDVs' first
@@ -498,9 +513,9 @@ module shader_core_fs2 #(
     // in d2_r, the first result in acc1_x, lambda2 on the built-in read). mblk: no multiply-add micro-op issues.
     reg  mblk, au_r;
     reg  [AAW-1:0] rg_a, rg_l, rg_r; reg [4:0] rg_lq; reg [3:0] rg_wait;
-    (* ram_style="distributed" *) reg [4*W-1:0] d2s [0:ADEP-1];
+    (* ram_style="distributed" *) reg [NQ*W-1:0] d2s [0:ADEP-1];    // D2.c per quad
     (* ram_style="distributed" *) reg [MW-1:0]  rmeta [0:ADEP-1];
-    reg  [MW-1:0] au_m; reg [4*W-1:0] d2_r;
+    reg  [MW-1:0] au_m; reg [NQ*W-1:0] d2_r;
     wire fire_n;
     // quarter-rate feeder / in-flight accounting (S reads these)
     reg  [2:0] qr_hold;                            // cycles until the next quarter-rate micro-op may issue
@@ -540,7 +555,7 @@ module shader_core_fs2 #(
     wire [CLS_W-1:0] cls_v [0:NWARP-1];
     wire [1:0]    rc_v [0:NWARP-1], wc_v [0:NWARP-1];
     wire [2:0]    mk_v [0:NWARP-1];
-    wire [15:0]   am_v  [0:NWARP-1], sm_v [0:NWARP-1], kill_v [0:NWARP-1];
+    wire [NL-1:0] am_v  [0:NWARP-1], sm_v [0:NWARP-1], kill_v [0:NWARP-1];
     reg  [WW-1:0] sel; reg issue;
 
     // ================================================================ warp bookkeeping
@@ -551,7 +566,7 @@ module shader_core_fs2 #(
     // output latch: the oldest finished warp leaves its slot when the latch is free or being freed (a warp's short life
     // would otherwise include the back end's 3 cycles per quad); ol_w = the slot whose output store the latch reads,
     // ol_own the same one-hot (the slot's next warp stalls at STO / STOZ)
-    reg ol_v; reg [WW-1:0] ol_w; reg [NWARP-1:0] ol_own; reg [15:0] ol_kill; reg ol_dw, ol_err;
+    reg ol_v; reg [WW-1:0] ol_w; reg [NWARP-1:0] ol_own; reg [NL-1:0] ol_kill; reg ol_dw, ol_err;
     wire retire = busy_v[rp] & fin_v[rp] & (~ol_v | out_ack);
     assign out_valid = ol_v;
     assign idle = ~|busy_v & ~ol_v;
@@ -594,20 +609,20 @@ module shader_core_fs2 #(
     genvar gw;
     generate for (gw = 0; gw < NWARP; gw = gw + 1) begin : WRP
         reg busy, fin, err;
-        reg [15:0] active, killed;
+        reg [NL-1:0] active, killed;
         reg [127:0] pending;                                        // one bit per scalar register {reg, comp}
         reg [2:0]  uidx;                                            // the index of the micro-op after u (uop_nxt)
-        reg [15:0] st_ent [0:7], st_then [0:7]; reg [3:0] ssp;      // IF stack
+        reg [NL-1:0] st_ent [0:7], st_then [0:7]; reg [3:0] ssp;    // IF stack
         reg ssp_z, ssp_f;                                           // ssp == 0 / == 8, registers (keeps the compares out of
                                                                     // the issue chain), as lsp_z / lsp_f
         reg [15:0] lcnt [0:3]; reg [AW-1:0] lpc [0:3]; reg [2:0] lsp; // loop stack: the levels BELOW the top (see lt_*)
-        reg [15:0] lent [0:3], lmask [0:3], cmask [0:3];            // entering / still looping / continued lanes
+        reg [NL-1:0] lent [0:3], lmask [0:3], cmask [0:3];          // entering / still looping / continued lanes
         // the loop stack's top as REGISTERS (otherwise `lsp` -> the lsp-1 index -> the loop-live mask
         // and the ENDL decision -> ready -> the grant -> the masks' writes is one long path):
         // lt_* = entry lsp-1 whenever lsp > 0; a push writes the old top back into the arrays at lsp-1, a pop reloads the
         // top from entry lsp-2; BRK / CONT / a repeated ENDL change the top only. lsp_z / lsp_f = lsp == 0 / == 4.
-        reg [15:0] lt_cnt, lt_ent, lt_mask, lt_cmask; reg [AW-1:0] lt_pc; reg lsp_z, lsp_f;
-        wire       lt_again = (lt_cnt > 16'd1) & (lt_mask != 16'd0);   // the ENDL repeats
+        reg [15:0] lt_cnt; reg [NL-1:0] lt_ent, lt_mask, lt_cmask; reg [AW-1:0] lt_pc; reg lsp_z, lsp_f;
+        wire       lt_again = (lt_cnt > 16'd1) & (lt_mask != '0);      // the ENDL repeats
         // circular prefetch queue (head = entry q_rp, writes at q_wp; a pop moves the read pointer, not the entries:
         // moving them fans the pop's enable out to every queue register), the classes decoded at
         // the queue write
@@ -780,14 +795,14 @@ module shader_core_fs2 #(
         wire drained = (pending == '0) & ~set_v & ~set_tv & ~pred_pend[gw];
         assign iss = grant[gw];
         // control flow: the next PC if this instruction issues (jump = not the next word)
-        wire [15:0] loop_live = lsp_z ? 16'hFFFF : (lt_mask & ~lt_cmask);
+        wire [NL-1:0] loop_live = lsp_z ? {NL{1'b1}} : (lt_mask & ~lt_cmask);
         reg [AW-1:0] npc; reg jump;
         always @* begin
             npc = ipc + 1'b1; jump = 1'b1;
             if (cls[C_BRA]) npc = imm[AW-1:0];
             else if (cls[C_ENDL] && ~lsp_z && lt_again) npc = lt_pc;
-            else if (cls[C_IF] && (active & pred[gw]) == 16'd0) npc = imm[AW-1:0];
-            else if (cls[C_ELSE] && (st_ent[ssp-1] & ~st_then[ssp-1] & loop_live) == 16'd0) npc = imm[AW-1:0];
+            else if (cls[C_IF] && (active & pred[gw]) == '0) npc = imm[AW-1:0];
+            else if (cls[C_ELSE] && (st_ent[ssp-1] & ~st_then[ssp-1] & loop_live) == '0) npc = imm[AW-1:0];
             else jump = 1'b0;
         end
         wire q_pop   = iss & last;
@@ -857,7 +872,7 @@ module shader_core_fs2 #(
                 fill_d <= ((pop_dry & q_wr) | fill_q) & ~(iss & jump);
                 if (u_load) begin hz <= hcm; hzr <= hcr; hl <= hl_c; end
                 else begin hz <= hz & ~hclr; hzr <= hzr & ~hrclr; hl <= hl & ~hl_clr; end
-                if (hv & sviol) begin err<=1'b1; killed<=16'hFFFF; end
+                if (hv & sviol) begin err<=1'b1; killed<='1; end
                 if (busy & ~fin & drained & ((hv & is_end) | err)) fin<=1'b1;
                 begin : PEND
                     reg [127:0] pn;
@@ -880,14 +895,14 @@ module shader_core_fs2 #(
                             lcnt[2'(lsp-3'd1)]<=lt_cnt; lpc[2'(lsp-3'd1)]<=lt_pc; lent[2'(lsp-3'd1)]<=lt_ent;
                             lmask[2'(lsp-3'd1)]<=lt_mask; cmask[2'(lsp-3'd1)]<=lt_cmask;
                         end
-                        lt_cnt<=imm; lt_pc<=ipc+1'b1; lt_ent<=active; lt_mask<=active; lt_cmask<=16'd0;
+                        lt_cnt<=imm; lt_pc<=ipc+1'b1; lt_ent<=active; lt_mask<=active; lt_cmask<='0;
                         lsp<=lsp+1'b1; lsp_z<=1'b0; lsp_f<=(lsp == 3'd3);
                     end
                     if (cls[C_BRK])  begin lt_mask <= lt_mask & ~(active & pred[gw]); active <= active & ~pred[gw]; end
                     if (cls[C_CONT]) begin lt_cmask <= lt_cmask | (active & pred[gw]);  active <= active & ~pred[gw]; end
                     if (cls[C_ENDL]) begin
                         if (lt_again) begin
-                            lt_cnt <= lt_cnt - 1'b1; active <= lt_mask; lt_cmask <= 16'd0;
+                            lt_cnt <= lt_cnt - 1'b1; active <= lt_mask; lt_cmask <= '0;
                         end else begin                          // pop: the level below becomes the top
                             lsp <= lsp - 1'b1; active <= lt_ent; lsp_z <= (lsp == 3'd1); lsp_f <= 1'b0;
                             lt_cnt <= lcnt[2'(lsp-3'd2)]; lt_pc <= lpc[2'(lsp-3'd2)]; lt_ent <= lent[2'(lsp-3'd2)];
@@ -962,8 +977,8 @@ module shader_core_fs2 #(
     // ================================================================ S -> X, the shared counters, predicate / acc flags
     // The issuing warp's fields = AND-OR of the one-hot grant and every warp's bundle: two LUT levels at 8 warps with no
     // select encode in front (`ins_v[sel]` behind a priority-encoded sel is 14 levels). Bundle layout,
-    // top down: ins 64, am 16, sm 16, wbm WBW, mk 3, rc 2, wc 2, first, last, qr, sfu, sc, cvt, imul, idiv, tex1.
-    localparam int BW = 112 + WBW;
+    // top down: ins 64, am NL, sm NL, wbm WBW, mk 3, rc 2, wc 2, first, last, qr, sfu, sc, cvt, imul, idiv, tex1.
+    localparam int BW = 80 + 2*NL + WBW;
     wire [BW-1:0] bnd_v [0:NWARP-1];
     generate for (gg = 0; gg < NWARP; gg = gg + 1) begin : BND
         assign bnd_v[gg] = {ins_v[gg], am_v[gg], sm_v[gg], wbm_v[gg], mk_v[gg], rc_v[gg], wc_v[gg], first_v[gg], last_v[gg],
@@ -978,7 +993,7 @@ module shader_core_fs2 #(
         assign s_bnd[gb] = |(grant & col);
     end endgenerate
     wire [63:0] s_ins = s_bnd[BW-1 -: 64];
-    wire [15:0] s_am = s_bnd[WBW+32 +: 16], s_sm = s_bnd[WBW+16 +: 16];
+    wire [NL-1:0] s_am = s_bnd[WBW+16+NL +: NL], s_sm = s_bnd[WBW+16 +: NL];
     wire [WBW-1:0] s_wbm = s_bnd[16 +: WBW];
     wire [2:0]  s_mk = s_bnd[15:13];
     wire [1:0]  s_rc = s_bnd[12:11], s_wc = s_bnd[10:9];
@@ -995,7 +1010,7 @@ module shader_core_fs2 #(
         assign s_xc[gb] = |(grant & col);
     end endgenerate
     wire bw_sfu, bw_sc, bw_cvt, bw_imul, bw_idiv;                  // a buffered class writes this cycle
-    reg  cdl_v, cdl_setp; reg [WW-1:0] cdl_w; reg [6:0] cdl_a; reg [15:0] cdl_l;
+    reg  cdl_v, cdl_setp; reg [WW-1:0] cdl_w; reg [6:0] cdl_a; reg [NL-1:0] cdl_l;
     wire [LW-1:0] y_cmp;
     always @(posedge clk) begin
         if (rst_q) begin x_valid <= 1'b0; wb_busy <= '0; qr_hold <= 3'd0; inf_sfu <= '0; inf_sc <= '0; inf_cvt <= '0;
@@ -1018,7 +1033,8 @@ module shader_core_fs2 #(
             // the write lands 2 + lat cycles after this S cycle = 1 + lat cycles after the next one (checked there)
             // (LDV1: a second step starting next cycle writes MADD_LAT cycles after that; fire_n saw the slot free)
             wb_busy <= (wb_busy >> 1) | s_wbm | (fire_n ? (WBW'(1) << MADD_LAT) : WBW'(0));
-            // quarter-rate micro-ops 4 cycles apart (the feeder is busy 4 cycles from X2); in flight per class
+            // quarter-rate micro-ops 4 cycles apart at every NL (the feeder is busy NC cycles from X2; the collectors' timing
+            // below rests on the 4); in flight per class
             qr_hold <= s_qr ? 3'd3 : (qr_hold != 3'd0) ? qr_hold - 3'd1 : 3'd0;
             inf_sfu <= inf_sfu + QIW'(s_sfu) - QIW'(bw_sfu);
             inf_sc  <= inf_sc  + QIW'(s_sc)  - QIW'(bw_sc);
@@ -1036,7 +1052,7 @@ module shader_core_fs2 #(
                 if (grant[w] && cls_v[w][C_SETP]) pred_pend[w] <= 1'b1;
                 else if (cdl_v && cdl_setp && cdl_w == WW'(w)) pred_pend[w] <= 1'b0;
                 if (cdl_v && cdl_setp && cdl_w == WW'(w))
-                    for (int l = 0; l < 16; l++) pred[w][l] <= (y_cmp[l*W +: W] != '0);
+                    for (int l = 0; l < NL; l++) pred[w][l] <= (y_cmp[l*W +: W] != '0);
                 // accumulators: not ready from the producing step's issue until one stage before it lands (the LDV's
                 // per component: its lambda2 step issues as soon as its own lambda1 step is in, not after the LAST
                 // lambda1 step has landed)
@@ -1122,10 +1138,10 @@ module shader_core_fs2 #(
         x2_tfirst <= x_first; x2_tlast <= x_last;
     end
 
-    // ================================================================ register file: 3 copies x 16 lanes, block RAM
-    reg         gpr_we; reg [GAW-1:0] gpr_wa; reg [15:0] gpr_wl; reg [LW-1:0] gpr_wd;
+    // ================================================================ register file: 3 copies x NL lanes, block RAM
+    reg         gpr_we; reg [GAW-1:0] gpr_wa; reg [NL-1:0] gpr_wl; reg [LW-1:0] gpr_wd;
     genvar gl;
-    generate for (gl = 0; gl < 16; gl = gl + 1) begin : GPRL
+    generate for (gl = 0; gl < NL; gl = gl + 1) begin : GPRL
         for (gk = 0; gk < 3; gk = gk + 1) begin : CP
             (* ram_style="block" *) reg [W-1:0] m [0:NWARP*128-1];
             reg [W-1:0] q;
@@ -1139,16 +1155,12 @@ module shader_core_fs2 #(
         assign cr[gl*W +: W] = CP[2].q;
     end endgenerate
 `ifndef SYNTHESIS
-    // simulation view: scalar register a = {warp, reg, comp} of lane l (benches: dut.gpr_peek(l, a))
+    // simulation view: scalar register a = {warp, reg, comp} of lane l (benches: dut.gpr_peek(l, a)) — a copy of the
+    // register file written beside it (never-written registers read X, as the block RAMs do)
+    reg [W-1:0] gpr_sv [0:NL-1][0:NWARP*128-1];
+    always @(posedge clk) for (int l = 0; l < NL; l++) if (gpr_we & gpr_wl[l]) gpr_sv[l][gpr_wa] <= gpr_wd[l*W +: W];
     function automatic [W-1:0] gpr_peek(input int l, input int a);
-        case (l)
-            0: gpr_peek = GPRL[0].CP[0].m[a];   1: gpr_peek = GPRL[1].CP[0].m[a];   2: gpr_peek = GPRL[2].CP[0].m[a];
-            3: gpr_peek = GPRL[3].CP[0].m[a];   4: gpr_peek = GPRL[4].CP[0].m[a];   5: gpr_peek = GPRL[5].CP[0].m[a];
-            6: gpr_peek = GPRL[6].CP[0].m[a];   7: gpr_peek = GPRL[7].CP[0].m[a];   8: gpr_peek = GPRL[8].CP[0].m[a];
-            9: gpr_peek = GPRL[9].CP[0].m[a];   10: gpr_peek = GPRL[10].CP[0].m[a]; 11: gpr_peek = GPRL[11].CP[0].m[a];
-            12: gpr_peek = GPRL[12].CP[0].m[a]; 13: gpr_peek = GPRL[13].CP[0].m[a]; 14: gpr_peek = GPRL[14].CP[0].m[a];
-            default: gpr_peek = GPRL[15].CP[0].m[a];
-        endcase
+        gpr_peek = gpr_sv[l][a];
     endfunction
 `endif
 
@@ -1158,7 +1170,7 @@ module shader_core_fs2 #(
     assign c_m = applymod(cr, x2_m2);
     wire [W-1:0]  pq_c = x2_pq[x2_sc_c*W +: W];                     // params broadcast
     reg  [LW-1:0] vr_c;                                             // the built-in component of every lane (also lambda)
-    always @* for (int l = 0; l < 16; l++)
+    always @* for (int l = 0; l < NL; l++)
         case (x2_vk)
             2'd0:    vr_c[l*W +: W] = x2_vh ? vo_q[l*W +: W] : ve_q[l*W +: W];
             2'd1:    vr_c[l*W +: W] = '0;
@@ -1166,7 +1178,7 @@ module shader_core_fs2 #(
             default: vr_c[l*W +: W] = ffq[x2_w][l >> 2] ? ONE1 : '0;
         endcase
     reg  [LW-1:0] t_f0, t_d1, t_d2;                                 // the triangle store's values per lane
-    always @* for (int l = 0; l < 16; l++) begin
+    always @* for (int l = 0; l < NL; l++) begin
         t_f0[l*W +: W] = trd[l >> 2][0 +: W]; t_d1[l*W +: W] = trd[l >> 2][W +: W]; t_d2[l*W +: W] = trd[l >> 2][2*W +: W];
     end
     // madd operands: ADD a*1+b, SUB a*1-b (b read through copy 2: it is the c operand), MUL a*b+0, MAD a*b+c, DDX /
@@ -1178,7 +1190,7 @@ module shader_core_fs2 #(
     // cycle is not a multiply-add one (fire_n looked at it in X), so the lanes are free.
     wire [LW-1:0] y_madd;
     wire [LW-1:0] d2_q;
-    generate for (gl = 0; gl < 16; gl = gl + 1) begin : D2L assign d2_q[gl*W +: W] = d2_r[(gl >> 2)*W +: W]; end endgenerate
+    generate for (gl = 0; gl < NL; gl = gl + 1) begin : D2L assign d2_q[gl*W +: W] = d2_r[(gl >> 2)*W +: W]; end endgenerate
     wire [2:0] m_mk = au_r ? MK_L1 : x2_mk;
     reg [LW-1:0] ma, mb, mc;
     always @* begin
@@ -1197,7 +1209,7 @@ module shader_core_fs2 #(
                     default: ;
                 endcase
                 if (x2_ddx | x2_ddy)
-                    for (int l = 0; l < 16; l++) begin : dd
+                    for (int l = 0; l < NL; l++) begin : dd
                         int q, p, hi, lo;
                         q = l >> 2; p = l & 3;
                         hi = x2_ddx ? (p | 1) : (p | 2); lo = x2_ddx ? (p & ~1) : (p & ~2);
@@ -1206,9 +1218,9 @@ module shader_core_fs2 #(
             end
         endcase
     end
-    wire [15:0] vm, vc;
+    wire [NL-1:0] vm, vc;
     wire [2:0] cmp_op = (x2_cmpop == 2'd2) ? x2_cc : (x2_cmpop == 2'd3) ? 3'd6 : {1'b0, x2_cmpop};   // float_cmp: 0 MIN 1 MAX 2 SLT 3 SGE 4 SEQ 5 SNE; float_cmp3: 6 CLAMP
-    generate for (gl = 0; gl < 16; gl = gl + 1) begin : LANE
+    generate for (gl = 0; gl < NL; gl = gl + 1) begin : LANE
         float_madd #(.EXP_W(EXP_W), .MAN_W(MAN_W), .DSP_ALIGN(ADD_DSP)) u_madd (.clk, .rst(rst_q), .in_valid((x2_valid & x2_madd) | au_r), .sub(x2_sub & (m_mk == MK_N)),
             .a(ma[gl*W +: W]), .b(mb[gl*W +: W]), .c(mc[gl*W +: W]), .out_valid(vm[gl]), .result(y_madd[gl*W +: W]), .prod_o());
         if (XCLAMP) begin : C3                                      // CLAMP rd, x, lo, hi: the third operand is its upper bound
@@ -1226,7 +1238,7 @@ module shader_core_fs2 #(
     // ADDSUB_LAT: the same two rounded operations, in the same operand order, as the lambda2 step through float_madd.
     wire [LW-1:0] y_ldv;
     generate if (LDV2P) begin : L2P
-        for (gl = 0; gl < 16; gl = gl + 1) begin : LN
+        for (gl = 0; gl < NL; gl = gl + 1) begin : LN
             wire [W-1:0] p2;
             float_mul #(EXP_W, MAN_W) u_mul2 (.clk, .rst(rst_q), .in_valid(1'b1), .a(vo_q[gl*W +: W]), .b(t_d2[gl*W +: W]),
                 .in_ready(), .out_valid(), .result(p2));
@@ -1244,15 +1256,15 @@ module shader_core_fs2 #(
     reg [LW-1:0] one_y;                                             // the 1-cycle path
     always @* begin
         one_y = a_m;                                                // MOV
-        if (x2_movi) one_y = {16{x2_imm}};
-        else if (x2_ldp) one_y = {16{pq_c}};
+        if (x2_movi) one_y = {NL{x2_imm}};
+        else if (x2_ldp) one_y = {NL{pq_c}};
         else if (x2_ldv) one_y = vr_c;
         else if (x2_sel) one_y = selv(ar, br, cr);
         else if (x2_int) one_y = int_alu(ar, br, x2_intop);
     end
     // STO / STOZ: colour and depth of the active, unkilled lanes into the output store = one LUTRAM per lane, rows
     // {warp, idx} (idx 0..3 the colour component, 4 gl_FragDepth); read for the latched warp at {ol_w, out_sel[2:0]},
-    // the quad out_sel[4:3] picked from the 16 lanes. A warp's last STO can be in X2 when the warp retires (its END
+    // the quad out_sel[4:3] picked from the NL lanes. A warp's last STO can be in X2 when the warp retires (its END
     // two cycles behind), and the store is first read two cycles after that, so its row is complete; odw is set in X
     // because the latch samples it AT the retire
     // STO2: a STO micro-op stores two components — x2_wc = 0 / 2 from a_m, x2_wc + 1 from b_m (the same
@@ -1263,7 +1275,7 @@ module shader_core_fs2 #(
     wire [LW-1:0] orow, orow2;
     generate if (STO2) begin : OS2
         wire [1:0] oe_idx = x2_stoz ? 2'd2 : {1'b0, x2_wc[1]};
-        for (gl = 0; gl < 16; gl = gl + 1) begin : OL
+        for (gl = 0; gl < NL; gl = gl + 1) begin : OL
             (* ram_style="distributed" *) reg [W-1:0] ome [0:NWARP*4-1];
             (* ram_style="distributed" *) reg [W-1:0] omo [0:NWARP*2-1];
             always @(posedge clk) if (x2_valid && (x2_sto || x2_stoz) && x2_sm[gl]) ome[{x2_w, oe_idx}] <= a_m[gl*W +: W];
@@ -1272,7 +1284,7 @@ module shader_core_fs2 #(
             assign orow2[gl*W +: W] = omo[{ol_w, out_sel2[1]}];
         end
     end else begin : OS1
-        for (gl = 0; gl < 16; gl = gl + 1) begin : OL
+        for (gl = 0; gl < NL; gl = gl + 1) begin : OL
             (* ram_style="distributed" *) reg [W-1:0] omem [0:NWARP*8-1];
             always @(posedge clk) if (x2_valid && (x2_sto || x2_stoz) && x2_sm[gl]) omem[{x2_w, o_idx}] <= a_m[gl*W +: W];
             assign orow[gl*W +: W]  = omem[{ol_w, out_sel[2:0]}];
@@ -1283,8 +1295,9 @@ module shader_core_fs2 #(
     always @(posedge clk) if (STO2 && !rst_q && ol_v && (out_sel[0] === 1'b1))
         $fatal(1, "shader_core_fs2: out_sel reads an odd row (STO2: idx 1 / 3 are out_sel2's)");
     // synthesis translate_on
-    assign out_row  = orow[out_sel[4:3]*4*W +: 4*W];
-    assign out_row2 = orow2[out_sel2[4:3]*4*W +: 4*W];
+    wire [1:0] o_q = out_sel[4:3] & 2'(NQ - 1), o_q2 = out_sel2[4:3] & 2'(NQ - 1);   // the quad (its low bits below 4 quads)
+    assign out_row  = orow[o_q*4*W +: 4*W];
+    assign out_row2 = orow2[o_q2*4*W +: 4*W];
     assign out_depthw = ol_dw;
     assign out_kill   = ol_kill;
     assign out_err    = ol_err;
@@ -1301,9 +1314,9 @@ module shader_core_fs2 #(
     wire v_div;
     // delay lines X2 -> W: madd (MADD_LAT, with the target, x2_tgt), cmp (1), the 1-cycle path (1)
     (* shreg_extract = "no" *) reg [MADD_LAT-1:0] mdl_v;   // flops (its stages feed the landing / readiness logic)
-    reg [WW-1:0] mdl_w [0:MADD_LAT-1]; reg [6:0] mdl_a [0:MADD_LAT-1]; reg [15:0] mdl_l [0:MADD_LAT-1];
+    reg [WW-1:0] mdl_w [0:MADD_LAT-1]; reg [6:0] mdl_a [0:MADD_LAT-1]; reg [NL-1:0] mdl_l [0:MADD_LAT-1];
     reg [1:0] mdl_t [0:MADD_LAT-1]; reg mdl_f [0:MADD_LAT-1];
-    reg sdl_v; reg [WW-1:0] sdl_w; reg [6:0] sdl_a; reg [15:0] sdl_l; reg [LW-1:0] sdl_y;
+    reg sdl_v; reg [WW-1:0] sdl_w; reg [6:0] sdl_a; reg [NL-1:0] sdl_l; reg [LW-1:0] sdl_y;
     always @(posedge clk) begin
         if (rst_q) begin mdl_v <= '0; cdl_v <= 1'b0; sdl_v <= 1'b0; end
         else begin
@@ -1314,14 +1327,14 @@ module shader_core_fs2 #(
         for (int i = MADD_LAT-1; i > 0; i--) begin mdl_w[i] <= mdl_w[i-1]; mdl_a[i] <= mdl_a[i-1]; mdl_l[i] <= mdl_l[i-1]; mdl_t[i] <= mdl_t[i-1]; mdl_f[i] <= mdl_f[i-1]; end
         mdl_w[0] <= x2_w; mdl_a[0] <= {x2_rd, x2_wc}; mdl_l[0] <= x2_am; mdl_t[0] <= x2_tgt; mdl_f[0] <= x2_ll;
         // LDV1: an LDV's second step is a register write with the meta its first step left in the ring
-        if (au_r) begin mdl_w[0] <= au_m[MW-1 -: WW]; mdl_a[0] <= au_m[16 +: 7]; mdl_l[0] <= au_m[15:0]; mdl_t[0] <= 2'd0; end
+        if (au_r) begin mdl_w[0] <= au_m[MW-1 -: WW]; mdl_a[0] <= au_m[NL +: 7]; mdl_l[0] <= au_m[NL-1:0]; mdl_t[0] <= 2'd0; end
         cdl_w <= x2_w; cdl_a <= {x2_rd, x2_wc}; cdl_l <= x2_am; cdl_setp <= x2_setp;
         sdl_w <= x2_w; sdl_a <= {x2_rd, x2_wc}; sdl_l <= x2_am; sdl_y <= one_y;
     end
     // LDV2P: an LDV's entry goes on from the madd delay line's tail (target 3) through the second adder's stages; its
     // write is the cycle after stage L2 - 2 (ldv_gw), the scoreboard clear at that stage
     localparam int L2 = ADDSUB_LAT;
-    reg [L2-1:0] l2_v; reg [WW-1:0] l2_w [0:L2-1]; reg [6:0] l2_a [0:L2-1]; reg [15:0] l2_l [0:L2-1];
+    reg [L2-1:0] l2_v; reg [WW-1:0] l2_w [0:L2-1]; reg [6:0] l2_a [0:L2-1]; reg [NL-1:0] l2_l [0:L2-1];
     reg ldv_gw;
     always @(posedge clk) begin
         if (rst_q) begin l2_v <= '0; ldv_gw <= 1'b0; end
@@ -1366,6 +1379,8 @@ module shader_core_fs2 #(
     end
     // LDV1, the ring of waiting second steps (declarations and fire_n: with the shared state / in X)
     reg [1:0] rg_cd;
+    wire [NQ*W-1:0] d2_all;                                         // D2.c of every quad of the warp in X2
+    generate for (gq = 0; gq < NQ; gq = gq + 1) begin : D2Q assign d2_all[gq*W +: W] = trd[gq][2*W +: W]; end endgenerate
     wire blk_n = LDVR & ((rg_lq >= 5'(RN / 2)) | (((rg_lq >= 5'(LDV_TH)) | (rg_wait >= 4'(LDV_WT))) & (rg_cd == 2'd0)));
     always @(posedge clk) begin
         if (rst_q) begin rg_a <= AAW'(NWARP); rg_l <= AAW'(NWARP); rg_r <= AAW'(NWARP); rg_lq <= 5'd0; rg_wait <= 4'd0; au_r <= 1'b0; mblk <= 1'b0; rg_cd <= 2'd0; end
@@ -1383,14 +1398,14 @@ module shader_core_fs2 #(
             rg_cd <= blk_n ? 2'd2 : (rg_cd != 2'd0) ? rg_cd - 2'd1 : 2'd0;
         end
         if (LDVR && x2_valid && x2_madd && x2_mk == MK_L0) begin
-            d2s[rg_a] <= {trd[3][2*W +: W], trd[2][2*W +: W], trd[1][2*W +: W], trd[0][2*W +: W]};
+            d2s[rg_a] <= d2_all;
             rmeta[rg_a] <= {x2_w, x2_rd, x2_wc, x2_am};
         end
         if (fire_n) begin au_m <= rmeta[rg_r]; d2_r <= d2s[rg_r]; end
     end
 
     // ================================================================ quarter-rate feeder and units
-    // X2 captures the 16-lane operands and starts the 4-cycle feed; cycle i sends lane 4k+i to unit k
+    // X2 captures the NL-lane operands and starts the NC-cycle feed; cycle i sends lane NC k + i to unit k
     reg qr_run; reg [1:0] qr_i; reg [LW-1:0] qr_x, qr_x2; reg [4:0] qr_cls; reg [1:0] qr_sfuop; reg qr_cos;
     reg [2:0] qr_cvtop; reg [1:0] qr_divmode;
     reg qr_fm, qr_sq;                                               // XSFU: this feed's results are multiplied by qr_x2 / it is a SQRT
@@ -1399,7 +1414,7 @@ module shader_core_fs2 #(
     always @(posedge clk) begin
         if (rst_q) begin qr_run <= 1'b0; qr_i <= 2'd0; end
         else if (qr_start) begin qr_run <= 1'b1; qr_i <= 2'd0; end
-        else if (qr_run) begin qr_i <= qr_i + 2'd1; if (qr_i == 2'd3) qr_run <= 1'b0; end
+        else if (qr_run) begin qr_i <= (qr_i == 2'(NC-1)) ? 2'd0 : qr_i + 2'd1; if (qr_i == 2'(NC-1)) qr_run <= 1'b0; end
         if (qr_start) begin
             qr_x <= (x2_imul | x2_idiv) ? ar : a_m;               // integers: raw registers
             // the second operand: the integers' raw register; XSFU: what the unit's result is multiplied by — the second
@@ -1436,8 +1451,8 @@ module shader_core_fs2 #(
     end endgenerate
     genvar gu;
     generate for (gu = 0; gu < 4; gu = gu + 1) begin : QU
-        assign ux[gu]  = qr_x [(4*gu + qr_i)*W +: W];
-        assign ux2[gu] = qr_x2[(4*gu + qr_i)*W +: W];
+        assign ux[gu]  = qr_x [(NC*gu + qr_i)*W +: W];
+        assign ux2[gu] = qr_x2[(NC*gu + qr_i)*W +: W];
         wire su_ov; wire [W-1:0] su_y;                              // the unit's own result
         float_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(SK), .KLOG(SKL), .SPLIT6(1'b1), .SPLIT1B(1'b1),   // SPLIT1B: splits the rsqrt seed RAM -> squaring DSPs path (timing at 120 MHz)
             .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM), .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM), .TAB_EXT(SFU_TAB2)) u_sfu (
@@ -1510,19 +1525,21 @@ module shader_core_fs2 #(
         assign u_imul_y[gu] = int4_ym[gu*W +: W];
     end endgenerate
     // the integer unit: IMUL (one DSP per lane, latency 3) and the divider on the 4 quarter-rate lanes.
-    // The divider takes a warp's 16 lanes as 4 rounds (DSEQ, ≈ 108
-    // cycles, one in flight) and returns them as 4 cycles of 4 lanes. The unit's IOP section is tied off.
-    int_unit #(.NL(4), .W(W), .ONE(ONE1), .DSEQ(4), .HAS_DIV(INT_DIV)) u_int4 (.clk, .rst(rst_q), .a(int4_a), .b(int4_b),
+    // The divider takes a warp's NL lanes as NC rounds (DSEQ, ≈ 27 cycles a round, one job in flight) and returns them
+    // as NC cycles of 4 lanes. The unit's IOP section is tied off.
+    int_unit #(.NL(4), .W(W), .ONE(ONE1), .DSEQ(NC), .HAS_DIV(INT_DIV)) u_int4 (.clk, .rst(rst_q), .a(int4_a), .b(int4_b),
         .mul_valid(qr_run & qr_cls[3]), .v_mul(int4_vm), .y_mul(int4_ym),
         .div_valid(qr_run & qr_cls[4]), .div_mode(qr_divmode), .div_ready(idiv_ready), .v_div(v_div), .y_div(y_div4),
         .iop_valid(1'b0), .iop_fn(4'd0), .v_iop(), .y_iop());
-    // collectors: the 4 results of cycle i land in lanes 4k+i; a collector is full after the 4th cycle and is taken,
-    // with the micro-op's meta (queued at the feed start), into ONE shared result queue (LUTRAM): one class
+    // collectors: the 4 results of cycle i land in lanes NC k + i; a collector is full after the NC-th cycle and is
+    // taken, with the micro-op's meta (queued at the feed start), into ONE shared result queue (LUTRAM): one class
     // per cycle, the longest-waiting class first. Quarter-rate micro-ops issue at most every 4th cycle, so a class's
-    // next results begin the cycle after its collector fills (slot 0 is overwritten then: a one-cycle wait keeps the
-    // old slot 0 in a shadow), and at most two collectors fill within two cycles — no collector waits more than one
-    // cycle (asserted). The queue head drains through the write port on a free cycle; up to QR_INF results per class
-    // exist (inf_*), so the queue (4 x QR_INF entries) never overflows, nor a collector's meta queue (QR_INF).
+    // next results begin at the earliest the cycle after its collector fills at NC = 4 (slot 0 is overwritten then: a
+    // one-cycle wait keeps the old slot 0 in a shadow; with NC < 4 they begin 4 - NC cycles later still, after the
+    // take), and at most two collectors fill within two cycles — no collector waits more than one cycle (asserted;
+    // a fill is the issue + the class's latency + NC, so NC shifts every fill alike). The queue head drains through
+    // the write port on a free cycle; up to QR_INF results per class exist (inf_*), so the queue (4 x QR_INF entries)
+    // never overflows, nor a collector's meta queue (QR_INF).
     wire [3:0] qc_ov = {int4_vm, u_cvt_ov[0], u_sc_ov[0], u_sfu_ov[0]};
     wire [3:0] qc_start = qr_start ? {x2_imul, x2_cvt, x2_sc, x2_sfu} : 4'd0;
     wire [3:0] qc_full, qc_wait; reg [3:0] qc_take;                 // collector full / full since the previous cycle / taken
@@ -1543,8 +1560,8 @@ module shader_core_fs2 #(
             else begin
                 if (qc_start[gc]) mq_wp <= mq_wp + MQW'(1);
                 if (qc_ov[gc]) begin
-                    cnt <= cnt + 2'd1;
-                    if (cnt == 2'd3) full <= 1'b1;
+                    cnt <= (cnt == 2'(NC-1)) ? 2'd0 : cnt + 2'd1;
+                    if (cnt == 2'(NC-1)) full <= 1'b1;
                     if (cnt == 2'd0 && full && !qc_take[gc]) sh_v <= 1'b1;   // the next stream overwrites slot 0 before the take
                 end
                 waitq <= full & ~qc_take[gc];
@@ -1554,12 +1571,12 @@ module shader_core_fs2 #(
             // col / sh0 clock enables); during a reset they take what the units still deliver, unused
             if (qc_start[gc]) mq[mq_wp] <= x2_meta;
             if (qc_ov[gc]) begin
-                for (int k = 0; k < 4; k++) col[(4*k + cnt)*W +: W] <= uy[k];
-                if (cnt == 2'd0 && full && !qc_take[gc]) for (int k = 0; k < 4; k++) sh0[k*W +: W] <= col[(4*k)*W +: W];
+                for (int k = 0; k < 4; k++) col[(NC*k + cnt)*W +: W] <= uy[k];
+                if (cnt == 2'd0 && full && !qc_take[gc]) for (int k = 0; k < 4; k++) sh0[k*W +: W] <= col[(NC*k)*W +: W];
             end
         end
         reg [LW-1:0] col_o;
-        always @* begin col_o = col; if (sh_v) for (int k = 0; k < 4; k++) col_o[(4*k)*W +: W] = sh0[k*W +: W]; end
+        always @* begin col_o = col; if (sh_v) for (int k = 0; k < 4; k++) col_o[(NC*k)*W +: W] = sh0[k*W +: W]; end
         assign qc_full[gc] = full; assign qc_wait[gc] = waitq; assign qc_col[gc] = col_o; assign qc_m[gc] = mq[mq_rp];
         // synthesis translate_off
         always @(posedge clk) if (!rst_q && full && waitq && !qc_take[gc]) $fatal(1, "shader_core_fs2: collector %0d waited 2 cycles", gc);
@@ -1591,34 +1608,35 @@ module shader_core_fs2 #(
         $fatal(1, "shader_core_fs2: more than QR_INF quarter-rate micro-ops of a class in flight");
     initial if (QR_INF != 2 && QR_INF != 4) $fatal(1, "shader_core_fs2: QR_INF is 2 or 4");
     // synthesis translate_on
-    // divider result (one in flight): the unit returns a warp's 16 lanes as 4 cycles of 4 (lanes 4k + i in cycle i, the
-    // feed order), assembled here; the next IDIV waits for this write (inf_idiv) and for the unit (idiv_ready)
+    // divider result (one in flight): the unit returns a warp's NL lanes as NC cycles of 4 (lanes NC k + i in cycle i,
+    // the feed order), assembled here; the next IDIV waits for this write (inf_idiv) and for the unit (idiv_ready)
     reg idiv_pend; reg [LW-1:0] idiv_y; reg [MW-1:0] idiv_m; reg [1:0] idv_i;
     always @(posedge clk) begin
         if (rst_q) begin idiv_pend <= 1'b0; idv_i <= 2'd0; end
         else begin
             if (x2_valid & x2_idiv) idiv_m <= x2_meta;
-            if (v_div) begin idv_i <= idv_i + 2'd1; if (idv_i == 2'd3) idiv_pend <= 1'b1; end
+            if (v_div) begin idv_i <= (idv_i == 2'(NC-1)) ? 2'd0 : idv_i + 2'd1; if (idv_i == 2'(NC-1)) idiv_pend <= 1'b1; end
             else if (bw_idiv) idiv_pend <= 1'b0;
         end
-        if (v_div) for (int k = 0; k < 4; k++) idiv_y[(4*k + idv_i)*W +: W] <= y_div4[k*W +: W];
+        if (v_div) for (int k = 0; k < 4; k++) idiv_y[(NC*k + idv_i)*W +: W] <= y_div4[k*W +: W];
     end
 
     // ================================================================ TEX: coordinate staging, requests, results
-    // Coordinate staging: micro-op k writes its component of all 16 lanes (raw register: no modifiers on TEX); the first
+    // Coordinate staging: micro-op k writes its component of all NL lanes (raw register: no modifiers on TEX); the first
     // micro-op zeroes the components outside the instruction's coordinate set (the TMU reads what its mode needs; a
     // zero there costs nothing and keeps X out of the simulation). After the LAST micro-op the sequencer sends ONE
     // request per quad that has an active lane (lanes 4q..4q+3; an inactive quad's lanes hold undefined registers and
     // would only cost TMU time), lowest quad first, then releases the staging (seq_done).
     // A TEX without any active lane sends nothing: its entry is complete at once (null entry).
-    reg  [LW-1:0] tstg [0:3]; reg [3:0] tstg_samp; reg [1:0] tstg_mode; reg tstg_bank; reg [15:0] tstg_mk;
-    reg  seq_run; reg [3:0] seq_rem; reg [1:0] seq_q;
-    always @* begin seq_q = 2'd0; for (int q = 3; q >= 0; q--) if (seq_rem[q]) seq_q = 2'(q); end
-    wire [3:0] x2_qm = {|x2_am[15:12], |x2_am[11:8], |x2_am[7:4], |x2_am[3:0]};
+    localparam bit TW2 = TEXW2 && (NQ > 1);                         // two result writers (a warp of one quad has one)
+    reg  [LW-1:0] tstg [0:3]; reg [3:0] tstg_samp; reg [1:0] tstg_mode; reg tstg_bank; reg [NL-1:0] tstg_mk;
+    reg  seq_run; reg [NQ-1:0] seq_rem; reg [1:0] seq_q;
+    always @* begin seq_q = 2'd0; for (int q = NQ-1; q >= 0; q--) if (seq_rem[q]) seq_q = 2'(q); end
+    wire [NQ-1:0] x2_qm = qm_of(x2_am);
     wire seq_acc = seq_run & tex_req_ready;
-    wire seq_lastq = ((seq_rem & (seq_rem - 4'd1)) == 4'd0);
+    wire seq_lastq = ((seq_rem & (seq_rem - 1'b1)) == '0);
     wire tex_c3 = x2_valid & x2_tex & x2_tlast;                     // the staging is complete (the set's last component)
-    wire null_done = tex_c3 & (x2_qm == 4'd0);
+    wire null_done = tex_c3 & (x2_qm == '0);
     assign seq_done = (seq_acc & seq_lastq) | null_done;
     always @(posedge clk) begin
         if (x2_valid & x2_tex) begin
@@ -1629,13 +1647,13 @@ module shader_core_fs2 #(
             end
             tstg_samp <= x2_samp; tstg_mode <= x2_mode; tstg_bank <= bank[x2_w]; tstg_mk <= tmk[x2_w];
         end
-        if (rst_q) begin seq_run <= 1'b0; seq_rem <= 4'd0; end
-        else if (tex_c3) begin seq_run <= (x2_qm != 4'd0); seq_rem <= x2_qm; end
-        else if (seq_acc) begin seq_rem <= seq_rem & ~(4'd1 << seq_q); if (seq_lastq) seq_run <= 1'b0; end
+        if (rst_q) begin seq_run <= 1'b0; seq_rem <= '0; end
+        else if (tex_c3) begin seq_run <= (x2_qm != '0); seq_rem <= x2_qm; end
+        else if (seq_acc) begin seq_rem <= seq_rem & ~(NQ'(1) << seq_q); if (seq_lastq) seq_run <= 1'b0; end
     end
     assign tex_req_valid = seq_run; assign tex_req_sampler = {tstg_bank, tstg_samp}; assign tex_req_mode = tstg_mode;
     assign tex_req_mask = tstg_mk[4*seq_q +: 4];
-    assign tex_req_cls = TEXW2 & seq_q[0];
+    assign tex_req_cls = TW2 & seq_q[0];
     genvar gp;
     generate for (gp = 0; gp < 4; gp = gp + 1) begin : TRQ          // pixel gp of quad seq_q
         assign tex_req_uv[gp*2*W +: W]   = tstg[0][(4*seq_q + gp)*W +: W];
@@ -1645,25 +1663,24 @@ module shader_core_fs2 #(
     end endgenerate
     // Results return in request order: entry rx_e (the oldest TEX with quads outstanding) expects its active quads
     // lowest first (rx_got marks the received ones); a quad's 16 texels are latched and written over 4 cycles
-    // (component c of its 4 pixels -> quad-block rr_q, row {entry, c}) into the result staging = 4 LUTRAM quad-blocks
-    // x TEXQ*4 rows x 4 pixels; the entry is complete (tc_done) after its last quad's last row, a null entry at once.
-    // rx_e steps over complete null entries. W drains the head entry (rs_rp) one wm component per free write cycle:
-    // row {rs_rp, tex_wc} of all 4 quad-blocks = 16 lanes (a null entry's drain writes no lane and clears rd.wm).
-    // TEXW2: two writers — writer k latches the quads of index bit 0 = k and writes quad-blocks k and
-    // k + 2 (each block's write data is one writer's row: no data mux), so a warp's quads 0 1 2 3 may return back to
-    // back; every writer takes exactly 4 cycles from its result, so the quads' last rows land in arrival order and the
-    // last quad's last row still completes the entry.
-    localparam int NRW = TEXW2 ? 2 : 1;
-    reg  [NRW-1:0] rr_run, rr_last; reg [1:0] rr_c [0:NRW-1], rr_q [0:NRW-1]; reg [TQW-1:0] rr_e [0:NRW-1]; reg [LW-1:0] rr_d [0:NRW-1];
-    reg  [TQW-1:0] rx_e, rs_rp; reg [3:0] rx_got; reg [TLW-1:0] rx_pend; reg [TEXQ-1:0] tc_done; reg [3:0] tex_done;
-    function automatic [3:0] qm_of(input [15:0] l); qm_of = {|l[15:12], |l[11:8], |l[7:4], |l[3:0]}; endfunction
+    // (component c of its 4 pixels -> quad-block rr_q, row {entry, c}) into the result staging = NL / 4 LUTRAM
+    // quad-blocks x TEXQ*4 rows x 4 pixels; the entry is complete (tc_done) after its last quad's last row, a null entry
+    // at once. rx_e steps over complete null entries. W drains the head entry (rs_rp) one wm component per free write
+    // cycle: row {rs_rp, tex_wc} of all quad-blocks = NL lanes (a null entry's drain writes no lane and clears rd.wm).
+    // TEXW2 (with two or more quads per warp): two writers — writer k latches the quads of index bit 0 = k and writes
+    // quad-blocks k and k + 2 (each block's write data is one writer's row: no data mux), so a warp's quads 0 1 2 3 may
+    // return back to back; every writer takes exactly 4 cycles from its result, so the quads' last rows land in arrival
+    // order and the last quad's last row still completes the entry. A writer latches one quad's 16 texels (QTW bits).
+    localparam int NRW = TW2 ? 2 : 1;
+    reg  [NRW-1:0] rr_run, rr_last; reg [1:0] rr_c [0:NRW-1], rr_q [0:NRW-1]; reg [TQW-1:0] rr_e [0:NRW-1]; reg [QTW-1:0] rr_d [0:NRW-1];
+    reg  [TQW-1:0] rx_e, rs_rp; reg [NQ-1:0] rx_got; reg [TLW-1:0] rx_pend; reg [TEXQ-1:0] tc_done; reg [3:0] tex_done;
     wire [TMW-1:0] tm_h = tmeta[rs_rp], tm_x = tmeta[rx_e];
-    wire [WW-1:0] tm_w = tm_h[TMW-1 -: WW]; wire [4:0] tm_rd = tm_h[24:20]; wire [3:0] tm_wm = tm_h[19:16]; wire [15:0] tm_l = tm_h[15:0];
-    wire [3:0] rx_qm = qm_of(tm_x[15:0]), rx_rem = rx_qm & ~rx_got;
+    wire [WW-1:0] tm_w = tm_h[TMW-1 -: WW]; wire [4:0] tm_rd = tm_h[NL+4 +: 5]; wire [3:0] tm_wm = tm_h[NL +: 4]; wire [NL-1:0] tm_l = tm_h[NL-1:0];
+    wire [NQ-1:0] rx_qm = qm_of(tm_x[NL-1:0]), rx_rem = rx_qm & ~rx_got;
     reg  [1:0] rx_next;
-    always @* begin rx_next = 2'd0; for (int q = 3; q >= 0; q--) if (rx_rem[q]) rx_next = 2'(q); end
-    wire rx_lastq = ((rx_rem & (rx_rem - 4'd1)) == 4'd0);
-    wire rx_skip = (rx_pend != '0) & tc_done[rx_e] & (rx_qm == 4'd0);   // a complete null entry at the receive pointer
+    always @* begin rx_next = 2'd0; for (int q = NQ-1; q >= 0; q--) if (rx_rem[q]) rx_next = 2'(q); end
+    wire rx_lastq = ((rx_rem & (rx_rem - 1'b1)) == '0);
+    wire rx_skip = (rx_pend != '0) & tc_done[rx_e] & (rx_qm == '0);   // a complete null entry at the receive pointer
     wire [3:0] tex_rem = tm_wm & ~tex_done;                          // components of the head still to write
     reg  [1:0] tex_wc;
     always @* begin tex_wc = 2'd0; for (int c = 3; c >= 0; c--) if (tex_rem[c]) tex_wc = 2'(c); end
@@ -1671,13 +1688,13 @@ module shader_core_fs2 #(
     reg  [4*W-1:0] rr_slice [0:NRW-1];                               // component rr_c of a writer's latched quad's 4 pixels
     always @* for (int k = 0; k < NRW; k++) for (int p = 0; p < 4; p++) rr_slice[k][p*W +: W] = rr_d[k][(p*4 + rr_c[k])*W +: W];
     wire [LW-1:0] tex_y;
-    generate for (gq = 0; gq < 4; gq = gq + 1) begin : TR
-        localparam int K = TEXW2 ? (gq % 2) : 0;                     // the block's writer
+    generate for (gq = 0; gq < NQ; gq = gq + 1) begin : TR
+        localparam int K = TW2 ? (gq % 2) : 0;                       // the block's writer
         (* ram_style="distributed" *) reg [4*W-1:0] rmem [0:TEXQ*4-1];
         always @(posedge clk) if (rr_run[K] && rr_q[K] == 2'(gq)) rmem[{rr_e[K], rr_c[K]}] <= rr_slice[K];
         assign tex_y[gq*4*W +: 4*W] = rmem[{rs_rp, tex_wc}];
     end endgenerate
-    wire rr_k = TEXW2 & rx_next[0];                                  // the arriving quad's writer
+    wire rr_k = TW2 & rx_next[0];                                    // the arriving quad's writer
     reg  [NRW-1:0] rr_fin; reg rr_endl; reg [TQW-1:0] rr_ende;       // a writer's last row; ... of an entry's last quad, that entry
     always @* begin
         rr_endl = 1'b0; rr_ende = '0;
@@ -1687,7 +1704,7 @@ module shader_core_fs2 #(
         end
     end
     always @(posedge clk) begin
-        if (rst_q) begin rr_run <= '0; rx_e <= '0; rx_got <= 4'd0; rx_pend <= '0; rs_rp <= '0; tc_done <= '0; tex_done <= 4'd0;
+        if (rst_q) begin rr_run <= '0; rx_e <= '0; rx_got <= '0; rx_pend <= '0; rs_rp <= '0; tc_done <= '0; tex_done <= 4'd0;
                        for (int k = 0; k < NRW; k++) rr_c[k] <= 2'd0; end
         else begin
             for (int k = 0; k < NRW; k++) begin
@@ -1696,7 +1713,7 @@ module shader_core_fs2 #(
                 end else if (rr_run[k]) begin rr_c[k] <= rr_c[k] + 2'd1; if (rr_c[k] == 2'd3) rr_run[k] <= 1'b0; end
             end
             if (tex_res_valid) begin
-                if (rx_lastq) begin rx_e <= nxt_t(rx_e); rx_got <= 4'd0; end else rx_got <= rx_got | (4'd1 << rx_next);
+                if (rx_lastq) begin rx_e <= nxt_t(rx_e); rx_got <= '0; end else rx_got <= rx_got | (NQ'(1) << rx_next);
             end else if (rx_skip) rx_e <= nxt_t(rx_e);
             rx_pend <= rx_pend + TLW'(s_tex1) - TLW'((tex_res_valid & rx_lastq) | (~tex_res_valid & rx_skip));
             for (int e = 0; e < TEXQ; e++) begin
@@ -1709,7 +1726,7 @@ module shader_core_fs2 #(
     // synthesis translate_off
     always @(posedge clk) if (!rst_q && tex_res_valid && rr_run[rr_k] && !rr_fin[rr_k]) $fatal(1, "shader_core_fs2: TEX results of one writer less than 4 cycles apart");
     always @(posedge clk) if (!rst_q && (&(rr_fin & rr_last)) && NRW == 2) $fatal(1, "shader_core_fs2: two TEX entries completed in one cycle");
-    always @(posedge clk) if (!rst_q && tex_res_valid && (rx_pend == '0 || rx_qm == 4'd0)) $fatal(1, "shader_core_fs2: unexpected TEX result");
+    always @(posedge clk) if (!rst_q && tex_res_valid && (rx_pend == '0 || rx_qm == '0)) $fatal(1, "shader_core_fs2: unexpected TEX result");
     // synthesis translate_on
 
     // ================================================================ W: the write port
@@ -1730,10 +1747,10 @@ module shader_core_fs2 #(
     assign bw_imul = bw_q & (bw_qcls == 2'd3);
     assign bw_idiv = bw_free & ~bw_q & idiv_pend;
     assign bw_tex  = bw_free & ~bw_q & ~idiv_pend & tc_done[rs_rp];
-    reg  bn_v; reg [GAW-1:0] bn_a; reg [15:0] bn_l; reg [LW-1:0] bn_d;   // the buffered write decided now
-    reg  w2_v; reg [GAW-1:0] w2_a; reg [15:0] w2_l; reg [LW-1:0] w2_d;   // ... written this cycle
+    reg  bn_v; reg [GAW-1:0] bn_a; reg [NL-1:0] bn_l; reg [LW-1:0] bn_d;   // the buffered write decided now
+    reg  w2_v; reg [GAW-1:0] w2_a; reg [NL-1:0] w2_l; reg [LW-1:0] w2_d;   // ... written this cycle
     always @* begin
-        bn_v = 1'b0; bn_a = '0; bn_l = 16'd0; bn_d = rq_h[LW-1:0];
+        bn_v = 1'b0; bn_a = '0; bn_l = '0; bn_d = rq_h[LW-1:0];
         if (bw_q)         begin bn_v = 1'b1; {bn_a, bn_l} = rq_h[LW +: MW]; bn_d = rq_h[LW-1:0]; end
         else if (bw_idiv) begin bn_v = 1'b1; {bn_a, bn_l} = idiv_m; bn_d = idiv_y; end
         else if (bw_tex)  begin bn_v = 1'b1; bn_a = {tm_w, tm_rd, tex_wc}; bn_l = tm_l; bn_d = tex_y; end
@@ -1743,7 +1760,7 @@ module shader_core_fs2 #(
         w2_a <= bn_a; w2_l <= bn_l; w2_d <= bn_d;
     end
     always @* begin
-        gpr_we = 1'b0; gpr_wa = '0; gpr_wl = 16'd0; gpr_wd = y_madd;
+        gpr_we = 1'b0; gpr_wa = '0; gpr_wl = '0; gpr_wd = y_madd;
         if (madd_gw)          begin gpr_we = 1'b1; gpr_wa = {mdl_w[MADD_LAT-1], mdl_a[MADD_LAT-1]}; gpr_wl = mdl_l[MADD_LAT-1]; gpr_wd = y_madd; end
         else if (ldv_gw)      begin gpr_we = 1'b1; gpr_wa = {l2_w[L2-1], l2_a[L2-1]}; gpr_wl = l2_l[L2-1]; gpr_wd = y_ldv; end   // LDV2P
         else if (cmp_gw)      begin gpr_we = 1'b1; gpr_wa = {cdl_w, cdl_a}; gpr_wl = cdl_l; gpr_wd = y_cmp; end

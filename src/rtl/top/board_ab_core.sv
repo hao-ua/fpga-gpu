@@ -37,6 +37,7 @@ module board_ab_core #(
     // warps in flight and lanes per warp: the vertex core (board A's geometry stage) and the fragment core
     parameter int    VS_NWARP       = 4,
     parameter int    B3D_NWARP      = 4,
+    parameter int    VS_NL          = 4,                // 16, 8 or 4 vertices a warp
     parameter int    B3D_NL         = 4,                // 16, 8 or 4 (a warp = B3D_NL / 4 quads)
     // B's draw buckets (word address): 448 MB, above board A's regions and below the host's B heap
     parameter [28:0] B3D_DS_BASE    = 29'h0700_0000,
@@ -130,7 +131,7 @@ module board_ab_core #(
                    .SNAP_CYCLES(SNAP_CYCLES), .JTAG_STATUS(JTAG_STATUS), .KEEPALIVE(KEEPALIVE), .B_ALIVE(B_ALIVE),
                    .RENDER_TIMEOUT(RENDER_TIMEOUT), .VS_SFU_TAB2(SFU_TAB2), .VS_INT_DIV(INT_DIV), .VS_SINCOS(SINCOS), .EXT_ARB(1'b1), .EXT_LINK(1'b1), .REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W),
                    .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .VS_NWARP(VS_NWARP), .BAND8_MAXW(BAND8_MAXW),
-                   .GEOM_PROF(GEOM_PROF), .JTAG_LEAN(1'b1)) u_a (
+                   .GEOM_PROF(GEOM_PROF), .JTAG_LEAN(1'b1), .VS_NL(VS_NL)) u_a (
         .clk_sys, .rst_sys, .calib_done, .clk_idelay(clk200),
         .rgmii_rxc, .rgmii_rx_ctl, .rgmii_rxd, .rgmii_txc, .rgmii_tx_ctl, .rgmii_txd,
         .phy_rstn, .mdc, .mdio_o, .mdio_oe, .mdio_i,

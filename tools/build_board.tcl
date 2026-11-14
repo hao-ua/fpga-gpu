@@ -13,8 +13,10 @@ set role [lindex $argv 0]
 set idly [expr {[llength $argv] > 1 ? [lindex $argv 1] : 19}]
 set rxd  [expr {[llength $argv] > 2 ? [lindex $argv 2] : 1}]
 # S: both halves on one board (board_ab_top: one MIG, the link inside the chip); IDELAY_DEFAULT / RXDLY_DEFAULT as for A.
-# B3D_NWARP / B3D_NLINES / B3D_CELLS / B3D_NLMAX / BAND8_MAXW / VS_NWARP (env) override the configuration's defaults
-# (board_ab_top)
+# The configuration's parameters (board_ab_top / board_ab_core, described there) can be overridden from the environment:
+# B3D_NWARP B3D_NLINES B3D_CELLS B3D_NLMAX BAND8_MAXW VS_NWARP B3D_MAXW DISP_MAXW DISP_LB_LINES (sizes), VS_NL B3D_NL
+# (lanes per warp: 16 / 8 / 4), SFU_TAB2 INT_DIV SINCOS B3D_XSFU B3D_ROP_BLEND1 GEOM_PROF (0 / 1), B3D_QRINF B3D_TEXQ
+# B3D_NTS (queues); e.g. INT_DIV=1 SINCOS=1 VS_NL=16 B3D_NL=16 on a larger part
 if {$role ne "A" && $role ne "B" && $role ne "S"} { puts "usage: -tclargs A [IDELAY_DEFAULT] [RXDLY_DEFAULT] | B | S [IDELAY_DEFAULT] [RXDLY_DEFAULT]"; exit 1 }
 set part xc7a200tfbg484-2
 set_param general.maxThreads 8
@@ -103,7 +105,8 @@ if {$role eq "S"} {
     read_verilog -sv [concat $rtl $link_rtl]
     read_xdc src/constrs/board_ab.xdc
     set gen [list -generic BUILD_ID=$bid -generic IDELAY_DEFAULT=$idly -generic RXDLY_DEFAULT=$rxd -generic OC_MHZ=$oc]
-    foreach g {B3D_NWARP B3D_NLINES B3D_CELLS B3D_NLMAX BAND8_MAXW VS_NWARP} {
+    foreach g {B3D_NWARP B3D_NLINES B3D_CELLS B3D_NLMAX BAND8_MAXW VS_NWARP B3D_MAXW DISP_MAXW DISP_LB_LINES VS_NL B3D_NL
+               SFU_TAB2 INT_DIV SINCOS B3D_XSFU B3D_QRINF B3D_TEXQ B3D_NTS B3D_ROP_BLEND1 GEOM_PROF} {
         if {[info exists ::env($g)]} { lappend gen -generic $g=$::env($g); puts "=== $g=$::env($g) ===" }
     }
     set_param general.maxThreads $synth_threads

@@ -9,8 +9,8 @@ module board_ab_top #(
     parameter int    IDELAY_DEFAULT = 19,       // board A's measured RGMII working point at 1000 Mbit/s
     parameter int    RXDLY_DEFAULT  = 1,
     parameter int    OC_MHZ         = 100,      // clk_sys = MIG ui_clk in MHz (DDR rate 8 x this); 100 = the generated MIG IP
-    // the configuration (board_ab_core, the same defaults): band height, band buffer, the widest target and mode, the
-    // cores' warps in flight
+    // the configuration (board_ab_core, the same defaults, described there): band height, band buffer, the widest target
+    // and mode, the cores' warps and lanes, the optional units, queues and debug
     parameter int    BAND8_MAXW     = 512,
     parameter int    B3D_NLMAX      = 8,
     parameter int    B3D_NLINES     = 4,
@@ -19,7 +19,18 @@ module board_ab_top #(
     parameter int    DISP_MAXW      = 800,
     parameter int    DISP_LB_LINES  = 8,
     parameter int    B3D_NWARP      = 4,
-    parameter int    VS_NWARP       = 4
+    parameter int    VS_NWARP       = 4,
+    parameter int    VS_NL          = 4,
+    parameter int    B3D_NL         = 4,
+    parameter bit    SFU_TAB2       = 1'b1,
+    parameter bit    INT_DIV        = 1'b0,
+    parameter bit    SINCOS         = 1'b0,
+    parameter bit    B3D_XSFU       = 1'b0,
+    parameter int    B3D_QRINF      = 2,
+    parameter int    B3D_TEXQ       = 4,
+    parameter int    B3D_NTS        = 8,
+    parameter bit    B3D_ROP_BLEND1 = 1'b1,
+    parameter bit    GEOM_PROF      = 1'b0
 )(
     input  wire        sys_clk_p, sys_clk_n,
     input  wire        rst_btn_n,
@@ -66,7 +77,9 @@ module board_ab_top #(
     board_ab_core #(.BUILD_ID(BUILD_ID), .IDELAY_DEFAULT(IDELAY_DEFAULT[4:0]), .RXDLY_DEFAULT(RXDLY_DEFAULT[0]),
                     .CLK_HZ(OC_MHZ * 1_000_000), .BAND8_MAXW(BAND8_MAXW), .B3D_NLMAX(B3D_NLMAX), .B3D_NLINES(B3D_NLINES),
                     .B3D_CELLS(B3D_CELLS), .B3D_MAXW(B3D_MAXW), .DISP_MAXW(DISP_MAXW), .DISP_LB_LINES(DISP_LB_LINES),
-                    .B3D_NWARP(B3D_NWARP), .VS_NWARP(VS_NWARP)) u_core (
+                    .B3D_NWARP(B3D_NWARP), .VS_NWARP(VS_NWARP), .VS_NL(VS_NL), .B3D_NL(B3D_NL), .SFU_TAB2(SFU_TAB2),
+                    .INT_DIV(INT_DIV), .SINCOS(SINCOS), .B3D_XSFU(B3D_XSFU), .B3D_QRINF(B3D_QRINF), .B3D_TEXQ(B3D_TEXQ),
+                    .B3D_NTS(B3D_NTS), .B3D_ROP_BLEND1(B3D_ROP_BLEND1), .GEOM_PROF(GEOM_PROF)) u_core (
         .clk_sys(clk_sys), .rst_sys(rst_sys), .calib_done(calib_done), .clk200(clk_idelay),
         .rgmii_rxc(rgmii_rxc), .rgmii_rx_ctl(rgmii_rx_ctl), .rgmii_rxd(rgmii_rxd),
         .rgmii_txc(rgmii_txc), .rgmii_tx_ctl(rgmii_tx_ctl), .rgmii_txd(rgmii_txd),

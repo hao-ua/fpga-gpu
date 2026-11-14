@@ -59,7 +59,7 @@ def phy_trial(b, rxdly, adv1000, tap):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--rxdly", type=int, choices=(0, 1))
     ap.add_argument("--entry-tap", type=int, default=16)
     ap.add_argument("--frames", type=int, default=3000)

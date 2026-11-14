@@ -21,13 +21,17 @@ Python 3, standard library only.
 
 ## Network setup (one time)
 
-Board A answers at **192.168.1.10**, UDP port **5000**, MAC 00:0a:35:01:02:03. The PC's Ethernet port
-that is cabled to board A needs an address in 192.168.1.0/24, for example from an administrator
-PowerShell (use the adapter name from `Get-NetAdapter`):
+Board A takes UDP port **5000**, MAC 00:0a:35:01:02:03. It asks DHCP for its address each time its link comes up, and
+uses **192.168.1.10** when no lease is bound within 10 s. Cabled directly to a PC it is therefore at 192.168.1.10, and
+the PC's Ethernet port needs an address in 192.168.1.0/24, for example from an administrator PowerShell (use the
+adapter name from `Get-NetAdapter`):
 
 ```
 New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 192.168.1.112 -PrefixLength 24
 ```
+
+On a network with a DHCP server, set `GPU2_IP` to the leased address or a name for it: every tool takes it as its
+default `--ip`, and `fb_status.py` prints the address in use and whether it is a lease.
 
 Replies go back to the address and port the last valid datagram came from, so the tools may run in
 Windows or in WSL (WSL2's NAT forwards the replies).

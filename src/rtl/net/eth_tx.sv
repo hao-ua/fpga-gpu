@@ -2,8 +2,12 @@
 // Ethernet clock domain. Sources, in priority order:
 //   1. ARP reply      (eth_net_rx arp_req)
 //   2. ICMP echo reply (eth_net_rx icmp_req; message read from its ICMP buffer, type 8 -> 0, new checksum)
-//   3. UDP datagram   (reply FIFO from clk_sys: descriptor d0..d3 + payload words, net_pkg format);
+//   3. DHCP client    (svc_req, a four-phase handshake with svc_done): an ARP request (svc_arp, broadcast, sender
+//                      address svc_sip, target svc_dip) or a UDP datagram 68 -> 67 read from the client's buffer
+//                      (addresses, length and UDP checksum given)
+//   4. UDP datagram   (reply FIFO from clk_sys: descriptor d0..d3 + payload words, net_pkg format);
 //                      started only once the whole datagram is in the FIFO, so it never underruns.
+// The source address of ARP / ICMP / reply-FIFO frames is my_ip.
 // The generator writes a complete frame — preamble, SFD, header, payload, zero pad to 60 bytes, FCS —
 // into a byte ring and commits its length; generation may stall freely. The drainer sends committed
 // frames to rgmii_tx (FWFT valid/data/adv) back to back with a 12-byte inter-frame gap, so writing the
@@ -11,14 +15,24 @@
 `default_nettype none
 module eth_tx #(
     parameter [47:0] MY_MAC  = 48'h00_0a_35_01_02_03,
-    parameter [31:0] MY_IP   = {8'd192, 8'd168, 8'd1, 8'd10},
     parameter [15:0] MY_PORT = 16'd5000,
     parameter int    ICMP_AW = 11,
     parameter int    RF_AW   = 11,            // reply FIFO depth 2**RF_AW words
+    parameter int    SVC_AW  = 9,             // DHCP client buffer: 2**SVC_AW bytes
     parameter int    TXR_AW  = 13             // 8 KB TX ring
 )(
     input  wire               clk, rst,
     input  wire               giga,
+    input  wire [31:0]        my_ip,
+    // DHCP client (the fields hold still while svc_req is up)
+    input  wire               svc_req,
+    input  wire               svc_arp,
+    input  wire [47:0]        svc_mac,
+    input  wire [31:0]        svc_sip, svc_dip,
+    input  wire [15:0]        svc_len, svc_ucs,
+    output reg                svc_done,
+    output wire [SVC_AW-1:0]  svc_raddr,
+    input  wire [7:0]         svc_rdata,      // byte at svc_raddr, one cycle later
     // ARP reply request
     input  wire               arp_req,
     input  wire [47:0]        arp_mac,
@@ -69,7 +83,8 @@ module eth_tx #(
     typedef enum logic [3:0] {G_IDLE, G_DESC, G_CS1, G_CS2, G_CS3, G_PRE, G_HDR, G_IC1,
                               G_PAY, G_PAD, G_FCS, G_COMMIT} gst_t;
     gst_t      gs;
-    reg [1:0]  src;                           // 0 ARP, 1 ICMP, 2 UDP
+    reg [1:0]  src;                           // 0 ARP, 1 ICMP, 2 UDP (reply FIFO), 3 UDP (DHCP client)
+    reg        src_svc;                       // the frame is the DHCP client's
     reg [335:0] hdr;                          // up to 42 header bytes, sent MSB first
     reg [5:0]  hdr_n, hi;                     // header length / index
     reg [15:0] pay_n, pj;                     // payload length / index
@@ -81,9 +96,11 @@ module eth_tx #(
     reg [15:0] d_len, d_port;
     reg [31:0] d_ip;
     reg [47:0] d_mac;
-    reg [47:0] t_mac; reg [31:0] t_ip; reg [7:0] t_proto; reg [15:0] t_tl;
+    reg [47:0] t_mac; reg [31:0] t_ip, t_sip; reg [7:0] t_proto; reg [15:0] t_tl;
+    reg [15:0] t_sport, t_dport, t_ulen, t_ucs;
     reg [19:0] cs_sum;
     reg [15:0] cs;
+    wire       svc_go = svc_req && !svc_done;
 
     wire [15:0] need_words = ((rf_data[15:0] + 16'd3) >> 2) + 16'd4;
     wire        udp_ready  = rf_valid && rf_data[35:34] == K_D0 && rf_count >= need_words;
@@ -94,7 +111,8 @@ module eth_tx #(
     always @(posedge clk) udp_ready_q <= !rst && udp_ready && (gs == G_IDLE);
     wire        can_start  = !lf_full && ring_free >= 2200;
     // the reply FIFO is first-word-fall-through: a word is consumed in the cycle it is used
-    wire        rf_skip    = (gs == G_IDLE) && can_start && !arp_req && !icmp_req && rf_valid && rf_data[35:34] != K_D0;
+    wire        rf_skip    = (gs == G_IDLE) && can_start && !arp_req && !icmp_req && !svc_go && rf_valid &&
+                             rf_data[35:34] != K_D0;
     wire        rf_desc    = (gs == G_DESC) && rf_valid;
     wire        rf_pay     = (gs == G_PAY) && (src == 2'd2) && (pj[1:0] == 2'd3 || pj == pay_n - 16'd1);
     assign rf_ren = rf_skip | rf_desc | rf_pay;
@@ -109,19 +127,29 @@ module eth_tx #(
     always @(posedge clk) begin
         w_en <= 1'b0; arp_ack <= 1'b0; icmp_ack <= 1'b0;
         if (rst) begin
-            gs <= G_IDLE; wp <= 0; wp_frame <= 0; lf_w <= 0; ip_id <= 16'h0; c_tx <= 0; c_resync <= 0;
+            gs <= G_IDLE; wp <= 0; wp_frame <= 0; lf_w <= 0; ip_id <= 16'h0; c_tx <= 0; c_resync <= 0; svc_done <= 1'b0;
         end else case (gs)
             G_IDLE: begin
-                crc <= 32'hFFFFFFFF; body <= 0; pre_i <= 0; hi <= 0; pj <= 0; fcs_i <= 0; wp_frame <= wp;
+                crc <= 32'hFFFFFFFF; body <= 0; pre_i <= 0; hi <= 0; pj <= 0; fcs_i <= 0; wp_frame <= wp; src_svc <= 1'b0;
                 if (can_start) begin
                     if (arp_req) begin
                         src <= 2'd0; arp_ack <= 1'b1; hdr_n <= 6'd42; pay_n <= 16'd0;
                         hdr <= {arp_mac, MY_MAC, 16'h0806, 16'h0001, 16'h0800, 8'd6, 8'd4, 16'h0002,
-                                MY_MAC, MY_IP, arp_mac, arp_ip};
+                                MY_MAC, my_ip, arp_mac, arp_ip};
                         gs <= G_PRE;
                     end else if (icmp_req) begin
-                        src <= 2'd1; t_mac <= icmp_mac; t_ip <= icmp_ip; t_proto <= 8'd1;
+                        src <= 2'd1; t_mac <= icmp_mac; t_ip <= icmp_ip; t_sip <= my_ip; t_proto <= 8'd1;
                         t_tl <= icmp_len + 16'd20; hdr_n <= 6'd34; pay_n <= icmp_len;
+                        gs <= G_CS1;
+                    end else if (svc_go && svc_arp) begin
+                        src <= 2'd0; src_svc <= 1'b1; hdr_n <= 6'd42; pay_n <= 16'd0;
+                        hdr <= {48'hFFFF_FFFF_FFFF, MY_MAC, 16'h0806, 16'h0001, 16'h0800, 8'd6, 8'd4, 16'h0001,
+                                MY_MAC, svc_sip, 48'h0, svc_dip};
+                        gs <= G_PRE;
+                    end else if (svc_go) begin
+                        src <= 2'd3; src_svc <= 1'b1; t_mac <= svc_mac; t_ip <= svc_dip; t_sip <= svc_sip;
+                        t_proto <= 8'd17; t_tl <= svc_len + 16'd28; hdr_n <= 6'd42; pay_n <= svc_len;
+                        t_sport <= 16'd68; t_dport <= 16'd67; t_ulen <= svc_len + 16'd8; t_ucs <= svc_ucs;
                         gs <= G_CS1;
                     end else if (rf_skip) begin
                         c_resync <= c_resync + 1;                      // not a datagram start: skipped
@@ -139,15 +167,16 @@ module eth_tx #(
                 endcase
                 if (di != 0 && rf_data[35:34] != K_DN) begin c_resync <= c_resync + 1; gs <= G_IDLE; end
                 else if (di == 2'd3) begin
-                    t_mac <= {rf_data[15:0], d_mac[31:0]}; t_ip <= d_ip; t_proto <= 8'd17;
+                    t_mac <= {rf_data[15:0], d_mac[31:0]}; t_ip <= d_ip; t_sip <= my_ip; t_proto <= 8'd17;
                     t_tl <= d_len + 16'd28; hdr_n <= 6'd42; pay_n <= d_len;
+                    t_sport <= MY_PORT; t_dport <= d_port; t_ulen <= d_len + 16'd8; t_ucs <= 16'h0000;
                     gs <= G_CS1;
                 end
                 di <= di + 1'b1;
             end
             G_CS1: begin
                 cs_sum <= 20'h4500 + t_tl + ip_id + 20'h4000 + {12'h040, t_proto} +
-                          MY_IP[31:16] + MY_IP[15:0] + t_ip[31:16] + t_ip[15:0];
+                          t_sip[31:16] + t_sip[15:0] + t_ip[31:16] + t_ip[15:0];
                 gs <= G_CS2;
             end
             G_CS2: begin cs_sum <= cs_sum[15:0] + cs_sum[19:16]; gs <= G_CS3; end
@@ -155,10 +184,10 @@ module eth_tx #(
                 cs = ~(cs_sum[15:0] + cs_sum[19:16]);
                 if (src == 2'd1)
                     hdr <= {t_mac, MY_MAC, 16'h0800, 16'h4500, t_tl, ip_id, 16'h4000, 8'd64, t_proto, cs,
-                            MY_IP, t_ip, 64'h0};
+                            t_sip, t_ip, 64'h0};
                 else
                     hdr <= {t_mac, MY_MAC, 16'h0800, 16'h4500, t_tl, ip_id, 16'h4000, 8'd64, t_proto, cs,
-                            MY_IP, t_ip, MY_PORT, d_port, d_len + 16'd8, 16'h0000};
+                            t_sip, t_ip, t_sport, t_dport, t_ulen, t_ucs};
                 ip_id <= ip_id + 1'b1;
                 gs <= G_PRE;
             end
@@ -173,11 +202,11 @@ module eth_tx #(
                 hi <= hi + 1'b1;
                 if (hi == hdr_n - 6'd1) begin
                     if (pay_n == 0)       gs <= G_PAD;
-                    else if (src == 2'd1) begin icmp_raddr <= 0; gs <= G_IC1; end
+                    else if (src[0])      begin icmp_raddr <= 0; gs <= G_IC1; end
                     else                  gs <= G_PAY;
                 end
             end
-            // ICMP buffer read pipeline: raddr registered here, buffer output registered one edge later,
+            // ICMP / DHCP buffer read pipeline: raddr registered here, buffer output registered one edge later,
             // so the address must run two bytes ahead: HDR(last) raddr=0, IC1 raddr=1, PAY(j) raddr=j+2.
             G_IC1: begin icmp_raddr <= 1; gs <= G_PAY; end
             G_PAY: begin
@@ -185,6 +214,9 @@ module eth_tx #(
                     // ICMP: type -> 0 (echo reply), checksum replaced, rest echoed
                     put((pj == 16'd0) ? 8'h00 : (pj == 16'd2) ? icmp_csum[15:8] :
                         (pj == 16'd3) ? icmp_csum[7:0] : icmp_rdata, 1'b1);
+                    icmp_raddr <= pj[ICMP_AW-1:0] + 2'd2;
+                end else if (src == 2'd3) begin
+                    put(svc_rdata, 1'b1);
                     icmp_raddr <= pj[ICMP_AW-1:0] + 2'd2;
                 end else begin
                     put(rf_data[8*pj[1:0] +: 8], 1'b1);          // word popped by rf_pay at lane 3 / last
@@ -208,11 +240,14 @@ module eth_tx #(
                 lf[lf_w[LF_AW-1:0]] <= wp - wp_frame;
                 lf_w <= lf_w + 1'b1;
                 c_tx <= c_tx + 1;
+                if (src_svc) svc_done <= 1'b1;
                 gs <= G_IDLE;
             end
             default: gs <= G_IDLE;
         endcase
+        if (!rst && !svc_req) svc_done <= 1'b0;
     end
+    assign svc_raddr = icmp_raddr[SVC_AW-1:0];
 
     // ---------------- drainer ----------------
     typedef enum logic [1:0] {D_IDLE, D_SEND, D_IFG} dst_t;

@@ -1,7 +1,7 @@
 # a_status_jtag.tcl — read board A's status vector over JTAG (BSCANE2 USER1, link_status_jtag).
 #   vivado -mode batch -nojournal -source tools/a_status_jtag.tcl -tclargs <serial> [reads=1] [interval_s=1]
 # Frame (LSB first on TDO): {MAGIC=A5, seq, status_vec (word 0 first), seq}; status_vec = STATUS_WORDS
-# (116, layout 10) x 32 bits, the same words as the STATUS datagram
+# (116, layout 11) x 32 bits, the same words as the STATUS datagram
 # (src/rtl/top/board_a_core.sv, host/fb/fbproto.py).
 if {[llength $argv] < 1} { puts "usage: -tclargs <target-serial> [reads=1] [interval_s=1]"; exit 1 }
 set serial [lindex $argv 0]
@@ -35,7 +35,7 @@ set names {layout build uptime_ms flags phy rx_ok rx_fcs rx_len rx_ovf rx_er arp
            snap_age replies replies_dropped b_flags b_frames b_pix_khz b_ur_moderr b_cp link_flags fwd b_events b_status
            link_crc_par link_disc_retx linkctl link_parmap ld_bursts ld_bursts_lg ld_hist ld_last_err ld_last_word ld_fills
            ld_fill_perr ld_perrs link_drops link_frm_trn b_link_crc_par b_link_info b_images b_pixels
-           b_ld_hist b_ld_last_err b_link_parmap b_xoff b_retx b_disc b_cmd_pkts b_rx_words a_xoff a_naks_to a_rx_words reserved
+           b_ld_hist b_ld_last_err b_link_parmap b_xoff b_retx b_disc b_cmd_pkts b_rx_words a_xoff a_naks_to a_rx_words ip
            cr_sent cr_consumed cr_wait cur_sync b_cb_taken b_cur_pal b_curcmd_xops b_x_pixels
            geom_busy_tris geom_err render_quads rs_pkts_inflight
            b_cyc_frame b_cyc_flush b_cyc_band b_cyc_draw b_cyc_fs b_cyc_bandload b_cyc_starved b_cyc_ropstall
@@ -63,6 +63,12 @@ for {set r 0} {$r < $reads} {incr r} {
         $seq0 [lindex $w 1] [lindex $w 2] [expr {$fl & 1}] [expr {($fl >> 1) & 1}] $spd [expr {($fl >> 4) & 1}] \
         [expr {($fl >> 5) & 1}] [expr {($fl >> 6) & 1}] [expr {($fl >> 8) & 31}] [expr {($fl >> 13) & 1}] \
         [expr {($fl >> 14) & 1}] [expr {($fl >> 16) & 31}] [expr {[lindex $w 4] & 0xFFFF}] [expr {[lindex $w 4] >> 16}]]
+    # layout 11: the address in use (word 75), the DHCP client's state and the address source (flags 21-26)
+    set ipw [lindex $w 75]
+    set dst [lindex {idle delay selecting requesting ack probing bound renewing rebinding hold ? ? ? ? ? ?} [expr {($fl >> 21) & 15}]]
+    set src [expr {(($fl >> 25) & 1) == 0 ? "none" : ((($fl >> 26) & 1) ? "DHCP lease" : "fallback")}]
+    puts [format "  IP %d.%d.%d.%d (%s) DHCP %s" [expr {($ipw >> 24) & 255}] [expr {($ipw >> 16) & 255}] \
+        [expr {($ipw >> 8) & 255}] [expr {$ipw & 255}] $src $dst]
     set line "  "
     for {set k 5} {$k < 37} {incr k} { append line [format "%s=%ld " [lindex $names $k] [lindex $w $k]] }
     puts $line

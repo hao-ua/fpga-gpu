@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-/* GPU2_IP (192.168.1.10), GPU2_PORT (5000), GPU2_LOG (a path; empty = no log), GPU2_HOLD (1: PRESENT waits for vsync), GPU2_SCALE
+/* GPU2_IP (board A's address or host name; 192.168.1.10), GPU2_PORT (5000), GPU2_LOG (a path; empty = no log), GPU2_HOLD (1: PRESENT waits for vsync), GPU2_SCALE
    (fit | stretch), GPU2_MIN_A (62: the first with LDPX), GPU2_FRAMES_AHEAD (1, or 2: frames Present leaves unfinished, more is more lag),
    GPU2_RECORD (a folder: d3d9 keeps the last 48 frames of draws, F12 writes them), GPU2_RECORD_AFTER (the frame to start from),
    GPU2_KEEP_MB (256: room on board A for buffers that stop changing, 0 = stream everything) */

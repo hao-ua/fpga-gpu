@@ -380,7 +380,7 @@ def main():
     a = sys.argv[1:]
     def opt(name, default=None, conv=str):
         return conv(a[a.index(name) + 1]) if name in a else default
-    ip = opt('--ip', "192.168.1.10")
+    ip = opt('--ip', fp.BOARD_IP)
     frames = opt('--frames', None, int); secs = opt('--secs', None, float); speed = opt('--speed', 1.0, float)
     ncubes = opt('--cubes', 32, int); instanced = '--draws' not in a; hold = '--nohold' not in a; strict = '--strict' in a
     bones = '--bones' in a

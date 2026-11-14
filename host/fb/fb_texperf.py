@@ -415,7 +415,7 @@ def main():
     if '--list' in a:
         for k, v in CASES.items(): print(k, v)
         return
-    ip = opt('--ip', "192.168.1.10"); mode = opt('--mode', 1, int); secs = opt('--secs', 6.0, float)
+    ip = opt('--ip', fp.BOARD_IP); mode = opt('--mode', 1, int); secs = opt('--secs', 6.0, float)
     cases = list(CASES) if '--all' in a else [opt('--case', 't1_256_bilinear')]
     for c in cases:
         if c not in CASES: raise SystemExit("unknown case %s (--list)" % c)

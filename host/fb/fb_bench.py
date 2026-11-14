@@ -215,7 +215,7 @@ def main():
     if '--list' in a:
         for t in TESTS: print(t.name)
         return 0
-    ip = opt('--ip', "192.168.1.10"); mode = opt('--mode', 1, int); secs = opt('--secs', 3.0, float)
+    ip = opt('--ip', fp.BOARD_IP); mode = opt('--mode', 1, int); secs = opt('--secs', 3.0, float)
     only = opt('--only', None); names = only.split(',') if only else None
     bd = fp.Board(ip)
     bd.hello()

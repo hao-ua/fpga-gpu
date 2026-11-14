@@ -55,7 +55,7 @@ package fb_pkg;
     // board link (words 37-47), layout 3 the link diagnostics, B's receiver and B's transfer counters
     // (words 48-63), layout 4 B's receive diagnostics, the XOFF / ARQ / word counters of both boards
     // (words 64-75, see board_a_core)
-    localparam [31:0] STATUS_LAYOUT = 32'd10;         // layout 5: credit, cursor, palette, transfer counters (76-83);
+    localparam [31:0] STATUS_LAYOUT = 32'd11;         // layout 5: credit, cursor, palette, transfer counters (76-83);
     localparam int    STATUS_WORDS  = 116;            // layout 6: A's geometry stage (84-87);
                                                       // layout 7: B's per-frame cycle counters (88-95, its STATUS words
                                                       // 24-31) and A's cumulative ones (96-99);
@@ -64,7 +64,9 @@ package fb_pkg;
                                                       // primitive-band visits of A's walk, cumulative;
                                                       // layout 10: the geometry side's profile, 13 cumulative
                                                       // counters from a_geom (101-113) + the dispatcher's idle and D_GWAIT
-                                                      // cycles (114, 115) — board_a_core / a_geom list them
+                                                      // cycles (114, 115) — board_a_core / a_geom list them;
+                                                      // layout 11: word 75 = the IPv4 address in use, word 3
+                                                      // (flags) bits 21-26 = DHCP state, address valid, leased
 
     // board link packets: header word {type, seq (stamped by the
     // link ARQ layer), len = payload words}

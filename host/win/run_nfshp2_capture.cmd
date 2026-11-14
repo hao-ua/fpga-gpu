@@ -20,7 +20,10 @@ set "DLL=%WIN%\build\x86\d3d8\d3d8.dll"
 
 if not exist "%DLL%" (echo no d3d8.dll at %DLL%: build it with host\win\build.ps1 -Arch x86 -Target d3d8, and set GPU2_REPO to the repository & goto fail)
 for %%g in (NFSHP2.exe Warlords_og.exe heroes4.exe openarena.exe) do tasklist /fi "imagename eq %%g" | find /i "%%g" >nul && (echo %%g is running and only one program can use the boards: close it first & goto fail)
-ping -n 1 -w 1000 192.168.1.10 | find "TTL=" >nul || (echo board A does not answer at 192.168.1.10: are the boards on? & goto fail)
+rem board A: GPU2_IP (an address or a host name), else the address it falls back to without a DHCP lease
+set "BOARD=%GPU2_IP%"
+if not defined BOARD set "BOARD=192.168.1.10"
+ping -n 1 -w 1000 %BOARD% | find "TTL=" >nul || (echo board A does not answer at %BOARD%: are the boards on? & goto fail)
 
 if not exist "%COPY%\NFSHP2.exe" (
     echo copying the game, once, about 580 MB

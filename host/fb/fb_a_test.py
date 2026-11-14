@@ -13,7 +13,7 @@ import fbproto as fp
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--mb", type=int, default=64, help="MB for the write-throughput test")
     ap.add_argument("--read-mb", type=int, default=16, help="MB for the read-throughput test")
     ap.add_argument("--memtest-mb", type=int, default=64)

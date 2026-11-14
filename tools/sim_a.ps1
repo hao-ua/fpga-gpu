@@ -1,6 +1,7 @@
 # sim_a.ps1 — compile + elaborate + run the board-A benches in xsim (Windows). Run from the repo root.
 #   powershell -File tools/sim_a.ps1 -Test mem        # tb_mem   (arbiter, DDR FIFO, transfer engine)
 #   powershell -File tools/sim_a.ps1 -Test eth        # tb_eth   (RGMII 100/1000, MAC, ARP/ICMP/UDP, MDIO)
+#   powershell -File tools/sim_a.ps1 -Test dhcp       # tb_dhcp  (DHCP client: lease, renewal, fallback address, conflicts)
 #   powershell -File tools/sim_a.ps1 -Test board_a    # tb_board_a (whole board A core, host protocol)
 #   powershell -File tools/sim_a.ps1 -Test video_mmcm # tb_video_mmcm (board B video-mode DRP ROM + MMCM reconfiguration)
 #   powershell -File tools/sim_a.ps1 -Test scan       # tb_scan_reader (board B scanout reader, random images)
@@ -37,7 +38,7 @@ $rtl = @(
   "src\rtl\net\net_pkg.sv", "src\rtl\proto\fb_pkg.sv",
   "src\rtl\net\rst_sync.sv", "src\rtl\net\afifo_bram.sv", "src\rtl\mem\sfifo.sv",
   "src\rtl\net\eth_rgmii_rx.sv", "src\rtl\net\eth_mac_rx.sv", "src\rtl\net\eth_net_rx.sv",
-  "src\rtl\net\eth_tx.sv", "src\rtl\net\mdio_mgr.sv", "src\rtl\net\eth_stack.sv",
+  "src\rtl\net\eth_tx.sv", "src\rtl\net\mdio_mgr.sv", "src\rtl\net\dhcp_client.sv", "src\rtl\net\eth_stack.sv",
   "src\rtl\rgmii_tx.sv", "src\rtl\rgmii_tx_adapt.sv",
   "src\rtl\mem\mem_arb.sv", "src\rtl\mem\ddr_fifo.sv", "src\rtl\res\xfer_lin.sv",
   "src\rtl\res\buf_table.sv", "src\rtl\proto\fb_reply.sv", "src\rtl\proto\fb_proto_a.sv",
@@ -73,6 +74,7 @@ if ($Mutant -ne "") {
 switch ($Test) {
   "mem"     { $top = "tb_mem";     $tb = @("sim\mig_app_model.sv", "sim\tb_mem.sv") }
   "eth"     { $top = "tb_eth";     $tb = @("sim\rgmii_phy_model.sv", "sim\tb_eth.sv") }
+  "dhcp"    { $top = "tb_dhcp";    $tb = @("sim\rgmii_phy_model.sv", "sim\tb_dhcp.sv") }
   "board_a" { $top = "tb_board_a"; $tb = @("sim\mig_app_model.sv", "sim\rgmii_phy_model.sv", "sim\tb_board_a.sv") }
   "video_mmcm" { $top = "tb_video_mmcm"; $tb = @("sim\tb_video_mmcm.sv") }
   "scan"    { $top = "tb_scan_reader"; $tb = @("sim\mig_app_model.sv", "sim\tb_scan_reader.sv") }

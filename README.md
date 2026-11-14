@@ -40,7 +40,8 @@ reports. `tools/gen/` is not in git.
     `tools/jtag_watch.tcl` reads it, or `GPU2_JTAG_A` / `GPU2_JTAG_B`.
 - Two straight 40-pin 2.54 mm ribbon cables between the boards: JM1 to JM1 and JM2 to JM2, pin *k* to pin *k*, 3.3 V.
   A sends on JM1 and receives on JM2; B the other way round.
-- A PC with a gigabit NIC, cabled directly to board A's RJ45 at 1000 Mbit/s full duplex.
+- A PC with a gigabit NIC and a 1000 Mbit/s full-duplex link to board A's RJ45: a direct cable, or a switch or router
+  on the PC's network.
 - An HDMI monitor that takes 640×480, 800×600, 1024×768, 1280×720 and 1280×800 at 60 Hz.
 - One USB JTAG cable per board.
 - Air cooling: without it the boards reached 100–105 °C, at or above the part's 100 °C limit.
@@ -74,10 +75,18 @@ reports. `tools/gen/` is not in git.
    either board (a missing table is no synthesis error, only an all-zero ROM).
 3. **Video modes.** `src/rtl/disp/video_modes.svh` is in git. Regenerate it only after changing the mode list, with
    `python3 tools/mmcm_drp_calc.py`; `tools/sim_a.ps1 -Test video_mmcm` checks the result.
-4. **Network.**
-   - Board A answers at **192.168.1.10, UDP port 5000** (MAC 00:0a:35:01:02:03).
-   - Give the PC's NIC a static address in 192.168.1.0/24, for example as administrator:
+4. **Network.** Board A takes UDP port **5000** (MAC 00:0a:35:01:02:03). Its IPv4 address:
+   - Each time its link comes up it asks DHCP for one, under the host name `fpga-gpu`. It checks a leased address with
+     ARP probes before using it, and renews the lease at T1 / T2 as RFC 2131 describes.
+   - When no lease is bound within 10 s of the link coming up, it uses **192.168.1.10**. It goes on asking; a lease
+     bound later replaces that address.
+   - Cabled directly to the PC, board A is at 192.168.1.10. Give the PC's NIC a static address in 192.168.1.0/24, for
+     example as administrator:
      `New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 192.168.1.112 -PrefixLength 24`.
+   - On a network with a DHCP server, set `GPU2_IP` to the leased address or a name for it; many routers put DHCP host
+     names in their DNS (`fpga-gpu`, `fpga-gpu.lan`, …).
+     - The router's lease list shows the address.
+     - So do `python3 host/fb/fb_status.py` (once it can reach the board) and `tools/a_status_jtag.tcl` (over JTAG).
    - The MTU stays at 1500; no jumbo frames are needed.
    - Energy-efficient Ethernet needs no PC change: board A stops its PHY from advertising it.
    - Board A replies to whoever sent last, so only one program may talk to the boards at a time.
@@ -174,7 +183,8 @@ powershell -File host/win/build.ps1 [-Arch x64,x86] [-Target ddraw,gl,gles,d3d9,
   - Half-Life and NFS HP2 take the game the launcher sits beside, else `HL_DIR` / `NFS_DIR`, else the default install
     folder. The HoMM launchers use GOG's default folders.
 - **Settings:** environment variables, or a `gpu2.ini` of `key=value` lines beside the `.exe` (`host/win/core/g2_env.c`):
-  - `GPU2_IP` (default 192.168.1.10), `GPU2_PORT` (5000);
+  - `GPU2_IP` (board A's address or host name, default 192.168.1.10; the launchers ping it, and the `host/fb` tools
+    take it as their default `--ip`), `GPU2_PORT` (5000);
   - `GPU2_LOG`, `GPU2_STATS` (seconds between statistics lines);
   - `GPU2_KEEP_MB`, `GPU2_FRAMES_AHEAD`, `GPU2_DUMP`, `GPU2_RECORD`, `GPU2_TRACE_DRAW`, `GPU2_CLK_MHZ` (120).
 

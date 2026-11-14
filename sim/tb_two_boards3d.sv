@@ -72,7 +72,7 @@ module tb_two_boards3d;
     wire [1:0] ledA;
     board_a_core #(.BUILD_ID(32'h0000_0A03), .IDELAY_DEFAULT(5'd3), .RING_LOG2(10), .MDIO_RST_MS(1), .MDIO_WAIT_MS(1),
                    .MDIO_POLL_US(100), .STATUS_PERIOD(300_000), .TRIAL_CYCLES(50_000), .PHY_TRIAL_CYCLES(600_000),
-                   .SNAP_CYCLES(2000), .JTAG_STATUS(1'b0),
+                   .SNAP_CYCLES(2000), .JTAG_STATUS(1'b0), .DHCP(1'b0),   // the fixed address at once (tb_dhcp tests DHCP)
                    .LINK_MHZ(100), .LINK_GUARD(3000), .LINK_MMCM_RST(20_000), .LINK_IDLE_TO(200_000), .LINK_TRAIN_WORDS(256),
                    .LINK_RETRY(20_000), .LINK_RELOCK(50_000), .LINK_RWIN(200_000), .KEEPALIVE(20_000), .B_ALIVE(100_000),
                    .RENDER_TIMEOUT(200_000), .LINK_SIM_SHIFTER(1'b1)) da (     // a frame B does not take is given up after 2 ms

@@ -14,7 +14,8 @@ libraries; there is no kernel driver. The exact RTL each board is built from is 
                                                  band walk + raster
 ```
 
-1. **Host to A.** The PC sends commands to board A at 192.168.1.10:5000. Board A's protocol engine writes them into an
+1. **Host to A.** The PC sends commands to board A's UDP port 5000 (its address from DHCP, else 192.168.1.10). Board A's
+   protocol engine writes them into an
    ingress ring in its DDR, and its dispatcher runs them in order:
    - A's own commands: buffers, vertex programs, uniforms, attributes, draws;
    - B's commands: forwarded unchanged over the link.
@@ -38,6 +39,8 @@ texture unit.
 - **Network and protocol:**
   - `eth_stack`: RGMII receive, MAC with FCS check and a 32 KB store-and-forward buffer, ARP / IPv4 / ICMP / UDP,
     transmit.
+  - `dhcp_client`: the IPv4 address. DHCP (RFC 2131) on each link-up, with ARP probes of a leased address (RFC 5227),
+    renewal and rebinding; 192.168.1.10 when no lease is bound within 10 s.
   - `mdio_mgr`: auto-negotiation and PHY status polling, with energy-efficient Ethernet off.
   - `fb_proto_a`: Go-Back-N receive, ACKs, STATUS.
   - `ddr_fifo`: the ingress ring.

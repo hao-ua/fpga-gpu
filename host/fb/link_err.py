@@ -79,7 +79,7 @@ def run_phase(b, name, secs):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--phases", default="idle")
     ap.add_argument("--secs", type=float, default=120.0)
     ap.add_argument("--repeat", type=int, default=1)

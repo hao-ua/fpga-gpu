@@ -42,7 +42,8 @@ module tb_board_a;
     localparam int TAP0 = 3;                   // non-zero power-up tap: IDELAYE2 VAR_LOAD starts at 0 unless loaded
     board_a_core #(.BUILD_ID(32'h0000_0A01), .IDELAY_DEFAULT(TAP0), .RING_LOG2(6), .MDIO_RST_MS(1), .MDIO_WAIT_MS(1), .MDIO_POLL_US(100),
                    .STATUS_PERIOD(300_000), .TRIAL_CYCLES(50_000), .PHY_TRIAL_CYCLES(600_000),
-                   .SNAP_CYCLES(2000), .JTAG_STATUS(1'b0), .B_WAIT(5000)) dut (   // no board B: give up after 50 us
+                   .SNAP_CYCLES(2000), .JTAG_STATUS(1'b0), .B_WAIT(5000),   // no board B: give up after 50 us
+                   .DHCP(1'b0)) dut (                                        // the fixed address at once (tb_dhcp tests DHCP)
         .clk_sys(clk), .rst_sys(rst), .calib_done(calib), .clk_idelay(clk200),
         .rgmii_rxc(rxc), .rgmii_rx_ctl(rx_ctl), .rgmii_rxd(rxd), .rgmii_txc(txc), .rgmii_tx_ctl(tx_ctl), .rgmii_txd(txd),
         .phy_rstn(phy_rstn), .mdc(mdc), .mdio_o(mdio_o), .mdio_oe(mdio_oe), .mdio_i(mdio),

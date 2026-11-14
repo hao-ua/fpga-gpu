@@ -162,7 +162,7 @@ def ibeam_shape():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--index", type=int, default=48, help="first image table index used (5 images)")
     ap.add_argument("--demo-secs", type=float, default=10.0)
     ap.add_argument("--no-checks", action="store_true")

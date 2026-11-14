@@ -149,7 +149,7 @@ def rotation(t):
 def main():
     a = sys.argv[1:]
     def opt(name, default, conv=str): return conv(a[a.index(name) + 1]) if name in a else default
-    ip = opt('--ip', "192.168.1.10"); mode = opt('--mode', 0, int); secs = opt('--secs', 120.0, float)
+    ip = opt('--ip', fp.BOARD_IP); mode = opt('--mode', 0, int); secs = opt('--secs', 120.0, float)
     nslices = opt('--slices', 36, int); size = opt('--size', 470, int); png = opt('--png', None)
     rv = glslc.compile_stage(open(os.path.join(TESTS, 'tex3d_demo.vert'), encoding='utf-8').read(), 'vs', isa64=True, forward=True)
     rf = glslc.compile_stage(open(os.path.join(TESTS, 'tex3d_demo.frag'), encoding='utf-8').read(), 'fs', isa64=True, forward=True)

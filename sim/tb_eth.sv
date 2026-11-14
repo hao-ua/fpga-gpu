@@ -28,7 +28,7 @@ module tb_eth;
     reg         phy_req = 0; wire phy_resp; wire [15:0] phy_rd;
     wire        init_done, link_up, duplex; wire [1:0] speed; wire [15:0] physr_o, bmsr_o; wire [31:0] polls;
     wire [32*14-1:0] cnt; wire [31:0] age;
-    eth_stack #(.MY_MAC(BMAC), .MY_IP(BIP), .SNAP_CYCLES(2000), .MDIO_RST_MS(1), .MDIO_WAIT_MS(1),
+    eth_stack #(.MY_MAC(BMAC), .FALLBACK_IP(BIP), .DHCP(1'b0), .SNAP_CYCLES(2000), .MDIO_RST_MS(1), .MDIO_WAIT_MS(1),
                 .MDIO_POLL_US(100)) dut (
         .clk_sys(clk), .rst_sys(rst), .clk_idelay(clk200),
         .rgmii_rxc(rxc), .rgmii_rx_ctl(rx_ctl), .rgmii_rxd(rxd), .rgmii_txc(txc), .rgmii_tx_ctl(tx_ctl),

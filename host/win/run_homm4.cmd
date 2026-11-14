@@ -15,7 +15,10 @@ set "DLL=%WIN%\build\x86\ddraw\ddraw.dll"
 
 if not exist "%DLL%" (echo no ddraw.dll at %DLL%: build it with host\win\build.ps1 -Arch x86 -Target ddraw, and set GPU2_REPO to the repository & goto fail)
 for %%g in (heroes4.exe Warlords_og.exe NFSHP2.exe openarena.exe) do tasklist /fi "imagename eq %%g" | find /i "%%g" >nul && (echo %%g is running and only one program can use the boards: close it first & goto fail)
-ping -n 1 -w 1000 192.168.1.10 | find "TTL=" >nul || (echo board A does not answer at 192.168.1.10: are the boards on? & goto fail)
+rem board A: GPU2_IP (an address or a host name), else the address it falls back to without a DHCP lease
+set "BOARD=%GPU2_IP%"
+if not defined BOARD set "BOARD=192.168.1.10"
+ping -n 1 -w 1000 %BOARD% | find "TTL=" >nul || (echo board A does not answer at %BOARD%: are the boards on? & goto fail)
 
 if not exist "%COPY%\copied.ok" (
     echo copying the game, once, about 970 MB

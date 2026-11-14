@@ -1,24 +1,43 @@
 // eth_net_rx — frame parser behind eth_mac_rx. Reads one
 // committed (FCS-checked) frame at a time from the MAC ring, one byte per clock, and handles:
-//   * ARP request for MY_IP            -> arp_req (sender MAC/IP) for the TX side
-//   * IPv4 header: version 4, IHL >= 5, header checksum, no fragments, destination MY_IP
-//   * ICMP echo request                -> message copied into the ICMP buffer, icmp_req for the TX side
+//   * ARP request for my_ip            -> arp_req (sender MAC/IP) for the TX side (only while have_ip)
+//   * any ARP request or reply         -> acd_hit when another station has acd_ip as its sender address, or
+//                                         probes for it (sender 0.0.0.0), while acd_on (RFC 5227 conflict)
+//   * IPv4 header: version 4, IHL >= 5, header checksum, no fragments; destination my_ip (to our MAC), or
+//     255.255.255.255, or any address to our MAC for DHCP
+//   * ICMP echo request to my_ip       -> message copied into the ICMP buffer, icmp_req for the TX side
 //                                         with the reply checksum (RFC 1624 incremental update 8 -> 0)
-//   * UDP to MY_PORT                   -> descriptor (d0..d3) + payload words into the payload FIFO
+//   * UDP to my_ip:MY_PORT             -> descriptor (d0..d3) + payload words into the payload FIFO
 //                                         (net_pkg word format). The whole datagram is dropped if the
 //                                         FIFO lacks room for it, so the FIFO never holds a partial one.
+//   * UDP 67 -> 68 (DHCP to the client) -> payload into the DHCP buffer, dh_done with its length and the
+//                                         frame's source MAC; dropped while dh_busy
 // Everything else is counted and dropped. Address issue stops at a barrier after the last UDP header
 // byte until the drop/accept decision is made and the descriptor is written.
 `default_nettype none
 module eth_net_rx #(
     parameter [47:0] MY_MAC  = 48'h00_0a_35_01_02_03,
-    parameter [31:0] MY_IP   = {8'd192, 8'd168, 8'd1, 8'd10},
     parameter [15:0] MY_PORT = 16'd5000,
     parameter int    RING_AW = 15,
     parameter int    ICMP_AW = 11,            // 2 KB ICMP buffer
-    parameter int    PF_AW   = 12             // payload FIFO depth 2**PF_AW words
+    parameter int    PF_AW   = 12,            // payload FIFO depth 2**PF_AW words
+    parameter int    DH_AW   = 11             // DHCP buffer: 2**DH_AW bytes
 )(
     input  wire               clk, rst,
+    // the address in use and the address being probed (they change rarely; see eth_stack)
+    input  wire [31:0]        my_ip,
+    input  wire               have_ip,
+    input  wire [31:0]        acd_ip,
+    input  wire               acd_on,
+    output reg                acd_hit,
+    // DHCP buffer (write side)
+    input  wire               dh_busy,
+    output reg                dh_we,
+    output reg  [DH_AW-1:0]   dh_wa,
+    output reg  [7:0]         dh_wd,
+    output reg                dh_done,        // a whole datagram is in the buffer
+    output reg  [15:0]        dh_len,
+    output reg  [47:0]        dh_smac,
     // committed frames from eth_mac_rx
     input  wire               f_avail,
     input  wire [13:0]        f_len,
@@ -72,7 +91,12 @@ module eth_net_rx #(
     reg [47:0] smac;
     reg [15:0] etype;
     reg        arp_ok;
-    reg [31:0] spa;
+    reg [1:0]  arp_op;
+    reg [31:0] spa, tpa;
+    reg        sha_me, spa_acd, spa_zero;
+    reg        d_hi_me, d_hi_bc, d_me, d_bc;   // destination address = my_ip / broadcast (upper 3 bytes, all 4)
+    reg        dmatch;                         // IPv4 to my_ip at our MAC
+    reg        dh_go;
     reg [3:0]  ihl;
     reg [13:0] hdr_end;                        // first byte after the IPv4 header
     reg [15:0] tl, csum;
@@ -101,12 +125,14 @@ module eth_net_rx #(
     function automatic [7:0] mac_byte(input [47:0] m, input [2:0] k);
         mac_byte = m[47 - 8*k -: 8];
     endfunction
-    function automatic [7:0] ip_byte(input [31:0] a, input [1:0] k);
-        ip_byte = a[31 - 8*k -: 8];
-    endfunction
+
+    // the IPv4 destination decided at the last header byte (byte 33 when IHL = 5: its last address byte is live)
+    wire dm_now   = (bi == 14'd33) ? (d_hi_me && rd_data == my_ip[7:0]) : d_me;
+    wire db_now   = (bi == 14'd33) ? (d_hi_bc && rd_data == 8'hFF) : d_bc;
+    wire dmatch_n = dm_now && have_ip && is_me;
 
     always @(posedge clk) begin
-        f_release <= 1'b0; pf_wen <= 1'b0; ib_we <= 1'b0;
+        f_release <= 1'b0; pf_wen <= 1'b0; ib_we <= 1'b0; dh_we <= 1'b0; dh_done <= 1'b0; acd_hit <= 1'b0;
         if (arp_ack)  arp_req  <= 1'b0;
         if (icmp_ack) icmp_req <= 1'b0;
         if (rst) begin
@@ -137,7 +163,7 @@ module eth_net_rx #(
                     st <= S_RUN; flen <= f_len; ai <= 0; done <= 0;
                     is_me <= 1'b1; is_bc <= 1'b1; arp_ok <= 1'b1; ip_ok <= 1'b1; frag_ok <= 1'b1;
                     csum <= 16'h0; ihl <= 4'd0; hdr_end <= 14'h3FFF; ip_end <= 14'h3FFF;
-                    icmp_go <= 1'b0; udp_go <= 1'b0; bar_hold <= 1'b0; barrier <= 14'h3FFF;
+                    icmp_go <= 1'b0; udp_go <= 1'b0; dh_go <= 1'b0; dmatch <= 1'b0; bar_hold <= 1'b0; barrier <= 14'h3FFF;
                     pk <= 0; pw <= 0;
                 end
                 S_RUN: begin
@@ -154,7 +180,7 @@ module eth_net_rx #(
                             else if ({etype[15:8], rd_data} == 16'h0806) begin
                                 if (flen < 14'd42) begin done <= 1'b1; c_other <= c_other + 1; end
                             end else if ({etype[15:8], rd_data} == 16'h0800) begin
-                                if (!is_me || flen < 14'd34) begin done <= 1'b1; c_other <= c_other + 1; end
+                                if (flen < 14'd34) begin done <= 1'b1; c_other <= c_other + 1; end
                             end else begin done <= 1'b1; c_other <= c_other + 1; end
                         end
                         // -------- ARP --------
@@ -167,13 +193,20 @@ module eth_net_rx #(
                                 14'd18: if (rd_data != 8'h06) arp_ok <= 1'b0;
                                 14'd19: if (rd_data != 8'h04) arp_ok <= 1'b0;
                                 14'd20: if (rd_data != 8'h00) arp_ok <= 1'b0;
-                                14'd21: if (rd_data != 8'h01) arp_ok <= 1'b0;
+                                14'd21: begin                                  // operation: 1 request, 2 reply
+                                    arp_op <= rd_data[1:0];
+                                    if (rd_data != 8'h01 && rd_data != 8'h02) arp_ok <= 1'b0;
+                                end
                                 14'd22, 14'd23, 14'd24, 14'd25, 14'd26, 14'd27: smac <= {smac[39:0], rd_data};
                                 14'd28, 14'd29, 14'd30, 14'd31: spa <= {spa[23:0], rd_data};
-                                14'd38, 14'd39, 14'd40: if (rd_data != ip_byte(MY_IP, bi - 14'd38)) arp_ok <= 1'b0;
+                                14'd34: begin sha_me <= (smac == MY_MAC); spa_acd <= (spa == acd_ip); spa_zero <= (spa == 32'h0); end
+                                14'd38, 14'd39, 14'd40: tpa <= {tpa[23:0], rd_data};
                                 14'd41: begin
                                     done <= 1'b1;
-                                    if (arp_ok && rd_data == MY_IP[7:0] && !arp_req) begin
+                                    if (arp_ok && acd_on && !sha_me &&
+                                        (spa_acd || (arp_op == 2'd1 && spa_zero && {tpa[23:0], rd_data} == acd_ip)))
+                                        acd_hit <= 1'b1;
+                                    if (arp_ok && arp_op == 2'd1 && have_ip && {tpa[23:0], rd_data} == my_ip && !arp_req) begin
                                         arp_req <= 1'b1; arp_mac <= smac; arp_ip <= spa; c_arp <= c_arp + 1;
                                     end else c_other <= c_other + 1;
                                 end
@@ -200,23 +233,31 @@ module eth_net_rx #(
                                 14'd30, 14'd31, 14'd32, 14'd33: dip <= {dip[23:0], rd_data};
                                 default: ;
                             endcase
+                            if (bi == 14'd32) begin
+                                d_hi_me <= ({dip[15:0], rd_data} == my_ip[31:8]);
+                                d_hi_bc <= ({dip[15:0], rd_data} == 24'hFF_FFFF);
+                            end
+                            if (bi == 14'd33) begin
+                                d_me <= d_hi_me && rd_data == my_ip[7:0];
+                                d_bc <= d_hi_bc && rd_data == 8'hFF;
+                            end
                             if (bi == hdr_end - 14'd1) begin
                                 // decision at the last header byte (the odd byte: csum completes now)
                                 if (!ip_ok || oc_add(csum, {cs_hi, rd_data}) != 16'hFFFF) begin
                                     done <= 1'b1; c_ipcsum <= c_ipcsum + 1;
-                                end else if (!frag_ok || ((bi == 14'd33) ? {dip[23:0], rd_data} : dip) != MY_IP ||
-                                             tl > {2'b00, flen} - 16'd14 ||
+                                end else if (!frag_ok || tl > {2'b00, flen} - 16'd14 ||
                                              tl < {10'd0, ihl, 2'b00} + 16'd8) begin
                                     done <= 1'b1; c_other <= c_other + 1;
                                 end else begin
                                     ip_end <= 14'd14 + tl[13:0];
-                                    if (proto == 8'd1) begin
+                                    dmatch <= dmatch_n;
+                                    if (proto == 8'd1 && dmatch_n) begin
                                         if (icmp_req || (tl - {10'd0, ihl, 2'b00}) > (1 << ICMP_AW)) begin
                                             done <= 1'b1; c_icmpdrop <= c_icmpdrop + 1;
                                         end else begin
                                             icmp_go <= 1'b1; icmp_len <= tl - {10'd0, ihl, 2'b00};
                                         end
-                                    end else if (proto == 8'd17) begin
+                                    end else if (proto == 8'd17 && (dmatch_n || db_now || is_me)) begin
                                         barrier <= hdr_end + 14'd7; bar_hold <= 1'b1;
                                     end else begin done <= 1'b1; c_other <= c_other + 1; end
                                 end
@@ -252,18 +293,30 @@ module eth_net_rx #(
                                     default: ;
                                 endcase
                                 if (bi == udp_dec) begin
-                                    if (dport != MY_PORT || ulen < 16'd8 || ulen > tl - {10'd0, ihl, 2'b00}) begin
+                                    if (ulen < 16'd8 || ulen > tl - {10'd0, ihl, 2'b00}) begin
                                         done <= 1'b1; c_other <= c_other + 1; bar_hold <= 1'b0;
-                                    end else if (pf_free < (((ulen - 16'd8) + 16'd3) >> 2) + 16'd4) begin
-                                        done <= 1'b1; c_pfdrop <= c_pfdrop + 1; bar_hold <= 1'b0;
-                                    end else begin
-                                        plen <= ulen - 16'd8; udp_go <= 1'b1; dsc <= 3'd4;
-                                        c_udp <= c_udp + 1;
-                                        if (ulen == 16'd8) begin
-                                            // empty payload: descriptor only (d0 says len = 0, no payload words)
-                                            done <= 1'b1;
+                                    end else if (dport == MY_PORT && dmatch) begin
+                                        if (pf_free < (((ulen - 16'd8) + 16'd3) >> 2) + 16'd4) begin
+                                            done <= 1'b1; c_pfdrop <= c_pfdrop + 1; bar_hold <= 1'b0;
+                                        end else begin
+                                            plen <= ulen - 16'd8; udp_go <= 1'b1; dsc <= 3'd4;
+                                            c_udp <= c_udp + 1;
+                                            if (ulen == 16'd8) begin
+                                                // empty payload: descriptor only (d0 says len = 0, no payload words)
+                                                done <= 1'b1;
+                                            end
                                         end
+                                    end else if (dport == 16'd68 && sport == 16'd67 && ulen != 16'd8 && !dh_busy &&
+                                                 ulen - 16'd8 <= 16'(1 << DH_AW)) begin
+                                        plen <= ulen - 16'd8; dh_go <= 1'b1; bar_hold <= 1'b0;
+                                    end else begin
+                                        done <= 1'b1; c_other <= c_other + 1; bar_hold <= 1'b0;
                                     end
+                                end
+                            end else if (dh_go) begin
+                                dh_we <= 1'b1; dh_wa <= pk[DH_AW-1:0]; dh_wd <= rd_data; pk <= pk + 1'b1;
+                                if (pk == plen - 16'd1) begin
+                                    done <= 1'b1; dh_done <= 1'b1; dh_len <= plen; dh_smac <= smac;
                                 end
                             end else if (udp_go) begin
                                 pw[8*pk[1:0] +: 8] <= rd_data;

@@ -14,7 +14,7 @@ import fbproto as fp
 
 
 def main():
-    ip = sys.argv[sys.argv.index('--ip') + 1] if '--ip' in sys.argv else "192.168.1.10"
+    ip = sys.argv[sys.argv.index('--ip') + 1] if '--ip' in sys.argv else fp.BOARD_IP
     bd = fp.Board(ip)
     bd.hello()
     st = bd.status()

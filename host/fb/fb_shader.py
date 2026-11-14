@@ -213,7 +213,7 @@ def main():
     a = sys.argv[1:]
     def opt(name, default=None, conv=str):
         return conv(a[a.index(name) + 1]) if name in a else default
-    ip = opt('--ip', "192.168.1.10")
+    ip = opt('--ip', fp.BOARD_IP)
     frames = opt('--frames', None, int); secs = opt('--secs', 5.0 if '--frames' not in a else None, float)
     shader = opt('--shader', 'raymarch'); steps = opt('--steps', 32, int); hold = '--hold' in a
     if shader not in SHADERS: raise SystemExit("--shader " + " | ".join(SHADERS))

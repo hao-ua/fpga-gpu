@@ -13,7 +13,10 @@ module board_a_core #(
     parameter [4:0]  IDELAY_DEFAULT = 5'd0,
     parameter bit    RXDLY_DEFAULT  = 1'b0,
     parameter [47:0] MY_MAC         = 48'h00_0a_35_01_02_03,
-    parameter [31:0] MY_IP          = {8'd192, 8'd168, 8'd1, 8'd10},
+    parameter [31:0] FALLBACK_IP    = {8'd192, 8'd168, 8'd1, 8'd10},   // the address when DHCP gets no lease
+    parameter bit    DHCP           = 1'b1,         // 0: FALLBACK_IP from reset, no DHCP
+    parameter [8*32-1:0] HOSTNAME   = "fpga-gpu",   // the DHCP host name (option 12)
+    parameter int    DHCP_FALLBACK_MS = 10_000,
     parameter int    RING_LOG2      = 21,           // ingress ring: 2**21 bursts = 64 MB at DDR address 0
     parameter int    MDIO_RST_MS    = 20, MDIO_WAIT_MS = 100, MDIO_POLL_US = 5000,
     parameter int    CLK_HZ         = 100_000_000,  // clk_sys (the MIG ui_clk); the millisecond timers below derive from it
@@ -79,7 +82,9 @@ module board_a_core #(
     wire        phy_req, phy_wr, phy_resp; wire [15:0] phy_page, phy_wdata, phy_rdata; wire [4:0] phy_reg;
     wire        mdio_init_done, link_up, duplex; wire [1:0] speed; wire [15:0] physr, bmsr; wire [31:0] mdio_polls;
     wire [32*14-1:0] cnt; wire [31:0] snap_age;
-    eth_stack #(.MY_MAC(MY_MAC), .MY_IP(MY_IP), .IDELAY_DEFAULT(IDELAY_DEFAULT), .RF_AW(RF_AW), .CLK_HZ(CLK_HZ),
+    wire [31:0] ip_addr; wire ip_valid, ip_leased; wire [3:0] dhcp_state;
+    eth_stack #(.MY_MAC(MY_MAC), .FALLBACK_IP(FALLBACK_IP), .DHCP(DHCP), .HOSTNAME(HOSTNAME),
+                .DHCP_FALLBACK_MS(DHCP_FALLBACK_MS), .IDELAY_DEFAULT(IDELAY_DEFAULT), .RF_AW(RF_AW), .CLK_HZ(CLK_HZ),
                 .SNAP_CYCLES(SNAP_CYCLES), .MDIO_RST_MS(MDIO_RST_MS), .MDIO_WAIT_MS(MDIO_WAIT_MS),
                 .MDIO_POLL_US(MDIO_POLL_US)) u_eth (
         .clk_sys(clk_sys), .rst_sys(rst_s), .clk_idelay(clk_idelay),
@@ -92,7 +97,8 @@ module board_a_core #(
         .phy_req(phy_req), .phy_req_wr(phy_wr), .phy_req_page(phy_page), .phy_req_reg(phy_reg),
         .phy_req_wdata(phy_wdata), .phy_resp(phy_resp), .phy_resp_rdata(phy_rdata),
         .mdio_init_done(mdio_init_done), .link_up(link_up), .duplex(duplex), .speed(speed),
-        .physr(physr), .bmsr(bmsr), .mdio_polls(mdio_polls), .cnt_snap(cnt), .snap_age(snap_age));
+        .physr(physr), .bmsr(bmsr), .mdio_polls(mdio_polls), .cnt_snap(cnt), .snap_age(snap_age),
+        .ip_addr(ip_addr), .ip_valid(ip_valid), .ip_leased(ip_leased), .dhcp_state(dhcp_state));
 
     // ---------------- memory arbiter: R0/W0 ingress ring, R1/W1 transfer engine, R2/R3/R4 + W2/W3 the geometry stage
     //                  (vertex fetch, program load, the render side's bin lists / records; triangle records, bin lists)
@@ -260,13 +266,13 @@ module board_a_core #(
     reg [31:0] ms_div, uptime_ms;
     always @(posedge clk_sys) begin
         if (rst_s) begin ms_div <= 0; uptime_ms <= 0; end
-        else if (ms_div == 99_999) begin ms_div <= 0; uptime_ms <= uptime_ms + 1; end
+        else if (ms_div == CLK_HZ / 1000 - 1) begin ms_div <= 0; uptime_ms <= uptime_ms + 1; end
         else ms_div <= ms_div + 1;
     end
     localparam int RING = 1 << RING_LOG2;
     wire [RING_LOG2:0] q_free = RING - q_used;
-    wire [31:0] flags = {11'h0, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok, host_valid, mdio_init_done,
-                         duplex, speed, link_up, calib_done};
+    wire [31:0] flags = {5'h0, ip_leased, ip_valid, dhcp_state, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok,
+                         host_valid, mdio_init_done, duplex, speed, link_up, calib_done};
     wire [31:0] sw [0:STATUS_WORDS-1];
     assign sw[0]  = STATUS_LAYOUT;
     assign sw[1]  = BUILD_ID;
@@ -333,7 +339,7 @@ module board_a_core #(
     assign sw[72] = l_xoff;                          // A RX FIFO XOFF events (backward lane paused B)
     assign sw[73] = {l_disc[31:16], l_retx[31:16]};  // A receiver NAKs requested, A transmitter timeouts
     assign sw[74] = l_rx_words;                      // A words received (backward lane, real words)
-    assign sw[75] = 32'h0;                           // reserved
+    assign sw[75] = ip_valid ? ip_addr : 32'h0;      // layout 11: the IPv4 address in use (0 = none yet)
     // layout 5: credit flow control, cursor fast path, palette and READ / FILL / COPY counters
     assign sw[76] = cr_sent;                         // A CMD words sent to B
     assign sw[77] = cr_consumed;                     // CMD words B reported as taken (CREDIT packets)

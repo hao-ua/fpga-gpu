@@ -84,7 +84,7 @@ module tb_two_boards;
     // link start-up times as tb_board_link; B counts as alive 1 ms after its last STATUS (every 100 us here)
     board_a_core #(.BUILD_ID(32'h0000_0A02), .IDELAY_DEFAULT(5'd3), .RING_LOG2(10), .MDIO_RST_MS(1), .MDIO_WAIT_MS(1),
                    .MDIO_POLL_US(100), .STATUS_PERIOD(300_000), .TRIAL_CYCLES(50_000), .PHY_TRIAL_CYCLES(600_000),
-                   .SNAP_CYCLES(2000), .JTAG_STATUS(1'b0),
+                   .SNAP_CYCLES(2000), .JTAG_STATUS(1'b0), .DHCP(1'b0),   // the fixed address at once (tb_dhcp tests DHCP)
                    .LINK_MHZ(100), .LINK_GUARD(3000), .LINK_MMCM_RST(20_000), .LINK_IDLE_TO(200_000), .LINK_TRAIN_WORDS(256),
                    .LINK_RETRY(20_000), .LINK_RELOCK(50_000), .LINK_RWIN(200_000), .KEEPALIVE(20_000), .B_ALIVE(100_000),
                    .LINK_SIM_SHIFTER(1'b1)) da (
@@ -1075,7 +1075,8 @@ module tb_two_boards;
             fail($sformatf("STATUS B receiver diagnostics not clean: hist %08h last %08h parmap %08h", st_w[64], st_w[65], st_w[66]));
         if (st_w[70] != n_fwd) fail($sformatf("STATUS B CMD packets %0d, expected %0d (forwarded)", st_w[70], n_fwd));
         if (st_w[71] == 0 || st_w[74] == 0) fail($sformatf("STATUS word counters B %0d A %0d", st_w[71], st_w[74]));
-        if (st_w[75] != 0) fail("STATUS reserved word not 0");
+        if (st_w[75] != 32'hC0A8010A || st_w[3][26:25] != 2'b01)
+            fail($sformatf("STATUS address %08h flags %08h: expected the fixed 192.168.1.10", st_w[75], st_w[3]));
         $display("ok: A STATUS layout 4: B rx words %0d xoff %0d retx %08h disc %08h, A rx words %0d xoff %0d naks/timeouts %08h",
                  st_w[71], st_w[67], st_w[68], st_w[69], st_w[74], st_w[72], st_w[73]);
         // layout 5: credit (everything sent was taken and reported), cursor, palette, READ / FILL / COPY counters

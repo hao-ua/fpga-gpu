@@ -35,7 +35,7 @@ def show(b, mode, image, now):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--mode", type=int, choices=sorted(fp.MODE_NAMES))
     ap.add_argument("--image", type=int, choices=range(10))
     ap.add_argument("--now", action="store_true", help="flip at once instead of at vsync")

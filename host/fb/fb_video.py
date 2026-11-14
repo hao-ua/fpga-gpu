@@ -310,7 +310,7 @@ def main():
     ap.add_argument("source", nargs="?", help="video file or URL (decoded by ffmpeg)")
     ap.add_argument("--test", action="store_true", help="play the generated test animation")
     ap.add_argument("--raw", metavar="FILE", help="raw frames in the transfer format ('-' = stdin); needs --size")
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--mode", type=int, choices=sorted(MODE_SIZE), help="set this video mode first")
     ap.add_argument("--size", type=parse_size, help="video area WxH, centred (default: fit the mode)")
     ap.add_argument("--stretch", action="store_true", help="fill the video area, ignoring the aspect ratio")

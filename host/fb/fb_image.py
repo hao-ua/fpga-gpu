@@ -169,7 +169,7 @@ def to_transfer(rgb, tfmt, storage):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--file", help="PNG / PPM / BMP file (default: generated test picture)")
     ap.add_argument("--mode", type=int, choices=sorted(MODE_SIZE), help="set this video mode first")
     ap.add_argument("--fit", action="store_true", help="scale the picture to the mode size")

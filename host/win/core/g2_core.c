@@ -649,6 +649,21 @@ void g2_get_counters(g2_board *b, g2_counters *c)
 }
 
 /* ---------------------------------------------------------------- session */
+/* the board's address: a dotted IPv4 address or a host name (resolved once, IPv4 only) */
+static int resolve_ipv4(const char *name, struct in_addr *out)
+{
+    struct addrinfo hints, *res = NULL;
+    unsigned long a = inet_addr(name);
+    if (a != INADDR_NONE || strcmp(name, "255.255.255.255") == 0) { out->s_addr = a; return 1; }
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(name, NULL, &hints, &res) != 0 || !res) return 0;
+    *out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return 1;
+}
+
 g2_board *g2_open(const char *ip, int port, const g2_options *opt)
 {
     static LONG wsa_done;
@@ -699,7 +714,11 @@ g2_board *g2_open(const char *ip, int port, const g2_options *opt)
     memset(&b->addr, 0, sizeof b->addr);
     b->addr.sin_family = AF_INET;
     b->addr.sin_port = htons((u_short)port);
-    b->addr.sin_addr.s_addr = inet_addr(ip);
+    if (!resolve_ipv4(ip, &b->addr.sin_addr)) {
+        fail(NULL, "board address %s: neither an IPv4 address nor a name that resolves", ip);
+        closesocket(b->sock); free(b);
+        return NULL;
+    }
     b->timer_period = timeBeginPeriod(1) == TIMERR_NOERROR;
     b->running = 1;
     b->rx_thread = CreateThread(NULL, 0, rx_loop, b, 0, NULL);

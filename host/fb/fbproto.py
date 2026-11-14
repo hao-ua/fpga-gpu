@@ -80,6 +80,9 @@ ACKF_NAK, ACKF_FULL = 1, 2
 REG_IDELAY, REG_PHYOPT, REG_PHYAD, REG_REINIT, REG_SCRATCH, REG_LINKCTL, REG_BUILD = 0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0010
 IDELAY_TRIAL = 0x100
 
+# board A's address: GPU2_IP (an address or a host name), else the address board A falls back to without a DHCP lease
+BOARD_IP = os.environ.get("GPU2_IP") or "192.168.1.10"
+
 MAX_DATA = 1440            # data bytes per WRITE_* datagram with a 1500-byte MTU (8 header + 8 fields + 1440)
 RD_CHUNK = 1440            # READ_DATA chunk size used by the board
 HEAP_A = 0x1800_0000       # board A host heap: [384 MB, 1 GB) (below: the ingress ring, two banks of records and bin lists)
@@ -100,7 +103,9 @@ STATUS_NAMES = [
     # transmitter {timeouts, rewinds}, B's receiver {NAKs, discards}, CMD packets B received, words received by
     # both receivers, A's {NAKs, timeouts}
     "b_ld_hist", "b_ld_last_err", "b_link_parmap", "b_xoff", "b_retx", "b_disc", "b_cmd_pkts", "b_rx_words",
-    "a_xoff", "a_naks_to", "a_rx_words", "reserved",
+    "a_xoff", "a_naks_to", "a_rx_words",
+    # layout 11: the IPv4 address in use (0 = none yet)
+    "ip",
     # layout 5: credit flow control (A words sent / B words taken as reported / A cycles waiting),
     # {cursor fast-path packets sent, credit SYNC packets sent}, B words taken, B {cursor packets, palette publishes},
     # B {cursor commands, READ / FILL / COPY operations}, B READ / FILL / COPY pixels
@@ -238,10 +243,25 @@ class _BatchCtx:
             self.board._batch = None
 
 
+DHCP_STATES = ["idle", "delay", "selecting", "requesting", "ack", "probing", "bound", "renewing", "rebinding", "hold"]
+
+
 def decode_flags(f):
     return {"calib": f & 1, "link": (f >> 1) & 1, "speed": ("10M", "100M", "1000M", "?")[(f >> 2) & 3],
             "fdx": (f >> 4) & 1, "mdio_init": (f >> 5) & 1, "host": (f >> 6) & 1, "b_present": (f >> 7) & 1,
-            "tap": (f >> 8) & 31, "rxdly": (f >> 13) & 1, "adv1000": (f >> 14) & 1, "phyad": (f >> 16) & 31}
+            "tap": (f >> 8) & 31, "rxdly": (f >> 13) & 1, "adv1000": (f >> 14) & 1, "phyad": (f >> 16) & 31,
+            # layout 11: the DHCP client
+            "dhcp": (f >> 21) & 15, "ip_valid": (f >> 25) & 1, "ip_leased": (f >> 26) & 1}
+
+
+def format_ip(st):
+    """the address in use and where it came from: '192.168.0.57 (DHCP lease, bound)' (STATUS layout 11)"""
+    if st.get("layout", 0) < 11: return "address not reported (STATUS layout < 11)"
+    fl = decode_flags(st["flags"]); a = st["ip"]
+    ds = DHCP_STATES[fl["dhcp"]] if fl["dhcp"] < len(DHCP_STATES) else "?"
+    if not fl["ip_valid"]: return "no address yet (DHCP %s)" % ds
+    return "%d.%d.%d.%d (%s, DHCP %s)" % (a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255,
+                                          "DHCP lease" if fl["ip_leased"] else "fallback", ds)
 
 
 def decode_b_flags(f):
@@ -262,6 +282,7 @@ def format_status(st):
     s = ("build %d up %.1fs calib %d link %d %s fdx %d tap %d rxdly %d adv1000 %d PHYSR %04X BMSR %04X\n"
          % (st["build"], st["uptime_ms"] / 1000.0, fl["calib"], fl["link"], fl["speed"], fl["fdx"], fl["tap"],
             fl["rxdly"], fl["adv1000"], st["phy"] & 0xFFFF, st["phy"] >> 16))
+    s += "  address %s\n" % format_ip(st)
     s += "  rx ok %(rx_ok)d fcs %(rx_fcs)d len %(rx_len)d ovf %(rx_ovf)d er %(rx_er)d | arp %(arp)d icmp %(icmp)d " \
          "udp %(udp)d ipcsum %(ipcsum)d other %(other)d pfdrop %(pfdrop)d | tx %(tx)d\n" % st
     s += "  proto exp %(exp_seq)d acc %(acc)d dup %(dup)d gap %(gap)d full %(full)d bad %(bad)d acks %(acks)d | " \
@@ -315,8 +336,9 @@ def format_status(st):
 class Board:
     """Board A reached over UDP; commands for board B go through it over the board link."""
 
-    def __init__(self, ip="192.168.1.10", port=5000, bind_port=0, window=64, verbose=False, drop_rx=0.0, b_sub_index=False):
-        self.addr = (ip, port)
+    def __init__(self, ip=None, port=5000, bind_port=0, window=64, verbose=False, drop_rx=0.0, b_sub_index=False):
+        # an address or a host name (resolved once); default GPU2_IP, else 192.168.1.10
+        self.addr = (socket.gethostbyname(ip or BOARD_IP), port)
         self.verbose = verbose
         self.window = window
         self._batch = None                            # the BATCH datagram being filled inside a batch() block

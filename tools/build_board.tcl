@@ -65,7 +65,7 @@ if {$role eq "A"} {
       src/rtl/net/net_pkg.sv src/rtl/proto/fb_pkg.sv \
       src/rtl/net/rst_sync.sv src/rtl/net/afifo_bram.sv src/rtl/mem/sfifo.sv \
       src/rtl/net/eth_rgmii_rx.sv src/rtl/net/eth_mac_rx.sv src/rtl/net/eth_net_rx.sv src/rtl/net/eth_tx.sv \
-      src/rtl/net/mdio_mgr.sv src/rtl/net/eth_stack.sv src/rtl/rgmii_tx.sv src/rtl/rgmii_tx_adapt.sv \
+      src/rtl/net/mdio_mgr.sv src/rtl/net/dhcp_client.sv src/rtl/net/eth_stack.sv src/rtl/rgmii_tx.sv src/rtl/rgmii_tx_adapt.sv \
       src/rtl/mem/mem_arb.sv src/rtl/mem/ddr_fifo.sv src/rtl/res/xfer_lin.sv src/rtl/res/buf_table.sv \
       src/rtl/proto/fb_reply.sv src/rtl/proto/fb_proto_a.sv src/rtl/proto/fb_dispatch_a.sv \
       src/rtl/gpu_clk_mig.sv \

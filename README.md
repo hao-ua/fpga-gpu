@@ -36,6 +36,7 @@ only they know the one-board memory map.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | how the two boards, the link and the host protocol work |
 | [FEATURES.md](FEATURES.md) | what the hardware and each library support, and what they refuse |
 | [PERF_TESTS.md](PERF_TESTS.md) | the performance tests, how to run them, the latest results |
+| [LINUX.md](LINUX.md) | this branch (`linux-driver`): the Linux DRM / KMS kernel driver and the Mesa Gallium driver, design and status |
 
 ## Repository layout
 

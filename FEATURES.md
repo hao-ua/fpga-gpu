@@ -210,8 +210,8 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 
 ## 5. The one-board build
 
-Everything in sections 1 and 2 holds on the one-board build (`board_ab_top`, see [ARCHITECTURE.md](ARCHITECTURE.md)
-section 10) unless listed here. The cuts make it slower, not less capable: OpenGL ES 2.0, OpenGL 2.0 and Direct3D 9
+Everything in sections 1 and 2 holds on the one-board build (`board_ab_top`, see [ARCHITECTURE.md](ARCHITECTURE.md))
+unless listed here. The cuts make it slower, not less capable: OpenGL ES 2.0, OpenGL 2.0 and Direct3D 9
 shader model 2.0 stay as they are.
 
 - **Same as the two boards:**

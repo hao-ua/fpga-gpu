@@ -13,14 +13,14 @@ still builds from this branch with its old defaults; master is its home.
 | document | contents |
 |---|---|
 | this file | the one-board build first, then what you need and how to build, load, simulate and run either design |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | how the halves, the link and the host protocol work; the one-board build in section 10 |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | how the one-board build works: the two halves, the link inside the chip, the shared memory, the host protocol, the cores |
 | [FEATURES.md](FEATURES.md) | what the hardware and each library support, and what they refuse; the one-board differences in section 5 |
 | [PERF_TESTS.md](PERF_TESTS.md) | the one-board build's performance tests, how to run them, and its results |
 
 ## The one-board build
 
 Board A's Ethernet side and board B's rendering and HDMI side in one XC7A200T (`board_ab_top`), on one DDR3. How it
-differs inside: [ARCHITECTURE.md](ARCHITECTURE.md) section 10; what it supports: [FEATURES.md](FEATURES.md) section 5;
+works inside: [ARCHITECTURE.md](ARCHITECTURE.md); what it supports: [FEATURES.md](FEATURES.md) section 5;
 measurements: [PERF_TESTS.md](PERF_TESTS.md).
 
 - **What you need:** one PA200T-Starlite board, no ribbon cables. The PC is cabled to its RJ45 and the monitor to its

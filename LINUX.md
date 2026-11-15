@@ -166,8 +166,14 @@ counters and the last STATUS.
   - Sources in `/root/fpgagpu/src`: Mesa 26.3.0 (a shallow clone of the release tag) and Linux 7.3.4, which checks the
     driver against current DRM interfaces.
   - The driver must therefore work on 6.1 and on current kernels. Version checks in the code cover the differences:
-    `platform_driver.remove` returns void from 6.11, `<linux/unaligned.h>` arrived in 6.12, and `drm_driver.date` was
-    dropped in 6.14.
+    - `platform_driver.remove` returns void from 6.11;
+    - `<linux/unaligned.h>` arrived in 6.12;
+    - `drm_driver.date` was dropped in 6.14;
+    - fbdev emulation is `drm_fbdev_generic_setup` (with its header from 6.2), then `drm_fbdev_shmem_setup` (6.11),
+      then `drm_client_setup` (6.13).
+  - Newer kernels renamed the atomic helpers' `struct drm_atomic_state` to `struct drm_atomic_commit`. Kbuild asks the
+    kernel being built against (`FG_HAVE_ATOMIC_COMMIT`), so DKMS builds for any version.
+  - Every change compiles against both 6.1.0-45 and 7.3.4.
 - **The relay** (`host/linux/tools/g2_relay.py`). The VPS is not on board A's network, so two relay ends carry the
   protocol's datagrams unchanged:
   ```
@@ -192,4 +198,5 @@ counters and the last STATUS.
 | phase | state |
 |---|---|
 | 1 | written: transport (HELLO, STATUS, the sequenced window, the resend rules, events), the DRM device with a render node, `GET_PARAM` / `GET_STATUS`, `fpgagpu_status` (the check), Kbuild and `dkms.conf`. It compiles without warnings against 6.1.0-45, and `dkms add / build / install` work on the VPS. It has not been loaded yet. |
-| 2–6 | not started |
+| 2 | written (`fpgagpu_kms.c`):<br>- the KMS pipe (CRTC, primary plane, encoder, HDMI-A connector with board B's five modes, 800×600 preferred);<br>- shmem dumb buffers;<br>- damage → WRITE_IMAGE into one scanout image at board B's heap start (handle 0xC3E8), PRESENT after a modeset or a new size or format;<br>- SET_MODE on modeset, flips completed at once (no vblank);<br>- fbdev for the console.<br>Compiles against 6.1.0-45 and 7.3.4, DKMS-installed. Not loaded. Still to do: double buffering (an update now draws into the image being scanned out) and the cursor plane. |
+| 3–6 | not started |

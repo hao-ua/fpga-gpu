@@ -10,7 +10,11 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/in.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_device.h>
+#include <drm/drm_encoder.h>
+#include <drm/drm_plane.h>
 
 /* protocol (host/fb/fbproto.py, src/rtl/proto/fb_pkg.sv) */
 #define FG_MAGIC		0x4246
@@ -99,10 +103,34 @@ int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *s
 int fg_net_wait_event(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms);
 u32 fg_net_rtt_us(struct fg_net *n);
 
+/* the atomic helpers' state type, by the kernel built against (Kbuild sets FG_HAVE_ATOMIC_COMMIT) */
+#ifdef FG_HAVE_ATOMIC_COMMIT
+typedef struct drm_atomic_commit fg_atomic_t;
+#else
+typedef struct drm_atomic_state fg_atomic_t;
+#endif
+
+/* the display (fpgagpu_kms.c): board B's HDMI output */
+struct fg_kms {
+	struct drm_plane plane;
+	struct drm_crtc crtc;
+	struct drm_encoder encoder;
+	struct drm_connector connector;
+	u8 *upbuf;				/* one WRITE_IMAGE body */
+	bool img_valid;				/* the scanout image's descriptor is on board B */
+	bool need_present;			/* after a modeset: send the whole image and PRESENT it */
+	u32 img_fourcc, img_w, img_h;
+	u32 frame_id;
+	int mode_id;
+};
+
 struct fpgagpu_device {
 	struct drm_device drm;
 	struct fg_net net;
+	struct fg_kms kms;
 };
+
+int fg_kms_init(struct fpgagpu_device *fdev);
 
 static inline struct fpgagpu_device *to_fpgagpu(struct drm_device *drm)
 {

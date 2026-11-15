@@ -14,11 +14,23 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_print.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#include <drm/clients/drm_client_setup.h>
+#include <drm/drm_fbdev_shmem.h>
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+#include <drm/drm_fbdev_shmem.h>
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+#include <drm/drm_fbdev_generic.h>
+#else
+#include <drm/drm_fb_helper.h>
+#endif
 
 #include "fpgagpu.h"
 #include "fpgagpu_drm.h"
@@ -109,7 +121,11 @@ static const struct drm_ioctl_desc fpgagpu_ioctls[] = {
 DEFINE_DRM_GEM_FOPS(fpgagpu_fops);
 
 static const struct drm_driver fpgagpu_drm_driver = {
-	.driver_features	= DRIVER_GEM | DRIVER_RENDER,
+	.driver_features	= DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET | DRIVER_ATOMIC,
+	DRM_GEM_SHMEM_DRIVER_OPS,			/* dumb buffers and the console: shmem objects in host memory */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
+#endif
 	.ioctls			= fpgagpu_ioctls,
 	.num_ioctls		= ARRAY_SIZE(fpgagpu_ioctls),
 	.fops			= &fpgagpu_fops,
@@ -121,6 +137,18 @@ static const struct drm_driver fpgagpu_drm_driver = {
 	.major			= 0,
 	.minor			= 1,
 };
+
+/* the Linux console on board B's monitor (fbdev emulation on shmem buffers) */
+static void fpgagpu_fbdev_setup(struct drm_device *drm)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+	drm_client_setup(drm, NULL);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+	drm_fbdev_shmem_setup(drm, 32);
+#else
+	drm_fbdev_generic_setup(drm, 32);
+#endif
+}
 
 /* ------------------------------------------------------------------ the platform device */
 
@@ -154,12 +182,17 @@ static int fpgagpu_probe(struct platform_device *pdev)
 		dev_warn(&pdev->dev, "no STATUS from %s:%u\n", ip, port);
 	kfree(w);
 
+	r = fg_kms_init(fdev);
+	if (r)
+		goto fail;
 	r = drm_dev_register(&fdev->drm, 0);
-	if (r) {
-		fg_net_fini(&fdev->net);
-		return r;
-	}
+	if (r)
+		goto fail;
+	fpgagpu_fbdev_setup(&fdev->drm);
 	return 0;
+fail:
+	fg_net_fini(&fdev->net);
+	return r;
 }
 
 static void fpgagpu_remove_device(struct platform_device *pdev)
@@ -167,6 +200,7 @@ static void fpgagpu_remove_device(struct platform_device *pdev)
 	struct fpgagpu_device *fdev = platform_get_drvdata(pdev);
 
 	drm_dev_unplug(&fdev->drm);
+	drm_atomic_helper_shutdown(&fdev->drm);
 	fg_net_fini(&fdev->net);
 }
 

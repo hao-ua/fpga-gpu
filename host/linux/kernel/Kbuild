@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0 OR MIT
 obj-m += fpgagpu.o
-fpgagpu-y := fpgagpu_drv.o fpgagpu_net.o
+fpgagpu-y := fpgagpu_drv.o fpgagpu_net.o fpgagpu_kms.o
 # our UAPI header, and the kernel's own uapi/drm for the "drm.h" it includes
 ccflags-y += -I$(src)/include/uapi/drm -I$(srctree)/include/uapi/drm
+# the atomic helpers' state is struct drm_atomic_commit in newer kernels (struct drm_atomic_state before): asked of
+# the kernel being built against, so DKMS builds for any version
+FG_ATOMIC_COMMIT := $(shell grep -qs '^struct drm_atomic_commit {' $(srctree)/include/drm/drm_atomic.h && echo y)
+ccflags-$(FG_ATOMIC_COMMIT) += -DFG_HAVE_ATOMIC_COMMIT

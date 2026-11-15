@@ -12,13 +12,13 @@ rem Words go together: run_halflife.cmd 800 dump. Steam must be running: the cop
 rem hl.exe imports no graphics library, it loads hw.dll at run time and hw.dll imports opengl32.dll: run_game.ps1 reads hl.exe's own imports
 rem only, so it is told -Api opengl. hl.exe deletes an opengl32.dll in its folder at start: run_game.ps1 places ours read-only for that.
 rem The copy is %LOCALAPPDATA%\gpu2\halflife, the log is its fpga_gpu.log, saves stay in the copy; the registry settings are put back after the run.
-rem The game is the one beside this file if there is one, else HL_DIR, else the Steam library on D:.
+rem The game is the one beside this file if there is one, else HL_DIR, else Steam's default library folder.
 rem run_game.ps1 is the one beside this file (host\win), else GPU2_REPO's: a copy of this file beside the game needs GPU2_REPO = the repository.
 setlocal
 set "RUN=%~dp0run_game.ps1"
 if not exist "%RUN%" set "RUN=%GPU2_REPO%\host\win\run_game.ps1"
 if exist "%~dp0hl.exe" set "HL_DIR=%~dp0."
-if not defined HL_DIR set "HL_DIR=D:\SteamLibrary\steamapps\common\Half-Life"
+if not defined HL_DIR set "HL_DIR=C:\Program Files (x86)\Steam\steamapps\common\Half-Life"
 set "W=640"
 set "H=480"
 set "SCREEN=-windowed"

@@ -321,6 +321,7 @@ module a_render #(
     reg signed [21:0] den, lstep;                  // 16 |dm|; 16 dn sign(dm): the numerator's step per major pixel
     reg signed [EW-1:0] num;                       // (na - 8 (lw - 1)) dm + (16 c + 8 - ma) dn, sign(dm) applied
     reg signed [EW-1:0] lp1, lp2;
+    reg signed [EW-1:0] lq1, lq2;                  // dx^2, dy^2 for the reference values (the sequencer's; lp1 / lp2 are the walk's)
     reg signed [17:0] lo_rq, hi_rq;                // the major range before the clamps (registered: timing)
     reg         lp_empty;                          // the pair has no quad in the band (W_LPAIR -> W_LPAIR2)
     reg [EW-1:0] dv_n, dv_q; reg [21:0] dv_r; reg [5:0] dv_i; reg dv_neg;   // the restoring divider: |num| / den
@@ -692,7 +693,7 @@ module a_render #(
                 tbox_ok <= !(xmax_u < $signed({2'b00, h_rx0, 4'd0})) && !(ymax_u < $signed({2'b00, h_ry0, 4'd0})) &&
                            !(xmin_u >= $signed({2'b00, h_rx1, 4'd0})) && !(ymin_u >= $signed({2'b00, h_ry1, 4'd0}));
                 // the products of the reference edge values at pixel (0, 0)
-                if (prim == 2'd1) begin p1 <= cxr * dx1; p2 <= cyr * dy1; lp1 <= dx1 * dx1; lp2 <= dy1 * dy1; end   // e1 = (c - a) . (b - a)
+                if (prim == 2'd1) begin p1 <= cxr * dx1; p2 <= cyr * dy1; lq1 <= dx1 * dx1; lq2 <= dy1 * dy1; end   // e1 = (c - a) . (b - a)
                 else begin p1 <= cxr * dy2; p2 <= dx2 * cyr; p3 <= dx1 * cyr; p4 <= cxr * dy1; end
                 sp <= SP_S3;
             end
@@ -703,7 +704,7 @@ module a_render #(
                 qy <= 11'(y0 >> 1); rows_left <= 3'(nl >> 1); qx_max <= 11'(xmax_px >> 1);
                 // the reference values before the shift (the square: cx - xl, yt - cy)
                 if (prim == 2'd2) begin ex1 <= EW'(18'sd8 - pxl); ex2 <= EW'(pyt - 18'sd8); end
-                else if (prim == 2'd1) begin ex1 <= p1 + p2; ex2 <= '0; len2 <= lp1 + lp2; end
+                else if (prim == 2'd1) begin ex1 <= p1 + p2; ex2 <= '0; len2 <= lq1 + lq2; end
                 else begin ex1 <= p1 - p2; ex2 <= p3 - p4; end
                 cxo <= 18'({xmin_px[11:1], 1'b0, 4'd8}) - 18'(SX0);       // 16 * (xmin_px & ~1) + 8 - x0
                 for (int i = 1; i < 3; i++) begin asx[i] <= A[i] >>> esh; bsy[i] <= B[i] >>> esh; end
@@ -740,22 +741,26 @@ module a_render #(
 
     // ================================================================ the bound lane, the coarse depth, the stream out
     // Every entry passes the lane (a quad's bounds from B's edges 1 and 2 and its visit's depth-bound words; the others'
-    // results are not used); its result in order is D0: a quad's block is read (registered), a BAND starts the next band's
-    // blocks; D1: the cut and the occluder update. The output takes an entry once it is decided.
+    // results are not used); its result in order is D0: a quad's block is read, a BAND starts the next band's blocks; E: the
+    // read in the RAM's output register; D1: the cut and the occluder update. The output takes an entry once it is decided.
     wire        cl_v, cl_ok; wire [23:0] cl_lo, cl_hi; wire [3:0] cl_tag;
     zq_lane #(.TAGW(4)) u_cz (.clk, .rst(rst | abort), .in_valid(oq_pv), .in_e1(oq_pb1[31:0]), .in_e2(oq_pb1[63:32]), .in_zq(oq_pzq),
         .in_d16(czf_d16), .in_tag(oq_pa), .out_valid(cl_v), .out_ok(cl_ok), .out_dlo(cl_lo), .out_dhi(cl_hi), .out_tag(cl_tag));
     // the blocks: {in use, band epoch[9:0], depth[23:0]}, one RAMB36 (1024 blocks a band; the epoch advances at each BAND, so
     // nothing is cleared between bands: the memory is scrubbed once per frame, 1024 cycles before the walk's first visit)
     (* ram_style = "block" *) reg [34:0] cz_mem [0:1023];
-    reg  [34:0] cz_rd, cz_bd; reg cz_byp;                    // the read, D1's same-cycle update of that block
-    wire [34:0] cz_q = cz_byp ? cz_bd : cz_rd;              // the block as D1 sees it
+    reg  [34:0] cz_rd0, cz_rd;                               // the read (D0), the RAM's output register (E): D1's
+    // D1's last two updates (u1: a cycle before, u2: two): the read two cycles before D1 cannot have seen them (the one two
+    // cycles back wrote in the read's own cycle). Every decision then sees every earlier update.
+    reg         u1_v, u2_v; reg [9:0] u1_a, u2_a; reg [34:0] u1_d, u2_d;
     reg  [9:0]  sc_i; reg [9:0] cz_ep; reg inv_band, fr_act; reg cut_q, occ_q;
-    // D1: the quad whose block is being read
+    // E and D1: the quad whose block is being read
+    reg         e_v, e_ok, e_inv, e_vis, e_band, d1_band; reg [3:0] e_i, e_cov; reg [2:0] e_zc; reg [23:0] e_lo, e_hi; reg [10:0] e_qx, e_qy; reg [9:0] e_ep, e_wa;
     reg         d1_v, d1_ok, d1_inv, d1_vis; reg [3:0] d1_i, d1_cov; reg [2:0] d1_zc; reg [23:0] d1_lo, d1_hi;
     reg  [10:0] d1_qx, d1_qy; reg [9:0] d1_ep, d1_wa;
+    wire [34:0] cz_q = (u1_v && u1_a == d1_wa) ? u1_d : (u2_v && u2_a == d1_wa) ? u2_d : cz_rd;   // the block as D1 sees it
     // an occluder quad at an even qx waiting for its pair
-    reg         pd_v, pd_vis; reg [10:0] pd_qx, pd_qy; reg [23:0] pd_hi;
+    reg         pd_v, pd_vis; reg [10:0] pd_qx, pd_qy; reg [23:0] pd_hi; reg [9:0] pd_ep;   // (pd_ep: the simulation's check)
     wire [3:0]  dq = cl_tag;
     wire [63:0] db0 = oq_b0[dq];
     wire        d0_quad = cl_v && (oq_t[dq] == Q_QUAD);
@@ -766,21 +771,23 @@ module a_render #(
     wire        d1_cut  = d1_zc[0] && d1_ok && !d1_inv && (d1_zc[2] ? (d1_lo > d1_val) : (d1_lo >= d1_val));
     wire        d1_full = d1_zc[0] && d1_zc[1] && d1_ok && (d1_cov == 4'hF);
     wire [23:0] pair_hi = (pd_hi > d1_hi) ? pd_hi : d1_hi;
-    // D1's update, and the bypass into D0's read of the same block in the same cycle: every decision then sees every
-    // earlier update, so the culled stream depends on the stream alone (tools/a_raster_ref.py models it decision for decision)
+    // D1's update (with the bypass above, the culled stream depends on the stream alone: tools/a_raster_ref.py models it
+    // decision for decision)
     wire        d1_we = d1_v && d1_full && d1_qx[0] && pd_v && pd_vis == d1_vis && pd_qy == d1_qy && pd_qx == d1_qx - 11'd1;
     wire [34:0] d1_wd = {1'b1, d1_ep, (pair_hi < d1_val) ? pair_hi : d1_val};
     // the block memory on its own: ONE write port (the frame's scrub, else D1's update; they never meet, the scrub ends
-    // before the frame's first entry) and a registered read every cycle (D1 uses it after a quad's D0), so it maps on a
-    // RAMB36 — written in the control block with two write ports it would not (flip-flops and LUTs by the ten thousand).
-    // The bypass of D1's same-cycle update sits behind the read.
+    // before the frame's first entry) and a read every cycle into the RAM's output register (cz_rd0 -> cz_rd: the RAM's
+    // clock-to-out is off D1's path), so it maps on a RAMB36 — written in the control block with two write ports it would
+    // not (flip-flops and LUTs by the ten thousand).
     wire        cz_we = !rst && !abort && (scrub || d1_we);
     wire [9:0]  cz_wa = scrub ? sc_i : d1_wa;
     wire [34:0] cz_wd = scrub ? 35'd0 : d1_wd;
     always @(posedge clk) begin
         if (cz_we) cz_mem[cz_wa] <= cz_wd;
-        cz_rd <= cz_mem[d0_ra];                                 // block (qy's row in the band, qx >> 1)
-        cz_byp <= d1_we && d1_wa == d0_ra; cz_bd <= d1_wd;
+        cz_rd0 <= cz_mem[d0_ra];                                // block (qy's row in the band, qx >> 1)
+        cz_rd <= cz_rd0;
+        u1_v <= d1_we && !rst && !abort; u1_a <= d1_wa; u1_d <= d1_wd;
+        u2_v <= u1_v && !rst && !abort; u2_a <= u1_a; u2_d <= u1_d;
     end
     // ---- out: the head entry once decided. A visit's entry closes the visit before it (a TRI item held and never sent:
     // its bursts dropped) and decides its own TRI item: sent now, held for the first quad sent (lazy), or not needed (the
@@ -791,7 +798,7 @@ module a_render #(
     typedef enum logic [2:0] {O_RUN, O_TW, O_TE, O_TR1, O_TR2} os_t;
     os_t o_st;
     wire [3:0]  rq = oq_rp[3:0];
-    wire        out_ok = (oq_rp != oq_dp) && !(d1_v && d1_i == rq);    // the head is decided
+    wire        out_ok = (oq_rp != oq_dp) && !(e_v && e_i == rq) && !(d1_v && d1_i == rq);    // the head is decided
     wire [1:0]  ht = oq_t[rq];
     wire [63:0] hb0 = oq_b0[rq], hb1 = oq_b1[rq];
     wire [IDX_W-1:0] h_tid = hb1[32 +: IDX_W];
@@ -819,12 +826,14 @@ module a_render #(
         if (rs_valid && rs_ready) rs_valid <= 1'b0;
         done <= 1'b0;
         if (rst) begin
-            oq_rp <= 5'd0; oq_dp <= 5'd0; rs_valid <= 1'b0; fr_act <= 1'b0; scrub <= 1'b0; d1_v <= 1'b0; pd_v <= 1'b0;
+            oq_rp <= 5'd0; oq_dp <= 5'd0; rs_valid <= 1'b0; fr_act <= 1'b0; scrub <= 1'b0; e_v <= 1'b0; d1_v <= 1'b0; pd_v <= 1'b0;
+            e_band <= 1'b0; d1_band <= 1'b0;
             inv_band <= 1'b0; cz_ep <= 10'd0; o_st <= O_RUN; odrop <= 6'd0; ov_act <= 1'b0; ov_need <= 1'b0; o_cur_ok <= 1'b0;
             bq_r <= 6'd0; cut_q <= 1'b0; occ_q <= 1'b0;
             c_cull <= 0; c_qsent <= 0; c_trisent <= 0; c_trihold <= 0; c_trinq <= 0; c_occ <= 0;
         end else if (abort) begin
-            oq_rp <= 5'd0; oq_dp <= 5'd0; rs_valid <= 1'b0; d1_v <= 1'b0; pd_v <= 1'b0; scrub <= 1'b0; cut_q <= 1'b0; occ_q <= 1'b0;
+            oq_rp <= 5'd0; oq_dp <= 5'd0; rs_valid <= 1'b0; e_v <= 1'b0; d1_v <= 1'b0; pd_v <= 1'b0; scrub <= 1'b0; cut_q <= 1'b0; occ_q <= 1'b0;
+            e_band <= 1'b0; d1_band <= 1'b0;
             o_st <= O_RUN; odrop <= 6'd0; ov_act <= 1'b0; ov_need <= 1'b0; bq_r <= 6'd0;
             if (fr_act) begin done <= 1'b1; fr_act <= 1'b0; end
         end else begin
@@ -836,15 +845,25 @@ module a_render #(
             end
             if (scrub) begin sc_i <= sc_i + 10'd1; if (sc_i == 10'd1023) scrub <= 1'b0; end      // (the write: cz_we)
             // D0: an entry's lane result (in push order); a quad's block is read, a BAND starts the next band's blocks
-            d1_v <= 1'b0;
+            e_v <= 1'b0;
             if (cl_v) begin
                 oq_dp <= oq_dp + 5'd1;
                 if (d0_quad) begin
-                    d1_v <= 1'b1; d1_i <= dq; d1_ok <= cl_ok; d1_lo <= cl_lo; d1_hi <= cl_hi; d1_zc <= oq_zc[dq];
-                    d1_cov <= db0[27:24]; d1_qx <= db0[10:0]; d1_qy <= db0[22:12]; d1_vis <= oq_vis[dq]; d1_ep <= cz_ep; d1_wa <= d0_ra;
-                    d1_inv <= inv_band;
+                    e_v <= 1'b1; e_i <= dq; e_ok <= cl_ok; e_lo <= cl_lo; e_hi <= cl_hi; e_zc <= oq_zc[dq];
+                    e_cov <= db0[27:24]; e_qx <= db0[10:0]; e_qy <= db0[22:12]; e_vis <= oq_vis[dq]; e_ep <= cz_ep; e_wa <= d0_ra;
+                    e_inv <= inv_band;
                     if (oq_zc[dq][1:0] == 2'b10) inv_band <= 1'b1;            // an INV quad: no culling for the rest of the band
-                end else if (oq_t[dq] == Q_BAND) begin cz_ep <= cz_ep + 10'd1; inv_band <= 1'b0; pd_v <= 1'b0; end
+                end else if (oq_t[dq] == Q_BAND) begin cz_ep <= cz_ep + 10'd1; inv_band <= 1'b0; end
+            end
+            // a BAND ends the waiting occluder at D1, after the quads ahead of it (cleared at D0, a quad of the band before
+            // still in E / D1 would set it again and pair with the next band's quad of the same block index)
+            e_band <= cl_v && !d0_quad && (oq_t[dq] == Q_BAND); d1_band <= e_band;
+            if (d1_band) pd_v <= 1'b0;
+            // E: the read in the RAM's output register
+            d1_v <= e_v;
+            if (e_v) begin
+                d1_i <= e_i; d1_ok <= e_ok; d1_lo <= e_lo; d1_hi <= e_hi; d1_zc <= e_zc; d1_cov <= e_cov; d1_qx <= e_qx; d1_qy <= e_qy;
+                d1_vis <= e_vis; d1_ep <= e_ep; d1_wa <= e_wa; d1_inv <= e_inv;
             end
             // D1: the cut, and the occluders' update (the two counters a cycle later: off the block read's path)
             cut_q <= d1_v && d1_cut; occ_q <= d1_we;
@@ -852,7 +871,7 @@ module a_render #(
             if (occ_q) c_occ <= c_occ + 1;
             if (d1_v) begin
                 oq_cut[d1_i] <= d1_cut;
-                if (d1_full && !d1_qx[0]) begin pd_v <= 1'b1; pd_qx <= d1_qx; pd_qy <= d1_qy; pd_vis <= d1_vis; pd_hi <= d1_hi; end
+                if (d1_full && !d1_qx[0]) begin pd_v <= 1'b1; pd_qx <= d1_qx; pd_qy <= d1_qy; pd_vis <= d1_vis; pd_hi <= d1_hi; pd_ep <= d1_ep; end
                 else pd_v <= 1'b0;
             end
             // the bursts to drop (one a cycle as they land) and the ones added by this cycle's head
@@ -918,6 +937,7 @@ module a_render #(
         $fatal(1, "a_render: an entry with %0d TRI bursts (the depth-bound words are in burst 3)", ent_cur[59:56]);
     always @(posedge clk) if (!rst && !abort && cl_v && oq_dp == oq_wp) $fatal(1, "a_render: a lane result without its queue entry");
     always @(posedge clk) if (!rst && !abort && odrop > 6'd40) $fatal(1, "a_render: %0d bursts to drop", odrop);
+    always @(posedge clk) if (!rst && !abort && d1_we && pd_ep != d1_ep) $fatal(1, "a_render: an occluder pair across bands (epochs %0d / %0d)", pd_ep, d1_ep);
     // synthesis translate_on
     wire _unused = &{1'b0, hdr, q1, q2, varmask, lp1, lp2, ent_cur[55:32], ent_cur[62:60], band, band_lo};
 endmodule

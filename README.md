@@ -6,6 +6,16 @@ primitives. Board A streams them over a ribbon-cable link to **board B**, which 
 blends and shows the picture on HDMI. Drop-in Windows libraries (`ddraw.dll`, `opengl32.dll`, `libGLESv2` / `libEGL`,
 `d3d9.dll`, `d3d8.dll`) let unmodified games render on it.
 
+**Two-board design:** this branch (`master`), the two boards described above, each with its own XC7A200T and DDR3,
+joined by ribbon cables:
+- 16 shader lanes in both cores, at 120 MHz with DDR3 at 960 MT/s;
+- SIN / COS and integer-divide units in both cores, and the SQRT / RCPM / RSQM micro-ops on board B;
+- render targets up to 1280 pixels wide, video modes up to 1280×800;
+- board A culls quads that coarse depth proves hidden before they reach board B.
+
+OpenArena's timedemo runs at 31.4 fps at 640×480 and 23.9 at 800×600; with board A's coarse depth and lazy TRI items
+off, 29.2 and 21.6 ([PERF_TESTS.md](PERF_TESTS.md)). How to build and run it: the rest of this file.
+
 **One-board variant:** the [`single-board`](../../tree/single-board) branch fits both halves into one board's FPGA and
 DDR3, with no ribbon cables. It keeps the same host protocol and the OpenGL ES 2.0 feature set, at a lower speed:
 - 4 shader lanes instead of 16, at 100 MHz;

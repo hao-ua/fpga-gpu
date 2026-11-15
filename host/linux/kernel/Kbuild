@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0 OR MIT
+obj-m += fpgagpu.o
+fpgagpu-y := fpgagpu_drv.o fpgagpu_net.o
+# our UAPI header, and the kernel's own uapi/drm for the "drm.h" it includes
+ccflags-y += -I$(src)/include/uapi/drm -I$(srctree)/include/uapi/drm

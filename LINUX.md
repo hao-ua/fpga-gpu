@@ -9,7 +9,7 @@ document is the plan.
 
 | question | choice |
 |---|---|
-| where Linux runs | a Hyper-V VM whose network adapter is bridged onto the NIC cabled to board A; the Linux build host (192.168.53.1) for compile checks |
+| where Linux runs | the Linux host 192.168.53.1, a VPS reached over WireGuard, which builds everything and reaches the boards through a UDP relay on the PC (section 6). A Hyper-V VM bridged onto board A's network may follow. |
 | kernel driver | a DRM driver, `fpgagpu`, with the board protocol's UDP transport inside the kernel; packaged for DKMS |
 | OpenGL | a Mesa Gallium driver, `fpgagpu`, with a new shader-compiler back end from NIR to the board's ISA |
 | the board's HDMI | a KMS connector: the Linux console, X and Wayland desktops and page flips show on the board's monitor |
@@ -48,6 +48,11 @@ can be compared byte by byte with the Python reference.
 - Sequenced datagrams in a 64-entry window, credit from the ACKs' free queue space, NAK and the heartbeat rule, resend
   on timeout, BATCH packing.
 - Replies: ACK, STATUS (the latest kept for userspace), EVENT (FENCE, PRESENT, MODE, ERROR) and READ_DATA reassembly.
+- **Timers scaled to the round trip.** On board A's own network the timers are fbproto's: the 2 ms heartbeat rule,
+  the 4 ms gap between resends, the 5 ms wait after FULL and the 10 ms stall timer. Through the relay the round trip
+  is about 70 ms, so each timer is at least the smoothed round trip plus twice its variation, measured RFC 6298-style
+  from datagrams acknowledged without a resend. A NAK or a heartbeat ACK that left the board before a resend arrived
+  then causes no second one.
 
 ### 3.3 Board memory and handles
 - Two heaps with `drm_mm`: board A's [384 MB, 1 GB) and board B's [256 MB, 1 GB), the two boards' map.
@@ -154,13 +159,37 @@ counters and the last STATUS.
 
 ## 6. Environment
 
-- **The VM** (created by the user):
-  - Hyper-V generation 2, Ubuntu (the release whose Mesa the overlay pins).
-  - An external virtual switch on the NIC cabled to board A, shared with the management OS so Windows keeps
-    192.168.1.112. The VM takes 192.168.1.113/24.
-  - Packages: `build-essential dkms linux-headers-$(uname -r) git meson ninja-build libdrm-dev libdrm-tests kmscube
-    mesa-utils`, plus Mesa's build dependencies.
-- **Development access:** SSH from this PC into the VM, and to the Linux build host (192.168.53.1) for compiling.
-- **One sender:** while the module is loaded the kernel talks to the boards. The Windows libraries and the `host/fb`
-  tools must not run at the same time; unload the module first.
+- **The Linux host:** 192.168.53.1, a VPS reached over WireGuard.
+  - Debian 12, kernel 6.1.0-45 (Debian 6.1.170-1). Its exact headers came from snapshot.debian.org, since the archive
+    has moved on.
+  - Build tools: DKMS 3.0, meson 1.7 and libdrm 2.4.123 (backports), gcc 12.
+  - Sources in `/root/fpgagpu/src`: Mesa 26.3.0 (a shallow clone of the release tag) and Linux 7.3.4, which checks the
+    driver against current DRM interfaces.
+  - The driver must therefore work on 6.1 and on current kernels. Version checks in the code cover the differences:
+    `platform_driver.remove` returns void from 6.11, `<linux/unaligned.h>` arrived in 6.12, and `drm_driver.date` was
+    dropped in 6.14.
+- **The relay** (`host/linux/tools/g2_relay.py`). The VPS is not on board A's network, so two relay ends carry the
+  protocol's datagrams unchanged:
+  ```
+  VPS:  python3 g2_relay.py remote --listen 192.168.53.1:5100 --allow 192.168.73.30 --local 127.0.0.1:5000
+  PC:   python3 g2_relay.py pc --remote 192.168.53.1:5100 --board 192.168.1.10:5000      (in WSL)
+  VPS:  modprobe fpgagpu ip=127.0.0.1
+  ```
+  - The PC end opens the flow with a keepalive every 2 s, so no inbound firewall rule is needed, and NAT on the way
+    keeps the flow open.
+  - The VPS end accepts that flow only from the PC's address, and serves programs on 127.0.0.1.
+  - The round trip is 62–131 ms (about 70 ms), so the boards work but slowly: 64 datagrams per round trip is about
+    1–2 MB/s.
+  - Proven 2026-11-15: `fb_status.py --ip 127.0.0.1` on the VPS read both boards' STATUS (A 154, link trained, B alive).
+- **A VM, if one comes:** Hyper-V generation 2, an external virtual switch on the NIC cabled to board A (shared with
+  the management OS so Windows keeps 192.168.1.112), the VM at 192.168.1.113/24, `modprobe fpgagpu` with no relay.
+- **One sender:** while the module or the relay is in use it is the boards' sender. The Windows libraries and the
+  `host/fb` tools on the PC must not run at the same time; stop the relay first.
 - **Not in scope yet:** the one-board build (its memory map and STATUS flags bit 29); a different heap layout.
+
+## 7. Status
+
+| phase | state |
+|---|---|
+| 1 | written: transport (HELLO, STATUS, the sequenced window, the resend rules, events), the DRM device with a render node, `GET_PARAM` / `GET_STATUS`, `fpgagpu_status` (the check), Kbuild and `dkms.conf`. It compiles without warnings against 6.1.0-45, and `dkms add / build / install` work on the VPS. It has not been loaded yet. |
+| 2–6 | not started |

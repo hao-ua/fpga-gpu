@@ -117,7 +117,7 @@ def png(path, W, H, rgba_rows):
 def main():
     a = sys.argv[1:]
     def opt(name, default, conv=str): return conv(a[a.index(name) + 1]) if name in a else default
-    ip = opt('--ip', "192.168.1.10"); mode = opt('--mode', 0, int); views = opt('--views', 60, int)
+    ip = opt('--ip', fp.BOARD_IP); mode = opt('--mode', 0, int); views = opt('--views', 60, int)
     rnd = random.Random(opt('--seed', 1, int)); out = opt('--png', None); order = opt('--order', 'lava')
     split = opt('--split', 1, int)
     W, H = MODE_SIZE[mode]

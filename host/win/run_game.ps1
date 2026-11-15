@@ -16,7 +16,7 @@ param(
     [switch]$Info, [switch]$Check, [switch]$Recopy, [switch]$Dump, [switch]$Record, [switch]$NoKeep
 )
 $ErrorActionPreference = 'Stop'
-$Board = '192.168.1.10'
+$Board = if ($env:GPU2_IP) { $env:GPU2_IP } else { '192.168.1.10' }   # GPU2_IP: an address or a host name
 
 # what we build, by the DLL a game imports
 $Ours = @{

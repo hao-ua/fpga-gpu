@@ -336,7 +336,7 @@ def main():
     if '--list' in a:
         for s in scenes(): print(s.name, s.vol)
         return 0
-    ip = a[a.index('--ip') + 1] if '--ip' in a else "192.168.1.10"
+    ip = a[a.index('--ip') + 1] if '--ip' in a else fp.BOARD_IP
     mode = int(a[a.index('--mode') + 1]) if '--mode' in a else 0
     bd = fp.Board(ip)
     bd.hello()

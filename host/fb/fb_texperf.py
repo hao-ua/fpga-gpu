@@ -142,12 +142,14 @@ def upload_texture(bd, handle, base, size, fmt, levels, layers=1, pattern=None):
 
 
 # ------------------------------------------------------------------------------------------------ programs
-def compile_programs(shader, forward=False):
+def compile_programs(shader, forward=False, noops=None):
+    """noops: fbproto.stage_noops of the board (the units its cores lack), None = both cores complete"""
+    noops = noops or {'vs': 0, 'fs': 0}
     forward = forward or shader.startswith('tunnel')
     src = open(os.path.join(TESTS, SHADERS[shader]), encoding='utf-8').read()
     if shader == 'tunnel_naive': src = src.replace('#define IMPLEMENTATION 1', '#define IMPLEMENTATION 0')
-    rv = glslc.compile_stage(open(os.path.join(TESTS, 'fs_quad.vert'), encoding='utf-8').read(), 'vs', isa64=True, forward=forward)
-    rf = glslc.compile_stage(src, 'fs', isa64=True, forward=forward)
+    rv = glslc.compile_stage(open(os.path.join(TESTS, 'fs_quad.vert'), encoding='utf-8').read(), 'vs', isa64=True, forward=forward, noops=noops['vs'])
+    rf = glslc.compile_stage(src, 'fs', isa64=True, forward=forward, noops=noops['fs'])
     wv, _ = isa64.assemble(rv['sasm'].splitlines(), vs=True)
     wf, _ = isa64.assemble(rf['sasm'].splitlines())
     assert rv['attribs'] == {'aPos': (0, 'vec2')} and rv['uniforms'] == {'uParam': (0, 'vec4')} and rv['const_base'] == 1
@@ -345,10 +347,10 @@ def sim_uops(wf, funi, fconst, fs_cb, scale, aspect):
     return res.uops, res.err
 
 
-def run_case(bd, case, mode, secs, check, dump=False, forward=False):
+def run_case(bd, case, mode, secs, check, dump=False, forward=False, noops=None):
     shader, texl, rep0, rep1 = CASES[case]
     texs = [(size, fmt, filt, levels, shader == 'texcube') for size, fmt, filt, levels in texl]
-    wv, wf, vconst, fconst, funi, fs_cb, samplers = compile_programs(shader, forward)
+    wv, wf, vconst, fconst, funi, fs_cb, samplers = compile_programs(shader, forward, noops)
     bd.set_mode(mode)
     W, H = MODE_SIZE[mode]; aspect = W / H; nquads = (W // 2) * (H // 2)
     size0 = texs[0][0]
@@ -415,7 +417,7 @@ def main():
     if '--list' in a:
         for k, v in CASES.items(): print(k, v)
         return
-    ip = opt('--ip', "192.168.1.10"); mode = opt('--mode', 1, int); secs = opt('--secs', 6.0, float)
+    ip = opt('--ip', fp.BOARD_IP); mode = opt('--mode', 1, int); secs = opt('--secs', 6.0, float)
     cases = list(CASES) if '--all' in a else [opt('--case', 't1_256_bilinear')]
     for c in cases:
         if c not in CASES: raise SystemExit("unknown case %s (--list)" % c)
@@ -424,10 +426,11 @@ def main():
     st = bd.status()
     lfl = fp.decode_link_flags(st['link_flags'])
     if not (lfl['trained'] and lfl['b_alive']): raise fp.ProtoError("the board link is not up / B is not alive")
-    print(f"board A build {st['build']}")
+    noops = fp.stage_noops(st)                                 # the ops the board's cores lack are lowered by the compiler
+    print(f"board A build {st['build']}{fp.noops_note(noops)}")
     results = []
     for c in cases:
-        r = run_case(bd, c, mode, secs, '--check' in a or '--all' in a, '--dump' in a, '--forward' in a)
+        r = run_case(bd, c, mode, secs, '--check' in a or '--all' in a, '--dump' in a, '--forward' in a, noops)
         results.append(r or f"RESULT {c} FAILED")
     print("\n".join(results))
 

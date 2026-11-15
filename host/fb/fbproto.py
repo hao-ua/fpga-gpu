@@ -80,6 +80,9 @@ ACKF_NAK, ACKF_FULL = 1, 2
 REG_IDELAY, REG_PHYOPT, REG_PHYAD, REG_REINIT, REG_SCRATCH, REG_LINKCTL, REG_BUILD = 0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0010
 IDELAY_TRIAL = 0x100
 
+# board A's address: GPU2_IP (an address or a host name), else the address board A falls back to without a DHCP lease
+BOARD_IP = os.environ.get("GPU2_IP") or "192.168.1.10"
+
 MAX_DATA = 1440            # data bytes per WRITE_* datagram with a 1500-byte MTU (8 header + 8 fields + 1440)
 RD_CHUNK = 1440            # READ_DATA chunk size used by the board
 HEAP_A = 0x1800_0000       # board A host heap: [384 MB, 1 GB) (below: the ingress ring, two banks of records and bin lists)
@@ -100,7 +103,9 @@ STATUS_NAMES = [
     # transmitter {timeouts, rewinds}, B's receiver {NAKs, discards}, CMD packets B received, words received by
     # both receivers, A's {NAKs, timeouts}
     "b_ld_hist", "b_ld_last_err", "b_link_parmap", "b_xoff", "b_retx", "b_disc", "b_cmd_pkts", "b_rx_words",
-    "a_xoff", "a_naks_to", "a_rx_words", "reserved",
+    "a_xoff", "a_naks_to", "a_rx_words",
+    # layout 11: the IPv4 address in use (0 = none yet)
+    "ip",
     # layout 5: credit flow control (A words sent / B words taken as reported / A cycles waiting),
     # {cursor fast-path packets sent, credit SYNC packets sent}, B words taken, B {cursor packets, palette publishes},
     # B {cursor commands, READ / FILL / COPY operations}, B READ / FILL / COPY pixels
@@ -126,7 +131,10 @@ STATUS_NAMES = [
     # dispatcher's idle cycles (no command queued: host-bound) and its cycles waiting for a geometry command (D_GWAIT)
     "a_prof_load", "a_prof_copy", "a_prof_feed", "a_prof_fetch_wait", "a_prof_core", "a_prof_asm", "a_prof_vo_stall",
     "a_prof_setup", "a_prof_push_stall", "a_prof_bin", "a_prof_clear", "a_prof_loads_draws", "a_prof_prims",
-    "a_disp_idle", "a_disp_gwait"]
+    "a_disp_idle", "a_disp_gwait",
+    # layout 12: the render side's coarse depth and TRI items, cumulative: quads culled, quads sent, TRI items sent, TRI items
+    # held back (no quad followed: dropped), TRI items sent for a visit that sent no quad, blocks an occluder pair lowered
+    "a_cz_culled", "a_cz_quads_sent", "a_tri_sent", "a_tri_held", "a_tri_noquad", "a_cz_blocks"]
 B_CYC_NAMES = ["frame", "flush", "band change", "draw change", "FS busy", "band set-up", "stream empty", "ROP stall"]
 # the boards' clk_sys in kHz, for cycle counters -> ms (GPU2_CLK_MHZ, default 120)
 CLK_KHZ = float(os.environ.get("GPU2_CLK_MHZ", "120")) * 1e3
@@ -147,6 +155,40 @@ def a_geom_split(st, st0, frames=1):
     return ("A geometry %.0f kcycles/frame: %s | per frame: loads %.1f draws %.1f prims %.0f | dispatcher idle %.0f k, "
             "geometry wait %.0f k cycles/frame" % (g / 1e3 / frames, parts, ld / frames, dr / frames, d("a_prof_prims") / frames,
                                                    d("a_disp_idle") / 1e3 / frames, d("a_disp_gwait") / 1e3 / frames))
+
+
+def a_cz_split(st, st0, frames=1):
+    """board A's coarse depth and TRI items between two STATUS snapshots, per frame (STATUS layout 12)"""
+    if st.get("layout", 0) < 12: return "no coarse-depth counters (STATUS layout < 12)"
+    d = lambda k: ((st[k] - st0[k]) & 0xFFFFFFFF) / max(frames, 1)
+    walked = d("a_cz_culled") + d("a_cz_quads_sent")
+    return ("A per frame: %.0f quads walked, %.0f culled (%.1f%%), %.0f sent | TRI items %.0f sent, %.0f held back, %.0f sent with "
+            "no quad | %.0f blocks lowered" % (walked, d("a_cz_culled"), 100.0 * d("a_cz_culled") / walked if walked else 0.0,
+                                               d("a_cz_quads_sent"), d("a_tri_sent"), d("a_tri_held"), d("a_tri_noquad"), d("a_cz_blocks")))
+
+
+# board A's coarse-depth flags of a draw (VS_STATE word 4 [28:25]) and the lazy TRI bit (29): vs_state(zc=...)
+ZC_OCC, ZC_CULL, ZC_STRICT, ZC_INV, ZC_LAZY = 1, 2, 4, 8, 16
+
+
+def zc_flags(h0, discard=False, frag_depth=False):
+    """the coarse-depth flags a draw may promise, from B's DRAW_STATE word h0 (depth test [0], write [1], function [4:2]
+    NEVER..ALWAYS, stencil [5], polygon offset [9]) and its fragment program (DISCARD, gl_FragDepth) — the libraries'
+    g2_render.c zc_flags, the same rule. A wrong bit culls visible quads.
+      OCC     every pixel it covers ends with a depth <= its own: LESS / LEQUAL with writes, no stencil, discard, gl_FragDepth,
+              polygon offset (a scissor box only as the draw's rectangle, vs_state rect=: board A's coverage stays inside it)
+      CULL    its fragments that fail the depth test change nothing: LESS / LEQUAL / EQUAL, no stencil, gl_FragDepth, offset
+      STRICT  LEQUAL / EQUAL: only quads strictly behind are culled
+      INV     its depth writes may raise the stored depth (GREATER / NOTEQUAL / GEQUAL / ALWAYS with writes, or the test off)"""
+    func, test, write = (h0 >> 2) & 7, h0 & 1, (h0 >> 1) & 1
+    stencil, offset = (h0 >> 5) & 1, (h0 >> 9) & 1
+    if write and (not test or func >= 4): return ZC_INV
+    if not test: return 0
+    z = 0
+    if func in (1, 3) and write and not (stencil or discard or frag_depth or offset): z |= ZC_OCC
+    if 1 <= func <= 3 and not (stencil or frag_depth or offset): z |= ZC_CULL
+    if z and func in (2, 3): z |= ZC_STRICT
+    return z
 
 
 def b_frame_split(st):
@@ -238,17 +280,51 @@ class _BatchCtx:
             self.board._batch = None
 
 
+DHCP_STATES = ["idle", "delay", "selecting", "requesting", "ack", "probing", "bound", "renewing", "rebinding", "hold"]
+
+
 def decode_flags(f):
     return {"calib": f & 1, "link": (f >> 1) & 1, "speed": ("10M", "100M", "1000M", "?")[(f >> 2) & 3],
             "fdx": (f >> 4) & 1, "mdio_init": (f >> 5) & 1, "host": (f >> 6) & 1, "b_present": (f >> 7) & 1,
-            "tap": (f >> 8) & 31, "rxdly": (f >> 13) & 1, "adv1000": (f >> 14) & 1, "phyad": (f >> 16) & 31}
+            "tap": (f >> 8) & 31, "rxdly": (f >> 13) & 1, "adv1000": (f >> 14) & 1, "phyad": (f >> 16) & 31,
+            # layout 11: the DHCP client
+            "dhcp": (f >> 21) & 15, "ip_valid": (f >> 25) & 1, "ip_leased": (f >> 26) & 1,
+            # the vertex core lacks the integer divider / SIN / COS (glslc noops for the vertex stage: (f >> 30) & 3)
+            "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}
+
+
+def stage_noops(st):
+    """the glslc noops of each stage from a STATUS snapshot: the units its core lacks, flags bits 30 (integer divider) / 31
+    (SIN / COS) — board A's word for the vertex stage, board B's for the fragment stage. 0 on boards whose cores have both
+    (every two-board build); a board without the bits reads 0 there as well"""
+    return {'vs': (st.get('flags', 0) >> 30) & 3,
+            'fs': (st.get('b_flags', 0) >> 30) & 3 if st.get('layout', 0) >= 2 else 0}
+
+
+def noops_note(noops):
+    """'' for complete cores, else what the compiler lowered: '; lowered for the cores: vs no SIN/COS, fs no SIN/COS, no IDIV'"""
+    def one(n): return ", ".join(s for b, s in ((2, "no SIN/COS"), (1, "no IDIV")) if n & b)
+    parts = [f"{k} {one(noops[k])}" for k in ('vs', 'fs') if noops.get(k)]
+    return "; lowered for the cores: " + "; ".join(parts) if parts else ""
+
+
+def format_ip(st):
+    """the address in use and where it came from: '192.168.0.57 (DHCP lease, bound)' (STATUS layout 11)"""
+    if st.get("layout", 0) < 11: return "address not reported (STATUS layout < 11)"
+    fl = decode_flags(st["flags"]); a = st["ip"]
+    ds = DHCP_STATES[fl["dhcp"]] if fl["dhcp"] < len(DHCP_STATES) else "?"
+    if not fl["ip_valid"]: return "no address yet (DHCP %s)" % ds
+    return "%d.%d.%d.%d (%s, DHCP %s)" % (a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255,
+                                          "DHCP lease" if fl["ip_leased"] else "fallback", ds)
 
 
 def decode_b_flags(f):
     return {"calib": f & 1, "mmcm_locked": (f >> 1) & 1, "video": (f >> 2) & 1, "mode_busy": (f >> 3) & 1,
             "mode": (f >> 4) & 7, "image_shown": (f >> 7) & 1, "fill_done": (f >> 8) & 1, "lock_fail": (f >> 11) & 1,
             "cp_busy": (f >> 12) & 1, "cur_img": (f >> 16) & 1023, "render_busy": (f >> 26) & 1,
-            "fs_stack_err": (f >> 27) & 1, "xsfu": (f >> 28) & 1, "xclamp": (f >> 29) & 1}
+            "fs_stack_err": (f >> 27) & 1, "xsfu": (f >> 28) & 1, "xclamp": (f >> 29) & 1,
+            # the fragment core lacks the integer divider / SIN / COS (glslc noops for the fragment stage: (f >> 30) & 3)
+            "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}
 
 
 def decode_link_flags(f):
@@ -262,6 +338,7 @@ def format_status(st):
     s = ("build %d up %.1fs calib %d link %d %s fdx %d tap %d rxdly %d adv1000 %d PHYSR %04X BMSR %04X\n"
          % (st["build"], st["uptime_ms"] / 1000.0, fl["calib"], fl["link"], fl["speed"], fl["fdx"], fl["tap"],
             fl["rxdly"], fl["adv1000"], st["phy"] & 0xFFFF, st["phy"] >> 16))
+    s += "  address %s\n" % format_ip(st)
     s += "  rx ok %(rx_ok)d fcs %(rx_fcs)d len %(rx_len)d ovf %(rx_ovf)d er %(rx_er)d | arp %(arp)d icmp %(icmp)d " \
          "udp %(udp)d ipcsum %(ipcsum)d other %(other)d pfdrop %(pfdrop)d | tx %(tx)d\n" % st
     s += "  proto exp %(exp_seq)d acc %(acc)d dup %(dup)d gap %(gap)d full %(full)d bad %(bad)d acks %(acks)d | " \
@@ -315,8 +392,9 @@ def format_status(st):
 class Board:
     """Board A reached over UDP; commands for board B go through it over the board link."""
 
-    def __init__(self, ip="192.168.1.10", port=5000, bind_port=0, window=64, verbose=False, drop_rx=0.0, b_sub_index=False):
-        self.addr = (ip, port)
+    def __init__(self, ip=None, port=5000, bind_port=0, window=64, verbose=False, drop_rx=0.0, b_sub_index=False):
+        # an address or a host name (resolved once); default GPU2_IP, else 192.168.1.10
+        self.addr = (socket.gethostbyname(ip or BOARD_IP), port)
         self.verbose = verbose
         self.window = window
         self._batch = None                            # the BATCH datagram being filled inside a batch() block
@@ -792,7 +870,8 @@ class Board:
         body += struct.pack("<IIII", *[c if isinstance(c, int) else fp24(c) for c in const])
         return self.send_seq(T_VERTEX_ATTR, body)
 
-    def vs_state(self, viewport, cull, front_cw, fsmask, width, height, draw_id, line_width=1, depth_range=(0.0, 1.0), guard=None, rect=None, z01=False):
+    def vs_state(self, viewport, cull, front_cw, fsmask, width, height, draw_id, line_width=1, depth_range=(0.0, 1.0), guard=None, rect=None, z01=False,
+                 zc=0):
         """viewport = (sxs, sxo, sys, syo) with window = ndc * s + o in 1/16 PIXEL (FP24 bits or floats); cull 0 none,
         1 back, 2 front, 3 front and back; fsmask = the fragment shader's read varyings (every varying the fragment
         program reads MUST be in it: an omitted one is undefined); the render target's size in pixels (1..2048 each,
@@ -808,7 +887,10 @@ class Board:
         target. Board A drops what has no pixel in it and walks inside it; a board A without it takes the command's
         first 13 words and drops the two (a sub-body's or an entry's unread tail), so both get the same bytes.
         z01 (word 4 bit 24, on a board A that has the flag): the program's z runs 0 .. w, not -w .. w — A clips at z >= 0 and window z =
-        n + ndc_z (f - n). For a host that keeps depth reversed (far at 0, where FP24 is fine); a board A without the flag ignores the bit"""
+        n + ndc_z (f - n). For a host that keeps depth reversed (far at 0, where FP24 is fine); a board A without the flag ignores the bit.
+        zc (word 4 [29:25], board A builds with the coarse depth; older ones ignore the bits): the draw's coarse-depth flags
+        (zc_flags: ZC_OCC / ZC_CULL / ZC_STRICT / ZC_INV — a PROMISE about its depth state, a wrong bit culls visible quads) | ZC_LAZY
+        (TRI items only in bands where a quad follows; the last VS_STATE before a FLUSH decides for its frame)"""
         lw = max(1, min(64, int(round(line_width))))
         n, f = depth_range
         zs, zo = (n, f) if isinstance(n, int) else (fp24(f - n), fp24(n)) if z01 else (fp24((f - n) / 2), fp24((n + f) / 2))
@@ -819,7 +901,8 @@ class Board:
                 gb += sorted(((-GUARD_BAND - o) / s, (GUARD_BAND - o) / s))
             guard = [fp24(c) for c in gb]
         body = struct.pack("<IIII", *[c if isinstance(c, int) else fp24(c) for c in viewport])
-        body += struct.pack("<HBBHHI", cull | ((1 if front_cw else 0) << 8) | (lw << 9), fsmask, 1 if z01 else 0, width, height, draw_id)
+        body += struct.pack("<HBBHHI", cull | ((1 if front_cw else 0) << 8) | (lw << 9), fsmask, (1 if z01 else 0) | ((zc & 0x1F) << 1),
+                            width, height, draw_id)
         body += struct.pack("<II", zs, zo)
         body += struct.pack("<IIII", *guard)
         x0, y0, x1, y1 = rect if rect is not None else (0, 0, width, height)

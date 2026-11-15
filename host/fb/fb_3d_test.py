@@ -75,7 +75,7 @@ def a_memory(seed):
 
 def main():
     a = sys.argv[1:]
-    ip = a[a.index('--ip') + 1] if '--ip' in a else "192.168.1.10"
+    ip = a[a.index('--ip') + 1] if '--ip' in a else fbproto.BOARD_IP
     seed = int(a[0]) if a and not a[0].startswith('--') else 11
     bcmds = b_commands(seed)
     acmds = a_commands(seed)

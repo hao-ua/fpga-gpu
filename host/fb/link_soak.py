@@ -105,7 +105,7 @@ def fmt_line(tag, s1, d, frames, mbytes, secs, resent, ev_errors):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--secs", type=float, default=3600.0)
     ap.add_argument("--report", type=float, default=60.0, help="seconds between counter reports")
     ap.add_argument("--formats", default="rgba8:bgrx,rgb565:rgb565,rgba8:rgb,rgb565:bgrx",

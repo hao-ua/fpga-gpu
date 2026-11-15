@@ -61,7 +61,7 @@ enum { G2_USE_SAMPLED = 1, G2_USE_RT = 2, G2_USE_SCANOUT = 4, G2_USE_TRANSFER = 
 enum { G2_REG_IDELAY = 0x0000, G2_REG_PHYOPT = 0x0001, G2_REG_PHYAD = 0x0002, G2_REG_REINIT = 0x0003, G2_REG_SCRATCH = 0x0004,
        G2_REG_LINKCTL = 0x0005, G2_REG_BUILD = 0x0010 };
 
-/* STATUS word positions, fbproto.STATUS_NAMES order (layout 9, 101 words; A builds before layout 8 send 100, the rest reads 0) */
+/* STATUS word positions, fbproto.STATUS_NAMES order (layout 12, 122 words; older A builds send fewer, the rest reads 0) */
 enum {
     G2_ST_LAYOUT, G2_ST_BUILD, G2_ST_UPTIME_MS, G2_ST_FLAGS, G2_ST_PHY, G2_ST_RX_OK, G2_ST_RX_FCS, G2_ST_RX_LEN, G2_ST_RX_OVF,
     G2_ST_RX_ER, G2_ST_ARP, G2_ST_ICMP, G2_ST_UDP, G2_ST_IPCSUM, G2_ST_OTHER, G2_ST_PFDROP, G2_ST_ICMPDROP, G2_ST_TX,
@@ -74,7 +74,7 @@ enum {
     G2_ST_LD_FILLS, G2_ST_LD_FILL_PERR, G2_ST_LD_PERRS, G2_ST_LINK_DROPS, G2_ST_LINK_FRM_TRN, G2_ST_B_LINK_CRC_PAR, G2_ST_B_LINK_INFO,
     G2_ST_B_IMAGES, G2_ST_B_PIXELS,
     G2_ST_B_LD_HIST, G2_ST_B_LD_LAST_ERR, G2_ST_B_LINK_PARMAP, G2_ST_B_XOFF, G2_ST_B_RETX, G2_ST_B_DISC, G2_ST_B_CMD_PKTS, G2_ST_B_RX_WORDS,
-    G2_ST_A_XOFF, G2_ST_A_NAKS_TO, G2_ST_A_RX_WORDS, G2_ST_RESERVED,
+    G2_ST_A_XOFF, G2_ST_A_NAKS_TO, G2_ST_A_RX_WORDS, G2_ST_IP,       /* layout 11: board A's IPv4 address in use, 0 = none yet */
     G2_ST_CR_SENT, G2_ST_CR_CONSUMED, G2_ST_CR_WAIT, G2_ST_CUR_SENT_SYNC, G2_ST_B_CB_TAKEN, G2_ST_B_CUR_PAL, G2_ST_B_CURCMD_XOPS,
     G2_ST_B_X_PIXELS,
     G2_ST_GEOM_BUSY_TRIS, G2_ST_GEOM_ERR, G2_ST_RENDER_QUADS, G2_ST_RS_PKTS_INFLIGHT,
@@ -87,10 +87,16 @@ enum {
     G2_ST_A_PROF_LOAD, G2_ST_A_PROF_COPY, G2_ST_A_PROF_FEED, G2_ST_A_PROF_FETCH_WAIT, G2_ST_A_PROF_CORE, G2_ST_A_PROF_ASM,
     G2_ST_A_PROF_VO_STALL, G2_ST_A_PROF_SETUP, G2_ST_A_PROF_PUSH_STALL, G2_ST_A_PROF_BIN, G2_ST_A_PROF_CLEAR,
     G2_ST_A_PROF_LOADS_DRAWS, G2_ST_A_PROF_PRIMS, G2_ST_A_DISP_IDLE, G2_ST_A_DISP_GWAIT,
+    /* layout 12: the render side's coarse depth and TRI items, cumulative: quads culled, quads sent, TRI items sent, TRI items held back
+       (no quad followed: dropped), TRI items sent for a visit that sent no quad, blocks an occluder pair lowered */
+    G2_ST_A_CZ_CULLED, G2_ST_A_CZ_QUADS_SENT, G2_ST_A_TRI_SENT, G2_ST_A_TRI_HELD, G2_ST_A_TRI_NOQUAD, G2_ST_A_CZ_BLOCKS,
     G2_ST_WORDS
 };
 #define G2_B_FLAG_MODE(f)      (((f) >> 4) & 7u)     /* decode_b_flags: the video mode */
 #define G2_B_FLAG_XOPS(f)      (((f) >> 28) & 3u)    /* board B's fragment core: bit 0 SQRT / RCPM / RSQM, bit 1 CLAMP (0 on B builds without them): g2sc_set_target */
+/* the units a core lacks, STATUS flags bits 30 / 31 (0 on every build that has them): bit 0 the integer divider, bit 1 SIN / COS — g2sc_set_absent */
+#define G2_A_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board A's flags (G2_ST_FLAGS): the vertex core */
+#define G2_B_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board B's flags (G2_ST_B_FLAGS): the fragment core */
 #define G2_LINK_B_ALIVE(f)     ((f) & 1u)            /* decode_link_flags */
 #define G2_LINK_TRAINED(f)     (((f) >> 2) & 1u)
 
@@ -182,6 +188,11 @@ g2_ref g2_vs_state(g2_board *b, const double viewport[4], int cull, int front_cw
 #define G2_A_ZCLIP0 147                             /* the first board A build with VS_STATE's z01: the clip volume 0 <= z <= w */
 g2_ref g2_vs_state2(g2_board *b, const double viewport[4], int cull, int front_cw, uint32_t fsmask, uint32_t width, uint32_t height,
                     uint32_t draw_id, double line_width, double depth_near, double depth_far, int z01, const uint32_t rect[4]);
+/* g2_vs_state3's a_flags: VS_STATE word 4 [29:25] — the draw's coarse-depth flags (g2_render.c zc_flags) and the lazy TRI items; a board A
+   without them ignores the bits */
+enum { G2_ZC_OCC = 1, G2_ZC_CULL = 2, G2_ZC_STRICT = 4, G2_ZC_INV = 8, G2_ZC_LAZY = 16 };
+g2_ref g2_vs_state3(g2_board *b, const double viewport[4], int cull, int front_cw, uint32_t fsmask, uint32_t width, uint32_t height,
+                    uint32_t draw_id, double line_width, double depth_near, double depth_far, int z01, uint32_t a_flags, const uint32_t rect[4]);
 g2_ref g2_draw(g2_board *b, int mode, uint32_t count, uint32_t first, int indexed, uint16_t index_handle, uint32_t index_offset,
                int index_u8);
 

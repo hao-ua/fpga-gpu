@@ -135,6 +135,10 @@ static int compile_opts(const char *src, int stage, const char *const *varying_o
 static volatile long g_xops;
 void g2sc_set_target(uint32_t xops) { g_xops = (long)(xops & 3u); }
 uint32_t g2sc_target(void) { return (uint32_t)g_xops; }
+/* and the units each stage's core lacks, glslc.compile_stage's noops */
+static volatile long g_noops_vs, g_noops_fs;
+void g2sc_set_absent(uint32_t vs, uint32_t fs) { g_noops_vs = (long)(vs & 3u); g_noops_fs = (long)(fs & 3u); }
+uint32_t g2sc_absent(int stage) { return (uint32_t)(stage == G2SC_FS ? g_noops_fs : g_noops_vs); }
 
 int g2sc_compile(const char *src, int stage, g2sc_result *out) { return compile_opts(src, stage, NULL, 0, 0, 0, 0, NULL, out); }
 int g2sc_compile_strict(const char *src, int stage, g2sc_result *out) { return compile_opts(src, stage, NULL, 0, 0, 1, 1, NULL, out); }
@@ -235,6 +239,7 @@ static int compile_opts(const char *src, int stage, const char *const *varying_o
     h->vmap = pack ? pack->vmap : NULL; h->nvmap = pack ? pack->nvmap : 0;
     h->depth_units = pack ? pack->depth_units : 0;
     h->xops = stage == G2SC_FS ? (uint32_t)g_xops & 3u : 0;     /* the vertex core has none of them */
+    h->noops = g2sc_absent(stage);
     sh_init(h);
 retry:
     if (setjmp(h->jb)) {

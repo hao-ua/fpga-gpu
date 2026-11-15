@@ -42,9 +42,11 @@ CLEAR = (0.0, 0.0, 0.0, 1.0)
 SHADERS = {'raymarch': 'fs_raymarch.frag', 'spiral': 'fs_spiral.frag', 'heart': 'fs_heart.frag'}
 
 
-def compile_programs(shader, forward=False):
-    rv = glslc.compile_stage(open(os.path.join(TESTS, 'fs_quad.vert')).read(), 'vs', isa64=True, forward=forward)
-    rf = glslc.compile_stage(open(os.path.join(TESTS, SHADERS[shader])).read(), 'fs', isa64=True, forward=forward)
+def compile_programs(shader, forward=False, noops=None):
+    """noops: fbproto.stage_noops of the board (the units its cores lack), None = both cores complete"""
+    noops = noops or {'vs': 0, 'fs': 0}
+    rv = glslc.compile_stage(open(os.path.join(TESTS, 'fs_quad.vert')).read(), 'vs', isa64=True, forward=forward, noops=noops['vs'])
+    rf = glslc.compile_stage(open(os.path.join(TESTS, SHADERS[shader])).read(), 'fs', isa64=True, forward=forward, noops=noops['fs'])
     wv, _ = isa64.assemble(rv['sasm'].splitlines(), vs=True)
     wf, _ = isa64.assemble(rf['sasm'].splitlines())
     assert rv['attribs'] == {'aPos': (0, 'vec2')}, rv['attribs']
@@ -213,18 +215,21 @@ def main():
     a = sys.argv[1:]
     def opt(name, default=None, conv=str):
         return conv(a[a.index(name) + 1]) if name in a else default
-    ip = opt('--ip', "192.168.1.10")
+    ip = opt('--ip', fp.BOARD_IP)
     frames = opt('--frames', None, int); secs = opt('--secs', 5.0 if '--frames' not in a else None, float)
     shader = opt('--shader', 'raymarch'); steps = opt('--steps', 32, int); hold = '--hold' in a
     if shader not in SHADERS: raise SystemExit("--shader " + " | ".join(SHADERS))
-    wv, wf, vconst, fconst, funi, fs_cb = compile_programs(shader, '--forward' in a)
     mode = opt('--mode', None, int)
-    if '--selftest' in a or '--sim' in a:
+    if '--selftest' in a:                                      # the programs alone, no board: complete cores
+        wv, wf, vconst, fconst, funi, fs_cb = compile_programs(shader, '--forward' in a)
         if not selftest(shader, wf, fconst, funi, fs_cb, steps): sys.exit(1)
-        if '--selftest' in a: return
+        return
     bd = fp.Board(ip)
     bd.hello()
     st = bd.status()
+    noops = fp.stage_noops(st)                                 # the ops the board's cores lack are lowered by the compiler
+    wv, wf, vconst, fconst, funi, fs_cb = compile_programs(shader, '--forward' in a, noops)
+    if '--sim' in a and not selftest(shader, wf, fconst, funi, fs_cb, steps): sys.exit(1)
     bfl = fp.decode_b_flags(st['b_flags']); lfl = fp.decode_link_flags(st['link_flags'])
     if not (lfl['trained'] and lfl['b_alive']): raise fp.ProtoError("the board link is not up / B is not alive")
     if mode is not None: bd.set_mode(mode)
@@ -233,7 +238,7 @@ def main():
     nquads = (W // 2) * (H // 2)
     print(f"board A build {st['build']}, B mode {mode} ({W} x {H}, {nquads} quads); {shader}{' steps %d' % steps if shader == 'raymarch' else ''}: "
           f"{len(wv)}-instruction vertex program, {len(wf)}-instruction fragment program, PRESENT "
-          f"{'hold (one frame per vsync)' if hold else 'without hold (as fast as rendered)'}")
+          f"{'hold (one frame per vsync)' if hold else 'without hold (as fast as rendered)'}{fp.noops_note(noops)}")
     nidx = setup(bd, W, H, wv, wf, fconst, funi, fs_cb, steps)
     errs = bd.take_errors()
     for e in errs: print("  EV_ERROR seq %d: %s" % (e[0], err_text(e)))

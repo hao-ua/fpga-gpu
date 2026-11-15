@@ -31,7 +31,7 @@ def set_eee(b, on):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--rxdly", type=int, choices=(0, 1))
     ap.add_argument("--adv1000", type=int, choices=(0, 1))
     ap.add_argument("--tap", type=int)

@@ -101,6 +101,12 @@ void g2sc_free(g2sc_result *r);
 void g2sc_set_target(uint32_t xops);
 uint32_t g2sc_target(void);
 
+/* The units a stage's core lacks, glslc.compile_stage's noops, one mask per stage: bit 0 the integer divider (int / is lowered to RCP and integer ops), bit 1
+ * SIN / COS (lowered to a polynomial) — STATUS flags bits 30 / 31: board A's for the vertex core, board B's b_flags for the fragment core (G2_*_FLAG_ABSENT in
+ * gpu2core.h); every build that has the units reads 0. A library sets it when it opens the board, before it compiles; 0 (the default) emits the units' ops. */
+void g2sc_set_absent(uint32_t vs, uint32_t fs);
+uint32_t g2sc_absent(int stage);
+
 /* isa64.assemble(lines, vs, max_if, max_loop) on its own, for hand-written programs; max_if / max_loop < 0 = no limit
  * (Python's None). The default limits are 8 and 4. *words is malloc'd, release it with free(). 0 ok, < 0 error. */
 int g2sc_assemble(const char *sasm, int vs, int max_if, int max_loop, uint64_t **words, int *nwords, char *error, int errsize);

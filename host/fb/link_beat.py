@@ -18,7 +18,7 @@ import fbproto as fp
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ip", default="192.168.1.10")
+    ap.add_argument("--ip", default=fp.BOARD_IP)
     ap.add_argument("--secs", type=float, default=600.0)
     ap.add_argument("--ival", type=float, default=0.2)
     a = ap.parse_args()

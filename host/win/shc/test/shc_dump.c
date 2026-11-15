@@ -1,5 +1,5 @@
 /* shc_dump — every result of the C compiler as canonical text, one block per file. oracle.py prints the same text from tools/glslc.py + tools/isa64.py; compare.ps1 compares them line by line.
- *   shc_dump [--xops n] [--order a,b,c] [--unread mask] [--strict] file.vert|file.frag ...      (.vert / .vs = vertex stage, anything else = fragment; --xops: g2sc_set_target)
+ *   shc_dump [--xops n] [--noops n] [--order a,b,c] [--unread mask] [--strict] file.vert|file.frag ...      (.vert / .vs = vertex stage, anything else = fragment; --xops: g2sc_set_target)
  * A file X.pack beside a shader is its Appendix A.7 layout (pack_check.py): a line "U urows slot..." and a line "V slot...", and a line "D bits": the samplers that read depth textures. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,6 +80,10 @@ int main(int argc, char **argv)
     uint32_t unread = 0;
     int a = 1, i, nord = 0, strict = 0;
     if (a + 1 < argc && !strcmp(argv[a], "--xops")) { g2sc_set_target((uint32_t)strtoul(argv[a + 1], NULL, 0)); a += 2; }     /* oracle.py --xops */
+    if (a + 1 < argc && !strcmp(argv[a], "--noops")) {                                                                        /* oracle.py --noops: both stages */
+        uint32_t n = (uint32_t)strtoul(argv[a + 1], NULL, 0);
+        g2sc_set_absent(n, n); a += 2;
+    }
     if (a + 1 < argc && !strcmp(argv[a], "--order")) {
         char *t;
         list = argv[a + 1];

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """oracle — the same canonical text as shc_dump.c, from the Python compiler (tools/glslc.py + tools/isa64.py). Python is the specification; the C port must match it word for word.
-    python3 host/win/shc/test/oracle.py [--xops n] [--order a,b,c] [--unread mask] [--strict] file.vert file.frag ...      (run from the repository root)
+    python3 host/win/shc/test/oracle.py [--xops n] [--noops n] [--order a,b,c] [--unread mask] [--strict] file.vert file.frag ...      (run from the repository root)
 --order renames nothing: it reorders the varying declarations of the source first, which is what g2sc_compile_ex must be equivalent to. --unread is g2sc_compile_vs, on the vertex shaders."""
 import os, re, signal, struct, sys
 sys.path.insert(0, 'tools')
@@ -57,6 +57,10 @@ def main():
     if args and args[0] == '--xops':                # board B's fragment-core operations (g2sc_set_target): 1 SQRT / RCPM / RSQM, 2 CLAMP
         xops = int(args[1], 0)
         args = args[2:]
+    noops = 0
+    if args and args[0] == '--noops':               # the units both stages' cores lack (g2sc_set_absent): 1 the integer divider, 2 SIN / COS
+        noops = int(args[1], 0)
+        args = args[2:]
     order = None
     if args and args[0] == '--order':
         order = args[1].split(',')
@@ -78,7 +82,7 @@ def main():
             if order:
                 src = reorder(src, order)
             pack = read_pack(path)
-            r = glslc.compile_stage(src, stage, isa64=True, forward=True, unread=unread if stage == 'vs' else 0, strict=strict and not pack, pack=pack, xops=xops)
+            r = glslc.compile_stage(src, stage, isa64=True, forward=True, unread=unread if stage == 'vs' else 0, strict=strict and not pack, pack=pack, xops=xops, noops=noops)
             words, _ = isa64.assemble(r['sasm'].splitlines(), vs=stage == 'vs')
         except Exception as e:
             print('ERROR', str(e).replace('\n', ' '))

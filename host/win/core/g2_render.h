@@ -15,6 +15,7 @@ typedef struct g2r_prog {
     uint32_t id;
     uint32_t vs_off, vs_n, fs_off, fs_n;
     uint32_t fsmask;                    /* the varyings the fragment program reads */
+    int fs_discard, fs_depth;           /* the fragment program has a DISCARD / writes its depth (STOZ): board A's coarse depth must not trust its quads' depth */
     uint32_t vs_const_base, vs_nconst, fs_const_base, fs_nconst;
     uint32_t *vs_const, *fs_const;      /* the compilers' constants, FP24 bits, 4 per vec4 */
 } g2r_prog;

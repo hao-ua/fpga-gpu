@@ -649,6 +649,21 @@ void g2_get_counters(g2_board *b, g2_counters *c)
 }
 
 /* ---------------------------------------------------------------- session */
+/* the board's address: a dotted IPv4 address or a host name (resolved once, IPv4 only) */
+static int resolve_ipv4(const char *name, struct in_addr *out)
+{
+    struct addrinfo hints, *res = NULL;
+    unsigned long a = inet_addr(name);
+    if (a != INADDR_NONE || strcmp(name, "255.255.255.255") == 0) { out->s_addr = a; return 1; }
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(name, NULL, &hints, &res) != 0 || !res) return 0;
+    *out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return 1;
+}
+
 g2_board *g2_open(const char *ip, int port, const g2_options *opt)
 {
     static LONG wsa_done;
@@ -699,7 +714,11 @@ g2_board *g2_open(const char *ip, int port, const g2_options *opt)
     memset(&b->addr, 0, sizeof b->addr);
     b->addr.sin_family = AF_INET;
     b->addr.sin_port = htons((u_short)port);
-    b->addr.sin_addr.s_addr = inet_addr(ip);
+    if (!resolve_ipv4(ip, &b->addr.sin_addr)) {
+        fail(NULL, "board address %s: neither an IPv4 address nor a name that resolves", ip);
+        closesocket(b->sock); free(b);
+        return NULL;
+    }
     b->timer_period = timeBeginPeriod(1) == TIMERR_NOERROR;
     b->running = 1;
     b->rx_thread = CreateThread(NULL, 0, rx_loop, b, 0, NULL);
@@ -1239,6 +1258,14 @@ g2_ref g2_vs_state(g2_board *b, const double vp[4], int cull, int front_cw, uint
 g2_ref g2_vs_state2(g2_board *b, const double vp[4], int cull, int front_cw, uint32_t fsmask, uint32_t width, uint32_t height,
                     uint32_t draw_id, double line_width, double depth_near, double depth_far, int z01, const uint32_t rect[4])
 {
+    return g2_vs_state3(b, vp, cull, front_cw, fsmask, width, height, draw_id, line_width, depth_near, depth_far, z01, 0, rect);
+}
+
+/* a_flags (board A builds with the coarse depth; earlier ones ignore the bits): word 4 [29:25] = {LAZY, INV, STRICT, CULL, OCC} — the draw's
+   coarse-depth flags (g2_render.c zc_flags: a promise about its depth state) and, from the last VS_STATE before a FLUSH, the frame's lazy TRI items */
+g2_ref g2_vs_state3(g2_board *b, const double vp[4], int cull, int front_cw, uint32_t fsmask, uint32_t width, uint32_t height,
+                    uint32_t draw_id, double line_width, double depth_near, double depth_far, int z01, uint32_t a_flags, const uint32_t rect[4])
+{
     uint8_t d[60];
     pk k = { d };
     int i, lw = (int)rint(line_width);
@@ -1252,7 +1279,7 @@ g2_ref g2_vs_state2(g2_board *b, const double vp[4], int cull, int front_cw, uin
     }
     for (i = 0; i < 4; i++) p32(&k, g2_fp24(vp[i]));
     p16(&k, (uint32_t)cull | (uint32_t)(front_cw ? 1 : 0) << 8 | (uint32_t)lw << 9);
-    p8(&k, fsmask); p8(&k, z01 ? 1 : 0); p16(&k, width); p16(&k, height); p32(&k, draw_id);
+    p8(&k, fsmask); p8(&k, (z01 ? 1u : 0u) | (a_flags & 0x1Fu) << 1); p16(&k, width); p16(&k, height); p32(&k, draw_id);
     if (z01) { p32(&k, g2_fp24(depth_far - depth_near)); p32(&k, g2_fp24(depth_near)); }
     else { p32(&k, g2_fp24((depth_far - depth_near) / 2)); p32(&k, g2_fp24((depth_near + depth_far) / 2)); }
     for (i = 0; i < 4; i++) p32(&k, gb[i]);

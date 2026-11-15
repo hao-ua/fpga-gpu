@@ -74,7 +74,7 @@ struct g2r {
     double sh_vp[4], sh_dn, sh_df, sh_lw;
     int sh_z01, a_build;
     int sh_cull, sh_cw, sh_vs_ok;
-    uint32_t sh_fsmask, sh_w, sh_h, sh_id;
+    uint32_t sh_fsmask, sh_w, sh_h, sh_id, sh_zc;
 
     /* draw ids */
     id_entry ids[ID_SLOTS];
@@ -337,7 +337,7 @@ g2r_prog *g2r_prog_create(g2r *r, const uint64_t *vs, uint32_t vs_n, const doubl
                           const uint64_t *fs, uint32_t fs_n, const double (*fc)[4], uint32_t fs_nconst, uint32_t fs_const_base, uint32_t fsmask)
 {
     g2r_prog *p = (g2r_prog *)calloc(1, sizeof *p);
-    uint32_t va = (r->prog_a_used + 31) & ~31u, fa = (r->prog_b_used + 31) & ~31u;
+    uint32_t va = (r->prog_a_used + 31) & ~31u, fa = (r->prog_b_used + 31) & ~31u, i;
     if (!p) return NULL;
     if (va + vs_n * 8 > PROG_A_BYTES || fa + fs_n * 8 > PROG_B_BYTES) { free(p); return NULL; }
     g2_write_buffer(r->bd, r->prog_a, va, vs, (size_t)vs_n * 8);
@@ -349,6 +349,11 @@ g2r_prog *g2r_prog_create(g2r *r, const uint64_t *vs, uint32_t vs_n, const doubl
     p->vs_const_base = vs_const_base; p->vs_nconst = vs_nconst; p->fs_const_base = fs_const_base; p->fs_nconst = fs_nconst;
     p->vs_const = const_bits(vc, vs_nconst);
     p->fs_const = const_bits(fc, fs_nconst);
+    for (i = 0; i < fs_n; i++) {                                /* the opcode, word [63:57]: 29 DISCARD, 21 STOZ in a fragment program */
+        uint32_t op = (uint32_t)(fs[i] >> 57) & 0x7F;
+        if (op == 29) p->fs_discard = 1;
+        if (op == 21) p->fs_depth = 1;
+    }
     return p;
 }
 
@@ -531,6 +536,40 @@ static void pass_open(g2r *r)
     r->pass_draws = 0;
 }
 
+/* board A's TRI items only in bands where the primitive sends a quad (VS_STATE word 4 bit 29; the last VS_STATE before a FLUSH decides
+   for its frame, so every VS_STATE carries it). On by default; GPU2_LAZY_TRI=0 turns it off for a comparison */
+static uint32_t lazy_tri(void)
+{
+    static int on = -1;
+    if (on < 0) on = g2e_get_int("GPU2_LAZY_TRI", 1);
+    return on ? G2_ZC_LAZY : 0;
+}
+
+/* board A's coarse depth: VS_STATE word 4 [28:25], a promise about the draw that B's DRAW_STATE (h0: depth test [0], write [1], function
+ * [4:2] NEVER..ALWAYS, stencil [5], polygon offset [9]) and the fragment program keep — a wrong bit culls visible quads
+ * (host/fb/fbproto.py zc_flags is the same rule).
+ *   OCC 1     every pixel it covers ends with a depth <= its own: LESS / LEQUAL with writes, no stencil, DISCARD, gl_FragDepth or polygon
+ *             offset (a scissor box is fine: board A's rectangle is the same box, so its coverage never leaves it)
+ *   CULL 2    its fragments that fail the depth test change nothing: LESS / LEQUAL / EQUAL, no stencil, gl_FragDepth or polygon offset
+ *   STRICT 4  LEQUAL / EQUAL: A culls only quads strictly behind
+ *   INV 8     its depth writes may raise the stored depth: writes with GREATER / NOTEQUAL / GEQUAL / ALWAYS (the depth clears by a quad
+ *             too), or with the test off
+ * On by default; GPU2_COARSE_Z=0 sends none (A then culls nothing). */
+static uint32_t zc_flags(const uint32_t *h, const g2r_prog *p)
+{
+    static int on = -1;
+    uint32_t func = h[0] >> 2 & 7, z = 0;
+    int test = (h[0] & 1u) != 0, write = (h[0] & 2u) != 0, stencil = (h[0] & 32u) != 0, offset = (h[0] & 512u) != 0;
+    if (on < 0) on = g2e_get_int("GPU2_COARSE_Z", 1);
+    if (!on) return 0;
+    if (write && (!test || func >= 4)) return G2_ZC_INV;
+    if (!test) return 0;
+    if ((func == 1 || func == 3) && write && !(stencil || p->fs_discard || p->fs_depth || offset)) z |= G2_ZC_OCC;
+    if (func >= 1 && func <= 3 && !(stencil || p->fs_depth || offset)) z |= G2_ZC_CULL;
+    if (z && (func == 2 || func == 3)) z |= G2_ZC_STRICT;
+    return z;
+}
+
 /* A learns the target's size from VS_STATE and ends a frame's bands by it, and draws are what send VS_STATE: a pass that is only a clear would cover the last target's rows, past the end of a smaller image */
 static void send_target_size(g2r *r)
 {
@@ -538,10 +577,10 @@ static void send_target_size(g2r *r)
     if (r->sh_vs_ok && r->sh_w == r->tgt.width && r->sh_h == r->tgt.height) return;
     vp[0] = r->tgt.width * 8.0; vp[1] = r->tgt.width * 8.0;
     vp[2] = r->tgt.height * 8.0; vp[3] = r->tgt.height * 8.0;
-    g2_vs_state(r->bd, vp, 0, 0, 0, r->tgt.width, r->tgt.height, 0, 1.0, 0.0, 1.0, NULL);
+    g2_vs_state3(r->bd, vp, 0, 0, 0, r->tgt.width, r->tgt.height, 0, 1.0, 0.0, 1.0, 0, lazy_tri(), NULL);
     memcpy(r->sh_vp, vp, sizeof vp);
     r->sh_dn = 0.0; r->sh_df = 1.0; r->sh_z01 = 0; r->sh_cull = 0; r->sh_cw = 0; r->sh_lw = 1.0;
-    r->sh_fsmask = 0; r->sh_w = r->tgt.width; r->sh_h = r->tgt.height; r->sh_id = 0;
+    r->sh_fsmask = 0; r->sh_w = r->tgt.width; r->sh_h = r->tgt.height; r->sh_id = 0; r->sh_zc = lazy_tri();
     r->sh_vs_ok = 1;
 }
 
@@ -797,20 +836,23 @@ void g2r_draw(g2r *r, const g2r_state *s, int mode, uint32_t count, uint32_t fir
         if (trace < 0) trace = g2e_get_int("GPU2_TRACE_DRAW", 0);
         if (trace) g2e_log("draw %llu pass %u: id %u prog %u fs_off %u h0 %08x sc %08x-%08x mode %d n %u vs_off %u", (unsigned long long)r->st.draws, (uint32_t)r->st.passes, id, p->id, p->fs_off, h[0], h[7], h[8], mode, count, p->vs_off);
     }
-    /* A's state: viewport, cull, the draw id */
+    /* A's state: viewport, cull, the draw id, the coarse-depth flags (from the very state B gets under this id) and the lazy TRI bit */
     {
         double vp[4];
+        uint32_t zc = zc_flags(h, p) | lazy_tri();
         vp[0] = s->vp_w * 8.0; vp[1] = (s->vp_x + s->vp_w / 2) * 16.0;
         vp[2] = s->vp_h * 8.0; vp[3] = (s->vp_y + s->vp_h / 2) * 16.0;
         if (!r->sh_vs_ok || memcmp(r->sh_vp, vp, sizeof vp) || r->sh_dn != s->depth_near || r->sh_df != s->depth_far || r->sh_z01 != s->z01 || r->sh_cull != s->cull ||
-            r->sh_cw != s->front_cw || r->sh_lw != s->line_width || r->sh_fsmask != p->fsmask || r->sh_w != r->tgt.width || r->sh_h != r->tgt.height || r->sh_id != id) {
+            r->sh_cw != s->front_cw || r->sh_lw != s->line_width || r->sh_fsmask != p->fsmask || r->sh_w != r->tgt.width || r->sh_h != r->tgt.height || r->sh_id != id ||
+            r->sh_zc != zc) {
             /* the draw's rectangle for board A: the scissor box of the state B gets under this id, when its scissor test is on — the same words, so the two boards can never
                disagree; a change of the box is a change of the id, which sends this again */
             uint32_t rect[4] = { h[7] & 0xFFFFu, h[7] >> 16, h[8] & 0xFFFFu, h[8] >> 16 };
-            g2_vs_state2(r->bd, vp, s->cull, s->front_cw, p->fsmask, r->tgt.width, r->tgt.height, id, s->line_width, s->depth_near, s->depth_far, s->z01, (h[0] & 256u) ? rect : NULL);
+            g2_vs_state3(r->bd, vp, s->cull, s->front_cw, p->fsmask, r->tgt.width, r->tgt.height, id, s->line_width, s->depth_near, s->depth_far, s->z01, zc,
+                         (h[0] & 256u) ? rect : NULL);
             memcpy(r->sh_vp, vp, sizeof vp);
             r->sh_dn = s->depth_near; r->sh_df = s->depth_far; r->sh_z01 = s->z01; r->sh_cull = s->cull; r->sh_cw = s->front_cw; r->sh_lw = s->line_width;
-            r->sh_fsmask = p->fsmask; r->sh_w = r->tgt.width; r->sh_h = r->tgt.height; r->sh_id = id;
+            r->sh_fsmask = p->fsmask; r->sh_w = r->tgt.width; r->sh_h = r->tgt.height; r->sh_id = id; r->sh_zc = zc;
             r->sh_vs_ok = 1;
         }
     }
@@ -883,6 +925,16 @@ void g2r_stats_tick(g2r *r)
                         (double)((ld >> 16) & 0xFFFF) / n, (double)(ld & 0xFFFF) / n, (double)(st[G2_ST_A_PROF_PRIMS] - st0[G2_ST_A_PROF_PRIMS]) / n,
                         (double)(st[G2_ST_A_DISP_IDLE] - st0[G2_ST_A_DISP_IDLE]) / ckhz / n, (double)(st[G2_ST_A_DISP_GWAIT] - st0[G2_ST_A_DISP_GWAIT]) / ckhz / n);
 #undef APCT
+            }
+            /* STATUS layout 12: board A's coarse depth and TRI items per frame (the quads A walked = culled + sent) */
+            if (st[G2_ST_LAYOUT] >= 12) {
+#define AD(w) ((double)(st[w] - st0[w]) / n)
+                g2e_log("  A per frame: %.0f quads walked, %.0f culled (%.1f%%), %.0f sent | TRI items %.0f sent, %.0f held back, %.0f sent with no quad | %.0f blocks lowered%s%s",
+                        AD(G2_ST_A_CZ_CULLED) + AD(G2_ST_A_CZ_QUADS_SENT), AD(G2_ST_A_CZ_CULLED),
+                        AD(G2_ST_A_CZ_CULLED) + AD(G2_ST_A_CZ_QUADS_SENT) > 0 ? 100.0 * AD(G2_ST_A_CZ_CULLED) / (AD(G2_ST_A_CZ_CULLED) + AD(G2_ST_A_CZ_QUADS_SENT)) : 0.0,
+                        AD(G2_ST_A_CZ_QUADS_SENT), AD(G2_ST_A_TRI_SENT), AD(G2_ST_A_TRI_HELD), AD(G2_ST_A_TRI_NOQUAD), AD(G2_ST_A_CZ_BLOCKS),
+                        g2e_get_int("GPU2_COARSE_Z", 1) ? "" : " (GPU2_COARSE_Z=0)", lazy_tri() ? "" : " (GPU2_LAZY_TRI=0)");
+#undef AD
             }
             memcpy(st0, st, sizeof st);
         }

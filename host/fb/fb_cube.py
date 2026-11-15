@@ -160,11 +160,13 @@ def cube_buffers(scene, instanced, bones=False):
     return vw, idx, 13 if instanced else 9
 
 
-def compile_programs(instanced, bones=False, ncubes=0, forward=False):
+def compile_programs(instanced, bones=False, ncubes=0, forward=False, noops=None):
+    """noops: fbproto.stage_noops of the board (the units its cores lack), None = both cores complete"""
+    noops = noops or {'vs': 0, 'fs': 0}
     vsrc = open(os.path.join(TESTS, 'cubes_bones.vert' if bones else 'cubes.vert' if instanced else 'cube.vert')).read()
     if bones: vsrc = f"#define NB {ncubes}\n" + vsrc                # the bone array's size = the cube count
-    rv = glslc.compile_stage(vsrc, 'vs', isa64=True, forward=forward)
-    rf = glslc.compile_stage(open(os.path.join(TESTS, 'cube.frag')).read(), 'fs', isa64=True, forward=forward)
+    rv = glslc.compile_stage(vsrc, 'vs', isa64=True, forward=forward, noops=noops['vs'])
+    rf = glslc.compile_stage(open(os.path.join(TESTS, 'cube.frag')).read(), 'fs', isa64=True, forward=forward, noops=noops['fs'])
     wv, _ = isa64.assemble(rv['sasm'].splitlines(), vs=True)
     wf, _ = isa64.assemble(rf['sasm'].splitlines())
     att = {'aPos': (0, 'vec3'), 'aNormal': (1, 'vec3'), 'aColor': (2, 'vec3')}
@@ -380,7 +382,7 @@ def main():
     a = sys.argv[1:]
     def opt(name, default=None, conv=str):
         return conv(a[a.index(name) + 1]) if name in a else default
-    ip = opt('--ip', "192.168.1.10")
+    ip = opt('--ip', fp.BOARD_IP)
     frames = opt('--frames', None, int); secs = opt('--secs', None, float); speed = opt('--speed', 1.0, float)
     ncubes = opt('--cubes', 32, int); instanced = '--draws' not in a; hold = '--nohold' not in a; strict = '--strict' in a
     bones = '--bones' in a
@@ -389,16 +391,19 @@ def main():
     forward = '--forward' in a                                 # compile with forward=True, as host/win/shc always does
     size = opt('--scale', 1.0, float)                          # cube size factor (0.05: a few pixels each = the per-frame floor)
     if not 1 <= ncubes <= MAX_CUBES: raise SystemExit(f"--cubes 1..{MAX_CUBES}")
-    wv, wf, vconst, fconst, fs_cb = compile_programs(instanced, bones, ncubes, forward)
     mode = opt('--mode', None, int)
     W, H = MODE_SIZE.get(mode if mode is not None else 1)
     scene = Scene(ncubes, W / H, size)
-    if '--selftest' in a or '--check' in a:
+    if '--selftest' in a:                                      # the programs alone, no board: complete cores
+        wv, wf, vconst, fconst, fs_cb = compile_programs(instanced, bones, ncubes, forward)
         if not selftest(scene, instanced, wv, wf, vconst, fconst, fs_cb, bones): sys.exit(1)
-        if '--selftest' in a: return
+        return
     bd = fp.Board(ip)
     bd.hello()
     st = bd.status()
+    noops = fp.stage_noops(st)                                 # the ops the board's cores lack are lowered by the compiler
+    wv, wf, vconst, fconst, fs_cb = compile_programs(instanced, bones, ncubes, forward, noops)
+    if '--check' in a and not selftest(scene, instanced, wv, wf, vconst, fconst, fs_cb, bones): sys.exit(1)
     bfl = fp.decode_b_flags(st['b_flags']); lfl = fp.decode_link_flags(st['link_flags'])
     if not (lfl['trained'] and lfl['b_alive']): raise fp.ProtoError("the board link is not up / B is not alive")
     if mode is not None: bd.set_mode(mode)
@@ -409,7 +414,7 @@ def main():
           f"{len(wv)}-instruction vertex program, "
           f"{len(wf)}-instruction fragment program, {24 * ncubes} vertices, {12 * ncubes} triangles, {speed} deg per frame, "
           f"PRESENT {'hold (one frame per vsync)' if hold else 'without hold (as fast as rendered)'}, "
-          f"{'BATCH datagrams' if batch else 'one datagram per command'}")
+          f"{'BATCH datagrams' if batch else 'one datagram per command'}{fp.noops_note(noops)}")
     nidx = setup(bd, W, H, scene, instanced, wv, wf, vconst, fconst, fs_cb, bones)
     errs = bd.take_errors()
     for e in errs: print("  EV_ERROR seq %d: %s" % (e[0], err_text(e)))

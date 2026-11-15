@@ -203,9 +203,6 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 | Half-Life | OpenGL 1.x | about 60 fps at 640×480; the hang on the first mission's tram ride is fixed in the RTL and in the flashed board A (A 149 and later), not yet replayed in the game |
 | Heroes Chronicles (Heroes III engine) | DirectDraw | menus and play at 800×600×16 |
 | Heroes of Might and Magic IV | DirectDraw | 1024×768×16, native video mode |
-| Contraption Maker | OpenGL ES | menus correct, 5.4 fps at 1280×800 |
-| Crayon Physics | Direct3D 9 | first screen correct, 8.6 fps |
-| Super Splatters | Direct3D 9 | intro plays, 4.6 fps |
 
 ## 4. Known open issues
 

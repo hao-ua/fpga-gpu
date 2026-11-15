@@ -165,13 +165,24 @@ def rect_of(st):
     return x0, y0, min(x1, st['wid']), min(y1, st['hgt'])
 
 
+def zc_hdr(zc):
+    """the draw's coarse-depth flags (VS_STATE word 4 [28:25] = {INV, STRICT, CULL, OCC}) as the record header carries
+    them (word 2 [15:13], a_setup.sv zc_enc): bit 0 = cull (CULL or OCC), bit 1 = OCC with bit 0, INV without it,
+    bit 2 = STRICT with bit 0. INV wins over the others (a draw that may raise the depth is never culled)."""
+    occ, cull, strict, inv = zc & 1, (zc >> 1) & 1, (zc >> 2) & 1, (zc >> 3) & 1
+    if inv: return 2
+    c = cull | occ
+    return c | (occ << 1) | ((strict & c) << 2)
+
+
 def hdr_rect(hdr, st):
     """the rectangle in the raster header's spare bits, for a_render's walk: x0 = word 1 [31:20], y0 = word 2 [31:20],
-    y1 = {word 0 [7:0], word 2 [19:16]}, x1 = {word 7 [31:26], word 7 [15:10]}"""
+    y1 = {word 0 [7:0], word 2 [19:16]}, x1 = {word 7 [31:26], word 7 [15:10]}; the coarse-depth flags in word 2 [15:13]
+    (zc_hdr)"""
     x0, y0, x1, y1 = rect_of(st)
     hdr[0] |= (y1 >> 4) & 0xFF
     hdr[1] |= x0 << 20
-    hdr[2] |= (y0 << 20) | ((y1 & 0xF) << 16)
+    hdr[2] |= (y0 << 20) | ((y1 & 0xF) << 16) | (zc_hdr(st.get('zc', 0)) << 13)
     hdr[7] |= ((x1 >> 6) << 26) | ((x1 & 0x3F) << 10)
     return hdr
 
@@ -382,6 +393,15 @@ def main():
     if '--sc' in a:
         k = a.index('--sc')
         st['sc'] = tuple(int(v) for v in a[k + 1:k + 5])
+    # board A's coarse depth: --zc N = the draw's flags {INV 8, STRICT 4, CULL 2, OCC 1} (VS_STATE word 4 [28:25], the
+    # records' header word 2 [15:13]); --zcd a,b,.. one per draw of --ndraw (cyclic); --lazy = VS_STATE word 4 bit 29 (TRI
+    # items only in bands where a quad follows); --cz 'd16 ds cden csc cdepth' = the frame's depth as its FLUSH gives it
+    # (as_<seed>_cz.hex with the lazy bit: a_raster_ref's culled stream, tb_a_render +CZ, b_ref aframe, whose ROP state then
+    # keeps the promise the flags make)
+    st['zc'] = int(a[a.index('--zc') + 1], 0) if '--zc' in a else 0
+    zcd = [int(v, 0) for v in a[a.index('--zcd') + 1].split(',')] if '--zcd' in a else None
+    if zcd: st['zc'] = zcd[0]
+    st['lazy'] = int('--lazy' in a)
     # --ndraw N (draws overlap on A): the same draw N times back to back, each with its own MVP rows
     # (uniforms 0..3), draw id and cull mode — the record ids continue across the draws (one frame), the command stream
     # carries VS_UNIFORMS / VS_STATE / DRAW per draw; as_<seed>_state.mem / av_<seed>_expect.mem describe draw 0 alone
@@ -395,6 +415,7 @@ def main():
               [fb(drng.uniform(-0.15, 0.15)), fb(drng.uniform(-0.15, 0.15)), fb(drng.uniform(-0.45, 0.3)), fb(1.0)]] + d['params'][4:]
         sk = dict(st); sk['draw_id'] = (st['draw_id'] + k) & 0x1FFF; sk['cull'] = drng.choice([0, 1, 2]); sk['front_cw'] = drng.randrange(2)
         if '--scalt' in a and (k & 1): sk.pop('sc', None)
+        if zcd: sk['zc'] = zcd[k % len(zcd)]
         draws.append((pk, sk))
     recs = []; tid = 0; nclip = ndrop = 0
     for pk, sk in draws:
@@ -431,6 +452,9 @@ def main():
         for tid, lo, hi, words in recs:
             f.write(f"{tid:x} {lo:x} {hi:x} {len(words):x} " + " ".join(f"{w:08x}" for w in words) + "\n")
     write_cmds(tag, d, draws)
+    czp = f"{GEN}/{tag}_cz.hex"
+    if '--cz' in a: open(czp, 'w').write(" ".join(str(int(v, 0)) for v in a[a.index('--cz') + 1].split()) + f" {st['lazy']}\n")   # decimal
+    elif os.path.exists(czp): os.remove(czp)
     print(f"{tag}: {len(d['prims'])} primitives (mode {d['mode']}) x {ndraw} draw(s) -> {len(recs)} records ({nclip} clipped to 0 / 2, {ndrop} dropped: degenerate / "
           f"culled / off-screen); cull {st['cull']} front_cw {st['front_cw']} fsmask {st['fsmask']:02x} lw {st['lw']} -> tools/gen/{tag}_*")
 
@@ -456,7 +480,8 @@ def write_cmds(tag, d, draws):
         cmd('VERTEX_ATTR', [i | (en << 8) | (size << 16) | (ty << 20) | (nm << 24), h, stride, off] + list(d['consts'][i]))
     for params, st in draws:
         cmd('VS_UNIFORMS', [(4 << 16) | 0] + [c for i in range(4) for c in params[i]])
-        cmd('VS_STATE', st['vp'][:4] + [st['cull'] | (st['front_cw'] << 8) | (st['lw'] << 9) | (st['fsmask'] << 16) | (st.get('z0', 0) << 24), st['wid'] | (st['hgt'] << 16), st['draw_id']]
+        cmd('VS_STATE', st['vp'][:4] + [st['cull'] | (st['front_cw'] << 8) | (st['lw'] << 9) | (st['fsmask'] << 16) | (st.get('z0', 0) << 24) |
+                                        (st.get('zc', 0) << 25) | (st.get('lazy', 0) << 29), st['wid'] | (st['hgt'] << 16), st['draw_id']]
                         + st['vp'][4:] + st['gb']                              # words 7, 8: the depth range zs, zo; 9..12: the guard band
                         + ([st['sc'][0] | (st['sc'][1] << 16), st['sc'][2] | (st['sc'][3] << 16)] if 'sc' in st else []))   # 13, 14: the rectangle, when the draw has one
         cmd('DRAW', [d['mode'] | (int(d['indexed']) << 8) | (int(d['u8']) << 16), 3, d.get('ioff_bytes', 0), d['first'], d['nidx']])

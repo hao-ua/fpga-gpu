@@ -53,6 +53,11 @@ module a_geom #(
     input  wire [1:0]  g_st_cull,
     input  wire        g_st_cw,
     input  wire        g_st_z0 = 1'b0,           // the clip volume 0 <= z <= w (VS_STATE word 4 bit 24: a_setup zclip0_i)
+    input  wire [3:0]  g_st_zc = 4'd0,           // the draw's coarse-depth flags {INV, STRICT, CULL, OCC} (VS_STATE word 4 [28:25])
+    input  wire        g_st_lazy = 1'b0,         // VS_STATE word 4 bit 29: TRI items only in bands where a quad follows (the last
+                                                 //   VS_STATE before a FLUSH decides for its frame)
+    input  wire        g_cz_d16 = 1'b0,          // with g_render, from the FLUSH: the depth attachment has 16 bits
+    input  wire [23:0] g_cz_init = 24'hFFFFFF,   //   the depth every pixel starts the frame with (the largest when unknown)
     input  wire [6:0]  g_st_lw,                  // the line width (pixels)
     input  wire [7:0]  g_st_fsmask,
     input  wire [11:0] g_st_w, g_st_h,
@@ -72,6 +77,8 @@ module a_geom #(
     output wire [IDX_W-1:0] tri_count,
     output wire [31:0] c_quads,                  // the render side's statistics
     output wire [31:0] c_vis,                    //   primitive-band visits, cumulative (STATUS word 100)
+    output wire [6*32-1:0] c_cz,                 //   the coarse depth and the TRI items, cumulative (STATUS words 116-121, a_render):
+                                                 //   {blocks lowered, TRIs sent with no quad, TRIs held back, TRIs sent, quads sent, quads culled}
     output wire [NPROF*32-1:0] prof,             // the geometry side's profile, cumulative cycle counters (STATUS words 101-113, see below)
     // DDR (mem_arb: read ports 0 = feed, 1 = loader, 2 = the render side; write ports 0 = records, 1 = bin lists)
     output wire [2:0]  r_en,
@@ -92,10 +99,13 @@ module a_geom #(
     localparam int W = 24, TW = 96;
     // ---- per-draw state registers
     reg [W-1:0] sxs, sxo, sys, syo, zs, zo; reg [1:0] cull; reg cw, z0; reg [6:0] lw; reg [7:0] fsmask; reg [11:0] scr_w, scr_h; reg [12:0] did; reg [95:0] gbv; reg [47:0] scv;
+    reg [3:0] zc; reg lazy;
     always @(posedge clk) if (g_st_we) begin
         sxs <= g_st_vp[0 +: W]; sxo <= g_st_vp[W +: W]; sys <= g_st_vp[2*W +: W]; syo <= g_st_vp[3*W +: W]; zs <= g_st_z[0 +: W]; zo <= g_st_z[W +: W];
         cull <= g_st_cull; cw <= g_st_cw; z0 <= g_st_z0; lw <= g_st_lw; fsmask <= g_st_fsmask; scr_w <= g_st_w; scr_h <= g_st_h; did <= g_st_did; gbv <= g_st_gb; scv <= g_st_sc;
+        zc <= g_st_zc;
     end
+    always @(posedge clk) if (rst) lazy <= 1'b0; else if (g_st_we) lazy <= g_st_lazy;
     // ---- the program loader: one burst outstanding, 4 instructions per burst (two words each, the low half first)
     typedef enum logic [1:0] {L_IDLE, L_REQ, L_WAIT, L_WRITE} ld_t;
     ld_t ld_st;
@@ -125,14 +135,14 @@ module a_geom #(
     //      descriptors when !g_copy_busy; the setup stage's per-draw state queues in a FIFO that the assembler's draw_done advances)
     wire dr_busy, dr_ok, copy_busy, draw_done, vo_valid, vo_ready, vo_first, prof_feed, prof_core, prof_asm; wire [TW-1:0] vo_pos; wire [NVEC*TW-1:0] vo_var; wire [W-1:0] vo_psize; wire [1:0] vo_prim;
     wire vo_la, pa_req, pa_req_first, pa_grant, pa_valid, pa_first; wire [TW-1:0] pa_pos;   // a triangle's positions ahead of its vertices
-    localparam int SFW = 6*W + 2 + 1 + 7 + 8 + 12 + 12 + 13 + 96 + 48 + 1;   // the state entry: vp, z, cull, cw, lw, fsmask, w, h, did, the guard band, the rectangle, z0
+    localparam int SFW = 6*W + 2 + 1 + 7 + 8 + 12 + 12 + 13 + 96 + 48 + 1 + 4;   // the state entry: vp, z, cull, cw, lw, fsmask, w, h, did, the guard band, the rectangle, z0, zc
     reg [SFW-1:0] sfifo [0:3]; reg [1:0] sf_wp, sf_rp; reg [2:0] sf_cnt;
     wire sf_full = (sf_cnt == 3'd4);
     wire [SFW-1:0] sf_head = sfifo[sf_rp];
     always @(posedge clk) begin
         if (rst) begin sf_wp <= 2'd0; sf_rp <= 2'd0; sf_cnt <= 3'd0; end
         else begin
-            if (g_dr_start) begin sfifo[sf_wp] <= {z0, scv, gbv, did, scr_h, scr_w, fsmask, lw, cw, cull, zo, zs, syo, sys, sxo, sxs}; sf_wp <= sf_wp + 2'd1; end
+            if (g_dr_start) begin sfifo[sf_wp] <= {zc, z0, scv, gbv, did, scr_h, scr_w, fsmask, lw, cw, cull, zo, zs, syo, sys, sxo, sxs}; sf_wp <= sf_wp + 2'd1; end
             if (draw_done) sf_rp <= sf_rp + 2'd1;
             sf_cnt <= sf_cnt + 3'(g_dr_start) - 3'(draw_done);
         end
@@ -169,7 +179,7 @@ module a_geom #(
         .vo_valid, .vo_ready, .vo_pos, .vo_var, .vo_psize, .vo_prim,
         .vo_la, .pa_req, .pa_req_first, .pa_grant, .pa_valid, .pa_pos, .pa_first,
         .sxs_i(sf_head[0 +: W]), .sxo_i(sf_head[W +: W]), .sys_i(sf_head[2*W +: W]), .syo_i(sf_head[3*W +: W]), .zs_i(sf_head[4*W +: W]), .zo_i(sf_head[5*W +: W]),
-        .cull_mode_i(sf_head[6*W +: 2]), .front_cw_i(sf_head[6*W+2]), .zclip0_i(sf_head[6*W+199]), .line_width_i(sf_head[6*W+3 +: 7]), .fsmask_i(sf_head[6*W+10 +: 8]),
+        .cull_mode_i(sf_head[6*W +: 2]), .front_cw_i(sf_head[6*W+2]), .zclip0_i(sf_head[6*W+199]), .zc_i(sf_head[6*W+200 +: 4]), .line_width_i(sf_head[6*W+3 +: 7]), .fsmask_i(sf_head[6*W+10 +: 8]),
         .scr_w_i(sf_head[6*W+18 +: 12]), .scr_h_i(sf_head[6*W+30 +: 12]), .draw_id_i(sf_head[6*W+42 +: 13]), .gb_i(sf_head[6*W+55 +: 96]), .sc_i(sf_head[6*W+151 +: 48]),
         .busy(s_busy), .tri_count, .rec_ovf,
         .w_req(w_req[0]), .w_en(w_en[0]), .w_addr(w_addr[28:0]), .w_data(w_data[255:0]), .w_mask(w_mask[31:0]), .w_wren(w_wren[0]), .w_wend(w_wend[0]),
@@ -195,7 +205,9 @@ module a_geom #(
     a_render #(.NL(4), .BANDW(BANDW), .IDX_W(IDX_W), .DID_W(DID_W), .PTR_W(PTR_W), .COUNT_W(COUNT_W), .REC_BASE(REC_BASE), .BINLIST_BASE(BINLIST_BASE),
                .REC_BANK_W(REC_BANK_W), .POOL_W(POOL_W))
       u_rn (.clk, .rst, .go(g_render), .go_bank(gbank), .abort(g_abort), .abort_soft(g_abort_soft), .done(g_render_done), .busy(rn_busy), .scr_w, .scr_h,
-        .c_vis,
+        .cz_d16(g_cz_d16), .cz_init(g_cz_init), .lazy,
+        .c_vis, .c_cull(c_cz[0 +: 32]), .c_qsent(c_cz[32 +: 32]), .c_trisent(c_cz[64 +: 32]), .c_trihold(c_cz[96 +: 32]),
+        .c_trinq(c_cz[128 +: 32]), .c_occ(c_cz[160 +: 32]),
         .q_bank, .q_band, .q_head, .q_count,
         .r_en(r_en[2]), .r_addr(r_addr[86:58]), .r_rdy(r_rdy[2]), .r_valid(r_valid[2]), .rd_data,
         .rs_valid, .rs_data, .rs_ready, .c_quads, .c_tris());

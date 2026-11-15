@@ -29,10 +29,10 @@ module tb_a_cmd;
     wire [28:0] g_ld_addr; wire [29:0] g_ad_base, g_dr_idx_base, g_ad_stride, g_ad_off; wire [11:0] g_ld_len, g_st_w, g_st_h; wire [7:0] g_param_idx, g_st_fsmask;
     wire [95:0] g_param_data, g_ac_const, g_st_vp; wire [3:0] g_ad_idx, g_ac_idx; wire g_ad_en, g_ad_norm, g_st_cw, g_st_z0, g_dr_indexed, g_dr_u8;
     wire [2:0] g_ad_size, g_ad_type, g_dr_mode; wire [31:0] g_dr_first, g_dr_count; wire [1:0] g_st_cull; wire [6:0] g_st_lw; wire [12:0] g_st_did;
-    wire [47:0] g_st_z, g_st_sc; wire [95:0] g_st_gb; wire [31:0] c_vis;
+    wire [47:0] g_st_z, g_st_sc; wire [95:0] g_st_gb; wire [31:0] c_vis; wire [3:0] g_st_zc;
     wire g_draw_ok, g_copy_busy;
     fb_dispatch_a #(.B_WAIT(200)) disp (.clk, .rst, .q_valid, .q_data, .q_ready, .g_render_done(1'b0), .g_render(), .g_rbusy(1'b0), .g_fb_ok(1'b1), .g_draw_ok, .g_copy_busy,
-        .g_ad_type, .g_ad_norm, .g_st_z, .g_st_gb, .g_st_sc,
+        .g_ad_type, .g_ad_norm, .g_st_z, .g_st_gb, .g_st_sc, .g_st_zc,
         .x_cmd_valid(x_cv), .x_op, .x_addr, .x_len, .x_seed, .x_flags, .x_cmd_ready(1'b1), .x_busy(1'b0),
         .x_wd_valid(x_wdv), .x_wd_data(x_wdd), .x_wd_ready(1'b1), .x_rd_valid(1'b0), .x_rd_data(32'd0), .x_rd_ready(x_rdr),
         .x_mt_done(1'b0), .x_mt_errors(32'd0), .x_mt_first_bad(30'd0),
@@ -70,7 +70,7 @@ module tb_a_cmd;
     a_geom #(.REC_BASE(REC_BASE), .BINLIST_BASE(BINLIST_BASE)) u_geom (.clk, .rst,
         .g_frame, .g_frame_done, .g_rbusy(), .g_fb_ok(), .g_draw_ok, .g_copy_busy, .g_ld_start, .g_ld_addr, .g_ld_len, .g_ld_done, .g_param_we, .g_param_idx, .g_param_data,
         .g_ad_we, .g_ad_idx, .g_ad_en, .g_ad_type, .g_ad_norm, .g_ad_base, .g_ad_size, .g_ad_stride, .g_ad_off, .g_ac_we, .g_ac_idx, .g_ac_const,
-        .g_st_we, .g_st_vp, .g_st_z, .g_st_gb, .g_st_sc, .g_st_cull, .g_st_cw, .g_st_z0, .g_st_lw, .g_st_fsmask, .g_st_w, .g_st_h, .g_st_did, .c_vis,
+        .g_st_we, .g_st_vp, .g_st_z, .g_st_gb, .g_st_sc, .g_st_cull, .g_st_cw, .g_st_z0, .g_st_lw, .g_st_fsmask, .g_st_w, .g_st_h, .g_st_did, .c_vis, .g_st_zc,
         .g_dr_start, .g_dr_mode, .g_dr_indexed, .g_dr_u8, .g_dr_idx_base, .g_dr_first, .g_dr_count, .g_render(1'b0), .g_render_done(), .g_abort(1'b0), .g_abort_soft(1'b0),
         .g_busy, .err_stack, .rec_ovf(), .bin_ovf(), .tri_count, .c_quads(),
         .r_en, .r_addr, .r_rdy, .r_valid, .rd_data, .w_req, .w_en, .w_addr, .w_data, .w_mask, .w_wren, .w_wend, .w_rdy, .w_wdf_rdy,

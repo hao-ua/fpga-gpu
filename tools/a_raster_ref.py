@@ -43,7 +43,10 @@ def load_records(path):
                          U18=(s32(w[5]), s32(w[6])),         # a point's centre before the 16-bit saturation (words 5 / 6)
                          # the rectangle [x0, x1) x [y0, y1) in the header's spare bits (a_setup_ref hdr_rect): the
                          # draw's scissor box cut to the target; the walk's bounds
-                         R=(w[1] >> 20, w[2] >> 20, ((w[7] >> 26) << 6) | ((w[7] >> 10) & 0x3F), ((w[0] & 0xFF) << 4) | ((w[2] >> 16) & 0xF))))
+                         R=(w[1] >> 20, w[2] >> 20, ((w[7] >> 26) << 6) | ((w[7] >> 10) & 0x3F), ((w[0] & 0xFF) << 4) | ((w[2] >> 16) & 0xF)),
+                         zc=(w[2] >> 13) & 7,                 # the coarse-depth flags (a_setup_ref zc_hdr)
+                         AB=[s32(v) for v in w[20:26]],       # the TRI's shifted steps A0 B0 A1 B1 A2 B2 (w12..w17)
+                         zq=w[26:30]))                        # the depth-bound words (w18..w21, zq_tri)
     return recs
 
 
@@ -189,33 +192,104 @@ def tri_quads(U, s, y0, R):
     return out
 
 
-def stream(recs, wid, hgt):
+class Coarse:
+    """board A's coarse depth (a_render.sv), decision for decision. For the band being walked a conservative UPPER bound of
+    the depth board B holds in every block of 4 x 2 pixels (two quads side by side in one quad row): {band epoch, depth},
+    a block not written in this band holding the frame's starting depth. Per quad, in stream order, from its primitive's
+    flags (record header word 2 [15:13], a_setup_ref zc_hdr) and its depth bounds [Dlo, Dhi] (zq_ref.zq_quad on the edge
+    values B itself forms: b_ref.quad_edges_ref from the TRI's reference values and shifted steps):
+      cut   CULL, bounds valid, no INV quad earlier in the band, Dlo >= bound (Dlo > bound when STRICT): not sent
+      occ   OCC, bounds valid, coverage 0xF at an even qx, the next quad of the same visit at qx + 1 in the same row also:
+            bound := min(bound, max(their Dhi))
+      INV   the quad's draw may raise the depth: no culling for the rest of the band"""
+    def __init__(self, d16, init):
+        self.d16, self.init = d16, init
+        self.mem = {}; self.ep = 0; self.inv = False; self.pend = None; self.vis = 0
+        self.cut = 0; self.occ = 0
+    def band(self):
+        self.ep += 1; self.inv = False; self.pend = None
+    def visit(self, r):
+        self.vis ^= 1; self.r = r
+        self.er = ref_words(r)
+    def quad(self, q):
+        """True: the quad is culled"""
+        import zq_ref
+        r = self.r; zc = r['zc']
+        cull, occ, inv, strict = zc & 1, (zc & 3) == 3, (zc & 3) == 2, (zc >> 2) & 1
+        qx, qy, cov = q[0] & 0xFFF, (q[0] >> 12) & 0xFFF, (q[0] >> 24) & 0xF
+        e = b_ref.quad_edges_ref(self.er, r['AB'], qx, qy)
+        ok, lo, hi = zq_ref.zq_quad(r['zq'], e[1], e[2], self.d16)
+        blk = (((qy & 3) << 8) | ((qx >> 1) & 0xFF)) if NL == 8 else (((qy & 1) << 9) | ((qx >> 1) & 0x1FF))
+        m = self.mem.get(blk)
+        val = m[1] if (m is not None and m[0] == self.ep) else self.init
+        inv0 = self.inv
+        if inv: self.inv = True
+        cut = bool(cull) and bool(ok) and not inv0 and ((lo > val) if strict else (lo >= val))
+        full = occ and bool(ok) and cov == 0xF
+        p = self.pend
+        self.pend = (qx, qy, self.vis, hi) if (full and not qx & 1) else None
+        if full and qx & 1 and p is not None and p[2] == self.vis and p[1] == qy and p[0] == qx - 1:
+            self.mem[blk] = (self.ep, min(val, max(p[3], hi))); self.occ += 1
+        self.cut += cut
+        if os.environ.get('CZ_TRACE'):
+            print(f"CZ {qx:x} {qy:x} cov {cov:x} zc {zc:x} ok {int(ok)} lo {lo:06x} hi {hi:06x} val {val:06x} ep {self.ep} cut {int(cut)} inv {int(inv0)}")
+        return cut
+
+
+def stream(recs, wid, hgt, cz=None, lazy=0):
+    """the render stream of the frame; cz = (d16, starting depth): through A's coarse depth (the quads it culls are left
+    out); lazy: a primitive's TRI item goes out only in front of the visit's first quad sent (a visit that sends none sends no
+    TRI and leaves B's current primitive as it was). Returns (beats, quads walked, counters)"""
     global NL
     NL = b_ref.band_lines(wid)
     beats = []
     def emit(words):
         words = words + [0] * (len(words) & 1)
         for k in range(0, len(words), 2): beats.append(words[k] | words[k + 1] << 32)
+    co = Coarse(*cz) if cz is not None else None
+    cnt = dict(cut=0, qsent=0, trisent=0, trihold=0, trinq=0, occ=0)
     nbands = (hgt + NL - 1) // NL
     cur = None
     nq = 0
     for b in range(nbands):
         y0 = NL * b
         emit([(4 << 28) | y0, 0])
+        if co: co.band()
         for r in recs:                                        # the bin list of band b, oldest first
             if not (r['lo'] <= b <= r['hi']): continue
             # the whole TRI item again (B never re-reads a record from its DDR); the walk inserts the reference beats after
             # the record's 11th beat (w22..w24 + 0), before the varyings
-            if b == r['lo'] or cur != r['id']: emit(r['w'][8:30] + ref_words(r) + [0] + r['w'][30:])
-            cur = r['id']
+            tri = r['w'][8:30] + ref_words(r) + [0] + r['w'][30:]
+            need = b == r['lo'] or cur != r['id']
+            sent = False; nsent = 0
+            if need and not lazy:
+                emit(tri); cur = r['id']; sent = True; cnt['trisent'] += 1
+            if co: co.visit(r)
             qs = (point_quads(r['U18'], r['ps'], y0, r['R']) if r['prim'] == 2 else
                   line_quads(r['U'][0], r['U'][1], r['lw'], r['s'], y0, r['R']) if r['prim'] == 1 else
                   tri_quads(r['U'], r['s'], y0, r['R']))
             for q in qs:
                 nq += 1
-                emit(q)
+                if co and co.quad(q): continue
+                if need and not sent:
+                    emit(tri); cur = r['id']; sent = True; cnt['trisent'] += 1
+                emit(q); nsent += 1
+            cnt['qsent'] += nsent
+            if need and not sent: cnt['trihold'] += 1
+            if sent and nsent == 0: cnt['trinq'] += 1
     emit([5 << 28, 0])
-    return beats, nq
+    if co: cnt['cut'], cnt['occ'] = co.cut, co.occ
+    return beats, nq, cnt
+
+
+def load_cz(seed):
+    """tools/gen/as_<seed>_cz.hex (a_setup_ref.py --cz): the frame's depth "d16 ds cden csc cdepth lazy" -> ((d16, starting
+    depth), lazy) as board A derives them from the FLUSH (fb_dispatch_a: the clear depth when no depth-stencil image is
+    attached or the clear covers it unscissored, else the largest) and the last VS_STATE (the lazy bit); None without it"""
+    p = f"{GEN}/as_{seed}_cz.hex"
+    if not os.path.exists(p): return None
+    d16, ds, cden, csc, cdepth, lazy = (int(v, 0) for v in open(p).read().split())
+    return (d16, (cdepth if (not ds or (cden and not csc)) else (0xFFFF if d16 else 0xFFFFFF))), lazy
 
 
 def check_vs_b_ref(n=200):
@@ -300,11 +374,22 @@ def main():
     recs = load_records(f"{GEN}/as_{seed}_rec.hex")
     st = int(open(f"{GEN}/as_{seed}_state.mem").read().split()[0], 16)
     wid, hgt = (st >> 112) & 0xFFF, (st >> 124) & 0xFFF
-    beats, nq = stream(recs, wid, hgt)
+    beats, nq, _ = stream(recs, wid, hgt)
     with open(f"{GEN}/as_{seed}_stream.hex", 'w') as f:
         for b in beats: f.write(f"{b:016x}\n")
     print(f"as_{seed}: {len(recs)} records, {wid} x {hgt}, {(hgt + NL - 1) // NL} bands -> {nq} quads, {len(beats)} beats"
           f" -> tools/gen/as_{seed}_stream.hex")
+    czl = load_cz(seed)
+    if czl is not None:                                       # the same frame through A's coarse depth / lazy TRI items
+        cz, lazy = czl
+        beats, nq, c = stream(recs, wid, hgt, cz, lazy)
+        with open(f"{GEN}/as_{seed}_stream_cz.hex", 'w') as f:
+            for b in beats: f.write(f"{b:016x}\n")
+        with open(f"{GEN}/as_{seed}_cz_counts.hex", 'w') as f:            # (decimal; .hex: the benches' run directories copy those)
+            f.write(" ".join(f"{c[k]}" for k in ('cut', 'qsent', 'trisent', 'trihold', 'trinq', 'occ')) + "\n")
+        print(f"as_{seed}: coarse depth (d16 {cz[0]}, starting depth {cz[1]:06x}, lazy {lazy}) culls {c['cut']} of {nq} quads "
+              f"({c['occ']} block updates), TRI items sent {c['trisent']}, held back {c['trihold']}, sent with no quad {c['trinq']} "
+              f"-> {len(beats)} beats -> tools/gen/as_{seed}_stream_cz.hex")
 
 
 if __name__ == '__main__': main()

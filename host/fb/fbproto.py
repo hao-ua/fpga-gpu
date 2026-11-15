@@ -131,7 +131,10 @@ STATUS_NAMES = [
     # dispatcher's idle cycles (no command queued: host-bound) and its cycles waiting for a geometry command (D_GWAIT)
     "a_prof_load", "a_prof_copy", "a_prof_feed", "a_prof_fetch_wait", "a_prof_core", "a_prof_asm", "a_prof_vo_stall",
     "a_prof_setup", "a_prof_push_stall", "a_prof_bin", "a_prof_clear", "a_prof_loads_draws", "a_prof_prims",
-    "a_disp_idle", "a_disp_gwait"]
+    "a_disp_idle", "a_disp_gwait",
+    # layout 12: the render side's coarse depth and TRI items, cumulative: quads culled, quads sent, TRI items sent, TRI items
+    # held back (no quad followed: dropped), TRI items sent for a visit that sent no quad, blocks an occluder pair lowered
+    "a_cz_culled", "a_cz_quads_sent", "a_tri_sent", "a_tri_held", "a_tri_noquad", "a_cz_blocks"]
 B_CYC_NAMES = ["frame", "flush", "band change", "draw change", "FS busy", "band set-up", "stream empty", "ROP stall"]
 # the boards' clk_sys in kHz, for cycle counters -> ms (GPU2_CLK_MHZ, default 120)
 CLK_KHZ = float(os.environ.get("GPU2_CLK_MHZ", "120")) * 1e3
@@ -152,6 +155,40 @@ def a_geom_split(st, st0, frames=1):
     return ("A geometry %.0f kcycles/frame: %s | per frame: loads %.1f draws %.1f prims %.0f | dispatcher idle %.0f k, "
             "geometry wait %.0f k cycles/frame" % (g / 1e3 / frames, parts, ld / frames, dr / frames, d("a_prof_prims") / frames,
                                                    d("a_disp_idle") / 1e3 / frames, d("a_disp_gwait") / 1e3 / frames))
+
+
+def a_cz_split(st, st0, frames=1):
+    """board A's coarse depth and TRI items between two STATUS snapshots, per frame (STATUS layout 12)"""
+    if st.get("layout", 0) < 12: return "no coarse-depth counters (STATUS layout < 12)"
+    d = lambda k: ((st[k] - st0[k]) & 0xFFFFFFFF) / max(frames, 1)
+    walked = d("a_cz_culled") + d("a_cz_quads_sent")
+    return ("A per frame: %.0f quads walked, %.0f culled (%.1f%%), %.0f sent | TRI items %.0f sent, %.0f held back, %.0f sent with "
+            "no quad | %.0f blocks lowered" % (walked, d("a_cz_culled"), 100.0 * d("a_cz_culled") / walked if walked else 0.0,
+                                               d("a_cz_quads_sent"), d("a_tri_sent"), d("a_tri_held"), d("a_tri_noquad"), d("a_cz_blocks")))
+
+
+# board A's coarse-depth flags of a draw (VS_STATE word 4 [28:25]) and the lazy TRI bit (29): vs_state(zc=...)
+ZC_OCC, ZC_CULL, ZC_STRICT, ZC_INV, ZC_LAZY = 1, 2, 4, 8, 16
+
+
+def zc_flags(h0, discard=False, frag_depth=False):
+    """the coarse-depth flags a draw may promise, from B's DRAW_STATE word h0 (depth test [0], write [1], function [4:2]
+    NEVER..ALWAYS, stencil [5], polygon offset [9]) and its fragment program (DISCARD, gl_FragDepth) — the libraries'
+    g2_render.c zc_flags, the same rule. A wrong bit culls visible quads.
+      OCC     every pixel it covers ends with a depth <= its own: LESS / LEQUAL with writes, no stencil, discard, gl_FragDepth,
+              polygon offset (a scissor box only as the draw's rectangle, vs_state rect=: board A's coverage stays inside it)
+      CULL    its fragments that fail the depth test change nothing: LESS / LEQUAL / EQUAL, no stencil, gl_FragDepth, offset
+      STRICT  LEQUAL / EQUAL: only quads strictly behind are culled
+      INV     its depth writes may raise the stored depth (GREATER / NOTEQUAL / GEQUAL / ALWAYS with writes, or the test off)"""
+    func, test, write = (h0 >> 2) & 7, h0 & 1, (h0 >> 1) & 1
+    stencil, offset = (h0 >> 5) & 1, (h0 >> 9) & 1
+    if write and (not test or func >= 4): return ZC_INV
+    if not test: return 0
+    z = 0
+    if func in (1, 3) and write and not (stencil or discard or frag_depth or offset): z |= ZC_OCC
+    if 1 <= func <= 3 and not (stencil or frag_depth or offset): z |= ZC_CULL
+    if z and func in (2, 3): z |= ZC_STRICT
+    return z
 
 
 def b_frame_split(st):
@@ -818,7 +855,8 @@ class Board:
         body += struct.pack("<IIII", *[c if isinstance(c, int) else fp24(c) for c in const])
         return self.send_seq(T_VERTEX_ATTR, body)
 
-    def vs_state(self, viewport, cull, front_cw, fsmask, width, height, draw_id, line_width=1, depth_range=(0.0, 1.0), guard=None, rect=None, z01=False):
+    def vs_state(self, viewport, cull, front_cw, fsmask, width, height, draw_id, line_width=1, depth_range=(0.0, 1.0), guard=None, rect=None, z01=False,
+                 zc=0):
         """viewport = (sxs, sxo, sys, syo) with window = ndc * s + o in 1/16 PIXEL (FP24 bits or floats); cull 0 none,
         1 back, 2 front, 3 front and back; fsmask = the fragment shader's read varyings (every varying the fragment
         program reads MUST be in it: an omitted one is undefined); the render target's size in pixels (1..2048 each,
@@ -834,7 +872,10 @@ class Board:
         target. Board A drops what has no pixel in it and walks inside it; a board A without it takes the command's
         first 13 words and drops the two (a sub-body's or an entry's unread tail), so both get the same bytes.
         z01 (word 4 bit 24, on a board A that has the flag): the program's z runs 0 .. w, not -w .. w — A clips at z >= 0 and window z =
-        n + ndc_z (f - n). For a host that keeps depth reversed (far at 0, where FP24 is fine); a board A without the flag ignores the bit"""
+        n + ndc_z (f - n). For a host that keeps depth reversed (far at 0, where FP24 is fine); a board A without the flag ignores the bit.
+        zc (word 4 [29:25], board A builds with the coarse depth; older ones ignore the bits): the draw's coarse-depth flags
+        (zc_flags: ZC_OCC / ZC_CULL / ZC_STRICT / ZC_INV — a PROMISE about its depth state, a wrong bit culls visible quads) | ZC_LAZY
+        (TRI items only in bands where a quad follows; the last VS_STATE before a FLUSH decides for its frame)"""
         lw = max(1, min(64, int(round(line_width))))
         n, f = depth_range
         zs, zo = (n, f) if isinstance(n, int) else (fp24(f - n), fp24(n)) if z01 else (fp24((f - n) / 2), fp24((n + f) / 2))
@@ -845,7 +886,8 @@ class Board:
                 gb += sorted(((-GUARD_BAND - o) / s, (GUARD_BAND - o) / s))
             guard = [fp24(c) for c in gb]
         body = struct.pack("<IIII", *[c if isinstance(c, int) else fp24(c) for c in viewport])
-        body += struct.pack("<HBBHHI", cull | ((1 if front_cw else 0) << 8) | (lw << 9), fsmask, 1 if z01 else 0, width, height, draw_id)
+        body += struct.pack("<HBBHHI", cull | ((1 if front_cw else 0) << 8) | (lw << 9), fsmask, (1 if z01 else 0) | ((zc & 0x1F) << 1),
+                            width, height, draw_id)
         body += struct.pack("<II", zs, zo)
         body += struct.pack("<IIII", *guard)
         x0, y0, x1, y1 = rect if rect is not None else (0, 0, width, height)

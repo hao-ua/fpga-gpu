@@ -117,6 +117,11 @@ module fb_dispatch_a #(
     output reg  [3:0]    g_ad_idx, g_ac_idx,
     output reg           g_ad_en, g_st_cw, g_dr_indexed, g_dr_u8,
     output reg           g_st_z0,                // VS_STATE word 4 bit 24: the clip volume 0 <= z <= w (depth reversed by the library)
+    output reg  [3:0]    g_st_zc,                // VS_STATE word 4 [28:25]: the draw's coarse-depth flags {INV, STRICT, CULL, OCC} (a promise
+                                                 //   about its depth state, a_render's coarse depth; 0 = A culls nothing of the draw)
+    output reg           g_st_lazy,              // VS_STATE word 4 bit 29: TRI items only in bands where a quad follows
+    output reg           g_cz_d16,               // with g_render, from the FLUSH: the depth attachment has 16 bits
+    output reg  [23:0]   g_cz_init,              //   the depth every pixel starts the frame with, the largest when unknown (loaded)
     output reg  [2:0]    g_ad_size, g_dr_mode,
     output reg  [31:0]   g_dr_first, g_dr_count,
     output reg  [1:0]    g_st_cull,
@@ -185,6 +190,7 @@ module fb_dispatch_a #(
             T_VS_STATE:                   nfields = (len >= 16'd60) ? 4'd15 : 4'd13;    // sxs sxo sys syo (x16), {0, fsmask, line width[15:9], front_cw, cull}, {height, width}, draw id, zs, zo (depth range), gxlo gxhi gylo gyhi (guard band) [, {y0, x0}, {y1, x1}: the rectangle]
             T_DRAW:                       nfields = 4'd5;     // {0, u8, indexed, mode}, {0, handle}, byte offset, first (32 bits), count (32 bits)
             T_FRAME_BEGIN:                nfields = 4'd1;
+            T_FLUSH:                      nfields = 4'd7;     // forwarded as read; the clear and the depth format: the frame's starting depth
             default:                      nfields = 4'd0;
         endcase
     endfunction
@@ -492,6 +498,7 @@ module fb_dispatch_a #(
                             g_st_we <= 1'b1; g_st_vp <= {f[3][23:0], f[2][23:0], f[1][23:0], f[0][23:0]}; g_st_z <= {f[8][23:0], f[7][23:0]};
                             g_st_gb <= {f[12][23:0], f[11][23:0], f[10][23:0], f[9][23:0]};
                             g_st_cull <= f[4][1:0]; g_st_cw <= f[4][8]; g_st_z0 <= f[4][24]; g_st_lw <= f[4][15:9]; g_st_fsmask <= f[4][23:16];
+                            g_st_zc <= f[4][28:25]; g_st_lazy <= f[4][29];
                             g_st_w <= f[5][11:0]; g_st_h <= f[5][27:16]; g_st_did <= f[6][12:0];
                             g_st_sc <= (nf == 4'd15) ? {sc_y1c, sc_x1c, sc_y0c, sc_x0c} : {f[5][27:16], f[5][11:0], 12'd0, 12'd0};
                             c_cmds <= c_cmds + 1; st <= D_END;
@@ -512,7 +519,14 @@ module fb_dispatch_a #(
                 // a FLUSH forwarded before a SYNC has no frame on B any more: it is not streamed (ERR_RENDER, detail 0)
                 // (an error of A's, not of the command: a batch carries on)
                 D_GRWAIT: if (fl_dead || sync_go) begin raise_err(ERR_RENDER, 32'h0); in_batch <= in_batch; end
-                          else if (!g_busy && !g_rbusy) begin g_render <= 1'b1; st <= D_END; end
+                          else if (!g_busy && !g_rbusy) begin
+                              g_render <= 1'b1; st <= D_END;
+                              // the frame's starting depth for the coarse depth (as board B starts its bands, b_rop): the clear
+                              // depth when no depth-stencil image is attached or the clear covers it unscissored, else unknown
+                              // (the largest)
+                              g_cz_d16 <= f[0][25];
+                              g_cz_init <= (f[6][15:0] == 16'h0 || (f[0][23] && !f[0][17])) ? f[3][23:0] : (f[0][25] ? 24'h00FFFF : 24'hFFFFFF);
+                          end
                 D_GUNI: begin                                   // 4 body words per uniform -> one param write
                     if (take_uni) begin
                         g_param_data[uni_k*24 +: 24] <= wcur[23:0]; uni_k <= uni_k + 1'b1;

@@ -62,6 +62,8 @@ module a_setup #(
     input  wire        zclip0_i = 1'b0,         // the clip volume is 0 <= z <= w, not -w <= z <= w (VS_STATE word 4 bit 24:
                                                 // a library that keeps depth reversed sends z' = w - z, far at 0; plane 1 = z >= 0)
     input  wire [6:0]  line_width_i,            // pixels (0 = 1; clamped to MAXLW)
+    input  wire [3:0]  zc_i = 4'd0,             // the draw's coarse-depth flags {INV, STRICT, CULL, OCC} (VS_STATE word 4 [28:25]):
+                                                // raster header word 2 [15:13] (zc_enc), for a_render's coarse depth
     input  wire [7:0]  fsmask_i,                // the fragment shader's read varyings (the record's varying mask)
     input  wire [DID_W-1:0] draw_id_i,
     input  wire [11:0] scr_w_i, scr_h_i,        // render target in pixels
@@ -94,6 +96,13 @@ module a_setup #(
     // the draw state of the primitive in hand (latched with its first vertex)
     reg [W-1:0] sxs, sxo, sys, syo, zs, zo; reg [1:0] cull_mode; reg front_cw, zclip0; reg [6:0] line_width; reg [7:0] fsmask; reg [DID_W-1:0] draw_id; reg [11:0] scr_w, scr_h;
     reg [4*W-1:0] gb;
+    // the coarse-depth flags in three header bits: bit 0 = the draw's failing quads may be culled (CULL or OCC),
+    // bit 1 = OCC with bit 0, INV without it, bit 2 = STRICT with bit 0; INV wins (a draw that may raise the depth is never culled)
+    function automatic [2:0] zc_enc(input [3:0] z);   // z = {INV, STRICT, CULL, OCC}
+        reg c; c = z[1] | z[0];
+        zc_enc = z[3] ? 3'b010 : {z[2] & c, z[0], c};
+    endfunction
+    reg [2:0] zc, b_zc;
     reg [11:0] sc_x0, sc_y0, sc_x1, sc_y1; reg sc_emp;      // the draw's rectangle; empty (no pixel: every primitive of the draw is dropped)
     localparam [W-1:0] HALF = ((((1 << (EXP_W-1)) - 1) - 1) << MAN_W);
     localparam [W-1:0] ONE  = ((((1 << (EXP_W-1)) - 1)) << MAN_W);
@@ -404,7 +413,7 @@ module a_setup #(
             // y0 = word 2 [31:20], y1 = {word 0 [7:0], word 2 [19:16]}, x1 = {word 7 [31:26], word 7 [15:10]}
             5'd0:  hdr_word = {4'hA, b_prim, (b_prim == 2'd0) ? b_front : 1'b1, (b_prim == 2'd1) ? b_lw_c : 7'd0, esh, b_fsmask, b_sc[47:40]};
             5'd1:  hdr_word = {b_sc[11:0], 20'(tid)};
-            5'd2:  hdr_word = {b_sc[23:12], b_sc[39:36], 16'(b_did)};
+            5'd2:  hdr_word = {b_sc[23:12], b_sc[39:36], b_zc, 13'(b_did)};
             5'd3:  hdr_word = a2s[31:0];
             5'd4:  hdr_word = {bSY[0], bSX[0]};
             5'd5:  hdr_word = (b_prim == 2'd2) ? 32'(bSX18) : {bSY[1], bSX[1]};             // a point: its 18-bit centre in words 5 / 6
@@ -568,6 +577,7 @@ module a_setup #(
                         prim <= vo_prim; psz <= vo_psize;
                         sxs <= sxs_i; sxo <= sxo_i; sys <= sys_i; syo <= syo_i; zs <= zs_i; zo <= zo_i; cull_mode <= cull_mode_i; front_cw <= front_cw_i; zclip0 <= zclip0_i;
                         line_width <= line_width_i; fsmask <= fsmask_i; draw_id <= draw_id_i; scr_w <= scr_w_i; scr_h <= scr_h_i; gb <= gb_i;
+                        zc <= zc_enc(zc_i);
                         {sc_y1, sc_x1, sc_y0, sc_x0} <= sc_i; sc_emp <= (sc_i[11:0] >= sc_i[35:24]) | (sc_i[23:12] >= sc_i[47:36]);
                     end
                     lc_p <= 3'd0;
@@ -711,7 +721,7 @@ module a_setup #(
                     end else if (hand) begin                            // the hand-off to the back (the front waits while the back works):
                         for (int i = 0; i < 3; i++) begin bSX[i] <= SX[i]; bSY[i] <= SY[i]; bZW[i] <= ZW[i]; bIW[i] <= IW[i]; end
                         bSX18 <= SX18; bSY18 <= SY18; b_a2 <= a2; b_len2 <= len2; b_ps_u <= ps_u; b_prim <= prim; b_fcw <= front_cw;
-                        b_lw <= line_width; b_fsmask <= fsmask; b_did <= draw_id; b_row_lo <= row_lo; b_row_hi <= row_hi;
+                        b_lw <= line_width; b_fsmask <= fsmask; b_did <= draw_id; b_zc <= zc; b_row_lo <= row_lo; b_row_hi <= row_hi;
                         b_sc <= {sc_y1, sc_x1, sc_y0, sc_x0};
                         bbuf <= s_buf; sbuf <= ~s_buf;                  //   the back takes this stream's buffer, the next stream the other
                         bk_go <= 1'b1; b_slp_ok <= 1'b0;                //   (the header writer: four rows pending; the slopes not yet)

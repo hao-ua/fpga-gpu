@@ -1044,6 +1044,16 @@ def gen_aframe(seed, NL=None):
     fmt = int(os.environ.get('BR_FMT', cfg.choice([0, 0, 1, 2, 3])))
     d16 = int(os.environ.get('BR_D16', cfg.choice([0, 0, 1])))
     ds = int(os.environ.get('BR_DS', cfg.choice([0, 1, 1])))
+    # board A's coarse depth / lazy TRI items (a_setup_ref.py --cz, --zc / --zcd, --lazy): the frame's depth as its FLUSH gives
+    # it ("d16 ds cden csc cdepth lazy"), and each draw's flags from its records (header word 2: did [12:0], flags [15:13]) —
+    # the draws' ROP states below then keep the promise the flags make
+    czp = os.path.join(GEN, f"as_{seed}_cz.hex"); cz = None; zmap = {}
+    if os.path.exists(czp):
+        cz = [int(v, 0) for v in open(czp).read().split()]
+        d16, ds = cz[0], cz[1]
+        for ln in open(os.path.join(GEN, f"as_{seed}_rec.hex")):
+            t = ln.split()
+            if len(t) > 6: w2 = int(t[6], 16); zmap[w2 & 0x1FFF] = (w2 >> 13) & 7
     dbits = 16 if d16 else 24
     nb = CHN[fmt]; bpp = FMT_BPP[fmt]; ppw = 4 // bpp
     assert (WID * bpp) % 32 == 0, "the target's pitch must be a multiple of 32 bytes"
@@ -1089,18 +1099,42 @@ def gen_aframe(seed, NL=None):
     # stream does not carry what the scissor box masks, so B's draw state must hold that box, as the driver's does (the
     # one box for the frame's draws: --scalt frames are for board A's benches only)
     asc = tuple((st_a >> (296 + 12 * i)) & 0xFFF for i in range(4))
-    if asc != (0, 0, 0, 0) and asc != (0, 0, WID, HGT):
+    a_rect = asc != (0, 0, 0, 0) and asc != (0, 0, WID, HGT)
+    if a_rect:
         st.update(scissor=1, sx0=asc[0], sy0=asc[1], sx1=asc[2], sy1=asc[3])
     d.st = st
     d.paddr = B_PROG_BASE
     for k, b in enumerate(words_to_bursts(list(d.w32))): ddr[d.paddr + 8 * k] = b
-    sw = pack_state(st, d.paddr, len(words), len(d.uni))
-    bucket = words_to_bursts(sw) + [0, 0, 0, 0]
-    for k in range(0, len(d.uni), 2):
-        u = d.uni[k:k + 2] + [[0] * 4] * (2 - len(d.uni[k:k + 2]))
-        bucket.append(sum(u[h][c] << (h * 128 + 32 * c) for h in range(2) for c in range(4)))
+    # each draw's state: the random one, or with coarse depth the one its flags promise (zmap: bit 0 CULL, bits 1:0 = 3 OCC,
+    # = 2 INV, bit 2 STRICT). CULL: depth test LESS (LEQUAL or EQUAL when STRICT), no stencil, no polygon offset; OCC also depth
+    # writes and no scissor box but A's rectangle (the program, b_fs_two, has no DISCARD / STOZ); INV: writes with a function
+    # that may raise the depth. A draw with no flag must not raise the depth: its writes go off unless its function only lowers.
+    prog_kill = any(((w >> 57) & 0x7F) in (isa64.OPS['DISCARD'], isa64.OPS['STOZ']) for w in words)
+    states = {}
     for di in ids:
+        s2 = dict(st)
+        if cz is not None:
+            z = zmap.get(di, 0)
+            zr = random.Random(seed * 131 + di)
+            if z & 1:
+                s2.update(depth_test=1, depth_func=(zr.choice([3, 2]) if z & 4 else 1), stencil=0, po=0)
+                if z & 2:
+                    assert not prog_kill, "an OCC draw's program must not discard or write its depth"
+                    s2['depth_mask'] = 1
+                    if not a_rect: s2['scissor'] = 0
+            elif z == 2:
+                s2.update(depth_test=1, depth_mask=1, depth_func=zr.choice([4, 5, 6, 7]))
+            elif s2['depth_mask'] and (not s2['depth_test'] or s2['depth_func'] >= 4):
+                s2['depth_mask'] = 0
+        states[di] = s2
+        sw = pack_state(s2, d.paddr, len(words), len(d.uni))
+        bucket = words_to_bursts(sw) + [0, 0, 0, 0]
+        for k in range(0, len(d.uni), 2):
+            u = d.uni[k:k + 2] + [[0] * 4] * (2 - len(d.uni[k:k + 2]))
+            bucket.append(sum(u[h][c] << (h * 128 + 32 * c) for h in range(2) for c in range(4)))
         for k, b in enumerate(bucket): ddr[B_DS_BASE + di * 512 + 8 * k] = b
+        if di == draw_id: sw0 = sw
+    sws = {di: pack_state(states[di], d.paddr, len(words), len(d.uni)) for di in ids}
     # the target, the depth-stencil image, the clear (as gen_frame)
     bpl = WID * bpp // 32
     fbp = [[rng.getrandbits(8 * bpp) for _ in range(WID)] for _ in range(HGT)]
@@ -1121,6 +1155,7 @@ def gen_aframe(seed, NL=None):
               stencil=rng.randrange(4), den=rng.choice([1, 1, 0]), sen=rng.choice([1, 1, 0]),
               smask=rng.choice([0xFF, 0xFF, rng.randrange(256)]))
     cl['x1'] = cl['x0'] + rng.randrange(WID // 2, WID); cl['y1'] = cl['y0'] + rng.randrange(HGT // 2, HGT)
+    if cz is not None: cl.update(den=cz[2], sc=cz[3], depth=cz[4])
     def dclear(x, y):
         t = bayer(x, y) if cl['dither'] else 0
         return sum((((cl['c16'] >> ((3 - c) * 13)) & 0x1FFF) + t >> 4) << ((3 - c) * 8) for c in range(4))
@@ -1149,9 +1184,11 @@ def gen_aframe(seed, NL=None):
             fb[y0 + l] = bc[l][:]
             if ds: dsi[y0 + l] = [bs[l][x] << 24 | bz[l][x] for x in range(WID)]
     def run(beats):
-        """render one stream into fb / dsi"""
+        """render one stream into fb / dsi; returns its quads as (key, hidden): hidden = every covered pixel fails the depth
+        test of the quad's draw against the depth stored when the quad arrives (what board A's coarse depth may cull)"""
         nonlocal cur, band, y0, nq
         cur = None; band = None; y0 = 0
+        quads = []
         words = []
         for b in beats: words += [b & 0xFFFFFFFF, b >> 32]
         i = 0
@@ -1186,7 +1223,8 @@ def gen_aframe(seed, NL=None):
                                      [(v >> (96 + 24 * c)) & 0xFFFFFF for c in range(4)],
                                      [(v >> (192 + 24 * c)) & 0xFFFFFF for c in range(4)])
                         j += 10
-                T.o24 = poly_offset24(st['pofac'], st['pounits'], T.tc['dzdx'], T.tc['dzdy'], dbits) if st['po'] else 0
+                sT = states[T.draw]
+                T.o24 = poly_offset24(sT['pofac'], sT['pounits'], T.tc['dzdx'], T.tc['dzdy'], dbits) if sT['po'] else 0
                 tris[T.id] = T; cur = T; i = j
             elif kind == 3:
                 cur = tris[words[i + 1]]; i += 2
@@ -1211,6 +1249,15 @@ def gen_aframe(seed, NL=None):
                 outc = [res.outc[p][c] for p in range(4) for c in range(4)]
                 killed = res.killed; outz = None if res.outz is None else res.outz[:4]
                 flog.append(f"Q {qx:x} {qy:x} {T.id:x} {d.id:x} " + "".join(f"{qsr[p]['l2']:06x}{qsr[p]['l1']:06x}" for p in (3, 2, 1, 0)))
+                sT = states[T.draw]
+                hidden = bool(sT['depth_test'])
+                for p in range(4):
+                    if (cov >> p) & 1:
+                        px, py = 2 * qx + (p & 1), 2 * qy + (p >> 1)
+                        z = f24_u24(outz[p], dbits) if outz is not None else qsr[p]['d24']
+                        sd = band[1][py - y0][px]
+                        if [False, z < sd, z == sd, z <= sd, z > sd, z != sd, z >= sd, True][sT['depth_func']]: hidden = False
+                quads.append(((qx, qy, T.id), hidden))
                 for p in range(4):
                     if (cov >> p) & 1 and not (killed >> p) & 1:
                         px, py = 2 * qx + (p & 1), 2 * qy + (p >> 1)
@@ -1218,10 +1265,36 @@ def gen_aframe(seed, NL=None):
                         sa = (f24_cn(outc[p * 4 + 3], nb[1]), f24_cn(outc[p * 4 + 3], nb[0]))
                         z = f24_u24(outz[p], dbits) if outz is not None else qsr[p]['d24']
                         flog.append(f"F {px:x} {py:x} {c16:x} {z:x}")
-                        rop_frag(st, band, px, py, py - y0, c16, z, T.front, fmt, sa)
+                        rop_frag(sT, band, px, py, py - y0, c16, z, T.front, fmt, sa)
             else:
                 raise ValueError(f"stream item kind {kind} at word {i}")
-    run(beats)
+        return quads
+    import copy
+    fb0, dsi0 = copy.deepcopy(fb), copy.deepcopy(dsi)
+    flog0 = len(flog)
+    quads = run(beats)
+    # board A's coarse depth / lazy TRI items (tools/a_raster_ref.py: as_<seed>_stream_cz.hex): the culled stream must render
+    # the very same target and depth-stencil image, and every quad it leaves out must fail the depth test at every pixel
+    czs = os.path.join(GEN, f"as_{seed}_stream_cz.hex")
+    if cz is not None and os.path.exists(czs):
+        fbp_, dsip_ = copy.deepcopy(fb), copy.deepcopy(dsi)
+        fb[:] = copy.deepcopy(fb0)
+        if ds: dsi[:] = copy.deepcopy(dsi0)
+        nq_plain = nq; del flog[flog0:]           # (the log: the stream board B gets, the culled one)
+        beats_cz = [int(ln, 16) for ln in open(czs) if ln.strip()]
+        kept = run(beats_cz)
+        nq = nq_plain
+        ks = [k for k, _ in kept]; ki = 0; culled = bad = 0
+        for k, hid in quads:
+            if ki < len(ks) and ks[ki] == k: ki += 1; continue
+            culled += 1
+            if not hid: bad += 1
+        same = (fb == fbp_) and (not ds or dsi == dsip_)
+        print(f"aframe seed {seed}: coarse depth culled {culled} of {len(quads)} quads ({bad} of them visible), stream "
+              f"{len(beats)} -> {len(beats_cz)} beats, {'the same' if same else 'a DIFFERENT'} image"
+              + ("" if ki == len(ks) else " (the culled stream is not a subsequence)"))
+        if bad or not same or ki != len(ks): raise SystemExit("aframe: the coarse depth culled a visible quad")
+        beats = beats_cz                          # the two-board bench runs board A with the frame's FLUSH: the culled stream
     with open(os.path.join(GEN, f"ab_{seed}_model_frags.txt"), "w") as fh: fh.write("\n".join(flog) + "\n")
     with open(os.path.join(GEN, f"ab_{seed}_ddr.hex"), "w") as fh:
         fh.write("\n".join(f"{a:08x} " + " ".join(f"{(v >> (64 * k)) & ((1 << 64) - 1):016x}" for k in (3, 2, 1, 0))
@@ -1258,6 +1331,7 @@ def gen_aframe(seed, NL=None):
     cmd(0x11, [0xC000, B_RT_BASE * 4, WID * bpp | tfmt[fmt] << 16 | 1 << 24, WID | HGT << 16, 1 | 1 << 8])
     if ds: cmd(0x11, [0xC003, B_DSI_BASE * 4, WID * 4 | 0x10 << 16 | 1 << 24, WID | HGT << 16, 1 | 1 << 8])
     for di in ids:
+        sw = sws[di]
         body = [di] + sw[:11] + [(len(d.words) << 16) | 0x8000, 0, len(d.uni), sw[13]] + [0] * 8
         for u in d.uni: body += [u[c] for c in range(4)]
         cmd(0x50, body)

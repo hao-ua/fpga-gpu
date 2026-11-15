@@ -92,5 +92,23 @@ python3 tools/a_setup_ref.py 57 --z0 --mode strip --nv 60 --nidx 120 --wid 96 --
 python3 tools/a_setup_ref.py 58 --z0 --mode points --nv 60 --nidx 80 --wid 128 --hgt 64 --fsmask 27
 python3 tools/a_setup_ref.py 59 --z0 --mode lines --nv 40 --nidx 60 --wid 128 --hgt 64 --lw 3 --fsmask 27
 python3 tools/a_setup_ref.py 60 --z0 --ndraw 3 --nv 40 --nidx 120 --wid 128 --hgt 64 --fsmask 27
+# board A's coarse depth and lazy TRI items (--zc / --zcd: the draws' flags {INV 8, STRICT 4, CULL 2, OCC 1}; --cz 'd16 ds cden
+# csc cdepth': the frame's depth as its FLUSH gives it; --lazy: TRI items only where a quad follows) — tb_a_render +CZ
+# compares the RTL's stream with as_<seed>_stream_cz.hex; b_ref.py aframe renders the plain and the culled stream (the same
+# image, no visible quad culled) for tb_two_boards3d. 61 OCC LESS with every TRI item; 62 the same lazy; 63 three draws
+# LEQUAL occluder / INV / LESS occluder, 16-bit depth; 64 a strip, CULL alone, a loaded depth-stencil image cleared whole;
+# 65 points; 66 800 wide, two draws, a scissored depth clear (the start unknown: the largest); 67 1040 wide (4-line bands);
+# 68 lines, an occluder draw then an INV draw; 69 huge triangles (edge shift s > 0); 70 a scissor rectangle; 71 lazy alone
+python3 tools/a_setup_ref.py 61 --nv 60 --nidx 180 --wid 128 --hgt 64 --fsmask 27 --zc 3 --cz '0 0 1 0 0xFFFFFF'
+python3 tools/a_setup_ref.py 62 --nv 60 --nidx 180 --wid 128 --hgt 64 --fsmask 27 --zc 3 --cz '0 0 1 0 0xFFFFFF' --lazy
+python3 tools/a_setup_ref.py 63 --ndraw 3 --nv 40 --nidx 120 --wid 128 --hgt 64 --fsmask 27 --zcd 7,8,3 --cz '1 0 1 0 0xFFFF' --lazy
+python3 tools/a_setup_ref.py 64 --mode strip --nv 60 --nidx 120 --wid 96 --hgt 48 --fsmask ff --zc 2 --cz '0 1 1 0 0xFFFFFF' --lazy
+python3 tools/a_setup_ref.py 65 --mode points --nv 60 --nidx 90 --wid 128 --hgt 64 --fsmask 27 --zc 7 --cz '0 0 1 0 0xFFFFFF' --lazy
+python3 tools/a_setup_ref.py 66 --ndraw 2 --nv 120 --nidx 360 --wid 800 --hgt 64 --fsmask 27 --zc 3 --cz '0 1 1 1 0x800000' --lazy
+python3 tools/a_setup_ref.py 67 --nv 60 --nidx 180 --wid 1040 --hgt 48 --fsmask 27 --zc 3 --cz '0 0 1 0 0xFFFFFF' --lazy
+python3 tools/a_setup_ref.py 68 --mode lines --ndraw 2 --nv 60 --nidx 90 --wid 128 --hgt 64 --lw 3 --fsmask 27 --zcd 3,8 --cz '0 0 1 0 0xFFFFFF' --lazy
+python3 tools/a_setup_ref.py 69 --huge --nv 40 --nidx 150 --wid 128 --hgt 64 --fsmask 27 --zc 3 --cz '0 0 1 0 0xFFFFFF' --lazy
+python3 tools/a_setup_ref.py 70 --nv 60 --nidx 180 --wid 128 --hgt 64 --fsmask 27 --sc 37 13 91 50 --zc 3 --cz '0 0 1 0 0xFFFFFF' --lazy
+python3 tools/a_setup_ref.py 71 --nv 30 --nidx 60 --wid 128 --hgt 64 --fsmask 27 --cz '0 0 1 0 0xFFFFFF' --lazy
 python3 tools/a_raster_ref.py --check
-for s in 1 2 3 6 7 8 9 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do python3 tools/a_raster_ref.py $s; done     # the render stream of each draw (a_render)
+for s in 1 2 3 6 7 8 9 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71; do python3 tools/a_raster_ref.py $s; done     # the render stream of each draw (a_render)

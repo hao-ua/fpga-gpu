@@ -32,10 +32,11 @@ module tb_a_render;
     wire [28:0] g_ld_addr; wire [29:0] g_ad_base, g_dr_idx_base, g_ad_stride, g_ad_off; wire [11:0] g_ld_len, g_st_w, g_st_h; wire [7:0] g_param_idx, g_st_fsmask;
     wire [95:0] g_param_data, g_ac_const, g_st_vp; wire [3:0] g_ad_idx, g_ac_idx; wire g_ad_en, g_ad_norm, g_st_cw, g_st_z0, g_dr_indexed, g_dr_u8;
     wire [2:0] g_ad_size, g_ad_type, g_dr_mode; wire [31:0] g_dr_first, g_dr_count; wire [1:0] g_st_cull; wire [6:0] g_st_lw; wire [12:0] g_st_did;
-    wire [47:0] g_st_z, g_st_sc; wire [95:0] g_st_gb; wire [31:0] c_vis;
+    wire [47:0] g_st_z, g_st_sc; wire [95:0] g_st_gb; wire [31:0] c_vis; wire [6*32-1:0] c_cz;
+    wire [3:0] g_st_zc; wire g_st_lazy, g_cz_d16; wire [23:0] g_cz_init;
     wire g_rbusy, g_fb_ok, g_draw_ok, g_copy_busy;
     fb_dispatch_a #(.B_WAIT(200)) disp (.clk, .rst, .q_valid, .q_data, .q_ready, .g_render_done, .g_render, .g_rbusy, .g_fb_ok, .g_draw_ok, .g_copy_busy,
-        .g_ad_type, .g_ad_norm, .g_st_z, .g_st_gb, .g_st_sc,
+        .g_ad_type, .g_ad_norm, .g_st_z, .g_st_gb, .g_st_sc, .g_st_zc, .g_st_lazy, .g_cz_d16, .g_cz_init,
         .x_cmd_valid(x_cv), .x_op, .x_addr, .x_len, .x_seed, .x_flags, .x_cmd_ready(1'b1), .x_busy(1'b0),
         .x_wd_valid(x_wdv), .x_wd_data(x_wdd), .x_wd_ready(1'b1), .x_rd_valid(1'b0), .x_rd_data(32'd0), .x_rd_ready(x_rdr),
         .x_mt_done(1'b0), .x_mt_errors(32'd0), .x_mt_first_bad(30'd0),
@@ -74,6 +75,7 @@ module tb_a_render;
         .g_frame, .g_frame_done, .g_rbusy, .g_fb_ok, .g_draw_ok, .g_copy_busy, .g_ld_start, .g_ld_addr, .g_ld_len, .g_ld_done, .g_param_we, .g_param_idx, .g_param_data,
         .g_ad_we, .g_ad_idx, .g_ad_en, .g_ad_type, .g_ad_norm, .g_ad_base, .g_ad_size, .g_ad_stride, .g_ad_off, .g_ac_we, .g_ac_idx, .g_ac_const,
         .g_st_we, .g_st_vp, .g_st_z, .g_st_gb, .g_st_sc, .g_st_cull, .g_st_cw, .g_st_z0, .g_st_lw, .g_st_fsmask, .g_st_w, .g_st_h, .g_st_did, .c_vis,
+        .g_st_zc, .g_st_lazy, .g_cz_d16, .g_cz_init, .c_cz,
         .g_dr_start, .g_dr_mode, .g_dr_indexed, .g_dr_u8, .g_dr_idx_base, .g_dr_first, .g_dr_count, .g_render, .g_render_done, .g_abort(1'b0), .g_abort_soft(1'b0),
         .g_busy, .err_stack, .rec_ovf(), .bin_ovf(), .tri_count, .c_quads,
         .r_en, .r_addr, .r_rdy, .r_valid, .rd_data, .w_req, .w_en, .w_addr, .w_data, .w_mask, .w_wren, .w_wend, .w_rdy, .w_wdf_rdy,
@@ -97,10 +99,16 @@ module tb_a_render;
             $display("VT %0t tri issue? tid %0d fbi %0d fnb %0d bq_w %0d bq_r %0d bres %0d free %0d can %b line_go %b", $time, u_geom.u_rn.ftid, u_geom.u_rn.fbi,
                      u_geom.u_rn.fnb, u_geom.u_rn.bq_w, u_geom.u_rn.bq_r, u_geom.u_rn.bres, u_geom.u_rn.bq_free, u_geom.u_rn.can_issue, u_geom.u_rn.line_go);
         if (u_geom.u_rn.r_valid && u_geom.u_rn.fetch_on && u_geom.u_rn.kq_h[1:0] == 2'd2) $display("VT %0t tri burst in: word1 %0d (bq_w %0d)", $time, rd_data[63:32], u_geom.u_rn.bq_w);
-        if (u_geom.u_rn.st == u_geom.u_rn.W_TRIW && u_geom.u_rn.bq_cnt != 0) $display("VT %0t tri burst out: word1 %0d (bq_r %0d)", $time, u_geom.u_rn.bq[u_geom.u_rn.bq_r[3:0]][63:32], u_geom.u_rn.bq_r);
+        if (u_geom.u_rn.tb_ld) $display("VT %0t tri burst out: word1 %0d (bq_r %0d)", $time, u_geom.u_rn.bq[u_geom.u_rn.bq_r[4:0]][63:32], u_geom.u_rn.bq_r);
+        if (u_geom.u_rn.drop_now) $display("VT %0t tri burst dropped: word1 %0d (bq_r %0d, %0d to drop)", $time, u_geom.u_rn.bq[u_geom.u_rn.bq_r[4:0]][63:32], u_geom.u_rn.bq_r, u_geom.u_rn.odrop);
         if (u_geom.u_rn.st == u_geom.u_rn.W_VISIT && !u_geom.u_rn.v_empty && u_geom.u_rn.v_rdy[u_geom.u_rn.vr] && !u_geom.u_rn.soft_pend)
             $display("VT %0t visit kind %0d tid %0d first %0d", $time, u_geom.u_rn.v_kind[u_geom.u_rn.vr], u_geom.u_rn.v_tid[u_geom.u_rn.vr], u_geom.u_rn.v_first[u_geom.u_rn.vr]);
     end
+    // +CZTRACE: every coarse-depth decision (as tools/a_raster_ref.py prints them with CZ_TRACE=1)
+    always @(posedge clk) if ($test$plusargs("CZTRACE") && u_geom.u_rn.d1_v)
+        $display("CZ %0h %0h cov %0h zc %0h ok %0d lo %06h hi %06h val %06h ep %0d cut %0d inv %0d", u_geom.u_rn.d1_qx, u_geom.u_rn.d1_qy,
+                 u_geom.u_rn.d1_cov, u_geom.u_rn.d1_zc, u_geom.u_rn.d1_ok, u_geom.u_rn.d1_lo, u_geom.u_rn.d1_hi, u_geom.u_rn.d1_val,
+                 u_geom.u_rn.d1_ep, u_geom.u_rn.d1_cut, u_geom.u_rn.d1_inv);
     // the walk's fetch: the most reads in flight, the cycles the rasterizer waited for a visit's header
     int max_out = 0, hdr_wait = 0;
     always @(posedge clk) begin
@@ -144,9 +152,22 @@ module tb_a_render;
 
     initial begin
         string seed; int fd, nexp, cyc, cyc_lim, b, k, n_first; reg [31:0] bi; reg [255:0] bd; reg [63:0] bt;
-        reg [255:0] flb;
+        reg [255:0] flb; int cz_d16, cz_ds, cz_cden, cz_csc, cz_cdepth, cz_lazy; bit cz; int czc [0:5];
         if (!$value$plusargs("SEED_%s", seed)) seed = "11";
-        flb = {224'h0, 32'h0000_C000};
+        // +CZ (coarse depth / lazy TRI items): the FLUSH carries the frame's depth from as_<seed>_cz.hex (the draws' VS_STATE
+        // their flags and the lazy bit, a_setup_ref.py --zc / --lazy), the expected stream is the culled one
+        // (as_<seed>_stream_cz.hex) and A's counters must equal the model's (as_<seed>_cz_counts.hex, twice: two frames)
+        cz = $test$plusargs("CZ"); flb = {224'h0, 32'h0000_C000};
+        if (cz) begin
+            fd = $fopen({"tools/gen/as_", seed, "_cz.hex"}, "r");
+            if (fd == 0 || $fscanf(fd, "%d %d %d %d %d %d", cz_d16, cz_ds, cz_cden, cz_csc, cz_cdepth, cz_lazy) != 6) begin $display("TB_FAIL tb_a_render: no as_%s_cz.hex", seed); $finish; end
+            $fclose(fd);
+            flb[31:0] = 32'h0000_C000 | (32'(cz_csc) << 17) | (32'(cz_cden) << 23) | (32'(cz_d16) << 25);
+            flb[3*32 +: 32] = 32'(cz_cdepth); flb[6*32 +: 32] = cz_ds ? 32'h0000_C001 : 32'h0;
+            fd = $fopen({"tools/gen/as_", seed, "_cz_counts.hex"}, "r");
+            if (fd == 0 || $fscanf(fd, "%d %d %d %d %d %d", czc[0], czc[1], czc[2], czc[3], czc[4], czc[5]) != 6) begin $display("TB_FAIL tb_a_render: no as_%s_cz_counts.hex", seed); $finish; end
+            $fclose(fd);
+        end
         for (k = 0; k < 4096; k++) cmds[k] = 'x;
         $readmemh({"tools/gen/as_", seed, "_cmds.hex"}, cmds);
         ncmd = 0; while (ncmd < 4096 && !$isunknown(cmds[ncmd])) ncmd++;
@@ -189,7 +210,7 @@ module tb_a_render;
         if (fd == 0) begin $display("TB_FAIL tb_a_render: no DDR image"); $finish; end
         b = 0; while ($fscanf(fd, "%h %h", bi, bd) == 2) begin mig.mem[longint'(bi)] = bd; b++; end
         $fclose(fd);
-        fd = $fopen({"tools/gen/as_", seed, "_stream.hex"}, "r");
+        fd = $fopen({"tools/gen/as_", seed, cz ? "_stream_cz.hex" : "_stream.hex"}, "r");
         if (fd == 0) begin $display("TB_FAIL tb_a_render: no stream golden (python3 tools/a_raster_ref.py)"); $finish; end
         while ($fscanf(fd, "%h", bt) == 1) exp_beats.push_back(bt);
         $fclose(fd);
@@ -237,6 +258,12 @@ module tb_a_render;
         if (errors_ev != 0 || c_errs != 0) begin err++; $display("  %0d error events (dispatcher errors %0d, last %h seq %0d)", errors_ev, c_errs, last_err, last_err_seq); end
         if (exp_beats.size() != 0) begin err++; $display("  %0d beats of the model not produced (%0d of %0d)", exp_beats.size(), nbeat, nexp); end
         if (err_stack) begin err++; $display("  core stack violation"); end
+        // the counters (cumulative over the two frames): {blocks lowered, TRIs with no quad, TRIs held back, TRIs sent, quads sent, culled}
+        $display("AR counters: culled %0d, quads sent %0d, TRI items sent %0d, held back %0d, sent with no quad %0d, blocks lowered %0d",
+                 c_cz[0 +: 32], c_cz[32 +: 32], c_cz[64 +: 32], c_cz[96 +: 32], c_cz[128 +: 32], c_cz[160 +: 32]);
+        if (cz) for (int i = 0; i < 6; i++) if (c_cz[32*i +: 32] != 32'(2 * czc[i])) begin
+            err++; $display("  counter %0d: %0d, the model's %0d (two frames)", i, c_cz[32*i +: 32], 2 * czc[i]);
+        end
         if (mig_errors != 0) begin err++; $display("  MIG model errors %0d", mig_errors); end
         $display("AR seed %s: %0d records, %0d beats (%0d expected, two frames), %0d quads, %0d visits, %0d cycles, %0d DDR reads, %0d forwarded words, overlap %0d, errors = %0d",
                  seed, tri_count, nbeat, nexp, c_quads, c_vis, cyc, n_rd, fwd_words, overlap, err);

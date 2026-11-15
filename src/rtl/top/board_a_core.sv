@@ -175,7 +175,8 @@ module board_a_core #(
         .g_param_idx(g_param_idx), .g_st_fsmask(g_st_fsmask), .g_param_data(g_param_data), .g_ac_const(g_ac_const), .g_st_vp(g_st_vp),
         .g_ad_idx(g_ad_idx), .g_ac_idx(g_ac_idx), .g_ad_en(g_ad_en), .g_ad_type(g_ad_type), .g_ad_norm(g_ad_norm), .g_st_cw(g_st_cw), .g_st_z0(g_st_z0), .g_dr_indexed(g_dr_indexed), .g_dr_u8(g_dr_u8),
         .g_ad_size(g_ad_size), .g_dr_mode(g_dr_mode), .g_ad_stride(g_ad_stride), .g_ad_off(g_ad_off), .g_dr_first(g_dr_first),
-        .g_dr_count(g_dr_count), .g_st_cull(g_st_cull), .g_st_lw(g_st_lw), .g_st_did(g_st_did), .g_st_z(g_st_z), .g_st_gb(g_st_gb), .g_st_sc(g_st_sc));
+        .g_dr_count(g_dr_count), .g_st_cull(g_st_cull), .g_st_lw(g_st_lw), .g_st_did(g_st_did), .g_st_z(g_st_z), .g_st_gb(g_st_gb), .g_st_sc(g_st_sc),
+        .g_st_zc(g_st_zc), .g_st_lazy(g_st_lazy), .g_cz_d16(g_cz_d16), .g_cz_init(g_cz_init));
     // ---------------- the geometry stage (3D on A): two banks of records (64 MB + 128 MB each) and
     //                  bin lists (320 MB + 32 MB each), the host heap from 384 MB ----------------
     wire        g_busy, g_rbusy, g_fb_ok, g_draw_ok, g_copy_busy, g_frame_done, g_ld_done, g_frame, g_ld_start, g_param_we, g_ad_we, g_ac_we, g_st_we, g_dr_start, g_err_stack;
@@ -185,7 +186,8 @@ module board_a_core #(
     wire [95:0] g_param_data, g_ac_const, g_st_vp; wire [3:0] g_ad_idx, g_ac_idx; wire g_ad_en, g_ad_norm, g_st_cw, g_st_z0, g_dr_indexed, g_dr_u8;
     wire [2:0]  g_ad_size, g_ad_type, g_dr_mode; wire [31:0] g_dr_first, g_dr_count; wire [1:0] g_st_cull; wire [12:0] g_st_did;
     wire [6:0]  g_st_lw; wire [19:0] g_tri_count;
-    wire [31:0] g_c_vis; wire [13*32-1:0] g_prof;
+    wire [31:0] g_c_vis; wire [13*32-1:0] g_prof; wire [6*32-1:0] g_c_cz;
+    wire [3:0]  g_st_zc; wire g_st_lazy, g_cz_d16; wire [23:0] g_cz_init;
     a_geom #(.REC_BASE(29'h1000000), .REC_BANK_W(29'h2000000), .BINLIST_BASE(29'h5000000), .POOL_W(29'h800000)) u_geom (.clk(clk_sys), .rst(rst_ddr),
         .g_frame(g_frame), .g_frame_done(g_frame_done), .g_rbusy(g_rbusy), .g_fb_ok(g_fb_ok), .g_draw_ok(g_draw_ok), .g_copy_busy(g_copy_busy),
         .g_ld_start(g_ld_start), .g_ld_addr(g_ld_addr), .g_ld_len(g_ld_len), .g_ld_done(g_ld_done),
@@ -194,6 +196,7 @@ module board_a_core #(
         .g_ad_stride(g_ad_stride), .g_ad_off(g_ad_off),
         .g_ac_we(g_ac_we), .g_ac_idx(g_ac_idx), .g_ac_const(g_ac_const),
         .g_st_we(g_st_we), .g_st_vp(g_st_vp), .g_st_z(g_st_z), .g_st_gb(g_st_gb), .g_st_sc(g_st_sc), .g_st_cull(g_st_cull), .g_st_cw(g_st_cw), .g_st_z0(g_st_z0), .g_st_lw(g_st_lw), .g_st_fsmask(g_st_fsmask), .g_st_w(g_st_w), .g_st_h(g_st_h), .g_st_did(g_st_did),
+        .g_st_zc(g_st_zc), .g_st_lazy(g_st_lazy), .g_cz_d16(g_cz_d16), .g_cz_init(g_cz_init), .c_cz(g_c_cz),
         .g_dr_start(g_dr_start), .g_dr_mode(g_dr_mode), .g_dr_indexed(g_dr_indexed), .g_dr_u8(g_dr_u8), .g_dr_idx_base(g_dr_idx_base),
         .g_dr_first(g_dr_first), .g_dr_count(g_dr_count), .g_render(g_render), .g_abort(g_abort), .g_abort_soft(g_abort_soft), .g_render_done(g_render_done),
         .c_vis(g_c_vis), .prof(g_prof),
@@ -387,6 +390,11 @@ module board_a_core #(
     end endgenerate
     assign sw[114] = c_hdr_wait;
     assign sw[115] = c_gwait;
+    // layout 12: the render side's coarse depth and TRI items, cumulative (a_render): quads culled, quads sent, TRI items sent,
+    // TRI items held back and dropped (no quad followed), TRI items sent for a visit that then sent no quad, blocks lowered
+    generate for (gi = 0; gi < 6; gi = gi + 1) begin : g_cz
+        assign sw[116 + gi] = g_c_cz[gi*32 +: 32];
+    end endgenerate
     generate for (gi = 0; gi < STATUS_WORDS; gi = gi + 1) begin : g_vec
         assign status_vec[gi*32 +: 32] = sw[gi];
     end endgenerate

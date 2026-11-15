@@ -69,7 +69,8 @@ while {![file exists $stopf]} {
     # frame read as 48 fails the sequence check or shows a layout below 4
     set b [read_words $tB 48]
     if {[llength $b] == 0 || [lindex $b 0] < 0xB0000004} { set b [read_words $tB 24] }
-    set a [read_words $tA 116]                          ;# STATUS layout 10: 116 words, as a_status_jtag.tcl
+    set a [read_words $tA 122]                          ;# STATUS layout 12: 122 words (116 before), as a_status_jtag.tcl
+    if {[llength $a] == 0 || [lindex $a 0] < 12} { set a [read_words $tA 116] }
     if {[llength $a] == 0 || [llength $b] == 0} {
         puts $fd "$t READ_FAIL a [llength $a] b [llength $b]"
     } else {

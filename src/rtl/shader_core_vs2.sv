@@ -6,14 +6,14 @@
 //   register rs_k). The stages F (prefetch) | S (select: oldest ready warp, hazards, control flow) | X (register / uniform /
 //   attribute addresses) | X2 (operands, routing, dispatch) | W (one write per cycle), the scheduled / buffered write
 //   rules, the chains for DP3 / DP4 (two accumulators per warp, bit-identical to float_dot4_sum's (p0 + p1) + (p2 + p3)),
-//   the quarter-rate units (SFU, SIN / COS, convert, IMUL, the divider as NL / 4 rounds of 4 lanes; no IOP: no language
+//   the quarter-rate units (SFU, SIN / COS, convert, IMUL, the divider as 4 rounds of NL / 4 lanes; no IOP: no language
 //   of the GL <= 2.0 era can express it) and the control flow (IF / ELSE / ENDIF,
 //   LOOP / ENDL / BREAK / CONT, BRA, SETP; a stack violation or an IOP stops the warp with err, err_stack sticky) are
 //   those of shader_core_fs2 — see its header; so are the one-hot issue grant and the registered head classes.
 //   The lane count changes only how many vertices a warp carries: every per-lane part (attribute, uniform and output
-//   stores, register file, lane units, operand routing, write-back, masks, collectors) is NL wide; the quarter-rate
-//   units stay 4, fed for NL / 4 cycles (lane (NL / 4) k + i through unit k in feed cycle i), and their micro-ops keep
-//   issuing at most every 4th cycle for every NL (the collectors' timing argument below).
+//   stores, register file, lane units, operand routing, write-back, masks, collectors) is NL wide, and so is the
+//   quarter-rate path: NU = NL / 4 sets of units, every micro-op fed for 4 cycles (lane 4k + i through unit k in feed
+//   cycle i) and issued at most every 4th cycle, the 16-lane timing for every NL.
 //   What differs:
 //   - INPUTS: 16 vertex attributes per lane. LDV i (i = 0..15, swizzled per component) reads the ATTRIBUTE STORE: per lane
 //     a block RAM of {warp, attribute} x vec4, written one attribute of one lane per cycle (va_*) for the warp being filled
@@ -102,7 +102,7 @@ module shader_core_vs2 #(
 );
     localparam int W = 1 + EXP_W + MAN_W, TW = 4*W, LW = NL*W;      // scalar, vec4, one component of NL lanes
     localparam int LNW = (NL > 1) ? $clog2(NL) : 1;                 // lane index
-    localparam int NC = NL / 4;                                     // quarter-rate feed cycles (4 units)
+    localparam int NU = NL / 4;                                     // quarter-rate unit sets (each fed for 4 cycles)
     if (NL != 16 && NL != 8 && NL != 4) $fatal(1, "shader_core_vs2: NL must be 16, 8 or 4");
     localparam int AW = $clog2(IRAM_DEPTH), PAW = $clog2(NPARAM), WW = (NWARP > 1) ? $clog2(NWARP) : 1;
     localparam int NAW = $clog2(NATTR);                             // attribute index
@@ -595,8 +595,7 @@ module shader_core_vs2 #(
             if (issue) begin x_w <= sel; x_ins <= s_ins; x_rc <= s_rc; x_wc <= s_wc; x_mk <= s_mk; x_am <= s_am; end
             // the write lands 2 + lat cycles after this S cycle = 1 + lat cycles after the next one (checked there)
             wb_busy <= (wb_busy >> 1) | s_wbm;
-            // quarter-rate micro-ops 4 cycles apart for every NL (the feeder is busy NC cycles from X2; the collectors
-            // rely on the spacing of 4); in flight per class
+            // quarter-rate micro-ops 4 cycles apart (the feeder is busy 4 cycles from X2); in flight per class
             qr_hold <= s_qr ? 3'd3 : (qr_hold != 3'd0) ? qr_hold - 3'd1 : 3'd0;
             inf_sfu <= inf_sfu + 2'(s_sfu) - 2'(bw_sfu);
             inf_sc  <= inf_sc  + 2'(s_sc)  - 2'(bw_sc);
@@ -794,7 +793,7 @@ module shader_core_vs2 #(
     end
 
     // ================================================================ quarter-rate feeder and units
-    // X2 captures the NL-lane operands and starts the NC-cycle feed (NC = NL / 4); cycle i sends lane NC k + i to unit k
+    // X2 captures the NL-lane operands and starts the 4-cycle feed; cycle i sends lane 4k+i to unit k (NU units)
     reg qr_run; reg [1:0] qr_i; reg [LW-1:0] qr_x, qr_x2; reg [4:0] qr_cls; reg [1:0] qr_sfuop; reg qr_cos;
     reg [2:0] qr_cvtop; reg [1:0] qr_divmode;
     wire qr_start = x2_valid & x2_qr;
@@ -802,25 +801,27 @@ module shader_core_vs2 #(
     always @(posedge clk) begin
         if (rst) begin qr_run <= 1'b0; qr_i <= 2'd0; end
         else if (qr_start) begin qr_run <= 1'b1; qr_i <= 2'd0; end
-        else if (qr_run) begin qr_i <= (qr_i == 2'(NC-1)) ? 2'd0 : qr_i + 2'd1; if (qr_i == 2'(NC-1)) qr_run <= 1'b0; end
+        else if (qr_run) begin qr_i <= qr_i + 2'd1; if (qr_i == 2'd3) qr_run <= 1'b0; end
         if (qr_start) begin
             qr_x <= (x2_imul | x2_idiv) ? ar : a_m; qr_x2 <= br;   // integers: raw registers
             qr_cls <= {x2_idiv, x2_imul, x2_cvt, x2_sc, x2_sfu}; qr_sfuop <= x2_sfuop; qr_cos <= x2_cos;
             qr_cvtop <= x2_cvtop; qr_divmode <= x2_divmode;
         end
     end
-    wire [W-1:0] ux [0:3], ux2 [0:3];                               // unit k's operands this feed cycle
-    wire [3:0] u_sfu_ov, u_sc_ov, u_cvt_ov;
-    wire [W-1:0] u_sfu_y [0:3], u_sc_y [0:3], u_cvt_y [0:3], u_imul_y [0:3];
-    wire [4*W-1:0] int4_a, int4_b, int4_ym, y_div4; wire int4_vm;
+    wire [W-1:0] ux [0:NU-1], ux2 [0:NU-1];                         // unit k's operands this feed cycle
+    wire [NU-1:0] u_sfu_ov, u_sc_ov, u_cvt_ov;
+    wire [W-1:0] u_sfu_y [0:NU-1], u_sc_y [0:NU-1], u_cvt_y [0:NU-1], u_imul_y [0:NU-1];
+    wire [NU*W-1:0] int4_a, int4_b, int4_ym, y_div4; wire int4_vm;
     reg [2:0] cv_d1, cv_d2;                                         // convert: the op travels with its results
     always @(posedge clk) begin cv_d1 <= qr_cvtop; cv_d2 <= cv_d1; end
-    // the SFUs' tables: inside each unit, or (SFU_TAB2) one sfu_tab2 per pair of units
+    // the SFUs' tables: inside each unit, or (SFU_TAB2) one sfu_tab2 per pair of units (units 0 + 1, 2 + 3); a single
+    // unit (NU 1) has no pair and keeps its own tables
     localparam int SK = (EXP_W >= 7) ? 12 : 8, SKL = (EXP_W >= 7) ? 11 : 8;
-    wire [SK-1:0] tr_a [0:3], ts_a [0:3]; wire [SKL-1:0] tl_i [0:3], te_i [0:3];
-    wire [MAN_W+1:0] tr_q [0:3], ts_q [0:3]; wire [23:0] tla [0:3], tlb [0:3], tea [0:3], teb [0:3];
-    generate if (SFU_TAB2) begin : g_tab
-        for (genvar gp = 0; gp < 2; gp++) begin : TP
+    localparam bit TABX = SFU_TAB2 && (NU >= 2);
+    wire [SK-1:0] tr_a [0:NU-1], ts_a [0:NU-1]; wire [SKL-1:0] tl_i [0:NU-1], te_i [0:NU-1];
+    wire [MAN_W+1:0] tr_q [0:NU-1], ts_q [0:NU-1]; wire [23:0] tla [0:NU-1], tlb [0:NU-1], tea [0:NU-1], teb [0:NU-1];
+    generate if (TABX) begin : g_tab
+        for (genvar gp = 0; gp < NU / 2; gp++) begin : TP
             sfu_tab2 #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(SK), .KLOG(SKL), .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM),
                        .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM)) u_tab (.clk,
                 .rcp_a0(tr_a[2*gp]), .rcp_a1(tr_a[2*gp+1]), .rsq_a0(ts_a[2*gp]), .rsq_a1(ts_a[2*gp+1]),
@@ -830,16 +831,16 @@ module shader_core_vs2 #(
                 .ea0(tea[2*gp]), .eb0(teb[2*gp]), .ea1(tea[2*gp+1]), .eb1(teb[2*gp+1]));
         end
     end else begin : g_ntab
-        for (genvar gq = 0; gq < 4; gq++) begin : TZ
+        for (genvar gq = 0; gq < NU; gq++) begin : TZ
             assign {tr_q[gq], ts_q[gq], tla[gq], tlb[gq], tea[gq], teb[gq]} = '0;
         end
     end endgenerate
     genvar gu;
-    generate for (gu = 0; gu < 4; gu = gu + 1) begin : QU
-        assign ux[gu]  = qr_x [(NC*gu + qr_i)*W +: W];
-        assign ux2[gu] = qr_x2[(NC*gu + qr_i)*W +: W];
+    generate for (gu = 0; gu < NU; gu = gu + 1) begin : QU
+        assign ux[gu]  = qr_x [(4*gu + qr_i)*W +: W];
+        assign ux2[gu] = qr_x2[(4*gu + qr_i)*W +: W];
         float_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(SK), .KLOG(SKL), .SPLIT6(SFU_SPLIT6), .SPLIT1B(SFU_SPLIT1B),
-            .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM), .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM), .TAB_EXT(SFU_TAB2)) u_sfu (
+            .RCP_MEM(RCP_MEM), .RSQRT_MEM(RSQRT_MEM), .LOG2_MEM(LOG2_MEM), .EXP2_MEM(EXP2_MEM), .TAB_EXT(TABX)) u_sfu (
             .clk, .rst, .in_valid(qr_run & qr_cls[0]), .op({1'b0, qr_sfuop}), .x(ux[gu]),
             .out_valid(u_sfu_ov[gu]), .result(u_sfu_y[gu]),
             .t_rcp_a(tr_a[gu]), .t_rsq_a(ts_a[gu]), .t_log_i(tl_i[gu]), .t_exp_i(te_i[gu]),
@@ -865,43 +866,41 @@ module shader_core_vs2 #(
         assign int4_a[gu*W +: W] = ux[gu]; assign int4_b[gu*W +: W] = ux2[gu];
         assign u_imul_y[gu] = int4_ym[gu*W +: W];
     end endgenerate
-    // the integer unit: IMUL (one DSP per lane, latency 3) and the divider on the 4 quarter-rate lanes (as in the
-    // fragment core), their results buffered like the SFU's. The divider takes a warp's NL lanes as NC rounds (DSEQ,
-    // ≈ 27 NC cycles, one in flight) and returns them as NC cycles of 4 lanes. The unit's IOP section is tied off.
-    int_unit #(.NL(4), .W(W), .ONE(ONE1), .DSEQ(NC), .HAS_DIV(INT_DIV)) u_int4 (.clk, .rst, .a(int4_a), .b(int4_b),
+    // the integer unit: IMUL (one DSP per lane, latency 3) and the divider on the NU quarter-rate lanes (as in the
+    // fragment core), their results buffered like the SFU's. The divider takes a warp's NL lanes as 4 rounds of NU (DSEQ,
+    // ≈ 108 cycles, one in flight) and returns them as 4 cycles of NU lanes. The unit's IOP section is tied off.
+    int_unit #(.NL(NU), .W(W), .ONE(ONE1), .DSEQ(4), .HAS_DIV(INT_DIV)) u_int4 (.clk, .rst, .a(int4_a), .b(int4_b),
         .mul_valid(qr_run & qr_cls[3]), .v_mul(int4_vm), .y_mul(int4_ym),
         .div_valid(qr_run & qr_cls[4]), .div_mode(qr_divmode), .div_ready(idiv_ready), .v_div(v_div), .y_div(y_div4),
         .iop_valid(1'b0), .iop_fn(4'd0), .v_iop(), .y_iop());
-    // collectors: the 4 results of cycle i land in lanes NC k + i; a collector is full after the NC-th cycle and is taken,
+    // collectors: the NU results of cycle i land in lanes 4k+i; a collector is full after the 4th cycle and is taken,
     // with the micro-op's meta (queued at the feed start), into ONE shared 8-entry result queue (LUTRAM): one class
     // per cycle, the longest-waiting class first (see shader_core_fs2 for the timing argument; asserted below).
-    // A class's next stream starts 4 cycles after its previous one at the earliest (qr_hold). NC = 4: its first result
-    // lands the cycle after the previous stream's last, over slot 0 (lanes 4k) of a collector that may still wait for
-    // its take: slot 0 is saved (sh0). NC < 4: the previous stream is full NC cycles after its first result and taken
-    // within 2 cycles, before the next stream's first result (4 cycles after) — no overlap, sh0 is never used.
     wire [3:0] qc_ov = {int4_vm, u_cvt_ov[0], u_sc_ov[0], u_sfu_ov[0]};
     wire [3:0] qc_start = qr_start ? {x2_imul, x2_cvt, x2_sc, x2_sfu} : 4'd0;
     wire [3:0] qc_full, qc_wait; reg [3:0] qc_take;                 // collector full / full since the previous cycle / taken
     wire [LW-1:0] qc_col [0:3]; wire [MW-1:0] qc_m [0:3];
     genvar gc;
     generate for (gc = 0; gc < 4; gc = gc + 1) begin : QC
-        wire [W-1:0] uy [0:3];
-        if (gc == 0) begin assign uy[0] = u_sfu_y[0]; assign uy[1] = u_sfu_y[1]; assign uy[2] = u_sfu_y[2]; assign uy[3] = u_sfu_y[3]; end
-        else if (gc == 1) begin assign uy[0] = u_sc_y[0]; assign uy[1] = u_sc_y[1]; assign uy[2] = u_sc_y[2]; assign uy[3] = u_sc_y[3]; end
-        else if (gc == 2) begin assign uy[0] = u_cvt_y[0]; assign uy[1] = u_cvt_y[1]; assign uy[2] = u_cvt_y[2]; assign uy[3] = u_cvt_y[3]; end
-        else begin assign uy[0] = u_imul_y[0]; assign uy[1] = u_imul_y[1]; assign uy[2] = u_imul_y[2]; assign uy[3] = u_imul_y[3]; end
-        reg [1:0] cnt; reg [LW-1:0] col; reg full, waitq, sh_v; reg [4*W-1:0] sh0;
+        wire [W-1:0] uy [0:NU-1];
+        for (genvar gk2 = 0; gk2 < NU; gk2 = gk2 + 1) begin : UY
+            if (gc == 0)      begin : S assign uy[gk2] = u_sfu_y[gk2];  end
+            else if (gc == 1) begin : C assign uy[gk2] = u_sc_y[gk2];   end
+            else if (gc == 2) begin : V assign uy[gk2] = u_cvt_y[gk2];  end
+            else              begin : M assign uy[gk2] = u_imul_y[gk2]; end
+        end
+        reg [1:0] cnt; reg [LW-1:0] col; reg full, waitq, sh_v; reg [NU*W-1:0] sh0;
         reg [MW-1:0] mq [0:1]; reg mq_wp, mq_rp;                    // meta of the ops fed, in order
         always @(posedge clk) begin
             if (rst) begin cnt <= 2'd0; full <= 1'b0; waitq <= 1'b0; sh_v <= 1'b0; mq_wp <= 1'b0; mq_rp <= 1'b0; end
             else begin
                 if (qc_start[gc]) begin mq[mq_wp] <= x2_meta; mq_wp <= ~mq_wp; end
                 if (qc_ov[gc]) begin
-                    for (int k = 0; k < 4; k++) col[(NC*k + cnt)*W +: W] <= uy[k];
-                    cnt <= (cnt == 2'(NC-1)) ? 2'd0 : cnt + 2'd1;
-                    if (cnt == 2'(NC-1)) full <= 1'b1;
-                    if (NC == 4 && cnt == 2'd0 && full && !qc_take[gc]) begin   // the next stream overwrites slot 0 before the take
-                        for (int k = 0; k < 4; k++) sh0[k*W +: W] <= col[(NC*k)*W +: W];
+                    for (int k = 0; k < NU; k++) col[(4*k + cnt)*W +: W] <= uy[k];
+                    cnt <= cnt + 2'd1;
+                    if (cnt == 2'd3) full <= 1'b1;
+                    if (cnt == 2'd0 && full && !qc_take[gc]) begin   // the next stream overwrites slot 0 before the take
+                        for (int k = 0; k < NU; k++) sh0[k*W +: W] <= col[(4*k)*W +: W];
                         sh_v <= 1'b1;
                     end
                 end
@@ -910,12 +909,12 @@ module shader_core_vs2 #(
             end
         end
         reg [LW-1:0] col_o;
-        always @* begin col_o = col; if (sh_v) for (int k = 0; k < 4; k++) col_o[(NC*k)*W +: W] = sh0[k*W +: W]; end
+        always @* begin col_o = col; if (sh_v) for (int k = 0; k < NU; k++) col_o[(4*k)*W +: W] = sh0[k*W +: W]; end
         assign qc_full[gc] = full; assign qc_wait[gc] = waitq; assign qc_col[gc] = col_o; assign qc_m[gc] = mq[mq_rp];
         // synthesis translate_off
         always @(posedge clk) if (!rst && full && waitq && !qc_take[gc]) $fatal(1, "shader_core_vs2: collector %0d waited 2 cycles", gc);
         // a stream's last result over a collector still full (its result would be lost)
-        always @(posedge clk) if (!rst && qc_ov[gc] && cnt == 2'(NC-1) && full) $fatal(1, "shader_core_vs2: collector %0d overrun", gc);
+        always @(posedge clk) if (!rst && qc_ov[gc] && cnt == 2'd3 && full) $fatal(1, "shader_core_vs2: collector %0d overrun", gc);
         // synthesis translate_on
     end endgenerate
     (* ram_style="distributed" *) reg [LW+MW+2-1:0] rq [0:7];       // {class, meta, result}
@@ -941,17 +940,17 @@ module shader_core_vs2 #(
     // synthesis translate_off
     always @(posedge clk) if (!rst && rq_push && rq_cnt == 4'd8 && !bw_q) $fatal(1, "shader_core_vs2: result queue overflow");
     // synthesis translate_on
-    // divider result (one in flight): the unit returns a warp's NL lanes as NC cycles of 4 (lanes NC k + i in cycle i,
-    // the feed order), assembled here; the next IDIV waits for this write (inf_idiv) and for the unit (idiv_ready)
+    // divider result (one in flight): the unit returns a warp's NL lanes as 4 cycles of NU (lanes 4k + i in cycle i, the
+    // feed order), assembled here; the next IDIV waits for this write (inf_idiv) and for the unit (idiv_ready)
     reg idiv_pend; reg [LW-1:0] idiv_y; reg [MW-1:0] idiv_m; reg [1:0] idv_i;
     always @(posedge clk) begin
         if (rst) begin idiv_pend <= 1'b0; idv_i <= 2'd0; end
         else begin
             if (x2_valid & x2_idiv) idiv_m <= x2_meta;
-            if (v_div) begin idv_i <= (idv_i == 2'(NC-1)) ? 2'd0 : idv_i + 2'd1; if (idv_i == 2'(NC-1)) idiv_pend <= 1'b1; end
+            if (v_div) begin idv_i <= idv_i + 2'd1; if (idv_i == 2'd3) idiv_pend <= 1'b1; end
             else if (bw_idiv) idiv_pend <= 1'b0;
         end
-        if (v_div) for (int k = 0; k < 4; k++) idiv_y[(NC*k + idv_i)*W +: W] <= y_div4[k*W +: W];
+        if (v_div) for (int k = 0; k < NU; k++) idiv_y[(4*k + idv_i)*W +: W] <= y_div4[k*W +: W];
     end
 
     // ================================================================ W: the write port
@@ -1003,6 +1002,6 @@ module shader_core_vs2 #(
 
     // ================================================================ outputs of the oldest warp
     assign out_err = err_v[rp];
-    wire _unused = &{1'b0, vm, vc, u_sfu_ov[3:1], u_sc_ov[3:1], u_cvt_ov[3:1]};
+    wire _unused = &{1'b0, vm, vc, u_sfu_ov, u_sc_ov, u_cvt_ov};
 endmodule
 `default_nettype wire

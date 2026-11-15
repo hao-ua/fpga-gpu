@@ -322,6 +322,7 @@ module a_render #(
     reg signed [EW-1:0] num;                       // (na - 8 (lw - 1)) dm + (16 c + 8 - ma) dn, sign(dm) applied
     reg signed [EW-1:0] lp1, lp2;
     reg signed [EW-1:0] lq1, lq2;                  // dx^2, dy^2 for the reference values (the sequencer's; lp1 / lp2 are the walk's)
+    reg signed [17:0] nlw;                         // na - 8 (lw - 1): the numerator's first factor (W_LS2B)
     reg signed [17:0] lo_rq, hi_rq;                // the major range before the clamps (registered: timing)
     reg         lp_empty;                          // the pair has no quad in the band (W_LPAIR -> W_LPAIR2)
     reg [EW-1:0] dv_n, dv_q; reg [21:0] dv_r; reg [5:0] dv_i; reg dv_neg;   // the restoring divider: |num| / den
@@ -583,12 +584,13 @@ module a_render #(
                 hi_c = (hi_rq > l_hi) ? l_hi : hi_rq;
                 lc_lo <= lo_c[11:0]; lc_hi <= hi_c[11:0]; cc <= lo_c[11:0];
                 bbox_ok <= !(lo_c > hi_c) && !(hi_rq < 0);
-                // the numerator at the first major pixel: (na - 8 (lw - 1)) dm + (16 lo + 8 - ma) dn — the first product, from
-                // the registered na / dm (timing: not from the xmaj mux)
-                lp1 <= (18'(na) - $signed(18'({lw, 3'd0})) + 18'sd8) * dm;
+                // the numerator at the first major pixel: (na - 8 (lw - 1)) dm + (16 lo + 8 - ma) dn — the first factor
+                // registered here (timing: the line width's subtract in front of the DSP is too long), both products next
+                nlw <= 18'(na) - $signed(18'({lw, 3'd0})) + 18'sd8;
                 st <= W_LS2C;
             end
-            W_LS2C: begin                                                // the numerator's second product
+            W_LS2C: begin                                                // the numerator's two products
+                lp1 <= nlw * dm;
                 lp2 <= ($signed(18'({lc_lo, 4'd8})) - 18'(ma)) * dn;
                 st <= W_LS3;
             end
@@ -749,16 +751,19 @@ module a_render #(
     // the blocks: {in use, band epoch[9:0], depth[23:0]}, one RAMB36 (1024 blocks a band; the epoch advances at each BAND, so
     // nothing is cleared between bands: the memory is scrubbed once per frame, 1024 cycles before the walk's first visit)
     (* ram_style = "block" *) reg [34:0] cz_mem [0:1023];
-    reg  [34:0] cz_rd0, cz_rd;                               // the read (D0), the RAM's output register (E): D1's
+    reg  [34:0] cz_rd0;                                      // the read (D0)
     // D1's last two updates (u1: a cycle before, u2: two): the read two cycles before D1 cannot have seen them (the one two
-    // cycles back wrote in the read's own cycle). Every decision then sees every earlier update.
-    reg         u1_v, u2_v; reg [9:0] u1_a, u2_a; reg [34:0] u1_d, u2_d;
+    // cycles back wrote in the read's own cycle). Every decision then sees every earlier update. E resolves what D1 takes,
+    // from registers and the RAM's latch: rd_val = the read block's bound (its depth if written in this band, else the
+    // frame's start), r_s1 / r_s2 = u1 / u2 is the same block of the same band (a write of another band's block is
+    // none of this quad's business: its block is still the start value here)
+    reg         u1_v, u2_v; reg [9:0] u1_a, u2_a, u1_e; reg [34:0] u1_d, u2_d;
+    reg  [23:0] rd_val; reg r_s1, r_s2;
     reg  [9:0]  sc_i; reg [9:0] cz_ep; reg inv_band, fr_act; reg cut_q, occ_q;
     // E and D1: the quad whose block is being read
     reg         e_v, e_ok, e_inv, e_vis, e_band, d1_band; reg [3:0] e_i, e_cov; reg [2:0] e_zc; reg [23:0] e_lo, e_hi; reg [10:0] e_qx, e_qy; reg [9:0] e_ep, e_wa;
     reg         d1_v, d1_ok, d1_inv, d1_vis; reg [3:0] d1_i, d1_cov; reg [2:0] d1_zc; reg [23:0] d1_lo, d1_hi;
     reg  [10:0] d1_qx, d1_qy; reg [9:0] d1_ep, d1_wa;
-    wire [34:0] cz_q = (u1_v && u1_a == d1_wa) ? u1_d : (u2_v && u2_a == d1_wa) ? u2_d : cz_rd;   // the block as D1 sees it
     // an occluder quad at an even qx waiting for its pair
     reg         pd_v, pd_vis; reg [10:0] pd_qx, pd_qy; reg [23:0] pd_hi; reg [9:0] pd_ep;   // (pd_ep: the simulation's check)
     wire [3:0]  dq = cl_tag;
@@ -766,7 +771,7 @@ module a_render #(
     wire        d0_quad = cl_v && (oq_t[dq] == Q_QUAD);
     // the quad's block: {its quad row in the band, qx >> 1}
     wire [9:0]  d0_ra = nl8 ? {db0[13:12], db0[8:1]} : {db0[12], db0[9:1]};
-    wire [23:0] d1_val = (cz_q[34] && cz_q[33:24] == d1_ep) ? cz_q[23:0] : czf_init;    // the block's bound
+    wire [23:0] d1_val = r_s1 ? u1_d[23:0] : r_s2 ? u2_d[23:0] : rd_val;              // the block's bound as D1 sees it
     // the flags: [0] cull, [1] with [0] occluder / without it INV, [2] strict
     wire        d1_cut  = d1_zc[0] && d1_ok && !d1_inv && (d1_zc[2] ? (d1_lo > d1_val) : (d1_lo >= d1_val));
     wire        d1_full = d1_zc[0] && d1_zc[1] && d1_ok && (d1_cov == 4'hF);
@@ -776,17 +781,19 @@ module a_render #(
     wire        d1_we = d1_v && d1_full && d1_qx[0] && pd_v && pd_vis == d1_vis && pd_qy == d1_qy && pd_qx == d1_qx - 11'd1;
     wire [34:0] d1_wd = {1'b1, d1_ep, (pair_hi < d1_val) ? pair_hi : d1_val};
     // the block memory on its own: ONE write port (the frame's scrub, else D1's update; they never meet, the scrub ends
-    // before the frame's first entry) and a read every cycle into the RAM's output register (cz_rd0 -> cz_rd: the RAM's
-    // clock-to-out is off D1's path), so it maps on a RAMB36 — written in the control block with two write ports it would
-    // not (flip-flops and LUTs by the ten thousand).
+    // before the frame's first entry) and a read every cycle (D0), whose result E checks into rd_val, so it maps on a
+    // RAMB36 — written in the control block with two write ports it would not (flip-flops and LUTs by the ten thousand).
     wire        cz_we = !rst && !abort && (scrub || d1_we);
     wire [9:0]  cz_wa = scrub ? sc_i : d1_wa;
     wire [34:0] cz_wd = scrub ? 35'd0 : d1_wd;
     always @(posedge clk) begin
         if (cz_we) cz_mem[cz_wa] <= cz_wd;
         cz_rd0 <= cz_mem[d0_ra];                                // block (qy's row in the band, qx >> 1)
-        cz_rd <= cz_rd0;
-        u1_v <= d1_we && !rst && !abort; u1_a <= d1_wa; u1_d <= d1_wd;
+        // E: the quad in e_* (its read in cz_rd0); D1 holds the quad ahead, whose update (d1_we) becomes u1, u1 becomes u2
+        rd_val <= (cz_rd0[34] && cz_rd0[33:24] == e_ep) ? cz_rd0[23:0] : czf_init;
+        r_s1 <= d1_we && d1_wa == e_wa && d1_ep == e_ep;
+        r_s2 <= u1_v && u1_a == e_wa && u1_e == e_ep;
+        u1_v <= d1_we && !rst && !abort; u1_a <= d1_wa; u1_e <= d1_ep; u1_d <= d1_wd;
         u2_v <= u1_v && !rst && !abort; u2_a <= u1_a; u2_d <= u1_d;
     end
     // ---- out: the head entry once decided. A visit's entry closes the visit before it (a TRI item held and never sent:

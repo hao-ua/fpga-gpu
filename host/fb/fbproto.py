@@ -87,6 +87,12 @@ MAX_DATA = 1440            # data bytes per WRITE_* datagram with a 1500-byte MT
 RD_CHUNK = 1440            # READ_DATA chunk size used by the board
 HEAP_A = 0x1800_0000       # board A host heap: [384 MB, 1 GB) (below: the ingress ring, two banks of records and bin lists)
 HEAP_A_END = 0x4000_0000
+HEAP_B, HEAP_B_END = 0x1000_0000, 0x4000_0000                   # board B host heap: [256 MB, 1 GB)
+# one address space (board A's STATUS flags bit 29: boards A and B are one chip with one DDR): A's buffers in [256 MB, 448 MB),
+# B's images, programs and MEM_WRITE / MEM_READ in [464 MB, 1 GB). 0-256 MB (A's ring, records, bin lists) and 448-464 MB (B's
+# draw buckets) are never the host's: the board refuses them with ERR_HEAP. heaps() picks the map
+ONE_HEAP_A, ONE_HEAP_A_END = 0x1000_0000, 0x1C00_0000
+ONE_HEAP_B, ONE_HEAP_B_END = 0x1D00_0000, 0x4000_0000
 
 STATUS_NAMES = [
     "layout", "build", "uptime_ms", "flags", "phy", "rx_ok", "rx_fcs", "rx_len", "rx_ovf", "rx_er", "arp", "icmp",
@@ -289,6 +295,8 @@ def decode_flags(f):
             "tap": (f >> 8) & 31, "rxdly": (f >> 13) & 1, "adv1000": (f >> 14) & 1, "phyad": (f >> 16) & 31,
             # layout 11: the DHCP client
             "dhcp": (f >> 21) & 15, "ip_valid": (f >> 25) & 1, "ip_leased": (f >> 26) & 1,
+            # one DDR address space for both halves (ONE_HEAP_*)
+            "one_space": (f >> 29) & 1,
             # the vertex core lacks the integer divider / SIN / COS (glslc noops for the vertex stage: (f >> 30) & 3)
             "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}
 
@@ -299,6 +307,14 @@ def stage_noops(st):
     (every two-board build); a board without the bits reads 0 there as well"""
     return {'vs': (st.get('flags', 0) >> 30) & 3,
             'fs': (st.get('b_flags', 0) >> 30) & 3 if st.get('layout', 0) >= 2 else 0}
+
+
+def heaps(st):
+    """{'a': (base, end), 'b': (base, end)}: the host heaps of the board pair a STATUS snapshot comes from (gpu2core g2_heaps);
+    the two-board map for a snapshot without flags"""
+    if (st.get('flags', 0) >> 29) & 1:
+        return {'a': (ONE_HEAP_A, ONE_HEAP_A_END), 'b': (ONE_HEAP_B, ONE_HEAP_B_END)}
+    return {'a': (HEAP_A, HEAP_A_END), 'b': (HEAP_B, HEAP_B_END)}
 
 
 def noops_note(noops):
@@ -339,6 +355,9 @@ def format_status(st):
          % (st["build"], st["uptime_ms"] / 1000.0, fl["calib"], fl["link"], fl["speed"], fl["fdx"], fl["tap"],
             fl["rxdly"], fl["adv1000"], st["phy"] & 0xFFFF, st["phy"] >> 16))
     s += "  address %s\n" % format_ip(st)
+    if fl["one_space"]:
+        h = heaps(st)
+        s += "  one address space: A heap %d-%d MB, B heap %d-%d MB\n" % (h['a'][0] >> 20, h['a'][1] >> 20, h['b'][0] >> 20, h['b'][1] >> 20)
     s += "  rx ok %(rx_ok)d fcs %(rx_fcs)d len %(rx_len)d ovf %(rx_ovf)d er %(rx_er)d | arp %(arp)d icmp %(icmp)d " \
          "udp %(udp)d ipcsum %(ipcsum)d other %(other)d pfdrop %(pfdrop)d | tx %(tx)d\n" % st
     s += "  proto exp %(exp_seq)d acc %(acc)d dup %(dup)d gap %(gap)d full %(full)d bad %(bad)d acks %(acks)d | " \
@@ -671,6 +690,12 @@ class Board:
                 if self.cv.wait_for(lambda: self.status_count > n0, timeout / 3):
                     return dict(zip(STATUS_NAMES, self.status_words))
         raise ProtoError("no STATUS from %s:%d" % self.addr)
+
+    def heaps(self):
+        """fbproto.heaps of the last STATUS this board answered, the two-board map before any: read status() first"""
+        with self.cv:
+            w = self.status_words
+        return heaps(dict(zip(STATUS_NAMES, w)) if w else {})
 
     def _local(self, typ, body, timeout=0.5, tries=3):
         for _ in range(tries):

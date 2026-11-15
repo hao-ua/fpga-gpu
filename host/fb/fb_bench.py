@@ -20,7 +20,7 @@ sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, '..', '..', 'too
 import fbproto as fp
 import glslc, isa64
 from fb_image import MODE_SIZE
-from fb_shader import (words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, B_FSPROG,
+from fb_shader import (words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, b_fsprog,
                        H_IMG, B_IMG, DRAW_ID, err_text)
 from fb_texperf import upload_texture, FILT, B_TEX
 
@@ -134,7 +134,7 @@ def run_test(bd, t, W, H, secs, textures_up):
         else: bd.vertex_attr(i, False, 4, 0, 0, 0, (0.0, 0.0, 0.0, 1.0))
     mask = 0
     for name, (slot, _ty) in rf['varyings'].items(): mask |= 1 << slot
-    bd.create_buffer(H_FSPROG, B_FSPROG, 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
+    bd.create_buffer(H_FSPROG, b_fsprog(bd), 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
     for h_, base in zip(H_IMG, B_IMG):
         bd.create_image(h_, base, W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
     if t.nsamp and not textures_up:

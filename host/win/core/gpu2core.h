@@ -38,6 +38,13 @@ enum { G2_ACKF_NAK = 1, G2_ACKF_FULL = 2 };
 #define G2_HEAP_A_END 0x40000000u
 #define G2_HEAP_B     0x10000000u     /* board B host heap: [256 MB, 1 GB) */
 #define G2_HEAP_B_END 0x40000000u
+/* one address space (G2_A_FLAG_ONE_SPACE: boards A and B are one chip with one DDR): A's buffers in [256 MB, 448 MB), B's images,
+   programs and MEM_WRITE / MEM_READ in [464 MB, 1 GB). 0-256 MB (A's ring, records, bin lists) and 448-464 MB (B's draw buckets) are
+   never the host's: the board refuses them with ERR_HEAP. g2_heaps picks the map */
+#define G2_ONE_HEAP_A     0x10000000u
+#define G2_ONE_HEAP_A_END 0x1C000000u
+#define G2_ONE_HEAP_B     0x1D000000u
+#define G2_ONE_HEAP_B_END 0x40000000u
 #define G2_GUARD_BAND 32640.0         /* board A clips x / y at +-2040 px, in 1/16 px */
 
 enum { G2_AT_BYTE, G2_AT_UBYTE, G2_AT_SHORT, G2_AT_USHORT, G2_AT_FIXED, G2_AT_FLOAT, G2_AT_FP24 };   /* VERTEX_ATTR formats */
@@ -97,6 +104,7 @@ enum {
 /* the units a core lacks, STATUS flags bits 30 / 31 (0 on every build that has them): bit 0 the integer divider, bit 1 SIN / COS — g2sc_set_absent */
 #define G2_A_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board A's flags (G2_ST_FLAGS): the vertex core */
 #define G2_B_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board B's flags (G2_ST_B_FLAGS): the fragment core */
+#define G2_A_FLAG_ONE_SPACE(f) (((f) >> 29) & 1u)    /* board A's flags: one DDR address space for both halves, the G2_ONE_HEAP_* map (0 on two boards) */
 #define G2_LINK_B_ALIVE(f)     ((f) & 1u)            /* decode_link_flags */
 #define G2_LINK_TRAINED(f)     (((f) >> 2) & 1u)
 
@@ -124,6 +132,10 @@ void g2_set_log(void (*fn)(const char *line));       /* process-wide; every libr
 int g2_hello(g2_board *b, int new_session);          /* <0 on failure, else the expected seq */
 int g2_status(g2_board *b, uint32_t out[G2_ST_WORDS], int *nwords);
 int g2_check_boards(g2_board *b, int min_a_build);   /* build / link / B alive; <0 + error text when not usable */
+/* the host heaps of the board pair: [a, a_end) for board A's buffers, [b, b_end) for board B's. From the last STATUS the board answered
+   (G2_A_FLAG_ONE_SPACE), the two-board map before any: read STATUS first */
+typedef struct g2_heap_map { uint32_t a, a_end, b, b_end; } g2_heap_map;
+g2_heap_map g2_heaps(g2_board *b);
 int g2_reg_read(g2_board *b, uint32_t addr, uint32_t *value);
 int g2_reg_write(g2_board *b, uint32_t addr, uint32_t value);
 

@@ -21,7 +21,7 @@ import fbproto as fp
 import float_ref as fr
 import tmu_ref as tr
 from fb_image import MODE_SIZE
-from fb_shader import (words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, B_FSPROG,
+from fb_shader import (words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, b_fsprog,
                        H_IMG, B_IMG, DRAW_ID, err_text)
 from fb_texperf import compile_programs, fs_uniforms, render_frame, B_TEX
 
@@ -222,7 +222,7 @@ def setup(bd, W, H, wv, wf, names):
         if i == 0: bd.vertex_attr(0, True, 2, H_VBO, 8, 0, type=fp.AT_FP24)
         else: bd.vertex_attr(i, False, 4, 0, 0, 0, (0.0, 0.0, 0.0, 1.0))
     bd.vs_state((W * 8.0, W * 8.0, H * 8.0, H * 8.0), cull=0, front_cw=0, fsmask=0x01, width=W, height=H, draw_id=DRAW_ID)
-    bd.create_buffer(H_FSPROG, B_FSPROG, 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
+    bd.create_buffer(H_FSPROG, b_fsprog(bd), 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
     for h, base in zip(H_IMG, B_IMG):
         bd.create_image(h, base, W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
     t0 = time.monotonic(); base = B_TEX; nb = 0

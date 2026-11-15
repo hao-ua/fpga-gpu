@@ -16,6 +16,7 @@
 #define PROG_A_BYTES (4u << 20)
 #define PROG_B_BYTES (16u << 20)
 #define RING_BYTES (128u << 20)
+#define RING_BYTES_ONE (64u << 20)      /* one address space: A's heap is 192 MB for PROG_A, the ring and the keep room together */
 #define MAX_IDS 8192
 #define ID_SLOTS 16384
 #define MAX_RING_FRAMES 3
@@ -33,13 +34,13 @@ struct g2r {
     g2_handles h_buf_a, h_buf_b, h_img;
     uint16_t prog_a, prog_b, ring;
     uint32_t prog_a_used, prog_b_used, next_prog;
-    uint32_t ring_used, ring_gen;
-    uint32_t ring_at_frame[2];          /* ring position when each in-flight frame was presented */
+    uint32_t ring_bytes, ring_used, ring_gen;
+    uint32_t ring_at_frame[2];         /* ring position when each in-flight frame was presented */
 
     /* buffers kept on board A: one buffer with its own allocator, so a kept copy costs no handle and no message */
     uint16_t keep;
     int keep_state;                     /* 0 not set up, 1 ready, -1 off */
-    uint32_t keep_room;
+    uint32_t keep_room, keep_max;       /* keep_max: what A's heap has left after PROG_A and the ring */
     g2_heap *keep_heap;
     g2r_kept *keep_list;
     dead_copy dead[MAX_DEAD];
@@ -101,16 +102,24 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n)
 g2r *g2r_create(g2_board *bd)
 {
     g2r *r = (g2r *)calloc(1, sizeof *r);
-    uint32_t a, b, rn;
+    uint32_t a, b, rn, st[G2_ST_WORDS];
+    g2_heap_map m;
     if (!r) return NULL;
     r->bd = bd;
-    r->heap_a = g2_heap_create(G2_HEAP_A, G2_HEAP_A_END);
-    r->heap_b = g2_heap_create(G2_HEAP_B, G2_HEAP_B_END);
+    if (g2_status(bd, st, NULL) == 0) r->a_build = (int)st[G2_ST_BUILD];     /* and g2_heaps reads the map from it */
+    m = g2_heaps(bd);
+    r->ring_bytes = m.a == G2_HEAP_A ? RING_BYTES : RING_BYTES_ONE;
+    r->keep_max = m.a_end - m.a - PROG_A_BYTES - r->ring_bytes;
+    if (m.a != G2_HEAP_A)
+        g2e_log("g2r: one address space: board A's heap %u-%u MB (ring %u MB, keep room up to %u MB), board B's %u-%u MB", m.a >> 20, m.a_end >> 20,
+                r->ring_bytes >> 20, r->keep_max >> 20, m.b >> 20, m.b_end >> 20);
+    r->heap_a = g2_heap_create(m.a, m.a_end);
+    r->heap_b = g2_heap_create(m.b, m.b_end);
     r->next_id = 1;
     r->next_prog = 1;
     a = g2_heap_alloc(r->heap_a, PROG_A_BYTES, 4096);
     b = g2_heap_alloc(r->heap_b, PROG_B_BYTES, 4096);
-    rn = g2_heap_alloc(r->heap_a, RING_BYTES, 4096);
+    rn = g2_heap_alloc(r->heap_a, r->ring_bytes, 4096);
     if (!a || !b || !rn || g2_handle_alloc(&r->h_buf_a, G2_HK_BUF_A, &r->prog_a) < 0 || g2_handle_alloc(&r->h_buf_b, G2_HK_BUF_B, &r->prog_b) < 0 ||
         g2_handle_alloc(&r->h_buf_a, G2_HK_BUF_A, &r->ring) < 0) {
         free(r);
@@ -118,7 +127,7 @@ g2r *g2r_create(g2_board *bd)
     }
     g2_create_buffer(bd, r->prog_a, a, PROG_A_BYTES, 0);
     g2_create_buffer(bd, r->prog_b, b, PROG_B_BYTES, 0);
-    g2_create_buffer(bd, r->ring, rn, RING_BYTES, 0);
+    g2_create_buffer(bd, r->ring, rn, r->ring_bytes, 0);
     r->h_img.limit = G2_HANDLES_MAX;    /* image handles are virtual: gpu2core maps them onto board B's table */
     r->clear_prog = g2r_prog_create(r, clear_vs_words, clear_vs_nwords, clear_vs_const, clear_vs_nconst, clear_vs_const_base, clear_fs_words, clear_fs_nwords,
                                     clear_fs_const, clear_fs_nconst, clear_fs_const_base, 0);
@@ -383,7 +392,7 @@ uint32_t g2r_stream_gen(g2r *r) { return r->ring_gen; }
 uint32_t g2r_stream(g2r *r, const void *data, uint32_t bytes, uint32_t align)
 {
     uint32_t a = (r->ring_used + align - 1) & ~(align - 1);
-    if (a + bytes > RING_BYTES) {                               /* wrap: nothing in flight may still read the start of the ring */
+    if (a + bytes > r->ring_bytes) {                            /* wrap: nothing in flight may still read the start of the ring */
         while (r->npending) wait_one(r);
         a = 0;
         r->ring_gen++;
@@ -464,6 +473,7 @@ static int keep_open(g2r *r)
     if (r->keep_state) return r->keep_state > 0;
     r->keep_state = -1;
     r->keep_room = (uint32_t)g2e_get_int("GPU2_KEEP_MB", 256) << 20;
+    if (r->keep_room > r->keep_max) r->keep_room = r->keep_max;    /* one address space: 124 MB */
     if (!r->keep_room) return 0;
     base = g2_heap_alloc(r->heap_a, r->keep_room, 4096);
     r->keep_heap = g2_heap_create(4096, r->keep_room);

@@ -30,16 +30,22 @@ from fb_image import MODE_SIZE
 
 TESTS = os.path.join(HERE, '..', '..', 'tests')
 
-# ---- resources (fb_cube's layout: A's host heap at 384 MB.., B's images at 0x3000_0000)
+# ---- resources (fb_cube's layout: A's buffers at 416 MB, B's program buffer at the start of B's heap, B's images at 0x3000_0000)
 H_VBO, H_IBO, H_VSPROG = 0x0021, 0x0022, 0x0023                 # board A buffers
 A_VBO, A_IBO, A_VSPROG = 0x1A00_0000, 0x1A40_0000, 0x1A50_0000
-H_FSPROG, B_FSPROG = 0x8021, 0x1000_0000                        # board B program buffer (bit 15), 64 KB
+H_FSPROG = 0x8021                                               # board B program buffer (bit 15), 64 KB at b_fsprog(bd)
 H_IMG = (0xC030, 0xC031)
 B_IMG = (0x3000_0000, 0x3040_0000)                              # 4 MB each: up to 1280 x 800 x 4
 DRAW_ID = 1
 RENDER_TIMEOUT_CYCLES = 300_000_000                             # fb_dispatch_a RENDER_TIMEOUT (3 s at 100 MHz)
 CLEAR = (0.0, 0.0, 0.0, 1.0)
 SHADERS = {'raymarch': 'fs_raymarch.frag', 'spiral': 'fs_spiral.frag', 'heart': 'fs_heart.frag'}
+
+
+def b_fsprog(bd):
+    """the byte address of B's program buffer: the start of B's heap (256 MB, 464 MB in one address space), from the board's
+    last STATUS"""
+    return bd.heaps()['b'][0]
 
 
 def compile_programs(shader, forward=False, noops=None):
@@ -159,7 +165,7 @@ def setup(bd, W, H, wv, wf, fconst, funi, fs_cb, steps):
         if i == 0: bd.vertex_attr(0, True, 2, H_VBO, 8, 0, type=fp.AT_FP24)
         else: bd.vertex_attr(i, False, 4, 0, 0, 0, (0.0, 0.0, 0.0, 1.0))
     bd.vs_state((W * 8.0, W * 8.0, H * 8.0, H * 8.0), cull=0, front_cw=0, fsmask=0x01, width=W, height=H, draw_id=DRAW_ID)
-    bd.create_buffer(H_FSPROG, B_FSPROG, 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
+    bd.create_buffer(H_FSPROG, b_fsprog(bd), 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
     for h, base in zip(H_IMG, B_IMG):
         bd.create_image(h, base, W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
     uni = fs_uniforms(funi, fconst, fs_cb, steps, (W, H))

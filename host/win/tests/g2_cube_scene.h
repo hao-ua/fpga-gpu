@@ -14,8 +14,7 @@
 #define A_VBO 0x1A000000u
 #define A_IBO 0x1A400000u
 #define A_VSPROG 0x1A500000u
-#define H_FSPROG 0x8021
-#define B_FSPROG 0x10000000u
+#define H_FSPROG 0x8021                 /* at the start of B's heap (g2_heaps), as fb_cube's b_fsprog */
 #define DRAW_ID 1
 static const uint16_t H_IMG[2] = { 0xC030, 0xC031 };
 static const uint32_t B_IMG[2] = { 0x30000000u, 0x30400000u };
@@ -214,7 +213,7 @@ static uint32_t scene_setup(g2_board *bd, uint32_t W, uint32_t H, const scene_t 
     }
     vp[0] = W * 8.0; vp[1] = W * 8.0; vp[2] = H * 8.0; vp[3] = H * 8.0;
     g2_vs_state(bd, vp, 1, 0, 0x01, W, H, DRAW_ID, 1, 0.0, 1.0, NULL);
-    g2_create_buffer(bd, H_FSPROG, B_FSPROG, 4096, 0);
+    g2_create_buffer(bd, H_FSPROG, g2_heaps(bd).b, 4096, 0);
     g2_write_buffer(bd, H_FSPROG, 0, cube_fs_words, (size_t)cube_fs_nwords * 8);
     for (i = 0; i < 2; i++)
         g2_create_image(bd, H_IMG[i], B_IMG[i], W, H, G2_FMT_RGBA8, 0, 1, 1, 1, 0, G2_USE_RT | G2_USE_SCANOUT | G2_USE_TRANSFER);

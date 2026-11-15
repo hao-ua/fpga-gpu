@@ -811,6 +811,20 @@ int g2_check_boards(g2_board *b, int min_a_build)
     return 0;
 }
 
+g2_heap_map g2_heaps(g2_board *b)
+{
+    g2_heap_map m = { G2_HEAP_A, G2_HEAP_A_END, G2_HEAP_B, G2_HEAP_B_END };
+    uint32_t f;
+    AcquireSRWLockExclusive(&b->lock);
+    f = b->status_count && b->status_n > G2_ST_FLAGS ? b->status_words[G2_ST_FLAGS] : 0;
+    ReleaseSRWLockExclusive(&b->lock);
+    if (G2_A_FLAG_ONE_SPACE(f)) {
+        m.a = G2_ONE_HEAP_A; m.a_end = G2_ONE_HEAP_A_END;
+        m.b = G2_ONE_HEAP_B; m.b_end = G2_ONE_HEAP_B_END;
+    }
+    return m;
+}
+
 static int local_msg(g2_board *b, uint8_t typ, const void *body, size_t len, uint32_t *w3)
 {
     int tries;

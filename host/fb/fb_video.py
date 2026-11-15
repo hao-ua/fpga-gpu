@@ -45,7 +45,6 @@ import time
 import fbproto as fp
 from fb_image import MODE_SIZE, to_transfer
 
-HEAP_B_END = 0x4000_0000
 # refresh rate per video mode: pixel clock (MMCM settings) / total pixels per frame (src/rtl/disp/video_modes.svh)
 REFRESH = {0: 25.15625e6 / (800 * 525), 1: 40e6 / (1056 * 628), 2: 74.25e6 / (1650 * 750), 3: 71e6 / (1440 * 823)}
 
@@ -404,8 +403,9 @@ def main():
         bpp = fp.STORAGE_BPP[storage]
         pitch = (mw * bpp + 31) & ~31
         stride = (pitch * mh + 0xFFFFF) & ~0xFFFFF
-        if a.base + 2 * stride > HEAP_B_END:
-            print("buffers do not fit below 1 GB (base %08X, 2 x %d bytes)" % (a.base, stride))
+        hb, he = fp.heaps(st0)['b']
+        if a.base < hb or a.base + 2 * stride > he:
+            print("buffers do not fit in B's heap %08X-%08X (base %08X, 2 x %d bytes)" % (hb, he, a.base, stride))
             return 1
         bufs = [(fp.image_handle_b(a.index + i), a.base + i * stride) for i in range(2)]
         if bflags["cur_img"] == a.index:                    # start with the buffer that is not on screen

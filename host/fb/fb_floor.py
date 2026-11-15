@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, '..', '..', 'tools'))
 import fbproto as fp
 from fb_image import MODE_SIZE
-from fb_shader import words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, B_FSPROG, H_IMG, B_IMG, DRAW_ID, err_text
+from fb_shader import words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, b_fsprog, H_IMG, B_IMG, DRAW_ID, err_text
 from fb_bench import compile_pair, uniforms
 
 VS = """attribute vec3 aPos;
@@ -142,7 +142,7 @@ def main():
     mask = 0
     for name, (slot, _ty) in rf['varyings'].items(): mask |= 1 << slot
     bd.vs_state((W * 8.0, W * 8.0, H * 8.0, H * 8.0), cull=0, front_cw=0, fsmask=mask or 1, width=W, height=H, draw_id=DRAW_ID)
-    bd.create_buffer(H_FSPROG, B_FSPROG, 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
+    bd.create_buffer(H_FSPROG, b_fsprog(bd), 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
     bd.create_image(H_IMG[0], B_IMG[0], W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
     ufs = uniforms(rf, {})
     h = [0] * 23

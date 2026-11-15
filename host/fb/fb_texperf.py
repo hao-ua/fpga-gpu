@@ -28,7 +28,7 @@ sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, '..', '..', 'too
 import fbproto as fp
 import glslc, isa64
 from fb_image import MODE_SIZE
-from fb_shader import (words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, B_FSPROG,
+from fb_shader import (words64_bytes, f24, H_VBO, H_IBO, H_VSPROG, A_VBO, A_IBO, A_VSPROG, H_FSPROG, b_fsprog,
                        H_IMG, B_IMG, DRAW_ID, CLEAR, RENDER_TIMEOUT_CYCLES, err_text)
 
 TESTS = os.path.join(HERE, '..', '..', 'tests')
@@ -178,7 +178,7 @@ def setup(bd, W, H, wv, wf, fconst, funi, fs_cb, samplers, texs, scale, pattern=
         if i == 0: bd.vertex_attr(0, True, 2, H_VBO, 8, 0, type=fp.AT_FP24)
         else: bd.vertex_attr(i, False, 4, 0, 0, 0, (0.0, 0.0, 0.0, 1.0))
     bd.vs_state((W * 8.0, W * 8.0, H * 8.0, H * 8.0), cull=0, front_cw=0, fsmask=0x01, width=W, height=H, draw_id=DRAW_ID)
-    bd.create_buffer(H_FSPROG, B_FSPROG, 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
+    bd.create_buffer(H_FSPROG, b_fsprog(bd), 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
     for h, base in zip(H_IMG, B_IMG):
         bd.create_image(h, base, W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
     # the textures: one image per sampler slot of the program

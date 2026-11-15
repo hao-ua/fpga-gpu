@@ -44,15 +44,23 @@ from fb_image import MODE_SIZE
 TESTS = os.path.join(HERE, '..', '..', 'tests')
 GEN = os.path.join(HERE, '..', '..', 'tools', 'gen')
 
-# ---- resources: A's host heap (384 MB..) and B's (256 MB..; fb_video's images are at 0x2800_0000)
+# ---- resources: A's host heap and B's (fbproto.heaps; fb_video's images are at 0x2800_0000). The fixed addresses lie in both
+# maps; B's program buffer goes at the start of B's heap (b_fsprog)
 H_VBO, H_IBO, H_VSPROG = 0x0021, 0x0022, 0x0023                 # board A buffers
 A_VBO, A_IBO, A_VSPROG = 0x1A00_0000, 0x1A40_0000, 0x1A50_0000  # byte addresses in A's heap (VBO up to 4 MB)
-H_FSPROG, B_FSPROG = 0x8021, 0x1000_0000                        # board B buffer (bit 15), byte address in B's heap
+H_FSPROG = 0x8021                                               # board B buffer (bit 15), at b_fsprog(bd)
 H_IMG = (0xC030, 0xC031)                                        # the two render targets / scanout images
 B_IMG = (0x3000_0000, 0x3040_0000)                              # 4 MB each: up to 1280 x 800 x 4
 DRAW_ID = 1
 MAX_CUBES = 2000                                                # 48 000 vertices: 1 draw < 65 536, VBO 48 000 x 13 words
 RENDER_TIMEOUT_CYCLES = 300_000_000                             # fb_dispatch_a RENDER_TIMEOUT (3 s at 100 MHz)
+
+
+def b_fsprog(bd):
+    """the byte address of B's program buffer: the start of B's heap (256 MB, 464 MB in one address space), from the board's
+    last STATUS"""
+    return bd.heaps()['b'][0]
+
 
 # ---- the scene
 FOV_DEG, NEAR, FAR, CAM_Z = 45.0, 1.0, 40.0, 4.0
@@ -272,7 +280,7 @@ def setup(bd, W, H, scene, instanced, wv, wf, vconst, fconst, fs_const_base, bon
         else: bd.vertex_attr(i, False, 4, 0, 0, 0, (0.0, 0.0, 0.0, 1.0))
     bd.vs_state((W * 8.0, W * 8.0, H * 8.0, H * 8.0), cull=1, front_cw=0, fsmask=0x01, width=W, height=H, draw_id=DRAW_ID)
     # B: the fragment program, the two images, the draw state (depth LESS + write, no blend, colour mask RGBA)
-    bd.create_buffer(H_FSPROG, B_FSPROG, 4096); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
+    bd.create_buffer(H_FSPROG, b_fsprog(bd), 4096);bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
     for h, base in zip(H_IMG, B_IMG):
         bd.create_image(h, base, W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
     h = [0] * 23

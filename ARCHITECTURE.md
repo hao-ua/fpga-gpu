@@ -67,6 +67,11 @@ texture unit.
 - **`tri_binner2`:** on-chip head tables and linked bin lists in DDR, in submission order, written 4 entries per burst.
 - **`a_render`:** the band walk and rasterizer. It covers one quad position per cycle, uses the top-left fill rule, and
   handles points and lines up to 64 pixels.
+  - **Coarse depth:** per band, a conservative upper bound of B's depth in every 4×2 block (one block RAM). A quad that
+    B's depth test would drop anyway is not sent. The bounds come from opaque draws, the quad's depth range from the same
+    edge values B forms; each draw's flags (VS_STATE, set by the libraries from its depth state) say what may be culled.
+  - **Lazy TRI items:** a primitive's setup goes to B only in front of its first quad that is sent in a band.
+  - Both are switched by the libraries (`GPU2_COARSE_Z`, `GPU2_LAZY_TRI`, on by default) and counted in STATUS.
 - **`mem_arb`:** 5 read and 4 write ports onto the DDR3 controller.
 
 ## 3. Board B — fragments, images and display
@@ -218,7 +223,7 @@ texture unit.
 
   | build | timing (setup / hold) | LUT | FF | slices | BRAM tiles | DSP |
   |---|---|---|---|---|---|---|
-  | A 151 | +0.005 / +0.020 ns | 88 277 (66.0 %) | 76 683 | 30 965 (92.6 %) | 231.5 (63.4 %) | 209 |
+  | A 154 | +0.005 / +0.036 ns | 90 165 (67.4 %) | 79 374 | 31 416 (93.9 %) | 232.5 (63.7 %) | 213 |
   | B 142 | +0.016 / +0.030 ns | 103 771 (77.6 %) | 74 633 | 32 010 (95.7 %) | 291 (79.7 %) | 311 |
 
   At these slice counts about three quarters of a failing path's delay is routing, and board B has almost no timing

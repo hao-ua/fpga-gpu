@@ -15,7 +15,7 @@ only what the hardware can do exactly, or what the PC can do exactly beside it; 
   - viewports smaller than the target are cut through the scissor;
   - each draw is bounded by its scissor rectangle.
 - **Culling:** back, front or both, with either winding; degenerate triangles are dropped.
-- **Coarse depth (board A builds from A 153):** quads that board B's depth test would drop are not sent. A keeps a
+- **Coarse depth:** quads that board B's depth test would drop are not sent. A keeps a
   conservative depth bound per 4×2 block of each band from the draws' flags (a promise about each draw's depth state, sent
   by the libraries); the image is unchanged. A triangle's setup goes to B only in a band where it sends a quad.
 
@@ -198,7 +198,7 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 
 | title | API | status |
 |---|---|---|
-| OpenArena | OpenGL | plays; timedemo at the game's default settings 31.3 fps at 640×480, 24.0 at 800×600 (A 153 / B 142) |
+| OpenArena | OpenGL | plays; timedemo at the game's default settings 31.4 fps at 640×480, 23.9 at 800×600 (A 154 / B 142) |
 | Need for Speed: Hot Pursuit 2 | Direct3D 8 | races run, 22–36 fps at 800×600 (A 147 / B 142); far-depth flicker fixed |
 | Half-Life | OpenGL 1.x | about 60 fps at 640×480; the hang on the first mission's tram ride is fixed in the RTL and in the flashed board A (A 149 and later), not yet replayed in the game |
 | Heroes Chronicles (Heroes III engine) | DirectDraw | menus and play at 800×600×16 |

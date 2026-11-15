@@ -115,21 +115,22 @@ are to be measured on the current pair and recorded here.
 
 ### OpenArena timedemo (demo088-test1, the game's default settings)
 
-A 153 / B 142, 2026-11-15, `opengl32.dll` built from 71e458e. A board build was running on the same PC during the runs.
-Board A's coarse depth and lazy TRI items on (the libraries' default):
+A 154 / B 142 (the flashed pair), 2026-11-15, `opengl32.dll` built from 71e458e. Board A's coarse depth and lazy TRI items on
+(the libraries' default):
 
 | | 640×480 | 800×600 |
 |---|---|---|
-| frame rate | **31.3 fps** (3 398 frames in 108.7 s) | **24.0 fps** (3 398 frames in 141.9 s) |
-| frame time min / mean / max / std dev | 9.0 / 32.0 / 69.0 / 10.3 ms | 10.0 / 41.7 / 84.0 / 10.5 ms |
-| board B frame (median) | 27.9 ms | 40.5 ms |
-| fragment core busy / stream starved | 84 % / 11 % | 86 % / 11 % |
-| board A geometry / walk per frame | 20.6 / 27.6 ms | 20.7 / 41.0 ms |
-| A per frame: quads walked / culled | 928 k / 393 k (42 %) | 1.48 M / 646 k (44 %) |
-| A per frame: TRI items sent / held back | 18.1 k / 11.3 k | 26.4 k / 15.9 k |
+| frame rate | **31.4 fps** (3 398 frames in 108.3 s) | **23.9 fps** (3 398 frames in 141.9 s) |
+| frame time min / mean / max / std dev | 8.0 / 31.9 / 68.0 / 10.5 ms | 10.0 / 41.8 / 152.0 / 10.7 ms |
+| board B frame (median) | 25.6 ms | 40.2 ms |
+| fragment core busy / stream starved | 85 % / 10 % | 86 % / 11 % |
+| board A geometry / walk per frame | 20.6 / 27.6 ms | 20.6 / 41.0 ms |
+| A per frame: quads walked / culled | 941 k / 403 k (43 %) | 1.48 M / 646 k (44 %) |
+| A per frame: TRI items sent / held back | 19.3 k / 11.5 k | 26.4 k / 15.9 k |
 | events lost | 0 | 0 |
 
-The four combinations of the two switches (frame rate, B frame median):
+The four combinations of the two switches (frame rate, B frame median), measured on A 153 / B 142 (A 154's design sends
+the same stream; a board build was running on the same PC):
 
 | | both on | coarse depth only | lazy TRI only | both off |
 |---|---|---|---|---|
@@ -137,8 +138,8 @@ The four combinations of the two switches (frame rate, B frame median):
 | 800×600 | **24.0 fps**, 40.5 ms | 23.2 fps, 41.1 ms | 22.0 fps, 44.9 ms | 21.6 fps, 45.5 ms |
 
 Culling takes about 40 % of the quads off board B, and lazy TRI items another third of the TRI items. Together they cut B's
-frame by 16 % at 640×480 and 11 % at 800×600. At 640×480 board B is no longer the only bound: its frame (28 ms) is shorter
-than the game's (32 ms), and the stream is starved 11 % of the time.
+frame by 16 % at 640×480 and 11 % at 800×600. At 640×480 board B is no longer the only bound: its frame (26–28 ms) is
+shorter than the game's (32 ms), and the stream is starved 10 % of the time.
 
 ### Other games
 - **NFS Hot Pursuit 2** (Direct3D 8, 800×600, A 147 / B 142): 22–36 fps in races.
@@ -161,7 +162,7 @@ than the game's (32 ms), and the stream is starved 11 % of the time.
   fill_depth_reject draws 12 layers with 11 hidden: board A culls 91 % of its quads. Every other rate is the same with the
   features off.
 - **fb_cube --check:** 0 mismatches; 32 cubes at 59.9 fps (vsync) for 5 minutes, no errors. **fb_3d_test** 11, 13, 15,
-  `--abort` and the coarse-depth seeds 61–71: bit-exact.
+  `--abort` and the coarse-depth seeds 61–71: bit-exact (A 153 and A 154).
 - **fb_texperf, fb_shader:** to be measured on the current pair.
 
 ### Simulation (the current board B options)

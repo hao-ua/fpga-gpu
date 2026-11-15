@@ -50,7 +50,8 @@ The Python tools run from `host/fb` (Python 3, standard library).
 - **host transfer:** upload and read-back.
 
 Each test prints a **RESULT** line with fps, the rate, B's frame ms, A's geometry ms and the walk's band visits. Its
-**PROFILE** line has A's geometry split.
+**PROFILE** line has A's geometry split, and its **CZ** line board A's coarse depth and TRI items (see below). Both board-A
+features are on, as in the libraries; `--no-zc` sends no coarse-depth flags, `--no-lazy` sends every TRI item.
 
 ## Tests in simulation
 
@@ -97,6 +98,16 @@ them each stage was busy. The shares overlap.
 Then loads / draws / primitives per frame, the dispatcher's idle ms (no command waiting: host-bound) and its geometry
 wait ms.
 
+**Line 3** (`A per frame: … quads walked`, STATUS layout 12): board A's coarse depth and TRI items per frame.
+- **quads walked / culled / sent:** A's walk found them; it did not send the culled ones, because board B's depth test
+  would have dropped them anyway (the draws' flags allow it, see `docs/OVERDRAW.md` §7);
+- **TRI items sent / held back / sent with no quad:** a triangle's setup goes to B only in a band where it sends a quad;
+  the held-back ones are what that saves; "sent with no quad" is the waste when lazy TRI items are off;
+- **blocks lowered:** the coarse-depth bounds that opaque draws lowered.
+
+The two board-A features have switches in the libraries, both on by default: `GPU2_COARSE_Z=0` (no culling) and
+`GPU2_LAZY_TRI=0` (every TRI item sent); the line names the one that is off.
+
 ## Latest results
 
 Only results measured on the current hardware are kept; each names the builds it was measured on. The board tests above
@@ -104,19 +115,30 @@ are to be measured on the current pair and recorded here.
 
 ### OpenArena timedemo (demo088-test1, the game's default settings)
 
-A 148 / B 142, 2026-11-14, `opengl32.dll` built from f205f6f. A board build was running on the same PC during both runs.
+A 153 / B 142, 2026-11-15, `opengl32.dll` built from 71e458e. A board build was running on the same PC during the runs.
+Board A's coarse depth and lazy TRI items on (the libraries' default):
 
 | | 640×480 | 800×600 |
 |---|---|---|
-| frame rate | **28.6 fps** (3 398 frames in 119.0 s) | **21.1 fps** (3 398 frames in 161.1 s) |
-| frame time min / mean / max / std dev | 12.0 / 35.0 / 314.0 / 11.6 ms | 11.0 / 47.4 / 147.0 / 11.5 ms |
-| board B frame (median) | 31.7 ms | 47.7 ms |
-| fragment core busy / stream starved | 76 % / 3 % | 77 % / 3 % |
-| board A geometry / walk per frame | 20.5 / 32.0 ms | 20.4 / 47.0 ms |
+| frame rate | **31.3 fps** (3 398 frames in 108.7 s) | **24.0 fps** (3 398 frames in 141.9 s) |
+| frame time min / mean / max / std dev | 9.0 / 32.0 / 69.0 / 10.3 ms | 10.0 / 41.7 / 84.0 / 10.5 ms |
+| board B frame (median) | 27.9 ms | 40.5 ms |
+| fragment core busy / stream starved | 84 % / 11 % | 86 % / 11 % |
+| board A geometry / walk per frame | 20.6 / 27.6 ms | 20.7 / 41.0 ms |
+| A per frame: quads walked / culled | 928 k / 393 k (42 %) | 1.48 M / 646 k (44 %) |
+| A per frame: TRI items sent / held back | 18.1 k / 11.3 k | 26.4 k / 15.9 k |
 | events lost | 0 | 0 |
 
-Board B paces the game at both sizes. A's geometry takes about 20 ms a frame whatever the size, and its walk follows B's
-frame.
+The four combinations of the two switches (frame rate, B frame median):
+
+| | both on | coarse depth only | lazy TRI only | both off |
+|---|---|---|---|---|
+| 640×480 | **31.3 fps**, 27.9 ms | 30.5 fps, 28.5 ms | 29.7 fps, 31.2 ms | 29.2 fps, 33.4 ms |
+| 800×600 | **24.0 fps**, 40.5 ms | 23.2 fps, 41.1 ms | 22.0 fps, 44.9 ms | 21.6 fps, 45.5 ms |
+
+Culling takes about 40 % of the quads off board B, and lazy TRI items another third of the TRI items. Together they cut B's
+frame by 16 % at 640×480 and 11 % at 800×600. At 640×480 board B is no longer the only bound: its frame (28 ms) is shorter
+than the game's (32 ms), and the stream is starved 11 % of the time.
 
 ### Other games
 - **NFS Hot Pursuit 2** (Direct3D 8, 800×600, A 147 / B 142): 22–36 fps in races.
@@ -125,7 +147,22 @@ frame.
 ### Board tests
 - **Shadertoy shaders through `gles_shader.exe`** (A 139 / B 142, 640×480): tunnel 1 064–1 080 ms per frame, Seascape
   1 467–1 484 ms, ray marcher 364–378 ms.
-- **fb_bench, fb_texperf, fb_cube, fb_shader:** to be measured on the current pair.
+- **fb_bench** (A 153 / B 142, 800×600, `--secs 3`, both board-A features on):
+
+  | test | rate | | test | rate |
+  |---|---|---|---|---|
+  | fill_flat | 118.9 Mpixels/s | | tex4_bilinear | 101.0 Msamples/s |
+  | fill_depth_pass | 118.7 Mpixels/s | | tex8_bilinear | 86.1 Msamples/s |
+  | fill_depth_reject | **310.6 Mpixels/s** (219.2 without culling) | | alu_16 / alu_64 | 1 279 / 1 454 Mscalar ops/s |
+  | fill_blend | 116.8 Mpixels/s | | tri_culled | 3.60 M triangles/s |
+  | tex1 nearest / bilinear / trilinear | 109.5 / 104.7 / 54.0 Msamples/s | | tri_8px / 32px / 128px / 512px | 2.67 / 1.80 / 0.62 / 0.19 M triangles/s |
+  | tex2_bilinear | 108.6 Msamples/s | | upload / read-back | 60.0 / 34.4 MB/s |
+
+  fill_depth_reject draws 12 layers with 11 hidden: board A culls 91 % of its quads. Every other rate is the same with the
+  features off.
+- **fb_cube --check:** 0 mismatches; 32 cubes at 59.9 fps (vsync) for 5 minutes, no errors. **fb_3d_test** 11, 13, 15,
+  `--abort` and the coarse-depth seeds 61–71: bit-exact.
+- **fb_texperf, fb_shader:** to be measured on the current pair.
 
 ### Simulation (the current board B options)
 - **`tb_b_render` frame cycles:**

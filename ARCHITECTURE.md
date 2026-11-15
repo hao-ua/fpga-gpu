@@ -1,5 +1,10 @@
 # Architecture
 
+**On this branch the GPU is the one-board build:** both halves of the design in one XC7A200T with one DDR3.
+[Section 10](#10-the-one-board-build-board_ab_top) describes how they are joined, the shared memory map, and how the
+cores and sizes differ. Sections 1–9 describe the two halves as the two-board design has them. The one-board build
+keeps all of that except what section 10 lists; there, "board A" and "board B" mean the two halves on the one chip.
+
 Two Artix-7 boards (XC7A200T-2, 1 GB DDR3 each) form one GPU. The host is a Windows PC running user-mode drop-in
 libraries; there is no kernel driver. The exact RTL each board is built from is listed in `tools/build_board.tcl`.
 
@@ -304,4 +309,4 @@ talks to board A's side at 192.168.1.10, and the HDMI output is the same board's
   The two boards' builds (A 147 + B 142) need about 190 k LUT together; the lane, unit and queue cuts above bring that
   under the part's 134.6 k.
 - **Throughput:** the fragment side sets the pace. In OpenArena at 640×480 board B's frame is about four times the two
-  boards' (7.2 against 29.2 fps); see [PERF_TESTS.md](PERF_TESTS.md), "One-board build".
+  boards' (7.2 against 29.2 fps); see [PERF_TESTS.md](PERF_TESTS.md).

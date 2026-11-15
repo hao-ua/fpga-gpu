@@ -1,5 +1,12 @@
 # Features
 
+**On this branch the GPU is the one-board build.** It supports everything in sections 1–3 except what
+[section 5](#5-the-one-board-build) lists. In short:
+- OpenGL ES 2.0, OpenGL 2.0 and Direct3D 9 shader model 2.0 stay;
+- SIN / COS and integer division are lowered by the compilers;
+- targets and video modes go up to 800×600;
+- everything else costs only speed.
+
 What the hardware does, what each Windows library offers on top of it, and what is refused. The libraries implement
 only what the hardware can do exactly, or what the PC can do exactly beside it; they never fake a feature.
 
@@ -231,7 +238,7 @@ shader model 2.0 stay as they are.
   - 4 TEX instructions live instead of 8;
   - 100 MHz.
 
-  Measured in [PERF_TESTS.md](PERF_TESTS.md), "One-board build".
+  Measured in [PERF_TESTS.md](PERF_TESTS.md).
 - **Debug:** board A's geometry profile counters are off, so the libraries' `GPU2_STATS` geometry split and
   `fb_bench`'s PROFILE lines read 0 %. JTAG reads board A's STATUS only.
 - **Host software:** this branch's libraries and `host/fb` tools.

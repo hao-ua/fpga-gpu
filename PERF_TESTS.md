@@ -1,65 +1,83 @@
-# Performance tests
+# Performance tests: the one-board build
 
-How to measure the GPU, what each test reports, and the latest results. Builds are named by board and build number,
-for example A 147 / B 142. Both boards run at 120 MHz.
+How to measure the one-board GPU (both halves in one board's FPGA, `board_ab_top`), what each test reports, and the
+latest results. Builds are named S and their build number, for example S 158. The two-board design's tests and results
+are in master's PERF_TESTS.md.
+
+## The build measured
+
+S 158 (`tools/build_board.tcl S`, this branch at 415abdf), loaded over JTAG, measured 2026-11-15.
+
+- **Configuration:**
+  - 100 MHz, DDR3 at 800 MT/s;
+  - both shader cores at 4 lanes; 4 vertex warps; 4 fragment warps of one quad;
+  - no SIN / COS units and no integer divider in either core (the compilers lower them, STATUS flags bits 30 / 31);
+  - no SQRT / RCPM / RSQM micro-ops;
+  - one blend unit per pixel pair;
+  - render targets and video modes up to 800 pixels wide.
+- **Utilisation:** 116.9 k LUT (87.4 %), slices 99.1 %, 261 block RAM tiles, 262 DSP, 96.3 k flip-flops.
+- **Timing:** met at 100 MHz, WNS +0.001 ns, WHS +0.035 ns.
 
 ## Rules for every measurement
 
-- **One program at a time.** Board A replies to whoever spoke last, so a second program on the boards (a test, a
-  status poll, a game) steals the first one's acknowledgements and both slow down. Check that no game or test is
-  running first.
+- **One program at a time.** The board replies to whoever spoke last, so a second program on it (a test, a status poll,
+  a game) steals the first one's acknowledgements and both slow down. Check that no game or test is running first.
 - **Check correctness before speed.** Run `fb_cube.py --check` and `fb_3d_test.py` before any sweep. Repeat a run whose
   wall time overshoots its `--secs`.
 - **Keep the PC quiet.** No simulations or builds during frame-rate runs; they skew the transfer numbers.
-- **Clock scaling.**
-  - The tools convert cycles to ms with `GPU2_CLK_MHZ` (default 120).
-  - Logs written before 2026-11-08 at 120 MHz show ms 1.2× too large; runs at 110 MHz (2026-11-04 to 11-07) need ×100/110.
-  - `tools/b_tmu_counters.ps1` still divides by a fixed 100 MHz.
+- **Clock:** set `GPU2_CLK_MHZ=100`. The tools and the libraries' statistics convert cycles to ms with it, and default to
+  120.
 - **Counters are 32-bit.** Take deltas modulo 2³², with a polling interval under 30 s.
-- **OpenArena timedemos** run at the game's default settings, with the driver build named in the results.
-- **Simulation overstates gains:** board B's gains in simulation reached the board at about a third of their size,
-  because the bench's lock-step warps overstate contention.
+- **Host software from this branch:**
+  - The `host/fb` tools read STATUS before compiling and lower SIN / COS and integer division for the cores.
+  - The libraries need the one-board heaps: board A's buffers in 256–448 MB, board B's images from 464 MB. They take
+    them from STATUS flags bit 29, which builds from eb90593 on report.
+  - S 158 predates bit 29, so its timedemo below used a test build of `opengl32.dll` with the heaps set by hand.
+  - With master's libraries the vertex ring runs over board B's draw buckets at 448 MB, and OpenArena stops after about
+    a minute, board B stuck at draw changes.
+- **Sizes:** 640×480 and 800×600 only; wider modes and targets are refused.
+- **OpenArena timedemos** run at the game's default settings, with the library build named in the results.
 
-## Tests on the boards
+## Tests on the board
 
 The Python tools run from `host/fb` (Python 3, standard library).
 
 | test | command | what it measures |
 |---|---|---|
-| **fb_bench** | `python3 fb_bench.py --mode M --secs 3 [--only a,b]` | 18 rates, each printed as a RESULT line and a PROFILE line (see below). About 1 min per mode. |
+| **fb_bench** | `python3 fb_bench.py --mode M --secs 3 [--only a,b]` | 18 rates, each printed as a RESULT line. About 1 min per mode. |
 | **fb_cube** | `python3 fb_cube.py --check`; `--cubes N --nohold --secs 6` | exactness against the model (32 cubes, held to vsync); throughput |
 | **fb_texperf** | `python3 fb_texperf.py --all --mode M [--check]` | 21 texture cases, cycles per quad; 6 s per case |
 | **fb_shader** | `python3 fb_shader.py --shader raymarch\|spiral\|heart --mode M` | fragment-shader-bound full-screen scenes |
 | **fb_3d_test** | `python3 fb_3d_test.py 11` (also 13, 15) | exactness of the whole 3D path against the reference models (not speed) |
-| **OpenArena timedemo** | `powershell -File tools/oa_timedemo.ps1 -Dll host/win/build/x86/gl/opengl32.dll -Tag <pair> -Mode 3\|4` | demo088-test1 frame rate (from `qconsole.log`), plus the library's statistics log at `GPU2_STATS=3` |
-| **timedemo statistics** | `powershell -File tools/oa_td_stats.ps1 -Tags a,b` | medians of the statistics lines of the runs named |
-| **JTAG status watch** | `vivado.bat -mode batch -nojournal -nolog -source tools/jtag_watch.tcl -tclargs <log> [interval_s]` | every STATUS word of both boards, and their temperatures, into `<log>.raw`. JTAG only, so it can run beside a game. |
-| **texture counters** | `powershell -File tools/b_tmu_counters.ps1 -Raw <log>.raw [-From -To]` | from a JTAG watch: texture jobs, stalls, cache hits and misses, quads, early-depth drops, triangles, frames |
-| **B frame profile** | `powershell -File tools/b_prof.ps1 -Raw <log>.raw [-Mhz 120]` | B's frame split: warps, texture round trip. Needs a board B built with its profile counters on (`PROF=1` in `b_render`); the standard builds have them off and read zeros. |
-| **library statistics** | set `GPU2_STATS=<seconds>` and `GPU2_LOG=<file>` before starting a game | fps and both boards' profile, every N seconds (see below) |
-| **replays** | `host/win/build/x86/d3d9/d3_replay <file.g2rc> <outdir>` | replays a Direct3D recording (`GPU2_RECORD`) on the boards, ms per frame |
+| **OpenArena timedemo** | `powershell -File tools/oa_timedemo.ps1 -Dll host/win/build/x86/gl/opengl32.dll -Tag <name> -Mode 3\|4` | demo088-test1 frame rate (from `qconsole.log`), plus the library's statistics log at `GPU2_STATS=3` |
+| **timedemo statistics** | `powershell -File tools/oa_td_stats.ps1 -Tags a,b -Root <repository>\tools\gen\oa_timedemo` | medians of the statistics lines of the runs named |
+| **library statistics** | set `GPU2_STATS=<seconds>` and `GPU2_LOG=<file>` before starting a game | fps and the profile, every N seconds (see below) |
 
-`fb_bench --mode` and `fb_texperf --mode` take: 0 = 640×480, 1 = 800×600 (the default), 2 = 1280×720, 3 = 1280×800,
-4 = 1024×768. `oa_timedemo -Mode 3 | 4` is the game's own mode number: 640×480 / 800×600.
+- `fb_bench --mode` and `fb_texperf --mode` take 0 = 640×480 and 1 = 800×600 (the default).
+- `oa_timedemo -Mode 3 | 4` is the game's own mode number: 640×480 / 800×600.
+- Build the `opengl32.dll` for the timedemo from this branch: `powershell -File host/win/build.ps1 -Arch x86 -Target gl`.
+- `oa_td_stats.ps1` needs `-Root` when started with `powershell -File`.
+- Not yet tried on one board: `tools/jtag_watch.tcl`, `tools/b_tmu_counters.ps1`, `tools/b_prof.ps1` and the
+  Direct3D replays. The one-board build has board A's JTAG status register only.
 
 ### fb_bench's rates
-- **fill:** fill rate, depth pass, depth reject, blend;
+- **fill:** fill rate, varying fill, depth pass, depth reject, blend;
 - **textures:** tex1 nearest / bilinear / trilinear, tex2, tex4, tex8;
 - **ALU:** alu_16, alu_64;
 - **triangles:** tri_culled, tri_8px, tri_32px, tri_128px, tri_512px;
 - **host transfer:** upload and read-back.
 
 Each test prints a **RESULT** line with fps, the rate, B's frame ms, A's geometry ms and the walk's band visits. Its
-**PROFILE** line has A's geometry split.
+**PROFILE** line (A's geometry split) reads 0 % on the one-board build: its geometry profile counters are off.
 
 ## Tests in simulation
 
 | bench | command | reports |
 |---|---|---|
-| `tb_b_render` | `tools/sim_gpu.ps1 -Test tb_b_render -Extra src/rtl/mem/mem_arb.sv,sim/mig_app_model.sv -Defines TB_NWARP8,TB_BOARD -Plusargs NOGAP,TMUSTAT`; frame sets: `tools/run_b_frames.ps1 -Frames hid3,vis3,fill3,qmod,oa,g1` | cycles per frame of B's render engine, texture statistics. The frames come from `python3 tools/b_ref.py frame …` in WSL. |
-| `tb_a_setup_cyc` | `tools/sim_gpu.ps1 -Test tb_a_setup_cyc -Plusargs MEMSLOW,CULL,CLIP,FSMASK0` | cycles per triangle in A's setup: drawn, culled, clipped, by varying count |
-| `tb_a_render` | `tools/run_a_seeds.ps1 -Test tb_a_render -Seeds 41 -Plusargs FASTSINK,RNPROF` | the band walk's cycles per visit |
-| `tb_tmu24` | `tools/sim_gpu.ps1 -Test tb_tmu24` or `tools/run_tmu24_seeds.ps1` | cold and warm cycles per quad of the texture unit |
+| `tb_one_board3d` | `powershell -File tools/sim_a.ps1 -Test one3d -Plusargs +SEED_11` | the whole chain on `board_ab_core`, host to B's memory, bit-exact against the models; about 6 min |
+| `tb_b_render` | `tools/sim_gpu.ps1 -Test tb_b_render -Extra src/rtl/mem/mem_arb.sv,sim/mig_app_model.sv -Defines TB_ONEB,TB_LANES4,TB_BOARD -Plusargs NOGAP,TMUSTAT` | cycles per frame of the one-board render engine, texture statistics; the frames come from `python3 tools/b_ref.py frame …` in WSL |
+| fragment benches | `tb_board_b3d`, `tb_fs2` with `-Defines TB_ONEB,TB_LANES4` | the one-board fragment core: 4 warps, 4 lanes, 4 TEX live, 2 quarter-rate micro-ops in flight, 8 triangle slots, no SQRT / RCPM / RSQM, SIN / COS or divider |
+| vertex benches | `tb_a_vertex`, `tb_a_geom`, `tb_a_cmd`, `tb_a_stress` with `-Defines VS_ONEB,VS_NL4` | the one-board vertex core: 4 warps of 4 lanes, no SIN / COS or divider |
 
 Plusargs must not contain `=`, because `xsim.bat` splits there.
 
@@ -71,147 +89,72 @@ Every *N* seconds the library logs two lines. "Per frame" means divided by the f
 - **fps**, then per frame:
   - **draws** and **new draw states**;
   - **passes**: more than 1.0 means the library splits frames, which costs a band pass each time;
-  - **KB vertices** (streamed), **KB to keep** and **kept binds** (vertex buffers held on board A), **datagrams**.
-- **EVENTs lost / resent** and **A gap**: protocol health, should be 0.
+  - **KB vertices** (streamed), **KB to keep** and **kept binds** (vertex buffers held in board A's heap),
+    **datagrams**.
+- **EVENTs lost / resent** and **A gap**: protocol health. Events lost should be 0.
 - **B last frame ms** with its shares: flush, band change, draw change, FS busy, band set-up, starved (the render stream
-  was empty, so A or the link is the bound) and ROP stall.
+  was empty, so the geometry side is the bound) and ROP stall.
   - This is a single frame sampled in the window, not an average.
   - The shares overlap and do not add up to 100 %.
 - **quads / tris:** mid-frame snapshots. Don't quote them as frame totals.
 - **A per frame:** geometry ms, walk ms (the walk includes waiting for B's credit) and band visits.
 
-**Line 2** (`A geometry … kcycles/frame`): A's geometry-busy cycles per frame and the share of
-them each stage was busy. The shares overlap.
-- **load:** program loads;
-- **copy:** uniform and descriptor copies;
-- **feed:** the vertex feed;
-- **fetch-wait:** the feed's refused DDR requests;
-- **core:** the vertex core;
-- **asm:** the primitive assembler;
-- **vo-stall:** a vertex waiting for the setup;
-- **setup:** primitive setup;
-- **push-stall:** the setup waiting for the binner;
-- **bin:** the binner;
-- **clear:** the frame's bin clear.
+**Line 2** (`A geometry … kcycles/frame`): the geometry stage's split. It reads 0 % on the one-board build (profile
+counters off), except the dispatcher's idle and geometry-wait times.
 
-Then loads / draws / primitives per frame, the dispatcher's idle ms (no command waiting: host-bound) and its geometry
-wait ms.
-
-## Latest results
-
-Only results measured on the current hardware are kept; each names the builds it was measured on. The board tests above
-are to be measured on the current pair and recorded here.
-
-### OpenArena timedemo (demo088-test1, the game's default settings)
-
-A 148 / B 142, 2026-11-14, `opengl32.dll` built from f205f6f. A board build was running on the same PC during both runs.
-
-| | 640×480 | 800×600 |
-|---|---|---|
-| frame rate | **28.6 fps** (3 398 frames in 119.0 s) | **21.1 fps** (3 398 frames in 161.1 s) |
-| frame time min / mean / max / std dev | 12.0 / 35.0 / 314.0 / 11.6 ms | 11.0 / 47.4 / 147.0 / 11.5 ms |
-| board B frame (median) | 31.7 ms | 47.7 ms |
-| fragment core busy / stream starved | 76 % / 3 % | 77 % / 3 % |
-| board A geometry / walk per frame | 20.5 / 32.0 ms | 20.4 / 47.0 ms |
-| events lost | 0 | 0 |
-
-Board B paces the game at both sizes. A's geometry takes about 20 ms a frame whatever the size, and its walk follows B's
-frame.
-
-### Other games
-- **NFS Hot Pursuit 2** (Direct3D 8, 800×600, A 147 / B 142): 22–36 fps in races.
-- **Half-Life** (OpenGL, 640×480, A 139 / B 142): about 60 fps.
-
-### Board tests
-- **Shadertoy shaders through `gles_shader.exe`** (A 139 / B 142, 640×480): tunnel 1 064–1 080 ms per frame, Seascape
-  1 467–1 484 ms, ray marcher 364–378 ms.
-- **fb_bench, fb_texperf, fb_cube, fb_shader:** to be measured on the current pair.
-
-### Simulation (the current board B options)
-- **`tb_b_render` frame cycles:**
-
-  | frame | cycles |
-  |---|---|
-  | hid3 | 41 689 |
-  | vis3 | 67 128 |
-  | fill3 | 65 674 |
-  | qmod | 52 073 |
-  | cm | 51 076 |
-  | smod | 143 155 |
-  | oa | 171 146 |
-  | g1 | 112 333 |
-
-## One-board build (board_ab_top)
-
-Board A's FPGA running both halves, one DDR3 and no board link: build S 158 (`tools/build_board.tcl S`, this branch at
-415abdf), measured 2026-11-15 on board A over JTAG, board B idle.
-
-- **Configuration:** 100 MHz; both shader cores 4 lanes (16 on the two boards); 4 fragment warps; no SIN / COS units and no
-  integer divider in either core (the compilers lower them, STATUS flags bits 30 / 31); no SQRT / RCPM / RSQM micro-ops;
-  one blend unit per pixel pair; targets and video modes up to 800 px wide; no coarse depth or lazy TRI items on board A.
-- **Utilisation:** 116.9 k LUT (87.4 %), slices 99.1 %, 261 block RAM tiles, 262 DSP, 96.3 k flip-flops; timing met at
-  100 MHz (WNS +0.001 ns, WHS +0.035 ns).
-- **How to measure it:**
-  - Set `GPU2_CLK_MHZ=100` for the tools' ms.
-  - The `host/fb` tools must lower for the cores; they do so from STATUS since 31a0cf2.
-  - The libraries need the one-board heaps: board A's buffers in 256-448 MB, board B's images from 464 MB. STATUS flags
-    bit 29 says so from eb90593 on, and this branch's libraries follow it from 0297942. S 158 predates bit 29, so the
-    timedemo below used a test build of `opengl32.dll`: 31a0cf2 with board A's heap at 384-448 MB, board B's from 464 MB
-    and a 32 MB vertex ring.
-  - With the two boards' heaps, the vertex ring runs over board B's draw buckets at 448 MB: OpenArena then stops after a
-    minute, board B stuck at draw changes.
+## Results (S 158, 2026-11-15)
 
 ### Correctness
-`fb_cube --check`: 0 mismatches (32 cubes at 60 fps, vsync). `fb_3d_test` 11, 13, 15: bit-exact. `fb_texperf`: 21 / 21
-checks ok. `fb_shader`: raymarch, spiral, heart pass.
+- `fb_cube --check`: 0 mismatches (32 cubes at 60 fps, vsync).
+- `fb_3d_test` 11, 13, 15: bit-exact.
+- `fb_texperf`: 21 / 21 checks ok.
+- `fb_shader`: raymarch, spiral and heart pass.
+- After the runs STATUS showed 0 command errors and no geometry error.
 
 ### OpenArena timedemo (demo088-test1, 640×480, the game's default settings)
 
-The two-board column is A 153 / B 142 with board A's coarse depth and lazy TRI items off (S 158 has neither); with both on,
-A 154 / B 142 reaches 31.4 fps. A simulation was running on the PC during the first minutes of the S 158 run.
+`opengl32.dll`: this branch's library at 31a0cf2 with the one-board heaps set by hand (board A's heap 384–448 MB, board
+B's from 464 MB, a 32 MB vertex ring), since S 158 has no STATUS bit 29. A simulation was running on the PC during the
+first minutes of the run.
 
-| | S 158 (one board, 100 MHz) | A 153 / B 142 (two boards, 120 MHz) |
+| | 640×480 |
+|---|---|
+| frame rate | **7.2 fps** (3 398 frames in 469.3 s) |
+| frame time min / mean / max / std dev | 11.0 / 138.1 / 284.0 / 25.6 ms |
+| board B frame (median) | 135.1 ms |
+| fragment core busy / stream starved | 93 % / 0 % |
+| board A geometry per frame | 24.8 ms |
+| events lost | 0 |
+
+The fragment side paces the game: the fragment core is busy 93 % of the frame and never starved, while the geometry takes
+a fifth of the frame. 800×600 has not been measured yet.
+
+### fb_bench (`--secs 3`)
+
+| test | 800×600 | 640×480 |
 |---|---|---|
-| frame rate | **7.2 fps** (3 398 frames in 469.3 s) | 29.2 fps |
-| frame time min / mean / max / std dev | 11.0 / 138.1 / 284.0 / 25.6 ms | |
-| board B frame (median) | 135.1 ms | 33.4 ms |
-| fragment core busy / stream starved | 93 % / 0 % | |
-| board A geometry per frame | 24.8 ms | 20.6 ms (A 154) |
-| events lost | 0 | 0 |
+| fill_flat | 66.3 Mpixels/s | 66.1 |
+| fill_varying | 39.2 Mpixels/s | 39.2 |
+| fill_depth_pass | 66.2 Mpixels/s | 66.2 |
+| fill_depth_reject | 170.3 Mpixels/s | 170.7 |
+| fill_blend | 66.1 Mpixels/s | 66.0 |
+| tex1 nearest / bilinear / trilinear | 17.4 / 17.3 / 17.6 Msamples/s | 17.2 / 17.1 / 17.5 |
+| tex2_bilinear | 25.8 Msamples/s | 25.6 |
+| tex4_bilinear | 27.3 Msamples/s | 26.8 |
+| tex8_bilinear | 18.4 Msamples/s | 18.4 |
+| alu_16 / alu_64 | 260 / 301 Mscalar ops/s | 260 / 301 |
+| tri_culled | 3.51 M triangles/s | 2.12 |
+| tri_8px / 32px / 128px / 512px | 2.06 / 1.12 / 0.39 / 0.11 M triangles/s | 1.71 / 1.13 / 0.38 / 0.11 |
+| upload / read-back | 61.2 / 39.6 MB/s | 56.3 / 36.5 |
 
-The fragment side paces the game: its frame is four times the two boards', while board A's geometry costs only a fifth more.
-
-### fb_bench (800×600, `--secs 3`)
-
-Two-board column: A 153 / B 142 with board A's features on, the same measurement as the two-board results above. Clock
-alone would give 0.83×.
-
-| test | S 158 | A 153 / B 142 | ratio |
-|---|---|---|---|
-| fill_flat | 66.3 Mpixels/s | 118.9 | 0.56× |
-| fill_varying | 39.2 Mpixels/s | | |
-| fill_depth_pass | 66.2 Mpixels/s | 118.7 | 0.56× |
-| fill_depth_reject | 170.3 Mpixels/s | 310.6 (219.2 without culling) | 0.78× of 219.2 |
-| fill_blend | 66.1 Mpixels/s | 116.8 | 0.57× |
-| tex1 nearest / bilinear / trilinear | 17.4 / 17.3 / 17.6 Msamples/s | 109.5 / 104.7 / 54.0 | 0.16 / 0.17 / 0.33× |
-| tex2_bilinear | 25.8 Msamples/s | 108.6 | 0.24× |
-| tex4_bilinear | 27.3 Msamples/s | 101.0 | 0.27× |
-| tex8_bilinear | 18.4 Msamples/s | 86.1 | 0.21× |
-| alu_16 / alu_64 | 260 / 301 Mscalar ops/s | 1 279 / 1 454 | 0.20 / 0.21× |
-| tri_culled | 3.51 M triangles/s | 3.60 | 0.97× |
-| tri_8px / 32px / 128px / 512px | 2.06 / 1.12 / 0.39 / 0.11 M triangles/s | 2.67 / 1.80 / 0.62 / 0.19 | 0.77 / 0.62 / 0.63 / 0.58× |
-| upload / read-back | 61.2 / 39.6 MB/s | 60.0 / 34.4 | 1.02 / 1.15× |
-
-At 640×480 the rates are the same within 3 %, except tri_culled and tri_8px (2.12 / 1.71 M triangles/s: those tests draw
-fewer triangles a frame there) and upload / read-back (56.3 / 36.5 MB/s).
-
-- The ALU rate is the lane count times the clock: 4 lanes / 16 × 100 / 120 = 0.21×.
-- Texturing loses most: with 4 warps of one quad each, too few quads are in flight to hide the texture latency.
-- Board A's triangle rate barely changes.
+- tri_culled and tri_8px draw fewer triangles a frame at 640×480, so their rates there are lower.
+- Fill runs at about 0.66 pixels per cycle, with the fragment core busy the whole frame.
+- The ALU tests reach 65–75 % of the 4 lanes' 400 M operations a second.
+- Texturing is latency-bound: 4 warps of one quad each are too few quads in flight to hide the texture round trip.
 
 ### fb_texperf (800×600, cycles per quad)
 
-Every case is about 4.7× its ideal (the cycles its instructions need); no two-board run of it is recorded yet.
+Every case takes about 4.7 times its ideal (the cycles its instructions need), for the same reason.
 
 | case | fps | cycles / quad | ideal |
 |---|---|---|---|

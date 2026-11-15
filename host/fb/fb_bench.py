@@ -4,7 +4,11 @@ pixel fill, depth test and rejection, blending, texturing, shader arithmetic, tr
 renders frames as fast as it can for a few seconds; the rate is what got through per second of wall clock, flush and host
 included, and B's cycle counters show its own part of the frame.
 
-  python3 host/fb/fb_bench.py [--ip 192.168.1.10] [--mode 1] [--secs 3] [--only NAME[,NAME]] [--list]
+  python3 host/fb/fb_bench.py [--ip 192.168.1.10] [--mode 1] [--secs 3] [--only NAME[,NAME]] [--list] [--no-zc] [--no-lazy]
+
+Board A's coarse depth (the draws' flags from their DRAW_STATE, fbproto.zc_flags) and lazy TRI items are on, as in the
+libraries: --no-zc sends no flags (A culls nothing), --no-lazy sends every TRI item; A's counters print per test (STATUS
+layout 12).
 
 Fill and texture tests draw L full-screen layers per frame, triangle tests a grid of triangles of a given area over the
 whole screen with an MVP transform (tri_culled: the same grid with both faces culled, so geometry and no pixels). Shaders
@@ -130,8 +134,6 @@ def run_test(bd, t, W, H, secs, textures_up):
         else: bd.vertex_attr(i, False, 4, 0, 0, 0, (0.0, 0.0, 0.0, 1.0))
     mask = 0
     for name, (slot, _ty) in rf['varyings'].items(): mask |= 1 << slot
-    bd.vs_state((W * 8.0, W * 8.0, H * 8.0, H * 8.0), cull=3 if t.name == 'tri_culled' else 0, front_cw=0, fsmask=mask or 1,
-                width=W, height=H, draw_id=DRAW_ID)
     bd.create_buffer(H_FSPROG, B_FSPROG, 65536); bd.write_buffer(H_FSPROG, 0, words64_bytes(wf))
     for h_, base in zip(H_IMG, B_IMG):
         bd.create_image(h_, base, W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
@@ -150,6 +152,11 @@ def run_test(bd, t, W, H, secs, textures_up):
     h[11] = len(wf) << 16 | H_FSPROG; h[12] = 0; h[13] = len(ufs)
     for name, unit in rf['samplers'].items():
         h[15 + unit] = H_T[unit] | FILT[t.filt] << 16
+    # board A's state, with the flags the draw state above promises (the program's DISCARD / STOZ, opcodes 29 / 21)
+    ops = {(w >> 57) & 0x7F for w in wf}
+    zc = (0 if NO_ZC else fp.zc_flags(h[0], discard=29 in ops, frag_depth=21 in ops)) | (0 if NO_LAZY else fp.ZC_LAZY)
+    bd.vs_state((W * 8.0, W * 8.0, H * 8.0, H * 8.0), cull=3 if t.name == 'tri_culled' else 0, front_cw=0, fsmask=mask or 1,
+                width=W, height=H, draw_id=DRAW_ID, zc=zc)
     bd.draw_state(DRAW_ID, h, ufs)
     bd.fence(timeout=10.0)
     errs = bd.take_errors()
@@ -191,6 +198,7 @@ def run_test(bd, t, W, H, secs, textures_up):
     if st.get('layout', 0) >= 9: rate += f" a_visits={((st['a_visits'] - st0['a_visits']) & 0xFFFFFFFF) / n:.0f}/frame"
     print(f"RESULT {t.name} fps={fps:.2f} {rate} b_frame_ms={bms:.2f} a_geom_ms={ams:.2f} instr={len(wf)} vs_instr={len(wv)} frames={n} | " + fp.b_frame_split(st))
     if st.get('layout', 0) >= 10: print(f"  PROFILE {t.name} " + fp.a_geom_split(st, st0, n))
+    if st.get('layout', 0) >= 12: print(f"  CZ {t.name} " + fp.a_cz_split(st, st0, n))
     sys.stdout.flush()
     return fps
 
@@ -209,9 +217,14 @@ def transfers(bd):
     print(f"RESULT transfer upload_MBps={up:.1f} readback_MBps={down:.1f}")
 
 
+NO_ZC = NO_LAZY = False
+
+
 def main():
+    global NO_ZC, NO_LAZY
     a = sys.argv[1:]
     def opt(name, default, conv=str): return conv(a[a.index(name) + 1]) if name in a else default
+    NO_ZC, NO_LAZY = '--no-zc' in a, '--no-lazy' in a
     if '--list' in a:
         for t in TESTS: print(t.name)
         return 0

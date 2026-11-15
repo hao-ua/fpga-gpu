@@ -140,3 +140,94 @@ frame.
   | smod | 143 155 |
   | oa | 171 146 |
   | g1 | 112 333 |
+
+## One-board build (board_ab_top)
+
+Board A's FPGA running both halves, one DDR3 and no board link: build S 158 (`tools/build_board.tcl S`, this branch at
+415abdf), measured 2026-11-15 on board A over JTAG, board B idle.
+
+- **Configuration:** 100 MHz; both shader cores 4 lanes (16 on the two boards); 4 fragment warps; no SIN / COS units and no
+  integer divider in either core (the compilers lower them, STATUS flags bits 30 / 31); no SQRT / RCPM / RSQM micro-ops;
+  one blend unit per pixel pair; targets and video modes up to 800 px wide; no coarse depth or lazy TRI items on board A.
+- **Utilisation:** 116.9 k LUT (87.4 %), slices 99.1 %, 261 block RAM tiles, 262 DSP, 96.3 k flip-flops; timing met at
+  100 MHz (WNS +0.001 ns, WHS +0.035 ns).
+- **How to measure it:**
+  - Set `GPU2_CLK_MHZ=100` for the tools' ms.
+  - The `host/fb` tools must lower for the cores; they do so from STATUS since 31a0cf2.
+  - The libraries need the one-board heaps: board A's buffers in 256-448 MB, board B's images from 464 MB. STATUS flags
+    bit 29 says so from eb90593 on, and this branch's libraries follow it from 0297942. S 158 predates bit 29, so the
+    timedemo below used a test build of `opengl32.dll`: 31a0cf2 with board A's heap at 384-448 MB, board B's from 464 MB
+    and a 32 MB vertex ring.
+  - With the two boards' heaps, the vertex ring runs over board B's draw buckets at 448 MB: OpenArena then stops after a
+    minute, board B stuck at draw changes.
+
+### Correctness
+`fb_cube --check`: 0 mismatches (32 cubes at 60 fps, vsync). `fb_3d_test` 11, 13, 15: bit-exact. `fb_texperf`: 21 / 21
+checks ok. `fb_shader`: raymarch, spiral, heart pass.
+
+### OpenArena timedemo (demo088-test1, 640×480, the game's default settings)
+
+The two-board column is A 153 / B 142 with board A's coarse depth and lazy TRI items off (S 158 has neither); with both on,
+A 154 / B 142 reaches 31.4 fps. A simulation was running on the PC during the first minutes of the S 158 run.
+
+| | S 158 (one board, 100 MHz) | A 153 / B 142 (two boards, 120 MHz) |
+|---|---|---|
+| frame rate | **7.2 fps** (3 398 frames in 469.3 s) | 29.2 fps |
+| frame time min / mean / max / std dev | 11.0 / 138.1 / 284.0 / 25.6 ms | |
+| board B frame (median) | 135.1 ms | 33.4 ms |
+| fragment core busy / stream starved | 93 % / 0 % | |
+| board A geometry per frame | 24.8 ms | 20.6 ms (A 154) |
+| events lost | 0 | 0 |
+
+The fragment side paces the game: its frame is four times the two boards', while board A's geometry costs only a fifth more.
+
+### fb_bench (800×600, `--secs 3`)
+
+Two-board column: A 153 / B 142 with board A's features on, the same measurement as the two-board results above. Clock
+alone would give 0.83×.
+
+| test | S 158 | A 153 / B 142 | ratio |
+|---|---|---|---|
+| fill_flat | 66.3 Mpixels/s | 118.9 | 0.56× |
+| fill_varying | 39.2 Mpixels/s | | |
+| fill_depth_pass | 66.2 Mpixels/s | 118.7 | 0.56× |
+| fill_depth_reject | 170.3 Mpixels/s | 310.6 (219.2 without culling) | 0.78× of 219.2 |
+| fill_blend | 66.1 Mpixels/s | 116.8 | 0.57× |
+| tex1 nearest / bilinear / trilinear | 17.4 / 17.3 / 17.6 Msamples/s | 109.5 / 104.7 / 54.0 | 0.16 / 0.17 / 0.33× |
+| tex2_bilinear | 25.8 Msamples/s | 108.6 | 0.24× |
+| tex4_bilinear | 27.3 Msamples/s | 101.0 | 0.27× |
+| tex8_bilinear | 18.4 Msamples/s | 86.1 | 0.21× |
+| alu_16 / alu_64 | 260 / 301 Mscalar ops/s | 1 279 / 1 454 | 0.20 / 0.21× |
+| tri_culled | 3.51 M triangles/s | 3.60 | 0.97× |
+| tri_8px / 32px / 128px / 512px | 2.06 / 1.12 / 0.39 / 0.11 M triangles/s | 2.67 / 1.80 / 0.62 / 0.19 | 0.77 / 0.62 / 0.63 / 0.58× |
+| upload / read-back | 61.2 / 39.6 MB/s | 60.0 / 34.4 | 1.02 / 1.15× |
+
+At 640×480 the rates are the same within 3 %, except tri_culled and tri_8px (2.12 / 1.71 M triangles/s: those tests draw
+fewer triangles a frame there) and upload / read-back (56.3 / 36.5 MB/s).
+
+- The ALU rate is the lane count times the clock: 4 lanes / 16 × 100 / 120 = 0.21×.
+- Texturing loses most: with 4 warps of one quad each, too few quads are in flight to hide the texture latency.
+- Board A's triangle rate barely changes.
+
+### fb_texperf (800×600, cycles per quad)
+
+Every case is about 4.7× its ideal (the cycles its instructions need); no two-board run of it is recorded yet.
+
+| case | fps | cycles / quad | ideal |
+|---|---|---|---|
+| t1_256_bilinear / nearest / 565_bilinear | 17.9 / 17.9 / 18.0 | 46.2 / 46.3 / 46.0 | 9.8 |
+| t1_2048_mag1 / tri_mag1 | 17.7 / 17.7 | 46.8 / 46.8 | 9.8 |
+| t1_2048_min8 / tri_min8 / tri_min6 | 16.6 / 17.6 / 17.0 | 50.1 / 47.2 / 48.9 | 9.8 |
+| t1_2048_mipn_min8 / 565_tri_min8 | 18.0 / 17.8 | 46.1 / 46.6 | 9.8 |
+| t2_2048tri_256 / _min6 | 13.4 / 13.3 | 62.1 / 62.4 | 13.8 |
+| t4_2x2048tri_2x256 / _min6 / t4_4x256_bilinear | 9.0 / 8.9 / 9.0 | 92.2 / 92.7 / 91.7 | 22.2 |
+| cube_256 bilinear / trilinear / tri_lv7 / tri_lv8 | 4.6 | 180.2 | 29.0 |
+| tunnel / tunnel_naive | 5.0 / 7.0 | 165.6 / 118.9 | 27.2 / 18.8 |
+
+### fb_shader (800×600, 120 400 quads a frame)
+
+| scene | fps | cycles / quad | fragment program |
+|---|---|---|---|
+| raymarch (32 steps) | 0.55 | 1 498 | 340 instructions |
+| spiral | 3.70 | 223 | 94 instructions |
+| heart | 2.28 | 364 | 198 instructions |

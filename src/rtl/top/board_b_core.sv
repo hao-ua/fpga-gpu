@@ -87,7 +87,8 @@ module board_b_core
     parameter int    DISP_LB_LINES  = 16,
     parameter bit    B3D_SFU_TAB2   = 1'b0,          // the fragment core's SFU tables shared by pairs of units (bit-identical)
     parameter bit    B3D_INT_DIV    = 1'b1,          // the fragment core's integer divider; 0: none (STATUS flags bit 30 set)
-    parameter bit    B3D_SINCOS     = 1'b1           // the fragment core's SIN / COS units; 0: none (STATUS flags bit 31 set)
+    parameter bit    B3D_SINCOS     = 1'b1,          // the fragment core's SIN / COS units; 0: none (STATUS flags bit 31 set)
+    parameter [31:0] HEAP_LO        = 32'h1000_0000  // the host's heap for images and transfers starts here (byte address)
 )(
     input  wire         clk_sys, rst_sys, calib_done,
     input  wire         clk200,                  // 200 MHz (BUFG) for the video and link MMCMs
@@ -369,7 +370,7 @@ module board_b_core
 
     // ---------------- command processor ----------------
     wire [15:0] cp_cmds, cp_errs; wire [31:0] cp_images; wire h_active;
-    fb_cmd_b #(.SIM_MODE4(SIM_MODE4), .MAXW(B3D_MAXW), .VOL3D(VOL3D), .DS_BYTE({1'b0, B3D_DS_BASE} << 2)) u_cp (
+    fb_cmd_b #(.SIM_MODE4(SIM_MODE4), .MAXW(B3D_MAXW), .VOL3D(VOL3D), .DS_BYTE({1'b0, B3D_DS_BASE} << 2), .HEAP_LO(HEAP_LO)) u_cp (
         .clk(clk_sys), .rst(rst_ddr),
         .c_valid(cw_valid), .c_data(cw_data), .c_first(cw_first), .c_last(cw_last), .c_ready(cw_ready),
         .c_old(cw_old), .sync_wipe(rs_abort),

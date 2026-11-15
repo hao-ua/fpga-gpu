@@ -41,7 +41,12 @@ module board_ab_core #(
     parameter int    B3D_NL         = 4,                // 16, 8 or 4 (a warp = B3D_NL / 4 quads)
     // B's draw buckets (word address): 448 MB, above board A's regions and below the host's B heap
     parameter [28:0] B3D_DS_BASE    = 29'h0700_0000,
-    parameter bit    B3D_ROP_BLEND1 = 1'b1,             // one blend unit shared by a pair's two pixels (the same rate)
+    // the host's two heaps (byte addresses): board A's buffers 256-448 MB, board B's images and transfers from 464 MB to
+    // 1 GB; a buffer or an image outside its heap is refused (ERR_HEAP), and STATUS flags bit 29 tells the host this map
+    parameter [31:0] A_HEAP_LO      = 32'h1000_0000,
+    parameter [31:0] A_HEAP_HI      = 32'h1C00_0000,
+    parameter [31:0] B_HEAP_LO      = 32'h1D00_0000,
+    parameter bit    B3D_ROP_BLEND1 = 1'b1,            // one blend unit shared by a pair's two pixels (the same rate)
     // both shader cores' SFU tables shared by pairs of units (block RAM for nothing, bit-identical)
     parameter bit    SFU_TAB2       = 1'b1,
     // both shader cores' integer dividers: none (the compilers lower integer division to float ops; STATUS says so)
@@ -131,7 +136,8 @@ module board_ab_core #(
                    .SNAP_CYCLES(SNAP_CYCLES), .JTAG_STATUS(JTAG_STATUS), .KEEPALIVE(KEEPALIVE), .B_ALIVE(B_ALIVE),
                    .RENDER_TIMEOUT(RENDER_TIMEOUT), .VS_SFU_TAB2(SFU_TAB2), .VS_INT_DIV(INT_DIV), .VS_SINCOS(SINCOS), .EXT_ARB(1'b1), .EXT_LINK(1'b1), .REC_BASE(REC_BASE), .REC_BANK_W(REC_BANK_W),
                    .BINLIST_BASE(BINLIST_BASE), .POOL_W(POOL_W), .VS_NWARP(VS_NWARP), .BAND8_MAXW(BAND8_MAXW),
-                   .GEOM_PROF(GEOM_PROF), .JTAG_LEAN(1'b1), .VS_NL(VS_NL)) u_a (
+                   .GEOM_PROF(GEOM_PROF), .JTAG_LEAN(1'b1), .VS_NL(VS_NL), .HEAP_LO(A_HEAP_LO), .HEAP_HI(A_HEAP_HI),
+                   .ONE_SPACE(1'b1)) u_a (
         .clk_sys, .rst_sys, .calib_done, .clk_idelay(clk200),
         .rgmii_rxc, .rgmii_rx_ctl, .rgmii_rxd, .rgmii_txc, .rgmii_tx_ctl, .rgmii_txd,
         .phy_rstn, .mdc, .mdio_o, .mdio_oe, .mdio_i,
@@ -152,7 +158,7 @@ module board_ab_core #(
                    .B3D_NTS(B3D_NTS), .B3D_NLMAX(B3D_NLMAX), .B3D_BAND8_MAXW(BAND8_MAXW), .DISP_MAXW(DISP_MAXW),
                    .DISP_LB_LINES(DISP_LB_LINES), .B3D_SFU_TAB2(SFU_TAB2), .B3D_INT_DIV(INT_DIV), .B3D_SINCOS(SINCOS), .B3D_XSFU(B3D_XSFU),
                    .B3D_QRINF(B3D_QRINF), .B3D_TEXQ(B3D_TEXQ), .B3D_NL(B3D_NL), .B3D_DS_BASE(B3D_DS_BASE),
-                   .B3D_ROP_BLEND1(B3D_ROP_BLEND1), .EXT_ARB(1'b1), .EXT_LINK(1'b1)) u_b (
+                   .B3D_ROP_BLEND1(B3D_ROP_BLEND1), .HEAP_LO(B_HEAP_LO), .EXT_ARB(1'b1), .EXT_LINK(1'b1)) u_b (
         .clk_sys, .rst_sys, .calib_done, .clk200, .key1_n, .dbg_cmd_valid, .dbg_cmd,
         .app_en(), .app_cmd(), .app_addr(), .app_wdf_data(), .app_wdf_mask(), .app_wdf_wren(), .app_wdf_end(),
         .app_rdy(1'b0), .app_wdf_rdy(1'b0), .app_rd_data_valid(1'b0), .app_rd_data(256'd0),
@@ -205,16 +211,24 @@ module board_ab_core #(
         .app_rdy(app_rdy), .app_wdf_rdy(app_wdf_rdy), .app_rd_data_valid(app_rd_data_valid), .app_rd_data(app_rd_data));
 
     // synthesis translate_off
-    // the shared address space's fixed regions: board B never writes below the end of board A's (the ring, the record
-    // banks, the bin pools); A's geometry writes (W2, W3) stay inside its record banks and bin pools
+    // the shared address space's regions: board B never writes below its draw buckets (board A's ring, record banks, bin
+    // pools and heap lie there); A's geometry writes (W2, W3) stay inside its record banks and bin pools, its transfer
+    // engine's (W1) inside its heap
     localparam [28:0] A_END = BINLIST_BASE + 2 * POOL_W;
+    localparam [28:0] DS_WORDS = 29'h40_0000;           // the draw buckets' region: 16 MB
     always @(posedge clk_sys) if (!rst_ddr) for (int i = 0; i < 8; i++) if (w_en[i] && w_rdy[i]) begin
-        if (i >= 4 && w_addr[i*29 +: 29] < A_END)
-            $fatal(1, "board_ab_core: board B write (port W%0d) at word %h, inside board A's regions (below %h)", i, w_addr[i*29 +: 29], A_END);
+        if (i >= 4 && w_addr[i*29 +: 29] < B3D_DS_BASE)
+            $fatal(1, "board_ab_core: board B write (port W%0d) at word %h, inside board A's regions or heap (below %h)", i, w_addr[i*29 +: 29], B3D_DS_BASE);
         if ((i == 2 || i == 3) && (w_addr[i*29 +: 29] < REC_BASE || w_addr[i*29 +: 29] >= A_END))
             $fatal(1, "board_ab_core: board A geometry write (port W%0d) at word %h, outside [%h, %h)", i, w_addr[i*29 +: 29], REC_BASE, A_END);
+        if (i == 1 && (w_addr[i*29 +: 29] < A_HEAP_LO[30:2] || w_addr[i*29 +: 29] >= A_HEAP_HI[30:2]))
+            $fatal(1, "board_ab_core: board A transfer write at word %h, outside its heap [%h, %h)", w_addr[i*29 +: 29], A_HEAP_LO[30:2], A_HEAP_HI[30:2]);
     end
-    initial if (B3D_DS_BASE < A_END) $fatal(1, "board_ab_core: B3D_DS_BASE %h inside board A's regions (below %h)", B3D_DS_BASE, A_END);
+    initial begin
+        if (A_HEAP_LO[30:2] < A_END) $fatal(1, "board_ab_core: A_HEAP_LO %h inside board A's regions (they end at word %h)", A_HEAP_LO, A_END);
+        if (A_HEAP_HI[30:2] > B3D_DS_BASE) $fatal(1, "board_ab_core: A_HEAP_HI %h above B's draw buckets (word %h)", A_HEAP_HI, B3D_DS_BASE);
+        if (B_HEAP_LO[30:2] < B3D_DS_BASE + DS_WORDS) $fatal(1, "board_ab_core: B_HEAP_LO %h inside B's draw buckets (they end at word %h)", B_HEAP_LO, B3D_DS_BASE + DS_WORDS);
+    end
     // synthesis translate_on
 
     // LEDs: DDR calibrated, Ethernet link up (board A's)

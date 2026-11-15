@@ -47,6 +47,12 @@ module board_a_core #(
     parameter [28:0] REC_BANK_W     = 29'h2000000,
     parameter [28:0] BINLIST_BASE   = 29'h5000000,
     parameter [28:0] POOL_W         = 29'h800000,
+    // the host's heap for board A's buffers (byte addresses; a CREATE_BUFFER outside it is refused), and ONE_SPACE: both
+    // halves share one address space (STATUS flags bit 29 set: the host keeps board A's buffers in 256-448 MB and board
+    // B's images in 464 MB - 1 GB, the two heaps board_ab_core gives the cores)
+    parameter [31:0] HEAP_LO        = 32'h1800_0000,
+    parameter [31:0] HEAP_HI        = 32'h4000_0000,
+    parameter bit    ONE_SPACE      = 1'b0,
     // the geometry stage: the vertex core's warps in flight (2..4), and the widest target that gets 8-row bands (wider ones
     // get 4; it must be board B's b_render BAND8_MAXW; 0 = 4-row bands always)
     parameter int    VS_NWARP       = 4,
@@ -208,7 +214,7 @@ module board_a_core #(
     wire [31:0] c_cmds, c_errs, last_err, last_err_seq, mt_last, c_fwd, c_hdr_wait, c_gwait;
     wire        f_valid, f_last, f_ready, link_ok; wire [31:0] f_data; wire [15:0] f_len;
     wire        g_abort, g_abort_soft, g_resync, l_sync_go;
-    fb_dispatch_a #(.B_WAIT(B_WAIT), .RENDER_TIMEOUT(RENDER_TIMEOUT)) u_disp (
+    fb_dispatch_a #(.B_WAIT(B_WAIT), .RENDER_TIMEOUT(RENDER_TIMEOUT), .HEAP_LO(HEAP_LO), .HEAP_HI(HEAP_HI)) u_disp (
         .clk(clk_sys), .rst(rst_ddr), .q_valid(qo_v), .q_data(qo_d), .q_ready(qo_rdy),
         .x_cmd_valid(x_cv), .x_op(x_op), .x_addr(x_addr), .x_len(x_len), .x_seed(x_seed), .x_flags(x_flags),
         .x_cmd_ready(x_crdy), .x_busy(x_busy), .x_wd_valid(x_wdv), .x_wd_data(x_wdd), .x_wd_ready(x_wdr),
@@ -345,8 +351,9 @@ module board_a_core #(
     localparam int RING = 1 << RING_LOG2;
     wire [RING_LOG2:0] q_free = RING - q_used;
     // bit 31: the vertex core has no SIN / COS units (SIN / COS stop the warp); bit 30: no integer divider (IDIV / IMOD /
-    // UDIV / UMOD stop the warp) — board B's flags have the same two bits for the fragment core; 0 on builds with them
-    wire [31:0] flags = {~VS_SINCOS, ~VS_INT_DIV, 9'h0, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok, host_valid, mdio_init_done,
+    // UDIV / UMOD stop the warp) — board B's flags have the same two bits for the fragment core; 0 on builds with them.
+    // bit 29: one address space for both halves (the host's two heaps are 256-448 MB for A and 464 MB - 1 GB for B)
+    wire [31:0] flags = {~VS_SINCOS, ~VS_INT_DIV, ONE_SPACE, 8'h0, phyad, 1'b0, adv1000, rxdly, idelay_tap, link_ok, host_valid, mdio_init_done,
                          duplex, speed, link_up, calib_done};
     wire [31:0] sw [0:STATUS_WORDS-1];
     assign sw[0]  = STATUS_LAYOUT;

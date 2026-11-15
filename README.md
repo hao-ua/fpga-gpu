@@ -16,6 +16,10 @@ joined by ribbon cables:
 OpenArena's timedemo runs at 31.4 fps at 640×480 and 23.9 at 800×600; with board A's coarse depth and lazy TRI items
 off, 29.2 and 21.6 ([PERF_TESTS.md](PERF_TESTS.md)). How to build and run it: the rest of this file.
 
+<img src="images/two-boards.jpg" alt="The two PA200T-StarLite boards stacked on standoffs: board A on top with the Ethernet cable, board B below with the HDMI cable" width="600">
+
+*Board A on top (Ethernet to the PC), board B below (HDMI to the monitor).*
+
 **One-board variant:** the [`single-board`](../../tree/single-board) branch fits both halves into one board's FPGA and
 DDR3, with no ribbon cables. It keeps the same host protocol and the OpenGL ES 2.0 feature set, at a lower speed:
 - 4 shader lanes instead of 16, at 100 MHz;
@@ -45,6 +49,7 @@ only they know the one-board memory map.
 | `tests/` | shader test programs: assembly (`.sasm`) and GLSL |
 | `host/win/` | the Windows libraries, the shader compiler (`shc`), test programs and game launchers |
 | `host/fb/` | Python host tools: the protocol library, board status, acceptance tests, benchmarks |
+| `images/` | photos used in this file |
 
 Everything generated goes to `tools/gen/`: the MIG IP, tables, goldens, simulation work directories, bitstreams and
 reports. `tools/gen/` is not in git.

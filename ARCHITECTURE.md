@@ -226,3 +226,82 @@ texture unit.
     issue.
   - See [PERF_TESTS.md](PERF_TESTS.md).
 - **Pairing:** A and B builds must use the same render-stream format; builds from the same source tree always do.
+
+## 10. The one-board build (`board_ab_top`)
+
+Both halves in one XC7A200T on one board, built with `tools/build_board.tcl S`. The PC sees the same protocol: it
+talks to board A's side at 192.168.1.10, and the HDMI output is the same board's.
+
+```
+ Windows PC ── UDP ──▶ board A's half (board_a_core) ── link_loop ──▶ board B's half (board_b_core) ──▶ HDMI
+                              │                                              │
+                              └──────────── one mem_arb, one DDR3 ───────────┘
+```
+
+- **`board_ab_core`:** it instantiates `board_a_core` and `board_b_core` with `EXT_ARB` and `EXT_LINK` set.
+  - Their memory ports go out to one shared `mem_arb`.
+  - `link_a_port` and `link_b_port` are joined by `link_loop` instead of the ribbon-cable PHYs, which stay in the
+    netlist idle.
+  - Everything above the link is unchanged: commands for B, the render stream, credits, B's STATUS, events and read-back.
+- **The shared arbiter:** 11 read and 8 write ports, highest priority first.
+  - Reads: B scanout (must-run), A ingress ring, A transfer engine, B READ / COPY, B `xfer_lin`, B band load, B texture
+    unit, B buckets and programs, then A's three geometry ports.
+  - Writes: A ring, A transfer engine, A's two geometry ports, B WRITE_IMAGE, B `xfer_lin`, B FILL / COPY, B band flush.
+- **One address space:** the two boards' DDR maps, packed into one 1 GB.
+
+  | range | use |
+  |---|---|
+  | 0–64 MB | A's ingress ring |
+  | 64–192 MB | A's triangle records: two frame banks of 2¹⁷ records × 512 B (half the two boards' banks) |
+  | 192–256 MB | A's bin lists: two pools of 2²² entries × 8 B |
+  | 256–448 MB | host heap for board A's buffers |
+  | 448–464 MB | B's per-draw state (8192 draw ids × 2 KB) |
+  | 464 MB–1 GB | host heap for board B's images, programs and buffers |
+
+  - Board A's STATUS flags **bit 29** says "one address space" (0 on the two boards). The host then uses these two heaps.
+  - From eb90593 on, board A refuses a CREATE_BUFFER outside 256–448 MB and board B an image, program or transfer
+    outside 464 MB–1 GB (ERR_HEAP, 4). S 158 predates this and keeps the two boards' bounds (A from 384 MB, B from
+    256 MB).
+  - Board A's MEM_READ, MEM_WRITE and MEMTEST are not bounded, so debug tools can read A's records. On one board they
+    reach every region, B's included.
+  - In simulation `board_ab_core` stops if board B writes below its draw buckets, or if A's geometry or transfer writes
+    leave their regions.
+- **The cores, against the two boards:**
+
+  | | one board | two boards |
+  |---|---|---|
+  | vertex core | 4 warps of 4 vertices | 4 warps of 16 |
+  | fragment core | 4 warps of 4 lanes (one quad) | 8 warps of 16 lanes (4 quads) |
+  | quarter-rate units per core | 1 | 4 |
+  | SIN / COS, integer divide | none | yes |
+  | SQRT / RCPM / RSQM micro-ops | none | yes |
+  | quarter-rate micro-ops in flight / TEX live / triangle slots | 2 / 4 / 8 | 4 / 8 / 16 |
+  | blend units in the ROP | one per pixel pair | one per pixel |
+
+  - The quarter-rate units scale with the lanes, one per 4 lanes. Lane 4k + i goes through unit k in cycle i, so a
+    quarter-rate micro-op takes 4 cycles at every lane count. A 16-lane core is cycle-identical to the two boards' one.
+  - Without the units, SIN, COS, IDIV, IMOD, UDIV and UMOD stop the warp, as IOP does. STATUS flags bits 31 (no SIN / COS)
+    and 30 (no integer divider) say so, in board A's flags for the vertex core and board B's for the fragment core. The
+    compilers then lower those operations to float code.
+  - The ROP's shared blend unit serves a pair's two pixels in consecutive cycles. B still fills at most one pixel a cycle.
+- **Sizes:**
+  - Render targets and video modes up to 800 pixels wide: 640×480 and 800×600. A wider mode is refused (a mode error), and
+    so is a FLUSH to a wider target.
+  - The band buffer has 2048 cells a bank: 8-row bands up to 512 pixels wide, 4 rows above that.
+  - The scanout line buffer holds 8 lines.
+- **Debug:**
+  - Board A's geometry profile counters are off: STATUS words 101–113 read 0.
+  - JTAG has board A's status register only (USER1), read out bit by bit from a snapshot. Board B's JTAG registers are
+    off; A's STATUS carries B's words as before.
+- **Clocks:** 100 MHz for everything on the system clock (the MIG's user clock, DDR3 at 800 MT/s), the link loop included.
+  Ethernet and video clocks are as on the two boards.
+- **Resources** (S 158, the first one-board build):
+
+  | build | timing (setup / hold) | LUT | FF | slices | BRAM tiles | DSP |
+  |---|---|---|---|---|---|---|
+  | S 158 | +0.001 / +0.035 ns | 116 936 (87.4 %) | 96 340 | 33 134 (99.1 %) | 261 (71.5 %) | 262 |
+
+  The two boards' builds (A 147 + B 142) need about 190 k LUT together; the lane, unit and queue cuts above bring that
+  under the part's 134.6 k.
+- **Throughput:** the fragment side sets the pace. In OpenArena at 640×480 board B's frame is about four times the two
+  boards' (7.2 against 29.2 fps); see [PERF_TESTS.md](PERF_TESTS.md), "One-board build".

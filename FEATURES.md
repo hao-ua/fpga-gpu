@@ -200,3 +200,50 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
   - `texture2DLod` is accepted in fragment shaders without the extension;
   - `for(; i++ < N;)` is not treated as a counted loop.
 - **Timing margin:** board B meets timing by only +0.016 ns at 95.7 % of its slices.
+
+## 5. The one-board build
+
+Everything in sections 1 and 2 holds on the one-board build (`board_ab_top`, see [ARCHITECTURE.md](ARCHITECTURE.md)
+section 10) unless listed here. The cuts make it slower, not less capable: OpenGL ES 2.0, OpenGL 2.0 and Direct3D 9
+shader model 2.0 stay as they are.
+
+- **Same as the two boards:**
+  - the shader number formats and instruction set;
+  - 32 registers, 4096 fragment instructions, the uniforms, varyings, attributes and samplers listed above;
+  - the texture formats, filters, wrap modes, cube maps and sizes up to 2048;
+  - depth, stencil, blending, dither and the colour mask;
+  - the 2D image operations, the palette and the cursor;
+  - the host protocol and every library entry point.
+- **Operations without a hardware unit,** lowered by the compilers (`tools/glslc.py`, `host/win/shc`) when STATUS says
+  the unit is absent:
+  - SIN and COS become a range reduction and a polynomial;
+  - integer division and remainder (IDIV, IMOD, UDIV, UMOD) become float operations;
+  - SQRT, RCPM and RSQM become RSQRT or RCP with a multiply, as on any board B without them.
+
+  Programs that use them get longer: `cubes.vert` grows from 71 to 148 instructions.
+- **Sizes:**
+  - render targets and video modes up to 800 pixels wide: 640×480 and 800×600 only;
+  - 2¹⁷ triangle records per frame (the two boards: 2¹⁸).
+- **Speed only:**
+  - 4 lanes per warp in both cores;
+  - 4 fragment warps of one quad;
+  - one quarter-rate unit per core;
+  - 4 TEX instructions live instead of 8;
+  - 100 MHz.
+
+  Measured in [PERF_TESTS.md](PERF_TESTS.md), "One-board build".
+- **Debug:** board A's geometry profile counters are off, so the libraries' `GPU2_STATS` geometry split and
+  `fb_bench`'s PROFILE lines read 0 %. JTAG reads board A's STATUS only.
+- **Host software:** this branch's libraries and `host/fb` tools.
+  - They read STATUS flags bit 29 and move to the one-board heaps: board A's buffers in 256–448 MB, with a 64 MB vertex
+    ring and up to 124 MB kept on board A; board B's from 464 MB.
+  - master's libraries keep the two boards' heaps and run over board B's draw buckets: OpenArena stops after about a
+    minute.
+- **Games:** OpenArena's timedemo runs to the end, 7.2 fps at 640×480 at the game's default settings (S 158, with a test
+  build of the library holding the one-board heaps). No other game has been run on one board.
+- **Open on one board:**
+  - The libraries do not know the 800-pixel limit: they still offer renderbuffers and modes up to 1280, and the board
+    refuses the wider ones.
+  - Only one board's PCB has run it, for minutes at a time; there has been no long run.
+  - Timing is met by +0.001 ns at 99.1 % of the slices, so any growth of the RTL needs timing work.
+  - The heap bounds and bit 29 (eb90593) have run in simulation only: no build has them yet.

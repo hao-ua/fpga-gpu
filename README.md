@@ -6,12 +6,16 @@ primitives. Board A streams them over a ribbon-cable link to **board B**, which 
 blends and shows the picture on HDMI. Drop-in Windows libraries (`ddraw.dll`, `opengl32.dll`, `libGLESv2` / `libEGL`,
 `d3d9.dll`, `d3d8.dll`) let unmodified games render on it.
 
+This branch (`single-board`) also builds a **one-board** version: both halves in one board's FPGA, sharing its DDR3,
+with no ribbon cables. It keeps the same host protocol and the same OpenGL ES 2.0 feature set, with fewer shader lanes
+and a lower clock; see [The one-board build](#the-one-board-build) below.
+
 | document | contents |
 |---|---|
 | this file | what you need, and how to build, load, simulate and run it |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | how the two boards, the link and the host protocol work |
-| [FEATURES.md](FEATURES.md) | what the hardware and each library support, and what they refuse |
-| [PERF_TESTS.md](PERF_TESTS.md) | the performance tests, how to run them, the latest results |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | how the two boards, the link and the host protocol work; the one-board build in section 10 |
+| [FEATURES.md](FEATURES.md) | what the hardware and each library support, and what they refuse; the one-board differences in section 5 |
+| [PERF_TESTS.md](PERF_TESTS.md) | the performance tests, how to run them, the latest results, the one-board results |
 
 ## Repository layout
 
@@ -113,6 +117,56 @@ C:\AMDDesignTools\2026.1\Vivado\bin\vivado.bat -mode batch -nojournal -source to
   `ROUTE_DIRECTIVE`, `PHYS_OPT`, `OPT_DIRECTIVE`, `PHYS_OPT_FANOUT`, `B_PBLOCK=0` (board B's floorplan block off).
 - **Bring-up designs:** `tools/build_link.tcl` builds a board-link test design and `tools/build_mig_test.tcl` a DDR3
   calibration test.
+
+## The one-board build
+
+Board A's Ethernet side and board B's rendering and HDMI side in one XC7A200T (`board_ab_top`), on one DDR3. How it
+differs inside: [ARCHITECTURE.md](ARCHITECTURE.md) section 10; what it supports: [FEATURES.md](FEATURES.md) section 5;
+measurements: [PERF_TESTS.md](PERF_TESTS.md), "One-board build".
+
+- **What you need:** one PA200T-Starlite board, no ribbon cables. The PC is cabled to its RJ45 and the monitor to its
+  HDMI, which must take 640×480 or 800×600 at 60 Hz. The same JTAG cable, network setup and software as above.
+- **Build** (about 2 h 20 min: synthesis 15 min, placement 20 min, route 1 h 25 min). It runs at 100 MHz with the stock
+  800 MT/s MIG, so leave `OC_MHZ` unset:
+  ```
+  C:\AMDDesignTools\2026.1\Vivado\bin\vivado.bat -mode batch -nojournal -source tools/build_board.tcl `
+      -log tools/gen/build_board_S_<yyyy-mm-dd_HHMM>.log -tclargs S
+  ```
+  - The output is `tools/gen/board_S_b<id>.bit`, with the same checkpoints and reports as a board build. The build
+    number comes from the same counter as boards A and B.
+  - The design fills 99 % of the part's slices (S 158: 116.9 k LUT, met at 100 MHz by +0.001 ns), so expect
+    little timing margin.
+  - `$env:SYNTH_THREADS='2'` as above; `SYNTH_ONLY=1` stops after synthesis, `FLAT=none` adds a per-module utilisation
+    report.
+- **Configuration from the environment.** Every cut is a parameter of `board_ab_top`. On a larger FPGA the two-board
+  values can be put back one by one, for example `$env:INT_DIV='1'; $env:SINCOS='1'; $env:VS_NL='16'; $env:B3D_NL='16'`.
+
+  | variable | one-board default | two-board value | what it sets |
+  |---|---|---|---|
+  | `VS_NL`, `B3D_NL` | 4 | 16 | lanes per warp of the vertex / fragment core: 16, 8 or 4 |
+  | `B3D_NWARP`, `VS_NWARP` | 4, 4 | 8, 4 | warps in flight |
+  | `INT_DIV`, `SINCOS` | 0, 0 | 1, 1 | the integer divider and the SIN / COS units, both cores |
+  | `B3D_XSFU` | 0 | 1 | the SQRT / RCPM / RSQM micro-ops |
+  | `B3D_QRINF`, `B3D_TEXQ`, `B3D_NTS` | 2, 4, 8 | 4, 8, 16 | quarter-rate micro-ops in flight, TEX instructions live, triangle slots |
+  | `B3D_ROP_BLEND1` | 1 | 0 | one blend unit per pixel pair instead of two |
+  | `SFU_TAB2` | 1 | 0 | SFU tables shared by pairs of units |
+  | `GEOM_PROF` | 0 | 1 | board A's geometry profile counters |
+  | `B3D_MAXW`, `DISP_MAXW` | 800, 800 | 1280, 1280 | the widest render target and video mode |
+  | `B3D_CELLS`, `BAND8_MAXW`, `DISP_LB_LINES` | 2048, 512, 8 | 4096, 1024, 16 | band-buffer cells, the widest target with 8-row bands, scanout line buffer |
+
+  `SHALLOW_LUT=1` puts the shallow, wide memories in LUTs instead of block RAM, for a configuration whose block RAM
+  would not fit (16 lanes on this part).
+- **Load** over JTAG with `bringup/program.tcl`, as above, using the board's serial and `tools/gen/board_S_b<id>.bit`.
+  Board A answers at 192.168.1.10 as before; `fb_status.py` shows the build, `link trained 1 … B alive 1` (the
+  link is inside the chip) and, on builds with STATUS flags bit 29, `one address space`.
+- **Simulate:** `powershell -File tools/sim_a.ps1 -Test one3d -Plusargs +SEED_11` runs the whole chain from the host
+  to board B's memory on `board_ab_core`, about 6 min (the same frames as `two3d`, bit-exact).
+- **Host software:** build the libraries and run the `host/fb` tools from this branch. Its libraries read STATUS:
+  - bits 30 / 31 (no integer divider / no SIN / COS) make the compilers lower those operations;
+  - bit 29 (one address space) moves the heaps to the one-board memory map.
+
+  Set `GPU2_CLK_MHZ=100` so the tools and the libraries' statistics convert cycles at the right clock. master's
+  libraries lack the one-board heaps: OpenArena on them stops after about a minute.
 
 ## Loading and flashing
 

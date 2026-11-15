@@ -110,8 +110,14 @@ if {$role eq "S"} {
         if {[info exists ::env($g)]} { lappend gen -generic $g=$::env($g); puts "=== $g=$::env($g) ===" }
     }
     set_param general.maxThreads $synth_threads
-    # ONE_CHIP: the shallow, wide memories in LUTs (SHALLOW_RAM in their modules), block RAM being the scarcer resource
-    synth_design -top board_ab_top -part $part -include_dirs {src/rtl/disp src/rtl/link} -verilog_define ONE_CHIP {*}$gen
+    # SHALLOW_LUT=1 (env): define ONE_CHIP = the shallow, wide memories in LUTs (SHALLOW_RAM in their modules), for a
+    # configuration whose block RAM does not fit otherwise (16 lanes on this part); unset: block RAM, the cheaper in LUTs.
+    # FLAT (env, e.g. none): synth_design -flatten_hierarchy, and a hierarchical utilisation report (the per-module rows of
+    # a flattened netlist are misattributed)
+    set defs {}
+    if {[info exists ::env(SHALLOW_LUT)] && $::env(SHALLOW_LUT)} { set defs [list -verilog_define ONE_CHIP]; puts "=== SHALLOW_LUT: ONE_CHIP ===" }
+    if {[info exists ::env(FLAT)]} { lappend defs -flatten_hierarchy $::env(FLAT); puts "=== FLAT=$::env(FLAT) ===" }
+    synth_design -top board_ab_top -part $part -include_dirs {src/rtl/disp src/rtl/link} {*}$defs {*}$gen
     set_param general.maxThreads 8
     read_xdc src/constrs/board_ab_clocks.xdc
 } elseif {$role eq "A"} {
@@ -152,6 +158,7 @@ write_checkpoint -force tools/gen/${tag}_synth.dcp
 report_timing_summary -file tools/gen/${tag}_timing_synth.txt
 failing_paths tools/gen/${tag}_failing_synth.txt
 report_utilization -file tools/gen/${tag}_util_synth.txt
+if {[info exists ::env(FLAT)]} { report_utilization -hierarchical -hierarchical_depth 5 -file tools/gen/${tag}_hier_synth.txt }
 set unplaced [get_ports -quiet -filter {PACKAGE_PIN == ""}]
 puts "UNPLACED_PORTS: [llength $unplaced] $unplaced"
 if {[llength $unplaced] > 0} { puts "ERROR: unplaced ports"; exit 1 }

@@ -293,6 +293,21 @@ def decode_flags(f):
             "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}
 
 
+def stage_noops(st):
+    """the glslc noops of each stage from a STATUS snapshot: the units its core lacks, flags bits 30 (integer divider) / 31
+    (SIN / COS) — board A's word for the vertex stage, board B's for the fragment stage. 0 on boards whose cores have both
+    (every two-board build); a board without the bits reads 0 there as well"""
+    return {'vs': (st.get('flags', 0) >> 30) & 3,
+            'fs': (st.get('b_flags', 0) >> 30) & 3 if st.get('layout', 0) >= 2 else 0}
+
+
+def noops_note(noops):
+    """'' for complete cores, else what the compiler lowered: '; lowered for the cores: vs no SIN/COS, fs no SIN/COS, no IDIV'"""
+    def one(n): return ", ".join(s for b, s in ((2, "no SIN/COS"), (1, "no IDIV")) if n & b)
+    parts = [f"{k} {one(noops[k])}" for k in ('vs', 'fs') if noops.get(k)]
+    return "; lowered for the cores: " + "; ".join(parts) if parts else ""
+
+
 def format_ip(st):
     """the address in use and where it came from: '192.168.0.57 (DHCP lease, bound)' (STATUS layout 11)"""
     if st.get("layout", 0) < 11: return "address not reported (STATUS layout < 11)"

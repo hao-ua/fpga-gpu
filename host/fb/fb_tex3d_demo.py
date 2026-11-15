@@ -151,13 +151,17 @@ def main():
     def opt(name, default, conv=str): return conv(a[a.index(name) + 1]) if name in a else default
     ip = opt('--ip', fp.BOARD_IP); mode = opt('--mode', 0, int); secs = opt('--secs', 120.0, float)
     nslices = opt('--slices', 36, int); size = opt('--size', 470, int); png = opt('--png', None)
-    rv = glslc.compile_stage(open(os.path.join(TESTS, 'tex3d_demo.vert'), encoding='utf-8').read(), 'vs', isa64=True, forward=True)
-    rf = glslc.compile_stage(open(os.path.join(TESTS, 'tex3d_demo.frag'), encoding='utf-8').read(), 'fs', isa64=True, forward=True)
+    bd = fp.Board(ip)
+    bd.hello()
+    st = bd.status()
+    noops = fp.stage_noops(st)                                 # the ops the board's cores lack are lowered by the compiler
+    rv = glslc.compile_stage(open(os.path.join(TESTS, 'tex3d_demo.vert'), encoding='utf-8').read(), 'vs', isa64=True, forward=True, noops=noops['vs'])
+    rf = glslc.compile_stage(open(os.path.join(TESTS, 'tex3d_demo.frag'), encoding='utf-8').read(), 'fs', isa64=True, forward=True, noops=noops['fs'])
     wv, _ = isa64.assemble(rv['sasm'].splitlines(), vs=True)
     wf, _ = isa64.assemble(rf['sasm'].splitlines())
     vconst = [tuple(float(c) for c in k) for k in rv['const_pool']]
     fconst = [tuple(float(c) for c in k) for k in rf['const_pool']]
-    print(f"programs: vertex {len(wv)}, fragment {len(wf)} instructions")
+    print(f"programs: vertex {len(wv)}, fragment {len(wf)} instructions{fp.noops_note(noops)}")
     t0 = time.monotonic()
     vol = Volume('rings', 128, 128, 128, RGBA8, 1, rings_slice_fn(32.0 / nslices))
     W, H = MODE_SIZE[mode]
@@ -169,9 +173,6 @@ def main():
             start[(axis, up)] = (len(idx) * 2, sum(len(s) for s in ranges[axis]))
             for s in (ranges[axis] if up else reversed(ranges[axis])): idx += s
     print(f"slices: {len(vw) // 3} vertices, {len(idx) // 6 // 3} triangles a frame on average, ready {time.monotonic() - t0:.1f} s after the start")
-    bd = fp.Board(ip)
-    bd.hello()
-    st = bd.status()
     lfl = fp.decode_link_flags(st['link_flags'])
     if not (lfl['trained'] and lfl['b_alive']): raise fp.ProtoError("the board link is not up / B is not alive")
     bd.set_mode(mode)

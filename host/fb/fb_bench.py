@@ -81,8 +81,8 @@ TESTS = [
 
 
 def compile_pair(vs, fs):
-    rv = glslc.compile_stage(vs, 'vs', isa64=True, forward=True)
-    rf = glslc.compile_stage(fs, 'fs', isa64=True, forward=True)
+    rv = glslc.compile_stage(vs, 'vs', isa64=True, forward=True, noops=NOOPS['vs'])
+    rf = glslc.compile_stage(fs, 'fs', isa64=True, forward=True, noops=NOOPS['fs'])
     wv, _ = isa64.assemble(rv['sasm'].splitlines(), vs=True)
     wf, _ = isa64.assemble(rf['sasm'].splitlines())
     return rv, rf, wv, wf
@@ -218,10 +218,11 @@ def transfers(bd):
 
 
 NO_ZC = NO_LAZY = False
+NOOPS = {'vs': 0, 'fs': 0}                                     # fbproto.stage_noops of the board (main sets it)
 
 
 def main():
-    global NO_ZC, NO_LAZY
+    global NO_ZC, NO_LAZY, NOOPS
     a = sys.argv[1:]
     def opt(name, default, conv=str): return conv(a[a.index(name) + 1]) if name in a else default
     NO_ZC, NO_LAZY = '--no-zc' in a, '--no-lazy' in a
@@ -237,7 +238,8 @@ def main():
     if not (lfl['trained'] and lfl['b_alive']): raise fp.ProtoError("the board link is not up / B is not alive")
     bd.set_mode(mode)
     W, H = MODE_SIZE[mode]
-    print(f"board A build {st['build']}, {W} x {H}, {secs} s per test")
+    NOOPS = fp.stage_noops(st)                                 # the ops the board's cores lack are lowered by the compiler
+    print(f"board A build {st['build']}, {W} x {H}, {secs} s per test{fp.noops_note(NOOPS)}")
     up = []
     for t in TESTS:
         if names is None or t.name in names:

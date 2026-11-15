@@ -6,6 +6,16 @@ primitives. Board A streams them over a ribbon-cable link to **board B**, which 
 blends and shows the picture on HDMI. Drop-in Windows libraries (`ddraw.dll`, `opengl32.dll`, `libGLESv2` / `libEGL`,
 `d3d9.dll`, `d3d8.dll`) let unmodified games render on it.
 
+**One-board variant:** the [`single-board`](../../tree/single-board) branch fits both halves into one board's FPGA and
+DDR3, with no ribbon cables. It keeps the same host protocol and the OpenGL ES 2.0 feature set, at a lower speed:
+- 4 shader lanes instead of 16, at 100 MHz;
+- no SIN / COS or integer-divide units (the compilers lower them);
+- targets and video modes up to 800×600.
+
+OpenArena's timedemo runs at 7.2 fps at 640×480 there, against 29 fps on the two boards. How to build and run it:
+[that branch's README](../../blob/single-board/README.md#the-one-board-build). Build its libraries from that branch too:
+only they know the one-board memory map.
+
 | document | contents |
 |---|---|
 | this file | what you need, and how to build, load, simulate and run it |

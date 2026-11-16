@@ -12,7 +12,9 @@
  *   5. a mipmapped texture (each level its own colour, uploaded level by level as Quake 3 does) drawn small enough
  *      to take level 2 (nearest mip), and magnified (level 0, which survives the chain's reallocation);
  *   6. the state Quake 3 draws its sky with (glDepthRange(1, 1), GL_LEQUAL, no depth writes, back faces culled), and
- *      culling: a clockwise quad with back faces culled and a counter-clockwise one with front faces culled vanish.
+ *      culling: a clockwise quad with back faces culled and a counter-clockwise one with front faces culled vanish;
+ *   7. rendering into a 50 x 30 texture (rows no multiple of 32 bytes: a render shadow), read back and sampled;
+ *   8. glBlitFramebuffer from a texture: a copy, a mirror in x, a 2x stretch.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -365,6 +367,54 @@ int main(int argc, char **argv)
 		check(&fails, near(at(48, 32), 255, 0, 0, 1), "(48, 32) the texture sampled: its red half", at(48, 32));
 		glDeleteFramebuffersEXT(1, &fbo2);
 		glDeleteTextures(1, &t_rt);
+	}
+
+	printf("8. glBlitFramebuffer from a 32 x 32 texture (left half green, right half red): a copy, a mirror, a stretch:\n");
+	{
+		PFNGLBLITFRAMEBUFFEREXTPROC glBlitFramebufferEXT =
+			(PFNGLBLITFRAMEBUFFEREXTPROC)eglGetProcAddress("glBlitFramebufferEXT");
+		GLuint t_src, fbo3;
+
+		if (!glBlitFramebufferEXT) {
+			printf("FAIL: no glBlitFramebufferEXT\n");
+			return 1;
+		}
+		glGenTextures(1, &t_src);
+		glBindTexture(GL_TEXTURE_2D, t_src);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 32, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glGenFramebuffersEXT(1, &fbo3);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo3);
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_src, 0);
+		glViewport(0, 0, 32, 32);
+		glLoadIdentity();
+		glOrtho(0, 32, 0, 32, -1, 1);
+		glClearColor(1, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glColor3f(0, 1, 0);
+		quad(0, 0, 16, 32, 0);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glLoadIdentity();
+		glOrtho(0, W, 0, H, -1, 1);
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, fbo3);
+		glBindFramebufferEXT(GL_DRAW_FRAMEBUFFER_EXT, fbo);
+		glBlitFramebufferEXT(0, 0, 32, 32, 0, 0, 32, 32, GL_COLOR_BUFFER_BIT, GL_NEAREST);    /* a copy */
+		glBlitFramebufferEXT(0, 0, 32, 32, 64, 32, 32, 64, GL_COLOR_BUFFER_BIT, GL_NEAREST);  /* mirrored in x */
+		glBlitFramebufferEXT(0, 0, 16, 16, 32, 0, 64, 32, GL_COLOR_BUFFER_BIT, GL_NEAREST);   /* green, stretched 2x */
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		read_back();
+		check(&fails, near(at(8, 16), 0, 255, 0, 1), "(8, 16) the copy's left: green", at(8, 16));
+		check(&fails, near(at(24, 16), 255, 0, 0, 1), "(24, 16) the copy's right: red", at(24, 16));
+		check(&fails, near(at(40, 48), 255, 0, 0, 1), "(40, 48) mirrored: red on the left", at(40, 48));
+		check(&fails, near(at(56, 48), 0, 255, 0, 1), "(56, 48) mirrored: green on the right", at(56, 48));
+		check(&fails, near(at(48, 16), 0, 255, 0, 1) && near(at(62, 30), 0, 255, 0, 1),
+		      "(48, 16), (62, 30) the stretch: green", at(62, 30));
+		glDeleteFramebuffersEXT(1, &fbo3);
+		glDeleteTextures(1, &t_src);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

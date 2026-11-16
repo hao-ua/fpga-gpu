@@ -127,6 +127,7 @@ int fg_net_status(struct fg_net *n, u32 *words, u32 room, u32 *got, u64 *serial,
 int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *seq, unsigned int timeout_ms);
 int fg_net_send_unseq(struct fg_net *n, u8 type, const void *body, u32 len);
 int fg_net_wait_event(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms);
+int fg_net_wait_event_uninterruptible(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms);
 int fg_net_wait_fence(struct fg_net *n, u32 seq, long timeout_jiffies);
 bool fg_net_fence_passed(struct fg_net *n, u32 seq);
 u32 fg_net_rtt_us(struct fg_net *n);

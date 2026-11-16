@@ -102,6 +102,12 @@ fg_submit_stream(struct fg_context *ctx)
    if (r) {
       /* nothing of it reached the boards: what it sent (programs, state, draw ids) is sent again */
       fprintf(stderr, "fpgagpu: SUBMIT of %u bytes failed: %s\n", ctx->ncmd, strerror(-r));
+      if (ctx->debug) {
+         fprintf(stderr, "fpgagpu:   its %u GEM handles:", ctx->nbos);
+         for (unsigned i = 0; i < ctx->nbos && i < 24; i++)
+            fprintf(stderr, " %u", ctx->bos[i]);
+         fprintf(stderr, "\n");
+      }
       fg_hw_lost(ctx);
    } else {
       fg_context_fenced(ctx, fence);
@@ -318,6 +324,31 @@ fg_end_pass(struct fg_context *ctx)
    ctx->cl_smask = 0xFF;
 }
 
+/* the pass's target images are held while they are the target: the frontend may let go of a framebuffer's image while
+ * the pass that renders into it is still open (its FLUSH and copy back come later) */
+void
+fg_target_hold(struct fg_context *ctx, const struct fg_target *t)
+{
+   struct fg_target old = ctx->tgt;
+   bool had = ctx->have_tgt;
+
+   ctx->tgt = t ? *t : (struct fg_target){ 0 };
+   ctx->have_tgt = t != NULL;
+   if (t) {
+      struct pipe_resource *hold[3] = { t->color, t->ds, t->shadow_of }, *p;
+
+      for (unsigned i = 0; i < 3; i++) {
+         p = NULL;
+         pipe_resource_reference(&p, hold[i]);    /* one more reference, kept by ctx->tgt */
+      }
+   }
+   if (had) {
+      pipe_resource_reference(&old.color, NULL);
+      pipe_resource_reference(&old.ds, NULL);
+      pipe_resource_reference(&old.shadow_of, NULL);
+   }
+}
+
 /* the image board B renders into in place of c (pitch a multiple of 32, one level, one layer), made the first time */
 static struct pipe_resource *
 fg_render_shadow(struct pipe_resource *c)
@@ -388,8 +419,7 @@ fg_set_target(struct fg_context *ctx)
    t.wmask = (uint8_t)fg_format_wmask(f);
    if (!ctx->have_tgt || memcmp(&ctx->tgt, &t, sizeof(t))) {
       fg_end_pass(ctx);
-      ctx->tgt = t;
-      ctx->have_tgt = true;
+      fg_target_hold(ctx, &t);
    }
    if (t.shadow_of && fg_resource(c)->shadow_stale) {
       /* the image changed (an upload, a copy, a first use): the shadow takes it before the pass renders. Board B
@@ -555,11 +585,7 @@ fg_invalidate_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
       pipe_resource_reference(&ctx->discard_color, prsc);
 }
 
-static void
-fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
-{
-   FG_NOTE_ONCE("blit");
-}
+static void fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info);
 
 static void
 fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, unsigned dst_level, unsigned dstx,
@@ -592,10 +618,10 @@ fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, un
 
 /* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key. Both
  * images are held until the stream is submitted: the frontend often lets go of a source right after a copy */
-void
-fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
-             unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
-             unsigned w, unsigned h)
+static void
+fg_emit_copy_scaled(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
+                    unsigned sy, unsigned sw, unsigned sh, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer,
+                    unsigned dx, unsigned dy, unsigned dw, unsigned dh, uint32_t flags)
 {
    uint8_t b[36];
 
@@ -607,18 +633,106 @@ fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel,
    b[7] = (uint8_t)dlayer;
    fg_put16(b + 8, sx);
    fg_put16(b + 10, sy);
-   fg_put16(b + 12, w);
-   fg_put16(b + 14, h);
+   fg_put16(b + 12, sw);
+   fg_put16(b + 14, sh);
    fg_put16(b + 16, dx);
    fg_put16(b + 18, dy);
-   fg_put16(b + 20, w);
-   fg_put16(b + 22, h);
-   fg_put32(b + 24, 0);
+   fg_put16(b + 20, dw);
+   fg_put16(b + 22, dh);
+   fg_put32(b + 24, flags);
    fg_put32(b + 28, 0);
    fg_put32(b + 32, 0);
    fg_emit(ctx, FG_T_COPY_IMAGE, b, sizeof(b), NULL, 0);
    fg_use_resource(ctx, src);
    fg_use_resource(ctx, dst);
+}
+
+void
+fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
+             unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
+             unsigned w, unsigned h)
+{
+   fg_emit_copy_scaled(ctx, src, slevel, slayer, sx, sy, w, h, dst, dlevel, dlayer, dx, dy, w, h, 0);
+}
+
+#define FG_COPY_MIRROR_X 1u
+#define FG_COPY_MIRROR_Y 2u
+
+/* a blit as board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors (negative box sizes), the
+ * scissor when the blit does not stretch. Blending, buffers and images of different storage are left out (noted) */
+static void
+fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
+{
+   struct fg_context *ctx = fg_context(pctx);
+   struct pipe_resource *src = info->src.resource, *dst = info->dst.resource;
+   struct fg_resource *s = fg_resource(src), *d = fg_resource(dst);
+   int sx = info->src.box.x, sy = info->src.box.y, sw = info->src.box.width, sh = info->src.box.height;
+   int dx = info->dst.box.x, dy = info->dst.box.y, dw = info->dst.box.width, dh = info->dst.box.height;
+   uint32_t flags = 0;
+
+   if (src->target == PIPE_BUFFER || dst->target == PIPE_BUFFER || !s->fmt || !d->fmt ||
+       s->fmt->storage != d->fmt->storage || info->alpha_blend || info->src.box.depth != info->dst.box.depth ||
+       !sw || !sh || !dw || !dh) {
+      FG_NOTE_ONCE("a blit board B cannot do as a copy (a buffer, images of different storage, blending)");
+      return;
+   }
+   if (s->fmt->depth && (info->mask & PIPE_MASK_ZS) != (util_format_has_stencil(util_format_description(src->format)) ?
+                                                         PIPE_MASK_ZS : PIPE_MASK_Z)) {
+      FG_NOTE_ONCE("a blit of depth or stencil alone out of a combined image");
+      return;
+   }
+   if (sw < 0) {
+      sx += sw;
+      sw = -sw;
+      flags ^= FG_COPY_MIRROR_X;
+   }
+   if (sh < 0) {
+      sy += sh;
+      sh = -sh;
+      flags ^= FG_COPY_MIRROR_Y;
+   }
+   if (dw < 0) {
+      dx += dw;
+      dw = -dw;
+      flags ^= FG_COPY_MIRROR_X;
+   }
+   if (dh < 0) {
+      dy += dh;
+      dh = -dh;
+      flags ^= FG_COPY_MIRROR_Y;
+   }
+   if (info->scissor_enable) {
+      const struct pipe_scissor_state *c = &info->scissor;
+      int l = MAX2((int)c->minx - dx, 0), t = MAX2((int)c->miny - dy, 0);
+      int r = MAX2(dx + dw - (int)c->maxx, 0), b = MAX2(dy + dh - (int)c->maxy, 0);
+
+      if (sw != dw || sh != dh) {
+         FG_NOTE_ONCE("a stretching blit's scissor is not applied");
+      } else if (l || t || r || b) {
+         if (l + r >= dw || t + b >= dh)
+            return;
+         sx += (flags & FG_COPY_MIRROR_X) ? r : l;
+         sy += (flags & FG_COPY_MIRROR_Y) ? b : t;
+         dx += l;
+         dy += t;
+         dw -= l + r;
+         dh -= t + b;
+         sw = dw;
+         sh = dh;
+      }
+   }
+   if (info->filter != PIPE_TEX_FILTER_NEAREST && (sw != dw || sh != dh))
+      FG_NOTE_ONCE("a linear stretching blit is done nearest");
+   /* board B copies at once and renders at a FLUSH: a pass that reads or writes either image ends first */
+   if (fg_context_pending_uses(ctx, src) || fg_context_pending_uses(ctx, dst))
+      fg_end_pass(ctx);
+   for (int z = 0; z < info->dst.box.depth; z++)
+      fg_emit_copy_scaled(ctx, src, info->src.level, info->src.box.z + z, sx, sy, sw, sh, dst, info->dst.level,
+                          info->dst.box.z + z, dx, dy, dw, dh, flags);
+   d->initialized = true;
+   d->shadow_stale = true;
+   if (!ctx->pass_open)
+      fg_submit_stream(ctx);
 }
 
 static void
@@ -827,6 +941,7 @@ fg_context_destroy(struct pipe_context *pctx)
       screen->last_ctx = NULL;
    fg_draw_fini(ctx);
    util_unreference_framebuffer_state(&ctx->fb);
+   fg_target_hold(ctx, NULL);
    pipe_resource_reference(&ctx->discard_color, NULL);
    pipe_resource_reference(&ctx->stencil_ds, NULL);
    if (pctx->stream_uploader)

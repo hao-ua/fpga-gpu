@@ -208,6 +208,19 @@ counters and the last STATUS.
   - Keyboard and mouse: Deskflow. The server runs on Windows, the client (`deskflow-client`, Debian's 1.22) in the VM's
     X, started by `start-x-fpgagpu.sh` with `DESKFLOW_SERVER=172.20.96.1` (the Default Switch's Windows address); the
     pointer crosses from the Windows screen onto board B's monitor and back. X itself opens no input devices.
+  - GNOME through GDM (the display manager; Debian 13's GNOME 48): `x11/20-fpgagpu.conf` in
+    `/etc/X11/xorg.conf.d` makes the fpgagpu card the primary GPU with glamor whenever the module is loaded (Hyper-V's
+    display is not added); `/etc/gdm3/daemon.conf` has `WaylandEnable=false`, `AutomaticLoginEnable=true`,
+    `AutomaticLogin=debian` (the VM's user, whose password is locked); its session starts the Deskflow client from
+    `~/.config/autostart` (`x11/deskflow-client.desktop`; the client's certificate and the server's fingerprint in
+    `~/.config/Deskflow/tls`). GNOME's screen lock and idle blank are off for it (gsettings
+    `org.gnome.desktop.screensaver lock-enabled false`, `org.gnome.desktop.session idle-delay 0`,
+    `org.gnome.desktop.lockdown disable-lock-screen true`).
+  - GTK 4 programs (GNOME Settings, Software) draw in software here (their GL renderer needs OpenGL 3.3 or GLES 3.0)
+    and hand X whole windows to upload. Settings' Displays panel kept X busy uploading and reading back until it was
+    closed; Deskflow could not connect meanwhile.
+  - Reloading the module under GDM: logind keeps the session's DRM devices open (in PID 1's descriptor store) after
+    GDM stops, so `rmmod` finds the module in use; a reboot of the VM (or ending those sessions) frees it.
   - Games (OpenArena): turn on the server's relative mouse moves and lock the pointer to the VM's screen with Scroll
     Lock. Otherwise the absolute pointer reaches the screen's edge and crosses to Windows, and on every crossing the
     Deskflow client takes X's keyboard focus, so the game loses its focus and its mouse grab.
@@ -266,6 +279,16 @@ counters and the last STATUS.
   SUBMIT also no longer leaves the driver believing its programs and state reached the boards: it places every program
   again and resends its state. The kernel logs which command it refused. The timedemo: 0 refused, 15.3 frames a
   second, the worst frame 149 ms (305 ms before), X's text right after it.
+- GNOME on Xorg under GDM renders on the boards (its desktop on board B, Deskflow for input). On the way:
+  - the pass did not hold its target: GNOME's compositor frees an offscreen texture right after rendering into it,
+    so the pass's FLUSH and copy back named a freed image (SUBMITs refused with EACCES, or with ENOENT for a GEM handle
+    already closed). The target's images are now held while they are the target;
+  - `glBlitFramebuffer` was ignored (GNOME on X11 presents with it): now COPY_IMAGE;
+  - a uniform at a constant offset was read as an integer although integers are floats by then: GNOME's vertex
+    shaders were refused as having a billion uniform vectors;
+  - a SET_MODE in an atomic commit waited interruptibly, and X's signals cut it short (-512): modeset and present
+    waits now end only by their timeout (compiled, loaded at the next module load);
+  - GNOME started with its session locked and `debian` has no password: the lock is turned off (above).
 
 **2026-11-16, later:** the module was reloaded with the zero-copy flips (1d67aa3). During a Mesa rebuild the VPS's kernel
 oopsed in ext4 (`ext4_mb_load_buddy_gfp`, a NULL dereference while meson deleted a file); filesystem operations hung

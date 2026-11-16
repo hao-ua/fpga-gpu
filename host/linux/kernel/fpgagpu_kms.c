@@ -140,7 +140,8 @@ static int fg_set_mode(struct fpgagpu_device *fdev, int id)
 	r = fg_net_send_seq(&fdev->net, T_SET_MODE, body, sizeof(body), &seq, SEND_TIMEOUT_MS);
 	if (r)
 		return r;
-	r = fg_net_wait_event(&fdev->net, seq, 0, &ev, MODE_TIMEOUT_MS);
+	/* inside an atomic commit, which cannot be restarted: a signal must not end the wait */
+	r = fg_net_wait_event_uninterruptible(&fdev->net, seq, 0, &ev, MODE_TIMEOUT_MS);
 	if (!r && (ev.code != FG_EV_MODE || ev.a0 != id))
 		r = -EIO;
 	return r;
@@ -197,7 +198,8 @@ static void fg_present(struct fpgagpu_device *fdev, u16 handle, bool wait)
 		return;
 	}
 	fdev->kms.shown = handle;
-	if (wait && (fg_net_wait_event(&fdev->net, seq, 0, &ev, PRESENT_TIMEOUT_MS) || ev.code != FG_EV_PRESENT))
+	if (wait && (fg_net_wait_event_uninterruptible(&fdev->net, seq, 0, &ev, PRESENT_TIMEOUT_MS) ||
+		     ev.code != FG_EV_PRESENT))
 		drm_warn(&fdev->drm, "PRESENT of image 0x%04x got no PRESENT event\n", handle);
 }
 

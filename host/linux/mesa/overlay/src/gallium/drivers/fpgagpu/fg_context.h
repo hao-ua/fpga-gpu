@@ -217,6 +217,7 @@ void fg_submit_stream(struct fg_context *ctx);
 void fg_pass_open(struct fg_context *ctx);
 void fg_end_pass(struct fg_context *ctx);
 bool fg_set_target(struct fg_context *ctx);
+void fg_target_hold(struct fg_context *ctx, const struct fg_target *t);
 void fg_write_buffer(struct fg_context *ctx, struct fg_ctx_bo *bo, uint32_t offset, const void *data, uint32_t len);
 uint32_t fg_stream(struct fg_context *ctx, const void *data, uint32_t bytes, uint32_t align);
 void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,

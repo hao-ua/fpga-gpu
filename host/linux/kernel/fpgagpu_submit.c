@@ -63,7 +63,7 @@ struct fg_allow {
 	unsigned int n;
 };
 
-static int fg_handle_ok(const struct fg_allow *al, u16 h, int want)
+static int fg_handle_ok_quiet(const struct fg_allow *al, u16 h, int want)
 {
 	unsigned int i;
 
@@ -82,6 +82,23 @@ static int fg_handle_ok(const struct fg_allow *al, u16 h, int want)
 		}
 	}
 	return -EACCES;
+}
+
+/* the same, saying which handle a refused command named and what the SUBMIT's list held */
+static int fg_handle_ok(const struct fg_allow *al, u16 h, int want)
+{
+	int r = fg_handle_ok_quiet(al, h, want);
+
+	if (r) {
+		char list[96];
+		unsigned int i, p = 0;
+
+		for (i = 0; i < al->n && i < 12 && p < sizeof(list) - 8; i++)
+			p += scnprintf(list + p, sizeof(list) - p, " %04x/%u", al->handle[i], al->kind[i]);
+		pr_warn_ratelimited("fpgagpu: board handle %04x (want %d) not on the SUBMIT's list of %u:%s\n", h, want,
+				    al->n, list);
+	}
+	return r;
 }
 
 /* one command's type, length and handles; the layouts are host/fb/fbproto.py's packers */
@@ -230,8 +247,14 @@ int fpgagpu_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *fi
 		return -EINVAL;
 	if (a->nbos) {
 		r = drm_gem_objects_lookup(file, u64_to_user_ptr(a->bos), a->nbos, &objs);
-		if (r)
+		if (r) {
+			u32 h[8] = { 0 };
+
+			if (!copy_from_user(h, u64_to_user_ptr(a->bos), min_t(u32, a->nbos, 8) * sizeof(u32)))
+				pr_warn_ratelimited("fpgagpu: SUBMIT's GEM handles not all found (%d): %u: %u %u %u %u %u %u %u %u\n",
+						    r, a->nbos, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
 			return r;
+		}
 	}
 	al.handle = kmalloc_array(max(a->nbos, 1u), sizeof(*al.handle), GFP_KERNEL);
 	al.kind = kmalloc_array(max(a->nbos, 1u), sizeof(*al.kind), GFP_KERNEL);

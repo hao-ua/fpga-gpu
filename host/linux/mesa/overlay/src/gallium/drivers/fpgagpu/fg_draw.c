@@ -1021,6 +1021,13 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
          continue;
       }
       r = fg_resource(view->texture);
+      if (r->pitch != view->texture->width0 * fg_storage_bpp(r->fmt) && ctx->debug) {
+         static unsigned shown;
+
+         if (shown++ < 16)
+            fprintf(stderr, "fpgagpu: sampling a %ux%u %s image whose rows are padded (pitch %u): the TMU reads tight rows\n",
+                    view->texture->width0, view->texture->height0, util_format_name(view->texture->format), r->pitch);
+      }
       filter = view->u.tex.last_level > view->u.tex.first_level ? s->filter : s->filter_nomip;
       h[15 + u] = r->board_handle | filter << 16 | s->wrap;
       fg_use_resource(ctx, view->texture);

@@ -451,8 +451,11 @@ int fg_net_status(struct fg_net *n, u32 *words, u32 room, u32 *got, u64 *serial,
 	return -ETIMEDOUT;
 }
 
-/* the event of a sequenced command: (seq, sub-message index); -EIO for an error event (its words in *ev) */
-int fg_net_wait_event(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms)
+/* the event of a sequenced command: (seq, sub-message index); -EIO for an error event (its words in *ev).
+ * intr: a signal ends the wait (-ERESTARTSYS); else only the timeout does (where the caller cannot restart, as in an
+ * atomic commit) */
+static int fg_net_wait_event_x(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms,
+			       bool intr)
 {
 	long left = msecs_to_jiffies(timeout_ms);
 
@@ -472,12 +475,25 @@ int fg_net_wait_event(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, un
 		}
 		seen = n->ev_next;
 		mutex_unlock(&n->lock);
-		left = wait_event_interruptible_timeout(n->wq, READ_ONCE(n->ev_next) != seen, left);
+		if (intr)
+			left = wait_event_interruptible_timeout(n->wq, READ_ONCE(n->ev_next) != seen, left);
+		else
+			left = wait_event_timeout(n->wq, READ_ONCE(n->ev_next) != seen, left);
 		if (left < 0)
 			return (int)left;
 		if (left == 0)
 			return -ETIMEDOUT;
 	}
+}
+
+int fg_net_wait_event(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms)
+{
+	return fg_net_wait_event_x(n, seq, idx, ev, timeout_ms, true);
+}
+
+int fg_net_wait_event_uninterruptible(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms)
+{
+	return fg_net_wait_event_x(n, seq, idx, ev, timeout_ms, false);
 }
 
 /* lockless: a wait condition must not sleep on the mutex */

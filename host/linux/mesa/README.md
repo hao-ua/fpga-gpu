@@ -37,7 +37,10 @@ game can share the boards.
 Written, not tested yet: points and lines, stencil, scissor, polygon offset, cube maps, linear filtering, clears
 inside a pass drawn as quads, draws whose indices span more than 16 bits.
 
-Not yet: blits, copies between buffers and images, mipmap generation, queries, instancing, importing buffers,
+Blits (`glBlitFramebuffer`) are board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors, the
+scissor when nothing stretches (`fg_egl_gl` test 8); blended blits and blits between storage formats are not done.
+
+Not yet: copies between buffers and images, mipmap generation, queries, instancing, importing buffers,
 rendering into a level or layer above 0 or a target wider than 1280, more than one context drawing at a time.
 
 ## Apply and build

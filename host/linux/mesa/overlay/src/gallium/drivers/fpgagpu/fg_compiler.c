@@ -620,7 +620,8 @@ static void emit_load_uniform(fgc *c, nir_intrinsic_instr *in)
    int base = nir_intrinsic_base(in), r, ix, f;
 
    if (nir_src_is_const(in->src[0])) {
-      int slot = base + (int)nir_src_as_uint(in->src[0]);
+      /* integers are floats by now (nir_lower_int_to_float): the offset constant is a float */
+      int slot = base + (int)nir_src_as_float(in->src[0]);
 
       if (slot + 1 > c->max_uniform)
          c->max_uniform = slot + 1;
@@ -1052,8 +1053,13 @@ retry:
    sv_room(c, c->vcount + 1);
 
    sasm =sh_optimize(h, &c->code, c->vcount, c->sv, c->remat, c->max_uniform, fs, c->pool, &c->npool);
-   if (c->max_uniform + c->npool > (fs ? FG_FS_PARAMS : FG_VS_PARAMS))
-      fail(c, "more uniforms and constants than the core's parameter vectors", NULL);
+   if (c->max_uniform + c->npool > (fs ? FG_FS_PARAMS : FG_VS_PARAMS)) {
+      char n[64];
+
+      snprintf(n, sizeof(n), "%d uniform + %d constant vectors, %d room", c->max_uniform, c->npool,
+               fs ? FG_FS_PARAMS : FG_VS_PARAMS);
+      fail(c, "more uniforms and constants than the core's parameter vectors", n);
+   }
    words = sh_assemble(h, sasm, !fs, IF_DEPTH, LOOP_DEPTH, &nwords);
 
    out->words = (uint64_t *)malloc((size_t)(nwords ? nwords : 1) * sizeof(uint64_t));

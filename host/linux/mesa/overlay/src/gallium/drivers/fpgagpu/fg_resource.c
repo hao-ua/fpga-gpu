@@ -201,6 +201,25 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    rsc->pitch = pitch;
    rsc->bo_size = c.size;
    p_atomic_inc(&screen->img_gen);	/* the handle may be one a cached draw state names */
+   if (f->storage == FG_FMT_D24S8 && (templ->bind & PIPE_BIND_SAMPLER_VIEW)) {
+      /* the TMU has no D24S8 format: samplers name an RGBA8 descriptor of the same bytes (the fragment program turns
+       * the word into the depth) */
+      struct drm_fpgagpu_bo_create a = c;
+
+      a.flags = FPGAGPU_BO_CREATE_ALIAS;
+      a.alias = c.handle;
+      a.format = FG_FMT_RGBA8;
+      a.usage = FG_USE_SAMPLED;
+      a.handle = a.board_handle = 0;
+      if (!drmIoctl(screen->fd, DRM_IOCTL_FPGAGPU_BO_CREATE, &a)) {
+         rsc->sample_gem = a.handle;
+         rsc->sample_handle = (uint16_t)a.board_handle;
+         fg_gem_ref(screen, a.handle);
+      } else {
+         fprintf(stderr, "fpgagpu: no RGBA8 alias of a %ux%u depth image: %s\n", templ->width0, templ->height0,
+                 strerror(errno));
+      }
+   }
    if (fg_format_wmask(f) != 0xF && (templ->bind & PIPE_BIND_RENDER_TARGET)) {
       /* the channels rendering leaves alone must read as the format says: A8 (0, 0, 0, .), R8 / RG8 (., ., 0, 1).
        * FILL_IMAGE: handle, level, layer, transfer format, channel mask, 0, x, y, w, h, value (bytes R, G, B, A) */
@@ -240,6 +259,8 @@ fg_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
    struct fg_resource *rsc = fg_resource(prsc);
 
    pipe_resource_reference(&rsc->shadow, NULL);
+   if (rsc->sample_gem)
+      fg_gem_unref(fg_screen(pscreen), rsc->sample_gem);
    if (rsc->gem)
       fg_gem_unref(fg_screen(pscreen), rsc->gem);
    align_free(rsc->data);

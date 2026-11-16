@@ -272,6 +272,8 @@ fg_create_sampler_state(struct pipe_context *pctx, const struct pipe_sampler_sta
    so->filter_nomip = mag | min;
    so->filter = mag | min | mip << 1;
    so->wrap = fg_wrap(cso->wrap_s) << 20 | fg_wrap(cso->wrap_t) << 22 | fg_wrap(cso->wrap_r) << 25;
+   if (cso->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE)
+      so->compare = (uint8_t)(cso->compare_func + 1);
    return so;
 }
 
@@ -502,6 +504,8 @@ fg_fs_variant(struct fg_context *ctx, struct fg_fs_state *fs, const struct fg_vs
          continue;
       if (util_format_is_depth_or_stencil(view->texture->format))
          key.depth_samplers |= 1u << u;
+      if (ctx->samplers[u] && ctx->samplers[u]->compare)
+         key.shadow_func |= (uint32_t)(ctx->samplers[u]->compare - 1) << (3 * u);
       unsigned sw = view->swizzle_r | view->swizzle_g << 3 | view->swizzle_b << 6 | view->swizzle_a << 9;
       if (sw != (PIPE_SWIZZLE_X | PIPE_SWIZZLE_Y << 3 | PIPE_SWIZZLE_Z << 6 | PIPE_SWIZZLE_W << 9)) {
          key.swizzled |= 1u << u;
@@ -1029,7 +1033,7 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
                     view->texture->width0, view->texture->height0, util_format_name(view->texture->format), r->pitch);
       }
       filter = view->u.tex.last_level > view->u.tex.first_level ? s->filter : s->filter_nomip;
-      h[15 + u] = r->board_handle | filter << 16 | s->wrap;
+      h[15 + u] = (r->sample_handle ? r->sample_handle : r->board_handle) | filter << 16 | s->wrap;
       fg_use_resource(ctx, view->texture);
    }
 

@@ -73,6 +73,8 @@ fg_use_resource(struct fg_context *ctx, struct pipe_resource *prsc)
    if (!rsc->gem)
       return;
    fg_use_bo(ctx, rsc->gem);
+   if (rsc->sample_gem)
+      fg_use_bo(ctx, rsc->sample_gem);
    for (unsigned i = 0; i < ctx->npass_res; i++)
       if (ctx->pass_res[i] == prsc)
          return;

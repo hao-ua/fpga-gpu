@@ -14,7 +14,9 @@
  *   6. the state Quake 3 draws its sky with (glDepthRange(1, 1), GL_LEQUAL, no depth writes, back faces culled), and
  *      culling: a clockwise quad with back faces culled and a counter-clockwise one with front faces culled vanish;
  *   7. rendering into a 50 x 30 texture (rows no multiple of 32 bytes: a render shadow), read back and sampled;
- *   8. glBlitFramebuffer from a texture: a copy, a mirror in x, a 2x stretch.
+ *   8. glBlitFramebuffer from a texture: a copy, a mirror in x, a 2x stretch;
+ *   9. a depth texture with ARB_shadow's compare (GL_LEQUAL against r) through fixed function; GL_VERSION printed;
+ *  10. a GLSL 1.10 program (OpenGL 2.0 with GLSL 1.10, the hardware's) drawing a quad; #version 120 refused.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -415,6 +417,110 @@ int main(int argc, char **argv)
 		      "(48, 16), (62, 30) the stretch: green", at(62, 30));
 		glDeleteFramebuffersEXT(1, &fbo3);
 		glDeleteTextures(1, &t_src);
+	}
+
+	printf("9. a depth texture compared (ARB_shadow, GL_LEQUAL) at depth 0.5: r 0.25 on the left, 0.75 on the right:\n");
+	{
+		GLuint t_z, rb4, fbo4;
+
+		printf("  GL_VERSION %s, GLSL %s\n", (const char *)glGetString(GL_VERSION),
+		       (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+		glGenTextures(1, &t_z);
+		glBindTexture(GL_TEXTURE_2D, t_z);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, 32, 32, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+		glGenRenderbuffersEXT(1, &rb4);
+		glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb4);
+		glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, 32, 32);
+		glGenFramebuffersEXT(1, &fbo4);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo4);
+		glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rb4);
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D, t_z, 0);
+		if (glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) != GL_FRAMEBUFFER_COMPLETE_EXT)
+			printf("  the depth framebuffer is incomplete (0x%04x)\n", glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT));
+		glViewport(0, 0, 32, 32);
+		glClearDepth(0.5);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glClearDepth(1.0);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glClearColor(0.5f, 0, 0.5f, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glBindTexture(GL_TEXTURE_2D, t_z);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE_ARB, GL_COMPARE_R_TO_TEXTURE_ARB);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC_ARB, GL_LEQUAL);
+		glTexParameteri(GL_TEXTURE_2D, GL_DEPTH_TEXTURE_MODE_ARB, GL_LUMINANCE);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+		glDisable(GL_DEPTH_TEST);
+		glBegin(GL_QUADS);
+		glTexCoord3f(0, 0, 0.25f); glVertex2f(0, 0);
+		glTexCoord3f(0.5f, 0, 0.25f); glVertex2f(32, 0);
+		glTexCoord3f(0.5f, 1, 0.25f); glVertex2f(32, 64);
+		glTexCoord3f(0, 1, 0.25f); glVertex2f(0, 64);
+		glTexCoord3f(0.5f, 0, 0.75f); glVertex2f(32, 0);
+		glTexCoord3f(1, 0, 0.75f); glVertex2f(64, 0);
+		glTexCoord3f(1, 1, 0.75f); glVertex2f(64, 64);
+		glTexCoord3f(0.5f, 1, 0.75f); glVertex2f(32, 64);
+		glEnd();
+		glDisable(GL_TEXTURE_2D);
+		read_back();
+		check(&fails, near(at(16, 32), 255, 255, 255, 1), "(16, 32) 0.25 <= 0.5: white", at(16, 32));
+		check(&fails, near(at(48, 32), 0, 0, 0, 1), "(48, 32) 0.75 > 0.5: black", at(48, 32));
+		glClearColor(0, 0, 0, 1);
+		glDeleteFramebuffersEXT(1, &fbo4);
+		glDeleteRenderbuffersEXT(1, &rb4);
+		glDeleteTextures(1, &t_z);
+	}
+
+	printf("10. a GLSL 1.10 program (built-in matrix, varying colour, a sampler); #version 120 refused:\n");
+	{
+		static const char *vs110 =
+			"#version 110\n"
+			"varying vec4 c;\n"
+			"void main() { gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex; c = gl_Color;\n"
+			"  gl_TexCoord[0] = gl_MultiTexCoord0; }\n";
+		static const char *fs110 =
+			"#version 110\n"
+			"uniform sampler2D t;\n"
+			"varying vec4 c;\n"
+			"void main() { gl_FragColor = c * texture2D(t, gl_TexCoord[0].st); }\n";
+		static const char *fs120 = "#version 120\nvoid main() { gl_FragColor = vec4(1.0); }\n";
+		static const uint8_t white[4] = { 255, 255, 255, 255 };
+		GLuint vs = glCreateShader(GL_VERTEX_SHADER), fs = glCreateShader(GL_FRAGMENT_SHADER);
+		GLuint f2 = glCreateShader(GL_FRAGMENT_SHADER), prog = glCreateProgram(), tw;
+		GLint ok = 0, ok120 = 1;
+
+		glShaderSource(vs, 1, &vs110, NULL);
+		glCompileShader(vs);
+		glShaderSource(fs, 1, &fs110, NULL);
+		glCompileShader(fs);
+		glAttachShader(prog, vs);
+		glAttachShader(prog, fs);
+		glLinkProgram(prog);
+		glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+		check(&fails, ok, "the 1.10 program links", (const uint8_t *)"\0\0\0\0");
+		glShaderSource(f2, 1, &fs120, NULL);
+		glCompileShader(f2);
+		glGetShaderiv(f2, GL_COMPILE_STATUS, &ok120);
+		check(&fails, !ok120, "#version 120 is refused", (const uint8_t *)"\0\0\0\0");
+		glGenTextures(1, &tw);
+		glBindTexture(GL_TEXTURE_2D, tw);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glUseProgram(prog);
+		glUniform1i(glGetUniformLocation(prog, "t"), 0);
+		glColor3f(0, 0, 1);
+		quad(16, 16, 48, 48, 0);
+		glUseProgram(0);
+		read_back();
+		check(&fails, near(at(32, 32), 0, 0, 255, 1), "(32, 32) the quad: blue", at(32, 32));
+		check(&fails, near(at(4, 4), 0, 0, 0, 1), "(4, 4) outside: black", at(4, 4));
+		glDeleteTextures(1, &tw);
+		glDeleteProgram(prog);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

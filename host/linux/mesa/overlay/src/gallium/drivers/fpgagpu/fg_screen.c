@@ -261,8 +261,14 @@ fg_screen_is_format_supported(struct pipe_screen *pscreen, enum pipe_format form
    f = fg_format_info(format);
    if (!f || (usage & ~image_binds))
       return false;
-   if (f->depth)
-      return !(usage & colour_binds);
+   if (f->depth) {
+      /* a D24S8 image is sampled as its 32-bit word, which the fragment program turns into the depth (and compares,
+       * for a shadow sampler); a 16-bit depth has no such reading */
+      unsigned sampled = format == PIPE_FORMAT_Z24_UNORM_S8_UINT ?
+                         PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SAMPLER_VIEW_SUBOPTIMAL : 0;
+
+      return !(usage & colour_binds & ~sampled);
+   }
    if (!fg_format_renderable(f) &&
        (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT)))
       return false; /* board B renders into RGBA8 and RGB565 only */
@@ -360,7 +366,8 @@ fg_init_screen_caps(struct fg_screen *screen)
    caps->alpha_test = false;
    caps->two_sided_color = false;
    caps->clip_planes = 0;
-   caps->texture_shadow_map = false;
+   /* depth compare (ARB_shadow, and with it OpenGL 2.0): the fragment program compares after reading the depth */
+   caps->texture_shadow_map = true;
    caps->native_fp32_depth = false;
    /* a sampler view's swizzle: the fragment program rearranges the texel after the TEX (fg_compile_key.swizzle) */
    caps->texture_swizzle = true;

@@ -83,6 +83,7 @@ struct fg_sampler_state {
    uint32_t filter_nomip;     /* sampler word [19:16] for an image of one level */
    uint32_t filter;           /* with the mip filter */
    uint32_t wrap;             /* [22:20] wrap s, t; [26:25] r */
+   uint8_t compare;           /* a depth compare (shadow sampler): its PIPE_FUNC_* + 1; 0 none */
 };
 
 struct fg_velem {

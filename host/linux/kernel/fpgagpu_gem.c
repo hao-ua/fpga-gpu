@@ -66,6 +66,8 @@ void fg_bo_free_work(struct work_struct *work)
 			drm_dev_exit(idx);
 		}
 		fg_mem_free(fdev, bo);
+		if (bo->alias_of)			/* the image whose memory it described may go now */
+			drm_gem_object_put(&bo->alias_of->base);
 		drm_gem_object_release(&bo->base);
 		kfree(bo);
 	}
@@ -77,12 +79,13 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 	struct drm_fpgagpu_bo_create *a = data;
 	struct fg_bo *bo;
 	u8 body[20];
+	struct fg_bo *orig = NULL;
 	u32 blen;
 	u8 type;
-	u64 size;
+	u64 size, addr;
 	int r, idx;
 
-	if (a->flags || a->pad)
+	if ((a->flags & ~FPGAGPU_BO_CREATE_ALIAS) || a->pad || a->pad2)
 		return -EINVAL;
 	switch (a->kind) {
 	case FPGAGPU_BO_A_BUFFER:
@@ -102,10 +105,25 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 	default:
 		return -EINVAL;
 	}
+	if (a->flags & FPGAGPU_BO_CREATE_ALIAS) {
+		/* another descriptor of an image's bytes: no memory of its own, at most the image's size */
+		struct drm_gem_object *o = a->kind == FPGAGPU_BO_B_IMAGE ? drm_gem_object_lookup(file, a->alias) : NULL;
+
+		orig = o ? to_fg_bo(o) : NULL;
+		if (!orig || orig->kind != FPGAGPU_BO_B_IMAGE || orig->alias_of || size > orig->size) {
+			if (o)
+				drm_gem_object_put(o);
+			return -EINVAL;
+		}
+	}
 
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
-	if (!bo)
+	if (!bo) {
+		if (orig)
+			drm_gem_object_put(&orig->base);
 		return -ENOMEM;
+	}
+	bo->alias_of = orig;				/* keeps the lookup's reference until the alias is freed */
 	drm_gem_private_object_init(drm, &bo->base, PAGE_ALIGN(size));
 	bo->base.funcs = &fg_bo_funcs;
 	bo->kind = a->kind;
@@ -118,18 +136,21 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 		bo->layers = a->layers;
 	}
 	bo->size = size;
-	r = fg_mem_alloc(fdev, bo, size);
+	r = fg_mem_alloc(fdev, bo, orig ? 0 : size);
 	if (r) {
+		if (orig)
+			drm_gem_object_put(&orig->base);
 		drm_gem_object_release(&bo->base);
 		kfree(bo);
 		return r;
 	}
+	addr = orig ? orig->node.start : bo->node.start;
 
 	if (a->kind == FPGAGPU_BO_B_IMAGE) {
 		type = T_CREATE_IMAGE;
 		put_unaligned_le16(bo->board_handle, body);
 		put_unaligned_le16(a->usage, body + 2);
-		put_unaligned_le32((u32)bo->node.start, body + 4);
+		put_unaligned_le32((u32)addr, body + 4);
 		put_unaligned_le16(a->pitch, body + 8);
 		body[10] = a->format;
 		body[11] = a->img_flags;
@@ -161,7 +182,7 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 	r = drm_gem_handle_create(file, &bo->base, &a->handle);
 	if (!r) {
 		a->board_handle = bo->board_handle;
-		a->board_addr = bo->node.start;
+		a->board_addr = addr;
 		a->size = size;
 	}
 put:

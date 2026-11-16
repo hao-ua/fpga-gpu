@@ -57,6 +57,8 @@ struct fg_resource {
    const struct fg_format *fmt;
    uint32_t gem;		/* GEM handle; 0 for host memory */
    uint16_t board_handle;	/* the handle commands name the image by */
+   uint32_t sample_gem;		/* a sampled D24S8 image: an RGBA8 alias of its bytes, which the TMU reads */
+   uint16_t sample_handle;	/* (the TMU has no D24S8 format); 0 none */
    uint32_t pitch;
    uint64_t bo_size;
    bool initialized;		/* a clear or a write has reached it */

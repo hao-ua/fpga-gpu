@@ -780,13 +780,11 @@ static void emit_intrinsic(fgc *c, nir_intrinsic_instr *in)
 
 static void emit_tex(fgc *c, nir_tex_instr *tex)
 {
-   int coord = -1, bias = -1, lod = -1, i, r, t, u = (int)tex->texture_index;
+   int coord = -1, bias = -1, lod = -1, cmp = -1, i, r, t, u = (int)tex->texture_index;
    bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE || tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
 
    if (!c->fs)
       fail(c, "a texture read in a vertex program (the vertex core has no texture unit)", NULL);
-   if (tex->is_shadow)
-      fail(c, "a shadow sampler", NULL);
    if (u < 0 || u >= 16)
       fail(c, "a sampler unit past 15", NULL);
    if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && !cube && tex->sampler_dim != GLSL_SAMPLER_DIM_EXTERNAL)
@@ -796,6 +794,7 @@ static void emit_tex(fgc *c, nir_tex_instr *tex)
 
       switch (tex->src[i].src_type) {
       case nir_tex_src_coord: coord = reg; break;
+      case nir_tex_src_comparator: cmp = reg; break;
       case nir_tex_src_bias: bias = reg; break;
       case nir_tex_src_lod: lod = reg; break;
       case nir_tex_src_texture_deref:
@@ -846,6 +845,30 @@ static void emit_tex(fgc *c, nir_tex_instr *tex)
       emit(c, "MIN r%d r%d r%d", o, z, kf(c, 1.0));
       emit(c, "MOV r%d r%d", d, o);
       emit(c, "MOV.w r%d r%d", d, kf(c, 1.0));
+      r = d;
+   }
+   if (tex->is_shadow) {
+      /* a depth compare (the TMU has none): the reference, clamped to [0, 1] as for a fixed-point depth, against
+       * the depth read (.x), by the sampler's function; 1 or 0 in every channel (the view's swizzle follows) */
+      unsigned func = u < 8 ? c->key->shadow_func >> (3 * u) & 7 : 0;
+      int ref = vreg(c, true), z = vreg(c, true), res = vreg(c, true), d = vreg(c, false);
+
+      if (cmp < 0)
+         fail(c, "a shadow read without its reference value", NULL);
+      emit(c, "MAX r%d r%d r%d", ref, cmp, kf(c, 0.0));
+      emit(c, "MIN r%d r%d r%d", ref, ref, kf(c, 1.0));
+      emit(c, "MOV r%d r%d.x", z, r);
+      switch (func) {
+      case 1: emit(c, "SET SLT r%d r%d r%d", res, ref, z); break;  /* less: ref < depth */
+      case 2: emit(c, "SET SEQ r%d r%d r%d", res, ref, z); break;  /* equal */
+      case 3: emit(c, "SET SGE r%d r%d r%d", res, z, ref); break;  /* less or equal: depth >= ref */
+      case 4: emit(c, "SET SLT r%d r%d r%d", res, z, ref); break;  /* greater: depth < ref */
+      case 5: emit(c, "SET SNE r%d r%d r%d", res, ref, z); break;  /* not equal */
+      case 6: emit(c, "SET SGE r%d r%d r%d", res, ref, z); break;  /* greater or equal */
+      case 7: emit(c, "MOV r%d r%d", res, kf(c, 1.0)); break;      /* always */
+      default: emit(c, "MOV r%d r%d", res, kf(c, 0.0)); break;     /* never */
+      }
+      emit(c, "MOV r%d r%d", d, res);
       r = d;
    }
    if (c->key->swizzled & (1u << u)) {

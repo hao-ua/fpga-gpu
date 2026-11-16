@@ -69,9 +69,14 @@ enum drm_fpgagpu_bo_kind {
 	FPGAGPU_BO_B_IMAGE	= 2,	/* board B: textures, render targets, depth-stencil, scanout */
 };
 
+/* BO_CREATE flags */
+#define FPGAGPU_BO_CREATE_ALIAS	(1u << 0)	/* an image over the memory of the image `alias` (no memory of its own):
+						 * another descriptor of the same bytes, e.g. a D24S8 image read by the
+						 * TMU as RGBA8. It keeps that image's memory while it exists */
+
 struct drm_fpgagpu_bo_create {
 	__u32 kind;		/* in: enum drm_fpgagpu_bo_kind */
-	__u32 flags;		/* in: must be 0 */
+	__u32 flags;		/* in: FPGAGPU_BO_CREATE_* */
 	__u64 size;		/* in: buffers: bytes; images: ignored. out: the bytes allocated */
 	/* images (FPGAGPU_BO_B_IMAGE): CREATE_IMAGE's descriptor (host/fb/fbproto.py create_image) */
 	__u16 usage;		/* bits: 0 sampled, 1 render target, 2 scanout, 3 transfer */
@@ -87,6 +92,9 @@ struct drm_fpgagpu_bo_create {
 	__u32 handle;		/* the GEM handle */
 	__u32 board_handle;	/* the 16-bit handle that commands name it by */
 	__u64 board_addr;	/* its byte address in the board's DDR */
+	/* in, with FPGAGPU_BO_CREATE_ALIAS */
+	__u32 alias;		/* the GEM handle of the image whose memory the new one describes */
+	__u32 pad2;		/* must be 0 */
 };
 
 /*

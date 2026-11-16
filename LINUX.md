@@ -217,6 +217,10 @@ counters and the last STATUS.
     compositor is off for `debian` (`x11/xfwm4-no-compositing.xml` as `~/.config/xfce4/xfconf/xfce-perchannel-xml/
     xfwm4.xml`). The Deskflow client runs in a loop with `--no-restart` (`x11/deskflow-client.desktop`): its own
     reconnecting hung after the Windows server restarted.
+  - OpenGL 2.0 with GLSL 1.10 (2026-11-16): ARB_shadow (depth compare) in the fragment program, the D24S8 image read
+    by the TMU through an RGBA8 alias (the kernel's BO_CREATE alias flag); Mesa's OpenGL 2.0 context kept at the
+    driver's GLSL 1.10 (`apply.sh` patches `version.c` and `getstring.c`). ioquake3's default `opengl2` renderer needs
+    GLSL 1.20 and stays out; `opengl1` is set for `debian` (profile and menu launcher).
   - fpgagpu does not load at boot: after a VM reboot, `modprobe fpgagpu` and `systemctl restart lightdm` put X on
     board B (until then LightDM's X runs on Hyper-V's display).
   - Board B once stopped taking commands (board A waiting on B's credit, its queue still) after X servers were killed

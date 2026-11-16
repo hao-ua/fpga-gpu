@@ -113,10 +113,10 @@ int fg_mem_alloc(struct fpgagpu_device *fdev, struct fg_bo *bo, u64 size)
 		r = -ENOSPC;
 		goto out;
 	}
-	r = drm_mm_insert_node_generic(mm, &bo->node, ALIGN(size, BO_ALIGN), BO_ALIGN, 0, DRM_MM_INSERT_BEST);
+	r = size ? drm_mm_insert_node_generic(mm, &bo->node, ALIGN(size, BO_ALIGN), BO_ALIGN, 0, DRM_MM_INSERT_BEST) : 0;
 	if (r)
 		goto out;
-	set_bit(idx, map);
+	set_bit(idx, map);				/* size 0: a handle alone (an alias of another image's memory) */
 	bo->board_handle = hbase | idx;
 out:
 	mutex_unlock(&m->lock);
@@ -129,10 +129,11 @@ void fg_mem_free(struct fpgagpu_device *fdev, struct fg_bo *bo)
 	unsigned long *map = bo->kind == FPGAGPU_BO_A_BUFFER ? m->a_buf : bo->kind == FPGAGPU_BO_B_BUFFER ? m->b_buf : m->b_img;
 
 	mutex_lock(&m->lock);
-	if (drm_mm_node_allocated(&bo->node)) {
+	if (drm_mm_node_allocated(&bo->node))
 		drm_mm_remove_node(&bo->node);
+	if (bo->board_handle)				/* every handle has its index bits set (entry 0 is never handed out) */
 		clear_bit(bo->board_handle & (FG_HANDLES - 1), map);
-	}
+	bo->board_handle = 0;
 	mutex_unlock(&m->lock);
 }
 

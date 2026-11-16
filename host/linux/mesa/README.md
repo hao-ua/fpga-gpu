@@ -37,6 +37,15 @@ game can share the boards.
 Written, not tested yet: points and lines, stencil, scissor, polygon offset, cube maps, linear filtering, clears
 inside a pass drawn as quads, draws whose indices span more than 16 bits.
 
+OpenGL 2.0 with GLSL 1.10, the version the hardware supports (as the Windows `opengl32`): `apply.sh` keeps a
+2.0 context's GLSL at the driver's 1.10 (Mesa would raise it to 1.20, which is compiler work beyond the hardware) and
+gives the version string for it. ARB_shadow, the one thing Mesa missed for 2.0, is done in the fragment program: the
+TMU reads a D24S8 image through an RGBA8 alias of its bytes (BO_CREATE with FPGAGPU_BO_CREATE_ALIAS; the TMU has no
+D24S8 format) and the program decodes the depth and compares it with the clamped reference by the sampler's function
+(`fg_egl_gl` tests 9 and 10). Such a depth texture is sampled right only when its rows are a multiple of 32 bytes
+(a width a multiple of 8): a depth target's pitch is aligned, and the TMU has none. ioquake3's `opengl2` renderer
+writes GLSL 1.20 and is refused; its `opengl1` renderer is the one for these boards.
+
 Blits (`glBlitFramebuffer`) are board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors, the
 scissor when nothing stretches (`fg_egl_gl` test 8); blended blits and blits between storage formats are not done.
 

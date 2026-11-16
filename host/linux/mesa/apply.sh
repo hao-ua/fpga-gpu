@@ -122,6 +122,21 @@ edit("src/gallium/targets/dril/dril_target.c",
      ["DEFINE_LOADER_DRM_ENTRYPOINT(fpgagpu)"],
      "after")
 
+# OpenGL 2.0 with GLSL 1.10: Mesa raises an OpenGL 2.0 context's GLSL to 1.20, while fpgagpu offers what its hardware
+# does, GLSL 1.10 (glsl_feature_level); a driver whose GLSL is 1.20 or more is not changed
+edit("src/mesa/main/version.c",
+     "         FALLTHROUGH; /* GLSL 1.20 is the minimum we support */",
+     ["         /* the driver's GLSL when it is 1.10 (fpgagpu: OpenGL 2.0 with GLSL 1.10), else 1.20 */",
+      "         ctx->Const.GLSLVersion = MAX2(110, MIN2(ctx->Const.GLSLVersion, 120));",
+      "         break;"],
+     "replace")
+
+edit("src/mesa/main/getstring.c",
+     "      case 120:",
+     ["      case 110:",
+      "         return (const GLubyte *) \"1.10\";"],
+     "before")
+
 # texture swizzle in OpenGL ES 2.0 contexts too: X's glamor keeps alpha-only pictures (glyphs) in GL_R8 textures and
 # reads their alpha through GL_TEXTURE_SWIZZLE_A = GL_RED on any GLES; without it every glyph samples alpha 1
 edit("src/mesa/main/extensions_table.h",

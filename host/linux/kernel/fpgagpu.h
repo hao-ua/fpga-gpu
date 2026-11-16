@@ -181,7 +181,8 @@ struct fg_bo {
 	u8 levels, layers;			/* images */
 	bool created;				/* CREATE_* was sent: DESTROY it when freed */
 	u64 size;				/* the bytes the board object covers */
-	struct drm_mm_node node;		/* its range in the board heap */
+	struct drm_mm_node node;		/* its range in the board heap (none for an alias) */
+	struct fg_bo *alias_of;			/* an image described over this other image's memory (held) */
 	u32 last_fence;				/* the newest SUBMIT fence that named it */
 	bool fenced;
 	struct list_head free_link;		/* on fpgagpu_device.bo_free while DESTROY is pending */

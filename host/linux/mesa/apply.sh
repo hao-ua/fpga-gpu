@@ -16,6 +16,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 cp -R "$HERE/overlay/." "$MESA/"
 echo "copied overlay/ into $MESA"
 
+# the shader compiler's back end (optimizer, register allocator, assembler) is the Windows libraries' own
+SHC="$HERE/../../win/shc"
+mkdir -p "$MESA/src/gallium/drivers/fpgagpu/shc"
+for f in shc_internal.h g2_shc.h shc_opt.c shc_asm.c shc_util.c; do
+	cp "$SHC/$f" "$MESA/src/gallium/drivers/fpgagpu/shc/$f"
+done
+echo "copied the shc back end from $SHC"
+
 python3 - "$MESA" <<'PY'
 import sys
 

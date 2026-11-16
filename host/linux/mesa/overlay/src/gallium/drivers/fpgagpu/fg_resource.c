@@ -17,6 +17,7 @@
 
 #include "util/format/u_format.h"
 #include "util/os_time.h"
+#include "util/u_atomic.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_transfer.h"
@@ -113,10 +114,14 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       goto fail;
    }
 
-   /* a mip chain or a layered image has tight rows; a single level gets a pitch that is a multiple of 32 bytes, as
-    * render targets and scanout need */
+   /* the TMU's descriptor has no pitch: what is sampled has tight rows, and so has a mip chain or a layered image.
+    * A single level that is only rendered into or scanned out gets a pitch that is a multiple of 32 bytes. A texture
+    * that is also a render target keeps tight rows (the two agree when a row is a multiple of 32 bytes anyway) */
    row = templ->width0 * f->bpp;
-   pitch = (levels > 1 || layers > 1) ? row : align(row, 32);
+   pitch = (levels > 1 || layers > 1 ||
+            ((templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
+             !(templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SHARED))))
+              ? row : align(row, 32);
 
    c.kind = FPGAGPU_BO_B_IMAGE;
    c.usage = FG_USE_SAMPLED | FG_USE_RT | FG_USE_TRANSFER;
@@ -136,6 +141,7 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    rsc->board_handle = (uint16_t)c.board_handle;
    rsc->pitch = pitch;
    rsc->bo_size = c.size;
+   p_atomic_inc(&screen->img_gen);	/* the handle may be one a cached draw state names */
    return &rsc->base;
 
 fail:

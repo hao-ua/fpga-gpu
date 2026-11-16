@@ -214,7 +214,8 @@ fg_screen_is_format_supported(struct pipe_screen *pscreen, enum pipe_format form
 }
 
 /* NIR options: the cores compute in floating point (no integer unit); SIN / COS are lowered on a core whose STATUS
- * flags say it has none */
+ * flags say it has none. The vertex core reads a uniform at a computed index (LDPX); nothing else is indexed at
+ * run time */
 #define FG_NIR_COMMON                                                                       \
    .lower_fpow = true,                                                                      \
    .lower_fdiv = true,                                                                      \
@@ -222,6 +223,9 @@ fg_screen_is_format_supported(struct pipe_screen *pscreen, enum pipe_format form
    .lower_flrp32 = true,                                                                    \
    .lower_flrp64 = true,                                                                    \
    .lower_fdph = true,                                                                      \
+   .lower_fsign = true,                                                                     \
+   .lower_ffract = true,                                                                    \
+   .max_varying_expression_cost = 2,                                                        \
    .lower_bitops = true,                                                                    \
    .lower_insert_byte = true,                                                               \
    .lower_insert_word = true,                                                               \
@@ -351,6 +355,7 @@ fg_screen_create(int fd, const struct pipe_screen_config *config, struct rendero
    if (!(screen->link_flags & 1))
       fprintf(stderr, "fpgagpu: board B is not alive (link flags 0x%x)\n", screen->link_flags);
    screen->debug = debug_get_bool_option("FPGAGPU_DEBUG", false);
+   screen->debug_shaders = debug_get_num_option("FPGAGPU_SHADERS", 0);
    if (screen->debug)
       fprintf(stderr, "fpgagpu: board A build %u, A flags 0x%08x, B flags 0x%08x, link flags 0x%x\n",
               screen->a_build, screen->a_flags, screen->b_flags, screen->link_flags);

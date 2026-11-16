@@ -3,8 +3,12 @@
 `overlay/` is a Gallium driver, `fpgagpu`, for Mesa 26.3 (written against the tag `mesa-26.3.0`). It runs on the
 `fpgagpu` DRM kernel driver (`../kernel`) and reaches the boards only through its ioctls.
 
-- `overlay/src/gallium/drivers/fpgagpu/`: screen (caps, formats, fences), context (state, clears, flushes),
+- `overlay/src/gallium/drivers/fpgagpu/`: screen (caps, formats, fences), context (the command stream, render
+  passes, clears, flushes), draws (state objects, shaders, a draw's messages), the shader compiler (`fg_compiler`),
   resources (board-B images through `BO_CREATE`, transfers through `READ` / `WRITE_IMAGE`).
+- The compiler turns NIR into the assembler lines of the Windows libraries' compiler and runs that compiler's back
+  end (optimizer, register allocator, assembler: `host/win/shc/shc_opt.c`, `shc_asm.c`, `shc_util.c`), which
+  `apply.sh` copies into the driver's `shc/` directory.
 - `overlay/src/gallium/winsys/fpgagpu/drm/`: one screen per DRM file description.
 - `overlay/include/drm-uapi/fpgagpu_drm.h`: a copy of `../kernel/include/uapi/drm/fpgagpu_drm.h`; keep the two
   identical.
@@ -13,12 +17,18 @@
   `drm_helper.h` descriptor (before kmsro), the pipe loader's table (before kmsro, else the device falls back to
   kmsro), the dril entry point. Running it again changes nothing; it stops if an anchor line is missing.
 
-What works: an OpenGL ES 2.0 context on the device, chosen by the loader from the kernel driver's name (no
-`MESA_LOADER_DRIVER_OVERRIDE`); `glClear` of the bound framebuffer (colour, depth, stencil) sent as one submission
-`FRAME_BEGIN` + `VS_STATE` (the target's size) + `FLUSH` with the clear; reads of images (`glReadPixels`) through
-`READ`, and writes (`glTexImage2D` / `glTexSubImage2D`) through `WRITE_IMAGE`. Not yet: draws (dropped, one note on stderr), blits, copies, mipmap generation, shader
-compilation (shaders are only kept), importing / exporting buffers, clears of a level or layer above 0 or of a target
-wider than 1280.
+Tested on the boards (`../tools/fg_egl_clear.c`, `../tools/fg_egl_draw.c`): an OpenGL ES 2.0 context on the device,
+chosen by the loader from the kernel driver's name (no `MESA_LOADER_DRIVER_OVERRIDE`); vertex and fragment shaders
+compiled for the two cores; triangles with vertices streamed into a ring on board A, interpolated varyings, a
+nearest-filtered 2D texture, alpha blending; render passes ending in a FLUSH with the hardware's clear; reads of
+images (`glReadPixels`) through `READ`, writes (`glTexImage2D`) through `WRITE_IMAGE`.
+
+Written, not tested yet: indexed draws (16-bit indices in the ring), points and lines, quads and polygons through
+Gallium's primitive converter, depth, stencil, scissor, polygon offset, culling, cube maps, mipmaps, linear filtering,
+clears inside a pass drawn as quads.
+
+Not yet: blits, image copies, mipmap generation, queries, instancing, importing buffers, rendering into a level or
+layer above 0 or a target wider than 1280, more than one context drawing at a time.
 
 ## Apply and build
 
@@ -45,5 +55,9 @@ cc -O2 -Wall -I/opt/fpgagpu-mesa/include host/linux/tools/fg_egl_clear.c -o fg_e
 LD_LIBRARY_PATH=$L ./fg_egl_clear
 ```
 
+`host/linux/tools/fg_egl_draw.c` (built the same way): draws in the same context, read back and checked: a solid
+triangle (with a map of the target), a triangle with interpolated colours, a 2 x 2 texture over the target, and a
+blend of white at alpha 0.5 over black.
+
 `FPGAGPU_DEBUG=1` prints the boards' flags when the screen is created and, for each read map, the time spent on the
-submission, the wait and the `READ`.
+submission, the wait and the `READ`. `FPGAGPU_SHADERS=1` prints each compiled program's assembler text.

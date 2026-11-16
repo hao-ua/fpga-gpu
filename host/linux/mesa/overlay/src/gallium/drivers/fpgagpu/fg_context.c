@@ -1,175 +1,352 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * fpgagpu context: framebuffer state, clears and flushes. State objects are kept but not sent, and draws are not
- * carried out: the first one prints a note on stderr.
+ * fpgagpu context: the command stream, render passes, clears and flushes.
  *
- * A frame that only clears is one submission, the way the Windows libraries end a clear-only pass:
- *   FRAME_BEGIN               board A starts a frame (its bins empty);
- *   VS_STATE                  the target's size, by which board A ends the frame's bands;
- *   FLUSH                     board B renders the frame into the colour image with the clear's flags and values,
- *                             keeping depth / stencil in the depth-stencil image.
+ * The hardware keeps a pass's clear in its FLUSH: a clear before the pass's first draw merges into it, a clear after
+ * a draw of the whole target's colour ends the pass, and one of a part of the target (or of depth / stencil alone) is
+ * drawn as a quad inside the pass (fg_clear_quad). These are the Windows libraries' rules (host/win/core/g2_render.c).
  */
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "util/format/u_format.h"
-#include "util/ralloc.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
 #include "util/u_framebuffer.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_transfer.h"
 #include "util/u_upload_mgr.h"
 
+#include "xf86drm.h"
+#include "drm-uapi/fpgagpu_drm.h"
+
 #include "fg_context.h"
 #include "fg_resource.h"
 #include "fg_screen.h"
 
-/* board A clips x / y at +-2040 pixels: VS_STATE's guard band, in 1/16 pixel */
-#define FG_GUARD_BAND 32640.0
+#define FG_T_WRITE_BUFFER 0x20
+#define FG_STREAM_CUT     (3u << 20) /* a SUBMIT is sent once its stream passes this (the kernel takes 4 MB) */
+#define FG_PROG_A_BYTES   (4u << 20)
+#define FG_PROG_B_BYTES   (16u << 20)
+#define FG_RING_BYTES     (64u << 20)
 
-/* colour channel mask bits, the same in Gallium's colour masks and FLUSH's: R 1, G 2, B 4, A 8 */
-#define FG_MASK_A 0x8u
-
-/* FP24: sign 1, exponent 7 (bias 63), mantissa 16; rounded to nearest even, flushed to zero */
-static uint32_t
-fg_fp24(double x)
+uint32_t
+fg_c16(double f, unsigned bits)
 {
-   uint32_t s;
-   double m, q;
-   int e;
-
-   if (x == 0.0)
-      return 0;
-   if (isinf(x))
-      return (0x7Fu << 16) | (x < 0 ? 0x800000u : 0);
-   if (isnan(x))
-      return (0x7Fu << 16) | 0x8000u;
-   s = x < 0 ? 0x800000u : 0;
-   m = frexp(fabs(x), &e);		/* |x| = m 2^e, m in [0.5, 1) */
-   e -= 1;
-   m *= 2;
-   q = rint(m * 65536.0);
-   if (q == 131072.0) {
-      q = 65536.0;
-      e += 1;
-   }
-   if (e + 63 <= 0)
-      return s;
-   if (e + 63 >= 0x7F)
-      return s | (0x7Fu << 16);
-   return s | ((uint32_t)(e + 63) << 16) | ((uint32_t)q & 0xFFFFu);
-}
-
-/* a colour component in the render target's channel units: round(f 16 (2^bits - 1)), 4080 = 1.0 for 8 bits */
-static uint32_t
-fg_c16(float f, unsigned bits)
-{
-   double c = f > 0.0f ? (f < 1.0f ? f : 1.0) : 0.0;
+   double c = f > 0.0 ? (f < 1.0 ? f : 1.0) : 0.0;
 
    return bits ? (uint32_t)rint(c * 16.0 * (double)((1u << bits) - 1)) : 0;
 }
 
-/* VS_STATE for a frame without draws: the viewport is the whole target, no culling, line width 1, depth range
- * 0 .. 1, fragment shader inputs none, draw id 0, the draw rectangle the whole target */
-static void
-fg_build_vs_state(uint8_t b[60], uint32_t width, uint32_t height)
+/* ------------------------------------------------------------------ the stream */
+
+void
+fg_use_bo(struct fg_context *ctx, uint32_t gem)
 {
-   const double vp[4] = { width * 8.0, width * 8.0, height * 8.0, height * 8.0 };	/* window = ndc s + o, 1/16 px */
+   for (unsigned i = 0; i < ctx->nbos; i++)
+      if (ctx->bos[i] == gem)
+         return;
+   if (ctx->nbos == ctx->boscap) {
+      unsigned cap = ctx->boscap ? 2 * ctx->boscap : 64;
+      uint32_t *n = realloc(ctx->bos, cap * sizeof(*n));
 
-   for (unsigned i = 0; i < 4; i++)
-      fg_put32(b + 4 * i, fg_fp24(vp[i]));
-   fg_put16(b + 16, 1u << 9);			/* cull 0, front clockwise 0, line width 1 */
-   b[18] = 0;					/* fragment shader inputs */
-   b[19] = 0;					/* z 0 .. w off, coarse-depth flags none */
-   fg_put16(b + 20, width);
-   fg_put16(b + 22, height);
-   fg_put32(b + 24, 0);				/* draw id */
-   fg_put32(b + 28, fg_fp24(0.5));		/* depth range (f - n) / 2 */
-   fg_put32(b + 32, fg_fp24(0.5));		/* (n + f) / 2 */
-   for (unsigned i = 0; i < 2; i++) {		/* the guard band's NDC bounds (+-G - o) / s, ordered */
-      double s = vp[2 * i], o = vp[2 * i + 1], lo = (-FG_GUARD_BAND - o) / s, hi = (FG_GUARD_BAND - o) / s;
-
-      fg_put32(b + 36 + 8 * i, fg_fp24(lo < hi ? lo : hi));
-      fg_put32(b + 40 + 8 * i, fg_fp24(lo < hi ? hi : lo));
+      if (!n)
+         return;
+      ctx->bos = n;
+      ctx->boscap = cap;
    }
-   fg_put16(b + 52, 0);				/* draw rectangle x0, y0, x1, y1 */
-   fg_put16(b + 54, 0);
-   fg_put16(b + 56, width);
-   fg_put16(b + 58, height);
+   ctx->bos[ctx->nbos++] = gem;
 }
+
+/* an image the open pass reads or writes: in the SUBMIT's list, and held until the pass's FLUSH is submitted (a BO
+ * destroyed before it would be DESTROYed on the board ahead of the FLUSH that renders with it) */
+void
+fg_use_resource(struct fg_context *ctx, struct pipe_resource *prsc)
+{
+   struct fg_resource *rsc = fg_resource(prsc);
+
+   if (!rsc->gem)
+      return;
+   fg_use_bo(ctx, rsc->gem);
+   for (unsigned i = 0; i < ctx->npass_res; i++)
+      if (ctx->pass_res[i] == prsc)
+         return;
+   if (ctx->npass_res == ctx->pass_res_cap) {
+      unsigned cap = ctx->pass_res_cap ? 2 * ctx->pass_res_cap : 32;
+      struct pipe_resource **n = realloc(ctx->pass_res, cap * sizeof(*n));
+
+      if (!n)
+         return;
+      ctx->pass_res = n;
+      ctx->pass_res_cap = cap;
+   }
+   ctx->pass_res[ctx->npass_res] = NULL;
+   pipe_resource_reference(&ctx->pass_res[ctx->npass_res++], prsc);
+}
+
+void
+fg_submit_stream(struct fg_context *ctx)
+{
+   struct fg_screen *screen = fg_screen(ctx->base.screen);
+   uint64_t fence;
+   int r;
+
+   if (!ctx->ncmd)
+      return;
+   r = fg_submit(screen, ctx->cmd, ctx->ncmd, ctx->bos, ctx->nbos, &fence);
+   if (r)
+      fprintf(stderr, "fpgagpu: SUBMIT of %u bytes failed: %s\n", ctx->ncmd, strerror(-r));
+   else
+      fg_context_fenced(ctx, fence);
+   ctx->ncmd = 0;
+   ctx->nbos = 0;
+}
+
+void
+fg_emit(struct fg_context *ctx, uint8_t type, const void *head, uint32_t head_len, const void *tail, uint32_t tail_len)
+{
+   uint32_t need = 4 + ((head_len + tail_len + 3u) & ~3u);
+
+   if (ctx->ncmd + need > FG_STREAM_CUT && ctx->ncmd)
+      fg_submit_stream(ctx); /* the BOs of what follows are named again */
+   if (ctx->ncmd + need > ctx->cmdcap) {
+      uint32_t cap = ctx->cmdcap ? ctx->cmdcap : 65536;
+      uint8_t *n;
+
+      while (cap < ctx->ncmd + need)
+         cap *= 2;
+      n = realloc(ctx->cmd, cap);
+      if (!n) {
+         fprintf(stderr, "fpgagpu: out of memory for the command stream\n");
+         return;
+      }
+      ctx->cmd = n;
+      ctx->cmdcap = cap;
+   }
+   ctx->ncmd += fg_put_cmd(ctx->cmd + ctx->ncmd, type, head, head_len, tail, tail_len);
+}
+
+void
+fg_write_buffer(struct fg_context *ctx, struct fg_ctx_bo *bo, uint32_t offset, const void *data, uint32_t len)
+{
+   const uint8_t *p = data;
+
+   for (uint32_t i = 0; i < len; i += FG_MAX_DATA) {
+      uint32_t n = MIN2(len - i, FG_MAX_DATA);
+      uint8_t hdr[8];
+
+      fg_put16(hdr, bo->handle);
+      fg_put16(hdr + 2, 0);
+      fg_put32(hdr + 4, offset + i);
+      fg_emit(ctx, FG_T_WRITE_BUFFER, hdr, sizeof(hdr), p + i, n);
+      fg_use_bo(ctx, bo->gem);
+   }
+}
+
+/* per-draw data for board A: copied into the ring, the offset returned. On a wrap what was submitted before is
+ * waited for: board A fetches a draw's vertices when it takes the DRAW, so a fence after it proves they are read */
+uint32_t
+fg_stream(struct fg_context *ctx, const void *data, uint32_t bytes, uint32_t align)
+{
+   uint32_t a = (ctx->ring.used + align - 1) & ~(align - 1);
+
+   if (a + bytes > ctx->ring.size) {
+      fg_submit_stream(ctx);
+      if (ctx->submitted)
+         fg_wait_fence(fg_screen(ctx->base.screen), ctx->last_fence, FG_WAIT_NS);
+      a = 0;
+   }
+   fg_write_buffer(ctx, &ctx->ring, a, data, bytes);
+   ctx->ring.used = a + bytes;
+   return a;
+}
+
+static bool
+fg_ctx_bo_create(struct fg_context *ctx, struct fg_ctx_bo *bo, uint32_t kind, uint32_t size)
+{
+   struct drm_fpgagpu_bo_create c = { .kind = kind, .size = size };
+
+   if (drmIoctl(fg_screen(ctx->base.screen)->fd, DRM_IOCTL_FPGAGPU_BO_CREATE, &c)) {
+      fprintf(stderr, "fpgagpu: BO_CREATE of a %u MB buffer failed: %s\n", size >> 20, strerror(errno));
+      return false;
+   }
+   bo->gem = c.handle;
+   bo->handle = (uint16_t)c.board_handle;
+   bo->size = size;
+   bo->used = 0;
+   return true;
+}
+
+static void
+fg_ctx_bo_destroy(struct fg_context *ctx, struct fg_ctx_bo *bo)
+{
+   if (bo->gem) {
+      struct drm_gem_close c = { .handle = bo->gem };
+
+      drmIoctl(fg_screen(ctx->base.screen)->fd, DRM_IOCTL_GEM_CLOSE, &c);
+   }
+   bo->gem = 0;
+}
+
+/* ------------------------------------------------------------------ passes */
 
 /* FLUSH: {target, flags}, clear colour {R, G} and {B, A} (13 bits each), {depth 24, stencil 8}, the clear's
  * scissor {x0, y0}, {x1, y1}, {depth-stencil image, stencil write mask} */
 static void
-fg_build_flush(uint8_t b[28], uint16_t target, uint32_t flags, const uint32_t c[4], uint32_t depth,
-               uint32_t stencil, const uint32_t sc[4], uint16_t ds, uint32_t stencil_mask)
+fg_emit_flush(struct fg_context *ctx, uint32_t flags)
 {
-   fg_put32(b + 0, (uint32_t)target | (flags & 0xFFFFu) << 16);
-   fg_put32(b + 4, (c[0] & 0x1FFFu) | (c[1] & 0x1FFFu) << 13);
-   fg_put32(b + 8, (c[2] & 0x1FFFu) | (c[3] & 0x1FFFu) << 13);
-   fg_put32(b + 12, (depth & 0xFFFFFFu) | (stencil & 0xFFu) << 24);
-   fg_put32(b + 16, (sc[0] & 0x1FFFu) | (sc[1] & 0x1FFFu) << 16);
-   fg_put32(b + 20, (sc[2] & 0x1FFFu) | (sc[3] & 0x1FFFu) << 16);
-   fg_put32(b + 24, (uint32_t)ds | (stencil_mask & 0xFFu) << 16);
+   uint8_t b[28];
+
+   fg_put32(b + 0, (uint32_t)ctx->tgt.color_handle | (flags & 0xFFFFu) << 16);
+   fg_put32(b + 4, (ctx->cl_c16[0] & 0x1FFFu) | (ctx->cl_c16[1] & 0x1FFFu) << 13);
+   fg_put32(b + 8, (ctx->cl_c16[2] & 0x1FFFu) | (ctx->cl_c16[3] & 0x1FFFu) << 13);
+   fg_put32(b + 12, (ctx->cl_depth & 0xFFFFFFu) | (ctx->cl_stencil & 0xFFu) << 24);
+   if (flags & FG_FL_CLEAR_SCISSOR) {
+      fg_put32(b + 16, (ctx->cl_sc[0] & 0x1FFFu) | (ctx->cl_sc[1] & 0x1FFFu) << 16);
+      fg_put32(b + 20, (ctx->cl_sc[2] & 0x1FFFu) | (ctx->cl_sc[3] & 0x1FFFu) << 16);
+   } else {
+      fg_put32(b + 16, 0);
+      fg_put32(b + 20, 0);
+   }
+   fg_put32(b + 24, (uint32_t)ctx->tgt.ds_handle | (ctx->cl_smask & 0xFFu) << 16);
+   fg_emit(ctx, FG_T_FLUSH, b, sizeof(b), NULL, 0);
+   fg_use_resource(ctx, ctx->tgt.color);
+   if (ctx->tgt.ds)
+      fg_use_resource(ctx, ctx->tgt.ds);
 }
 
-static void
-fg_pending_reset(struct fg_pending_clear *p)
+void
+fg_pass_open(struct fg_context *ctx)
 {
-   memset(p, 0, sizeof(*p));
-   p->depth = 0xFFFFFF;
-   p->stencil_mask = 0xFF;
+   uint8_t z[4] = { 0, 0, 0, 0 };
+
+   if (ctx->pass_open)
+      return;
+   fg_emit(ctx, FG_T_FRAME_BEGIN, z, sizeof(z), NULL, 0);
+   ctx->pass_open = true;
+   ctx->pass_draws = 0;
+}
+
+void fg_send_target_size(struct fg_context *ctx);
+
+void
+fg_end_pass(struct fg_context *ctx)
+{
+   uint32_t fl;
+
+   if (!ctx->pass_open) {
+      if (!ctx->cl_flags || !ctx->have_tgt)
+         return;
+      fg_pass_open(ctx);
+   }
+   fg_send_target_size(ctx);
+   if (ctx->discard_color && ctx->discard_color == ctx->tgt.color) {
+      /* the colour is undefined: a clear costs nothing, loading the band does */
+      if (!(ctx->cl_flags & (FG_FL_CLEAR_COLOR | FG_FL_CLEAR_SCISSOR))) {
+         ctx->cl_flags |= FG_FL_CLEAR_COLOR | FG_FL_CMASK(0xF);
+         memset(ctx->cl_c16, 0, sizeof(ctx->cl_c16));
+      }
+      pipe_resource_reference(&ctx->discard_color, NULL);
+   }
+   /* depth and stencil share the D24S8 word: a whole-image depth clear keeps the stencil by clearing it to what it
+    * already is, so the band need not be loaded */
+   if ((ctx->cl_flags & FG_FL_CLEAR_DEPTH) && !(ctx->cl_flags & (FG_FL_CLEAR_STENCIL | FG_FL_CLEAR_SCISSOR)) &&
+       ctx->tgt.ds && (!ctx->tgt.has_stencil || (ctx->stencil_known && ctx->stencil_ds == ctx->tgt.ds))) {
+      ctx->cl_flags |= FG_FL_CLEAR_STENCIL;
+      ctx->cl_stencil = ctx->tgt.has_stencil ? ctx->stencil_value : 0;
+      ctx->cl_smask = 0xFF;
+   }
+   fl = ctx->cl_flags | (ctx->tgt.depth16 ? FG_FL_DEPTH16 : 0);
+   fg_emit_flush(ctx, fl);
+   fg_submit_stream(ctx);
+   if (ctx->cl_flags & FG_FL_CLEAR_COLOR)
+      fg_resource(ctx->tgt.color)->initialized = true;
+   if (ctx->tgt.ds && (ctx->cl_flags & (FG_FL_CLEAR_DEPTH | FG_FL_CLEAR_STENCIL)))
+      fg_resource(ctx->tgt.ds)->initialized = true;
+   if (ctx->pass_draws) {
+      fg_resource(ctx->tgt.color)->initialized = true;
+      if (ctx->tgt.ds)
+         fg_resource(ctx->tgt.ds)->initialized = true;
+   }
+   for (unsigned i = 0; i < ctx->npass_res; i++)
+      pipe_resource_reference(&ctx->pass_res[i], NULL);
+   ctx->npass_res = 0;
+   ctx->pass_open = false;
+   ctx->pass_draws = 0;
+   ctx->cl_flags = 0;
+   ctx->cl_depth = 0xFFFFFF;
+   ctx->cl_smask = 0xFF;
+}
+
+/* the framebuffer's first colour buffer and depth-stencil buffer as the pass's target; a change ends the pass.
+ * false: nothing board B can render into */
+bool
+fg_set_target(struct fg_context *ctx)
+{
+   struct pipe_framebuffer_state *fb = &ctx->fb;
+   struct pipe_resource *c = fb->nr_cbufs ? fb->cbufs[0].texture : NULL;
+   struct pipe_resource *z = fb->zsbuf.texture;
+   struct fg_target t;
+   const struct fg_format *f;
+
+   if (!c) {
+      FG_NOTE_ONCE("rendering without a colour buffer");
+      return false;
+   }
+   if (fb->cbufs[0].level || fb->cbufs[0].first_layer || c->width0 > FG_FLUSH_MAX_WIDTH ||
+       (z && (fb->zsbuf.level || fb->zsbuf.first_layer || z->width0 < c->width0 || z->height0 < c->height0))) {
+      FG_NOTE_ONCE("rendering into a mip level above 0, a cube face or layer above 0, or a target wider than 1280");
+      return false;
+   }
+   f = fg_resource(c)->fmt;
+   if (!f || f->depth)
+      return false;
+   memset(&t, 0, sizeof(t));
+   t.color = c;
+   t.ds = z;
+   t.color_handle = fg_resource(c)->board_handle;
+   t.ds_handle = z ? fg_resource(z)->board_handle : 0;
+   t.width = c->width0;
+   t.height = c->height0;
+   t.depth16 = z && z->format == PIPE_FORMAT_Z16_UNORM;
+   t.has_stencil = z && util_format_has_stencil(util_format_description(z->format));
+   memcpy(t.bits, f->bits, sizeof(t.bits));
+   t.no_alpha = f->force_alpha;
+   if (ctx->have_tgt && !memcmp(&ctx->tgt, &t, sizeof(t)))
+      return true;
+   fg_end_pass(ctx);
+   ctx->tgt = t;
+   ctx->have_tgt = true;
+   return true;
 }
 
 bool
 fg_context_pending_uses(struct fg_context *ctx, struct pipe_resource *prsc)
 {
-   return ctx->clear.flags && prsc && (ctx->clear.cbuf == prsc || ctx->clear.zsbuf == prsc);
+   if (!prsc)
+      return false;
+   if (ctx->cl_flags && ctx->have_tgt && (ctx->tgt.color == prsc || ctx->tgt.ds == prsc))
+      return true;
+   if (ctx->pass_open && ctx->have_tgt && (ctx->tgt.color == prsc || ctx->tgt.ds == prsc))
+      return true;
+   for (unsigned i = 0; i < ctx->npass_res; i++)
+      if (ctx->pass_res[i] == prsc)
+         return true;
+   return false;
 }
 
 void
 fg_context_flush_pending(struct fg_context *ctx)
 {
-   struct fg_pending_clear *p = &ctx->clear;
-   struct fg_screen *screen = fg_screen(ctx->base.screen);
-   struct fg_resource *cb, *zs;
-   uint8_t cmds[(4 + 4) + (4 + 60) + (4 + 28)], frame[4] = { 0 }, vs[60], fl[28];
-   uint32_t bos[2], nbos = 0, n = 0, flags;
-   uint64_t fence;
-   int r;
-
-   if (!p->flags)
-      return;
-   cb = fg_resource(p->cbuf);
-   zs = p->zsbuf ? fg_resource(p->zsbuf) : NULL;
-   flags = p->flags | (zs && zs->fmt->storage == FG_FMT_D16 ? FG_FL_DEPTH16 : 0);
-
-   fg_build_vs_state(vs, cb->base.width0, cb->base.height0);
-   fg_build_flush(fl, cb->board_handle, flags, p->c16, p->depth, p->stencil, p->sc, zs ? zs->board_handle : 0,
-                  p->stencil_mask);
-   n += fg_put_cmd(cmds + n, FG_T_FRAME_BEGIN, frame, sizeof(frame), NULL, 0);
-   n += fg_put_cmd(cmds + n, FG_T_VS_STATE, vs, sizeof(vs), NULL, 0);
-   n += fg_put_cmd(cmds + n, FG_T_FLUSH, fl, sizeof(fl), NULL, 0);
-   bos[nbos++] = cb->gem;
-   if (zs)
-      bos[nbos++] = zs->gem;
-
-   r = fg_submit(screen, cmds, n, bos, nbos, &fence);
-   if (r) {
-      fprintf(stderr, "fpgagpu: SUBMIT of a clear failed: %s\n", strerror(-r));
-   } else {
-      fg_context_fenced(ctx, fence);
-      if (flags & FG_FL_CLEAR_COLOR)
-         cb->initialized = true;
-      if (zs && (flags & (FG_FL_CLEAR_DEPTH | FG_FL_CLEAR_STENCIL)))
-         zs->initialized = true;
-   }
-   pipe_resource_reference(&p->cbuf, NULL);
-   pipe_resource_reference(&p->zsbuf, NULL);
-   fg_pending_reset(p);
+   fg_end_pass(ctx);
+   fg_submit_stream(ctx);
 }
+
+/* ------------------------------------------------------------------ clears */
 
 static void
 fg_clear(struct pipe_context *pctx, unsigned buffers, uint32_t color_clear_mask, uint8_t stencil_clear_mask,
@@ -177,95 +354,106 @@ fg_clear(struct pipe_context *pctx, unsigned buffers, uint32_t color_clear_mask,
          unsigned stencil)
 {
    struct fg_context *ctx = fg_context(pctx);
-   struct pipe_framebuffer_state *fb = &ctx->fb;
-   struct fg_pending_clear *p = &ctx->clear;
-   struct pipe_resource *cres = fb->nr_cbufs ? fb->cbufs[0].texture : NULL;
-   struct pipe_resource *zres = fb->zsbuf.texture;
-   uint32_t want = 0, sflag = 0, sc[4] = { 0, 0, 0, 0 };
+   const uint32_t kinds = FG_FL_CLEAR_COLOR | FG_FL_CLEAR_DEPTH | FG_FL_CLEAR_STENCIL;
+   uint32_t want = 0, flags, have, sc[4] = { 0, 0, 0, 0 }, cmask, dz = 0, c16[4] = { 0, 0, 0, 0 };
+   struct fg_target *t;
+   bool same_sc;
 
-   if ((buffers & PIPE_CLEAR_COLOR0) && cres)
+   if (!fg_set_target(ctx))
+      return;
+   t = &ctx->tgt;
+   cmask = color_clear_mask & 0xF;
+   if (t->no_alpha)
+      cmask = cmask ? cmask | 0x8 : 0;
+   else if (!t->bits[3])
+      cmask &= 0x7;
+   if ((buffers & PIPE_CLEAR_COLOR0) && cmask)
       want |= FG_FL_CLEAR_COLOR;
-   if ((buffers & PIPE_CLEAR_DEPTH) && zres)
+   if ((buffers & PIPE_CLEAR_DEPTH) && t->ds)
       want |= FG_FL_CLEAR_DEPTH;
-   if ((buffers & PIPE_CLEAR_STENCIL) && zres && util_format_has_stencil(util_format_description(zres->format)))
+   if ((buffers & PIPE_CLEAR_STENCIL) && t->has_stencil)
       want |= FG_FL_CLEAR_STENCIL;
-   if ((buffers & PIPE_CLEAR_COLOR) & ~PIPE_CLEAR_COLOR0)
-      FG_NOTE_ONCE("clearing a colour buffer other than the first");
    if (!want)
       return;
-   if (!cres) {
-      FG_NOTE_ONCE("a depth / stencil clear without a colour buffer");
-      return;
-   }
-   if (fb->cbufs[0].level || fb->cbufs[0].first_layer || cres->width0 > FG_FLUSH_MAX_WIDTH ||
-       (zres && (fb->zsbuf.level || fb->zsbuf.first_layer))) {
-      FG_NOTE_ONCE("a clear of a mip level above 0, a cube face or array layer above 0, or a target wider than 1280");
-      return;
-   }
-
-   if (scissor && (scissor->minx > 0 || scissor->miny > 0 || scissor->maxx < cres->width0 ||
-                   scissor->maxy < cres->height0)) {
-      if (scissor->maxx <= scissor->minx || scissor->maxy <= scissor->miny)
-         return;
-      sflag = FG_FL_CLEAR_SCISSOR;
-      sc[0] = scissor->minx;
-      sc[1] = scissor->miny;
-      sc[2] = MIN2(scissor->maxx, cres->width0);
-      sc[3] = MIN2(scissor->maxy, cres->height0);
-   }
-
-   /* clears merge while they name the same buffers, agree on the rectangle and do not overlap */
-   if (p->flags && (p->cbuf != cres || p->zsbuf != zres || (p->flags & FG_FL_CLEAR_SCISSOR) != sflag ||
-                    (sflag && memcmp(p->sc, sc, sizeof(sc))) || (p->flags & want)))
-      fg_context_flush_pending(ctx);
-
+   flags = want;
    if (want & FG_FL_CLEAR_COLOR) {
-      const struct fg_format *f = fg_resource(cres)->fmt;
-      uint32_t mask = color_clear_mask & 0xF;
-
+      flags |= FG_FL_CMASK(fg_board_cmask(cmask));
+      if (ctx->blend && ctx->blend->dither)
+         flags |= FG_FL_DITHER;
       for (unsigned i = 0; i < 3; i++)
-         p->c16[i] = fg_c16(color->f[i], f->bits[i]);
-      if (f->force_alpha) {
-         p->c16[3] = fg_c16(1.0f, 8);
-         if (mask)
-            mask |= FG_MASK_A;
-      } else {
-         p->c16[3] = fg_c16(color->f[3], f->bits[3]);
-         if (!f->bits[3])
-            mask &= ~FG_MASK_A;
-      }
-      if (mask) {
-         p->flags |= FG_FL_CMASK(mask);
-         if (ctx->blend && ctx->blend->dither)
-            p->flags |= FG_FL_DITHER;
-      } else {
-         want &= ~FG_FL_CLEAR_COLOR;
-      }
+         c16[i] = fg_c16(color->f[i], t->bits[i]);
+      c16[3] = t->no_alpha ? fg_c16(1.0, 8) : fg_c16(color->f[3], t->bits[3]);
    }
    if (want & FG_FL_CLEAR_DEPTH) {
       double d = depth > 0.0 ? (depth < 1.0 ? depth : 1.0) : 0.0;
 
-      p->depth = (uint32_t)rint(d * (zres->format == PIPE_FORMAT_Z16_UNORM ? 65535.0 : 16777215.0));
+      dz = (uint32_t)rint(d * (t->depth16 ? 65535.0 : 16777215.0));
    }
-   if (want & FG_FL_CLEAR_STENCIL) {
-      p->stencil = stencil & 0xFF;
-      p->stencil_mask = stencil_clear_mask;
+   if (scissor && (scissor->minx > 0 || scissor->miny > 0 || scissor->maxx < t->width || scissor->maxy < t->height)) {
+      if (scissor->maxx <= scissor->minx || scissor->maxy <= scissor->miny)
+         return;
+      flags |= FG_FL_CLEAR_SCISSOR;
+      sc[0] = scissor->minx;
+      sc[1] = scissor->miny;
+      sc[2] = MIN2(scissor->maxx, t->width);
+      sc[3] = MIN2(scissor->maxy, t->height);
    }
-   if (!want)
-      return;
 
-   pipe_resource_reference(&p->cbuf, cres);
-   pipe_resource_reference(&p->zsbuf, zres);
-   p->flags |= want | sflag;
-   memcpy(p->sc, sc, sizeof(sc));
+   /* what the stencil holds from here on */
+   if (want & FG_FL_CLEAR_STENCIL) {
+      if (!(flags & FG_FL_CLEAR_SCISSOR) && stencil_clear_mask == 0xFF) {
+         pipe_resource_reference(&ctx->stencil_ds, t->ds);
+         ctx->stencil_known = true;
+         ctx->stencil_value = stencil & 0xFF;
+      } else if (stencil_clear_mask &&
+                 !(ctx->stencil_known && (stencil & stencil_clear_mask) == (ctx->stencil_value & stencil_clear_mask))) {
+         ctx->stencil_known = false;
+      }
+   }
+
+   /* inside a pass that has draws: a quad, unless it is a whole-target colour clear (that one ends the pass, and the
+    * next starts with the FLUSH's fast clear). A quad reaches depth 0 and all ones exactly */
+   if (ctx->pass_draws && (!(want & FG_FL_CLEAR_COLOR) || (flags & FG_FL_CLEAR_SCISSOR)) &&
+       (!(want & FG_FL_CLEAR_DEPTH) || dz == 0 || dz == (t->depth16 ? 0xFFFFu : 0xFFFFFFu))) {
+      fg_clear_quad(ctx, flags, c16, dz, stencil & 0xFF, stencil_clear_mask, sc);
+      return;
+   }
+
+   /* clears merge into the pass while it has no draw, when the two agree on the rectangle and share nothing */
+   have = ctx->cl_flags & kinds;
+   same_sc = (ctx->cl_flags & FG_FL_CLEAR_SCISSOR) == (flags & FG_FL_CLEAR_SCISSOR) &&
+             (!(flags & FG_FL_CLEAR_SCISSOR) || !memcmp(ctx->cl_sc, sc, sizeof(sc)));
+   if (ctx->pass_draws || (have && (!same_sc || (have & want))))
+      fg_end_pass(ctx);
+   if (want & FG_FL_CLEAR_COLOR)
+      memcpy(ctx->cl_c16, c16, sizeof(c16));
+   if (want & FG_FL_CLEAR_DEPTH)
+      ctx->cl_depth = dz;
+   if (want & FG_FL_CLEAR_STENCIL) {
+      ctx->cl_stencil = stencil & 0xFF;
+      ctx->cl_smask = stencil_clear_mask;
+   }
+   ctx->cl_flags |= flags;
+   if (flags & FG_FL_CLEAR_SCISSOR)
+      memcpy(ctx->cl_sc, sc, sizeof(sc));
 }
+
+/* ------------------------------------------------------------------ flushes */
 
 static void
 fg_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence, unsigned flags)
 {
    struct fg_context *ctx = fg_context(pctx);
+   struct fg_screen *screen = fg_screen(pctx->screen);
 
    fg_context_flush_pending(ctx);
+   if (flags & PIPE_FLUSH_END_OF_FRAME) {
+      /* one frame in flight: board A bins the next while board B renders this one */
+      if (ctx->frame_fence_valid)
+         fg_wait_fence(screen, ctx->frame_fence, FG_WAIT_NS);
+      ctx->frame_fence = ctx->last_fence;
+      ctx->frame_fence_valid = ctx->submitted;
+   }
    if (fence) {
       struct pipe_fence_handle *f = fg_fence_create(ctx->submitted, ctx->last_fence);
 
@@ -280,20 +468,14 @@ fg_set_framebuffer_state(struct pipe_context *pctx, const struct pipe_framebuffe
    util_copy_framebuffer_state(&fg_context(pctx)->fb, state);
 }
 
+/* the next pass into this colour image need not keep its contents (a back buffer after a swap) */
 static void
-fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsigned drawid_offset,
-            const struct pipe_draw_indirect_info *indirect, const struct pipe_draw_start_count_bias *draws,
-            unsigned num_draws)
+fg_invalidate_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
 {
-   FG_NOTE_ONCE("drawing (draw_vbo)");
-}
+   struct fg_context *ctx = fg_context(pctx);
 
-static void
-fg_draw_vertex_state(struct pipe_context *pctx, struct pipe_vertex_state *state, uint32_t partial_velem_mask,
-                     struct pipe_draw_vertex_state_info info, const struct pipe_draw_start_count_bias *draws,
-                     unsigned num_draws)
-{
-   FG_NOTE_ONCE("drawing (draw_vertex_state)");
+   if (prsc && prsc->target != PIPE_BUFFER && fg_resource(prsc)->fmt && !fg_resource(prsc)->fmt->depth)
+      pipe_resource_reference(&ctx->discard_color, prsc);
 }
 
 static void
@@ -307,7 +489,12 @@ fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, un
                         unsigned dsty, unsigned dstz, struct pipe_resource *src, unsigned src_level,
                         const struct pipe_box *src_box)
 {
-   FG_NOTE_ONCE("resource_copy_region");
+   if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
+      memcpy((uint8_t *)fg_resource(dst)->data + dstx, (uint8_t *)fg_resource(src)->data + src_box->x,
+             src_box->width);
+      return;
+   }
+   FG_NOTE_ONCE("resource_copy_region of images");
 }
 
 static void
@@ -341,11 +528,6 @@ fg_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc, enum p
 
 static void
 fg_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
-{
-}
-
-static void
-fg_invalidate_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
 {
 }
 
@@ -401,138 +583,13 @@ fg_set_active_query_state(struct pipe_context *pctx, bool enable)
 {
 }
 
-/* ------------------------------------------------------------------ state objects: kept, not sent */
-
-struct fg_shader {
-   void *nir;			/* the nir_shader handed over by the frontend (ralloc'ed), or NULL */
-};
-
-static void *
-fg_create_shader_state(struct pipe_context *pctx, const struct pipe_shader_state *cso)
-{
-   struct fg_shader *so = CALLOC_STRUCT(fg_shader);
-
-   if (so && cso->type == PIPE_SHADER_IR_NIR)
-      so->nir = cso->ir.nir;
-   return so;
-}
-
 static void
-fg_delete_shader_state(struct pipe_context *pctx, void *hwcso)
-{
-   struct fg_shader *so = hwcso;
-
-   if (so)
-      ralloc_free(so->nir);
-   FREE(so);
-}
-
-static void *
-fg_create_compute_state(struct pipe_context *pctx, const struct pipe_compute_state *cso)
-{
-   return CALLOC_STRUCT(fg_shader);
-}
-
-static void *
-fg_create_blend_state(struct pipe_context *pctx, const struct pipe_blend_state *cso)
-{
-   struct pipe_blend_state *so = MALLOC_STRUCT(pipe_blend_state);
-
-   if (so)
-      *so = *cso;
-   return so;
-}
-
-static void
-fg_bind_blend_state(struct pipe_context *pctx, void *hwcso)
-{
-   fg_context(pctx)->blend = hwcso;
-}
-
-static void
-fg_delete_blend_state(struct pipe_context *pctx, void *hwcso)
-{
-   struct fg_context *ctx = fg_context(pctx);
-
-   if (ctx->blend == hwcso)
-      ctx->blend = NULL;
-   FREE(hwcso);
-}
-
-static void *
-fg_create_dsa_state(struct pipe_context *pctx, const struct pipe_depth_stencil_alpha_state *cso)
-{
-   return MALLOC(1);
-}
-
-static void *
-fg_create_rs_state(struct pipe_context *pctx, const struct pipe_rasterizer_state *cso)
-{
-   return MALLOC(1);
-}
-
-static void *
-fg_create_sampler_state(struct pipe_context *pctx, const struct pipe_sampler_state *cso)
-{
-   return MALLOC(1);
-}
-
-static void *
-fg_create_vertex_elements(struct pipe_context *pctx, unsigned count, const struct pipe_vertex_element *elements)
-{
-   return MALLOC(1);
-}
-
-static void
-fg_bind_state(struct pipe_context *pctx, void *hwcso)
+fg_render_condition(struct pipe_context *pctx, struct pipe_query *query, bool condition,
+                    enum pipe_render_cond_flag mode)
 {
 }
 
-static void
-fg_delete_state(struct pipe_context *pctx, void *hwcso)
-{
-   FREE(hwcso);
-}
-
-static void
-fg_bind_sampler_states(struct pipe_context *pctx, mesa_shader_stage shader, unsigned start, unsigned count,
-                       void **states)
-{
-}
-
-static struct pipe_sampler_view *
-fg_create_sampler_view(struct pipe_context *pctx, struct pipe_resource *texture,
-                       const struct pipe_sampler_view *templ)
-{
-   struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
-
-   if (!view)
-      return NULL;
-   *view = *templ;
-   view->texture = NULL;
-   pipe_resource_reference(&view->texture, texture);
-   pipe_reference_init(&view->reference, 1);
-   view->context = pctx;
-   return view;
-}
-
-static void
-fg_sampler_view_destroy(struct pipe_context *pctx, struct pipe_sampler_view *view)
-{
-   pipe_resource_reference(&view->texture, NULL);
-   FREE(view);
-}
-
-static void
-fg_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader, unsigned start, unsigned count,
-                     unsigned unbind_num_trailing_slots, struct pipe_sampler_view **views)
-{
-}
-
-static void
-fg_set_blend_color(struct pipe_context *pctx, const struct pipe_blend_color *state)
-{
-}
+/* ------------------------------------------------------------------ state with nothing to send */
 
 static void
 fg_set_clip_state(struct pipe_context *pctx, const struct pipe_clip_state *state)
@@ -540,14 +597,7 @@ fg_set_clip_state(struct pipe_context *pctx, const struct pipe_clip_state *state
 }
 
 static void
-fg_set_constant_buffer(struct pipe_context *pctx, mesa_shader_stage shader, uint index,
-                       const struct pipe_constant_buffer *cb)
-{
-}
-
-static void
-fg_set_inlinable_constants(struct pipe_context *pctx, mesa_shader_stage shader, uint num_values,
-                           uint32_t *values)
+fg_set_inlinable_constants(struct pipe_context *pctx, mesa_shader_stage shader, uint num_values, uint32_t *values)
 {
 }
 
@@ -558,28 +608,6 @@ fg_set_polygon_stipple(struct pipe_context *pctx, const struct pipe_poly_stipple
 
 static void
 fg_set_sample_mask(struct pipe_context *pctx, unsigned sample_mask)
-{
-}
-
-static void
-fg_set_scissor_states(struct pipe_context *pctx, unsigned start_slot, unsigned num_scissors,
-                      const struct pipe_scissor_state *state)
-{
-}
-
-static void
-fg_set_stencil_ref(struct pipe_context *pctx, const struct pipe_stencil_ref state)
-{
-}
-
-static void
-fg_set_viewport_states(struct pipe_context *pctx, unsigned start_slot, unsigned num_viewports,
-                       const struct pipe_viewport_state *state)
-{
-}
-
-static void
-fg_set_vertex_buffers(struct pipe_context *pctx, unsigned count, const struct pipe_vertex_buffer *buffers)
 {
 }
 
@@ -631,12 +659,6 @@ fg_set_stream_output_targets(struct pipe_context *pctx, unsigned num_targets,
 }
 
 static void
-fg_render_condition(struct pipe_context *pctx, struct pipe_query *query, bool condition,
-                    enum pipe_render_cond_flag mode)
-{
-}
-
-static void
 fg_texture_barrier(struct pipe_context *pctx, unsigned flags)
 {
 }
@@ -674,11 +696,23 @@ static void
 fg_context_destroy(struct pipe_context *pctx)
 {
    struct fg_context *ctx = fg_context(pctx);
+   struct fg_screen *screen = fg_screen(pctx->screen);
 
    fg_context_flush_pending(ctx);
+   if (screen->last_ctx == ctx)
+      screen->last_ctx = NULL;
+   fg_draw_fini(ctx);
    util_unreference_framebuffer_state(&ctx->fb);
+   pipe_resource_reference(&ctx->discard_color, NULL);
+   pipe_resource_reference(&ctx->stencil_ds, NULL);
    if (pctx->stream_uploader)
       u_upload_destroy(pctx->stream_uploader);
+   fg_ctx_bo_destroy(ctx, &ctx->prog_a);
+   fg_ctx_bo_destroy(ctx, &ctx->prog_b);
+   fg_ctx_bo_destroy(ctx, &ctx->ring);
+   free(ctx->cmd);
+   free(ctx->bos);
+   free(ctx->pass_res);
    p_atomic_dec(&pctx->screen->num_contexts);
    FREE(ctx);
 }
@@ -694,10 +728,26 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx = &ctx->base;
    pctx->screen = pscreen;
    pctx->priv = priv;
-   fg_pending_reset(&ctx->clear);
+   ctx->debug = fg_screen(pscreen)->debug;
+   ctx->cl_depth = 0xFFFFFF;
+   ctx->cl_smask = 0xFF;
+   ctx->next_id = 1;
+
+   if (!fg_ctx_bo_create(ctx, &ctx->prog_a, FPGAGPU_BO_A_BUFFER, FG_PROG_A_BYTES) ||
+       !fg_ctx_bo_create(ctx, &ctx->prog_b, FPGAGPU_BO_B_BUFFER, FG_PROG_B_BYTES) ||
+       !fg_ctx_bo_create(ctx, &ctx->ring, FPGAGPU_BO_A_BUFFER, FG_RING_BYTES)) {
+      fg_ctx_bo_destroy(ctx, &ctx->prog_a);
+      fg_ctx_bo_destroy(ctx, &ctx->prog_b);
+      fg_ctx_bo_destroy(ctx, &ctx->ring);
+      FREE(ctx);
+      return NULL;
+   }
 
    pctx->stream_uploader = u_upload_create_default(pctx);
    if (!pctx->stream_uploader) {
+      fg_ctx_bo_destroy(ctx, &ctx->prog_a);
+      fg_ctx_bo_destroy(ctx, &ctx->prog_b);
+      fg_ctx_bo_destroy(ctx, &ctx->ring);
       FREE(ctx);
       return NULL;
    }
@@ -716,8 +766,6 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->flush_resource = fg_flush_resource;
    pctx->invalidate_resource = fg_invalidate_resource;
    pctx->resource_release = fg_resource_release;
-   pctx->draw_vbo = fg_draw_vbo;
-   pctx->draw_vertex_state = fg_draw_vertex_state;
 
    pctx->create_query = fg_create_query;
    pctx->destroy_query = fg_destroy_query;
@@ -727,46 +775,11 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->set_active_query_state = fg_set_active_query_state;
    pctx->render_condition = fg_render_condition;
 
-   pctx->create_blend_state = fg_create_blend_state;
-   pctx->bind_blend_state = fg_bind_blend_state;
-   pctx->delete_blend_state = fg_delete_blend_state;
-   pctx->create_depth_stencil_alpha_state = fg_create_dsa_state;
-   pctx->bind_depth_stencil_alpha_state = fg_bind_state;
-   pctx->delete_depth_stencil_alpha_state = fg_delete_state;
-   pctx->create_rasterizer_state = fg_create_rs_state;
-   pctx->bind_rasterizer_state = fg_bind_state;
-   pctx->delete_rasterizer_state = fg_delete_state;
-   pctx->create_sampler_state = fg_create_sampler_state;
-   pctx->bind_sampler_states = fg_bind_sampler_states;
-   pctx->delete_sampler_state = fg_delete_state;
-   pctx->create_vertex_elements_state = fg_create_vertex_elements;
-   pctx->bind_vertex_elements_state = fg_bind_state;
-   pctx->delete_vertex_elements_state = fg_delete_state;
-   pctx->create_vs_state = fg_create_shader_state;
-   pctx->bind_vs_state = fg_bind_state;
-   pctx->delete_vs_state = fg_delete_shader_state;
-   pctx->create_fs_state = fg_create_shader_state;
-   pctx->bind_fs_state = fg_bind_state;
-   pctx->delete_fs_state = fg_delete_shader_state;
-   pctx->create_compute_state = fg_create_compute_state;
-   pctx->bind_compute_state = fg_bind_state;
-   pctx->delete_compute_state = fg_delete_state;
-
-   pctx->create_sampler_view = fg_create_sampler_view;
-   pctx->sampler_view_destroy = fg_sampler_view_destroy;
-   pctx->sampler_view_release = u_default_sampler_view_release;
-   pctx->set_sampler_views = fg_set_sampler_views;
    pctx->set_framebuffer_state = fg_set_framebuffer_state;
-   pctx->set_blend_color = fg_set_blend_color;
    pctx->set_clip_state = fg_set_clip_state;
-   pctx->set_constant_buffer = fg_set_constant_buffer;
    pctx->set_inlinable_constants = fg_set_inlinable_constants;
    pctx->set_polygon_stipple = fg_set_polygon_stipple;
    pctx->set_sample_mask = fg_set_sample_mask;
-   pctx->set_scissor_states = fg_set_scissor_states;
-   pctx->set_stencil_ref = fg_set_stencil_ref;
-   pctx->set_viewport_states = fg_set_viewport_states;
-   pctx->set_vertex_buffers = fg_set_vertex_buffers;
    pctx->set_window_rectangles = fg_set_window_rectangles;
    pctx->set_shader_buffers = fg_set_shader_buffers;
    pctx->set_shader_images = fg_set_shader_images;
@@ -781,6 +794,7 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->get_sample_position = fg_get_sample_position;
 
    fg_resource_context_init(pctx);
+   fg_draw_init(pctx);
 
    p_atomic_inc(&pscreen->num_contexts);
    return pctx;

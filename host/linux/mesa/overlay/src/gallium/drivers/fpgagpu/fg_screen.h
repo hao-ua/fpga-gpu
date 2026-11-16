@@ -42,7 +42,7 @@ struct pipe_screen_config;
 /* FLUSH flags */
 #define FG_FL_CLEAR_COLOR	0x001
 #define FG_FL_CLEAR_SCISSOR	0x002
-#define FG_FL_CMASK(m)		(((m) & 0xFu) << 2)	/* colour channels the clear writes: R 1, G 2, B 4, A 8 */
+#define FG_FL_CMASK(m)		(((m) & 0xFu) << 2)	/* colour channels the clear writes: R 8, G 4, B 2, A 1 */
 #define FG_FL_DITHER		0x040
 #define FG_FL_CLEAR_DEPTH	0x080
 #define FG_FL_CLEAR_STENCIL	0x100
@@ -64,6 +64,13 @@ struct fg_screen {
    uint32_t link_flags;		/* bit 0 board B alive, bit 2 the board link trained */
 
    bool debug;			/* FPGAGPU_DEBUG: flags at creation, the time each read map spends on stderr */
+   unsigned debug_shaders;	/* FPGAGPU_SHADERS=1: each program's assembler text on stderr */
+
+   /* the boards hold one context's state at a time: its programs, attributes, uniforms and draw states */
+   void *last_ctx;
+   /* image BOs created or destroyed: a draw state names images by handle, and board B turns a handle into an
+    * address when the state arrives, so a handle given again starts a new generation of draw ids */
+   uint32_t img_gen;
 };
 
 static inline struct fg_screen *

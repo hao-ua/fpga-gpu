@@ -183,6 +183,9 @@ counters and the last STATUS.
   ```
   - The PC end opens the flow with a keepalive every 2 s, so no inbound firewall rule is needed, and NAT on the way
     keeps the flow open.
+  - Between the ends every datagram travels in pieces of at most 1200 bytes, put together again on the other side.
+    The protocol's datagrams are up to 1472 bytes (WRITE_* data, READ_DATA chunks); the WireGuard path's MTU is 1420,
+    and its IP fragments were all lost. The first load showed 39 000 large datagrams sent and none reaching the board.
   - The VPS end accepts that flow only from the PC's address, and serves programs on 127.0.0.1.
   - The round trip is 62–131 ms (about 70 ms), so the boards work but slowly: 64 datagrams per round trip is about
     1–2 MB/s.
@@ -194,6 +197,18 @@ counters and the last STATUS.
 - **Not in scope yet:** the one-board build (its memory map and STATUS flags bit 29); a different heap layout.
 
 ## 7. Status
+
+**On hardware, 2026-11-16** (VPS kernel 6.1.0-55 after an update; DKMS rebuilt the module for it by itself):
+- `modprobe fpgagpu ip=127.0.0.1` through the relay: board A build 154, STATUS layout 12, link trained, B alive,
+  round trip about 60 ms.
+- `fpgagpu_status`: every `GET_PARAM` and `GET_STATUS` works.
+- `fpgagpu_selftest` **passes**:
+  - a board-B image created, filled with `SUBMIT`, fenced and read back (every pixel);
+  - a board-A buffer written and read back byte-exact;
+  - `MEM_WRITE` refused with EPERM, and a handle missing from the BO list refused with EACCES.
+- KMS registers card1 with HDMI-A-1 connected and the five modes. The VPS's X server (lightdm's Xorg) took card1 as a
+  GPU screen and holds DRM master, so `modetest` cannot set a mode, and nothing has been shown on board B's monitor
+  yet.
 
 | phase | state |
 |---|---|

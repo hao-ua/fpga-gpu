@@ -14,18 +14,61 @@ the PC, and NAT on the way (WSL, a router) keeps the flow open. Keepalives start
 The remote end accepts that flow only from --allow, and forwards what local programs send only once a PC end is
 known. The latest local sender gets the board's replies, as the boards themselves do.
 
+Between the two ends every datagram travels in pieces of at most PIECE bytes, each with an 8-byte header {PIECE_MAGIC,
+message id, index, count}, and is put together again on the other side. The protocol's datagrams are up to 1472 bytes
+(WRITE_* data, READ_DATA chunks), and a VPN path (WireGuard: MTU 1420) would fragment them; IP fragments are often
+dropped on the way, which loses every large datagram. Pieces fit any common path unfragmented. A message whose pieces do
+not all arrive within REASSEMBLY_S is dropped; the protocol resends it.
+
 Counters go to stderr every 10 s (or at once with SIGUSR1). Only the Python standard library is used.
 """
 import argparse
 import select
 import signal
 import socket
+import struct
 import sys
 import time
 
 KA_MAGIC = b"G2RLY-KA"          # never a protocol datagram: those start with the little-endian magic 0x4246 ("FB")
 KA_PERIOD = 2.0
 STATS_PERIOD = 10.0
+PIECE_MAGIC = b"G2"             # pieces: b"G2" + u16 message id + u8 index + u8 count + u16 bytes + data
+PIECE = 1200                    # data bytes per piece: with the headers far below a 1420-byte tunnel MTU
+REASSEMBLY_S = 1.0
+
+
+class Pieces:
+    """cut datagrams into pieces and put them together again"""
+
+    def __init__(self, st):
+        self.st, self.next_id, self.partial = st, 0, {}
+
+    def cut(self, d):
+        self.next_id = (self.next_id + 1) & 0xFFFF
+        count = max(1, (len(d) + PIECE - 1) // PIECE)
+        return [PIECE_MAGIC + struct.pack("<HBBH", self.next_id, i, count, len(d[i * PIECE:(i + 1) * PIECE]))
+                + d[i * PIECE:(i + 1) * PIECE] for i in range(count)]
+
+    def join(self, p, src):
+        """the whole datagram once its last piece is in, else None"""
+        if len(p) < 8 or not p.startswith(PIECE_MAGIC):
+            self.st.add("bad_piece")
+            return None
+        mid, idx, count, n = struct.unpack_from("<HBBH", p, 2)
+        data = p[8:8 + n]
+        if count == 1:
+            return data
+        now = time.monotonic()
+        for k in [k for k, v in self.partial.items() if now - v[0] > REASSEMBLY_S]:
+            del self.partial[k]
+            self.st.add("dropped_partial")
+        ent = self.partial.setdefault((src, mid), [now, count, {}])
+        ent[2][idx] = data
+        if len(ent[2]) < count:
+            return None
+        del self.partial[(src, mid)]
+        return b"".join(ent[2][i] for i in range(count))
 
 
 def addr(text):
@@ -56,6 +99,7 @@ def run_pc(a):
     board = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     board.connect(addr(a.board))
     st = Stats("pc")
+    pieces = Pieces(st)
     signal.signal(signal.SIGUSR1, lambda *_: st.show(True))
     last_ka = 0.0
     while True:
@@ -75,9 +119,11 @@ def run_pc(a):
                 st.add("up_err")
                 d = b""
             if d and not d.startswith(KA_MAGIC):
-                board.send(d)
-                st.add("to_board")
-                st.add("to_board_bytes", len(d))
+                d = pieces.join(d, "remote")
+                if d is not None:
+                    board.send(d)
+                    st.add("to_board")
+                    st.add("to_board_bytes", len(d))
         if board in r:
             try:
                 d = board.recv(2048)
@@ -85,7 +131,8 @@ def run_pc(a):
                 st.add("board_err")
                 d = b""
             if d:
-                up.send(d)
+                for p in pieces.cut(d):
+                    up.send(p)
                 st.add("from_board")
                 st.add("from_board_bytes", len(d))
         st.show()
@@ -101,6 +148,7 @@ def run_remote(a):
     pc = None                                            # the PC end's (address, port), from its keepalives
     client = None                                        # the latest local sender
     st = Stats("remote")
+    pieces = Pieces(st)
     signal.signal(signal.SIGUSR1, lambda *_: st.show(True))
     while True:
         r, _, _ = select.select([wan, loc], [], [], 0.5)
@@ -113,17 +161,22 @@ def run_remote(a):
                     sys.stderr.write("%s remote: PC end at %s:%d\n" % (time.strftime("%H:%M:%S"), src[0], src[1]))
                 pc = src
                 st.add("ka_recv")
-            elif client:
-                loc.sendto(d, client)
-                st.add("to_local")
-                st.add("to_local_bytes", len(d))
             else:
-                st.add("no_local_client")
+                d = pieces.join(d, src)
+                if d is None:
+                    pass
+                elif client:
+                    loc.sendto(d, client)
+                    st.add("to_local")
+                    st.add("to_local_bytes", len(d))
+                else:
+                    st.add("no_local_client")
         if loc in r:
             d, src = loc.recvfrom(2048)
             client = src
             if pc:
-                wan.sendto(d, pc)
+                for p in pieces.cut(d):
+                    wan.sendto(p, pc)
                 st.add("to_pc")
                 st.add("to_pc_bytes", len(d))
             else:

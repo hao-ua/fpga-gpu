@@ -110,6 +110,11 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 	bo->base.funcs = &fg_bo_funcs;
 	bo->kind = a->kind;
 	bo->format = a->format;
+	if (a->kind == FPGAGPU_BO_B_IMAGE) {
+		bo->width = a->width;
+		bo->height = a->height;
+		bo->pitch = a->pitch;
+	}
 	bo->size = size;
 	r = fg_mem_alloc(fdev, bo, size);
 	if (r) {

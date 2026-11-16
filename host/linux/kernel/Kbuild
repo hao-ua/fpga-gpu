@@ -7,3 +7,6 @@ ccflags-y += -I$(src)/include/uapi/drm -I$(srctree)/include/uapi/drm
 # the kernel being built against, so DKMS builds for any version
 FG_ATOMIC_COMMIT := $(shell grep -qs '^struct drm_atomic_commit {' $(srctree)/include/drm/drm_atomic.h && echo y)
 ccflags-$(FG_ATOMIC_COMMIT) += -DFG_HAVE_ATOMIC_COMMIT
+# the shadow-plane helpers map a framebuffer in begin_fb_access in newer kernels (prepare_fb before)
+FG_BEGIN_FB_ACCESS := $(shell grep -qs 'drm_gem_begin_shadow_fb_access' $(srctree)/include/drm/drm_gem_atomic_helper.h && echo y)
+ccflags-$(FG_BEGIN_FB_ACCESS) += -DFG_HAVE_BEGIN_FB_ACCESS

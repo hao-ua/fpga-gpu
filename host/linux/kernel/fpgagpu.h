@@ -146,6 +146,7 @@ struct fg_kms {
 	struct drm_encoder encoder;
 	struct drm_connector connector;
 	u8 *upbuf;				/* one WRITE_IMAGE body */
+	u16 shown;				/* the image board B was last told to show: the scanout image, a BO's, 0 */
 	bool img_valid;				/* the scanout image's descriptor is on board B */
 	bool need_present;			/* after a modeset: send the whole image and PRESENT it */
 	u32 img_fourcc, img_w, img_h;
@@ -169,6 +170,7 @@ struct fg_bo {
 	u32 kind;				/* enum drm_fpgagpu_bo_kind */
 	u16 board_handle;
 	u8 format;				/* images: the storage format */
+	u16 width, height, pitch;		/* images: level 0 */
 	bool created;				/* CREATE_* was sent: DESTROY it when freed */
 	u64 size;				/* the bytes the board object covers */
 	struct drm_mm_node node;		/* its range in the board heap */

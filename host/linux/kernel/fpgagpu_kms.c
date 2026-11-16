@@ -3,10 +3,14 @@
  * fpgagpu_kms: board B's HDMI output as a KMS display.
  *
  * One CRTC, one primary plane, one encoder and one HDMI-A connector, always connected, with board B's five video
- * modes. Framebuffers live in host memory (shmem GEM: dumb buffers, the fbdev console). A plane update sends the
+ * modes. A framebuffer in host memory (shmem GEM: dumb buffers, the fbdev console) is copied: a plane update sends the
  * damaged rectangle with WRITE_IMAGE into one board-B image, which board B scans out from its DDR every frame, so
  * an update shows on the next frame without another PRESENT. The image is (re)created and PRESENTed when the
  * framebuffer's size or format changes; a modeset sends SET_MODE first.
+ *
+ * A framebuffer over a board-B image BO (what Mesa renders into, through GBM) is shown as it is: the plane update
+ * PRESENTs that image, nothing is copied. The commands that drew it went to the boards before, in the same stream,
+ * so board B has rendered it by the time it takes the PRESENT. Such an image must be the mode's size.
  *
  * Over Gigabit Ethernet a whole 800 x 600 RGBA8 frame is 1.9 MB (about 55 frames a second at best); through the
  * relay to a remote host it takes seconds. Consoles and desktops mostly update small rectangles.
@@ -36,6 +40,7 @@
 #include <drm/drm_vblank.h>
 
 #include "fpgagpu.h"
+#include "fpgagpu_drm.h"
 
 /* protocol: board B's images and display (host/fb/fbproto.py) */
 #define T_CREATE_IMAGE		0x11
@@ -45,6 +50,7 @@
 #define T_PRESENT		0x31
 #define FMT_RGBA8		0x00
 #define FMT_RGB565		0x04
+#define TF_RGBA8888		0x01
 #define TF_BGRX8888		0x03
 #define TF_RGB565		0x04
 #define USE_SAMPLED		1
@@ -66,7 +72,29 @@ static const struct { u16 w, h; u8 id; } fg_modes[] = {
 	{ 640, 480, 0 }, { 800, 600, 1 }, { 1024, 768, 4 }, { 1280, 720, 2 }, { 1280, 800, 3 },
 };
 
-static const u32 fg_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_RGB565 };
+/* a copied framebuffer's alpha is not shown; an image BO stores its pixels as board B's RGBA8 or RGB565 whatever the
+ * byte order the fourcc names (the driver that rendered it converts on every CPU transfer) */
+static const u32 fg_formats[] = {
+	DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565,
+};
+
+static bool fg_fourcc_bgr(u32 fourcc)
+{
+	return fourcc == DRM_FORMAT_XBGR8888 || fourcc == DRM_FORMAT_ABGR8888;
+}
+
+static u8 fg_fourcc_storage(u32 fourcc)
+{
+	return fourcc == DRM_FORMAT_RGB565 ? FMT_RGB565 : FMT_RGBA8;
+}
+
+/* the board-B image a framebuffer is made of, or NULL for one in host memory */
+static struct fg_bo *fg_fb_image(const struct drm_framebuffer *fb)
+{
+	struct fg_bo *bo = fb ? to_fg_bo(fb->obj[0]) : NULL;
+
+	return bo && bo->kind == FPGAGPU_BO_B_IMAGE ? bo : NULL;
+}
 
 static int fg_mode_id(int w, int h)
 {
@@ -104,7 +132,7 @@ static int fg_set_mode(struct fpgagpu_device *fdev, int id)
 
 static int fg_create_scanout(struct fpgagpu_device *fdev, u32 fourcc, u32 w, u32 h)
 {
-	u8 fmt = fourcc == DRM_FORMAT_RGB565 ? FMT_RGB565 : FMT_RGBA8;
+	u8 fmt = fg_fourcc_storage(fourcc);
 	u32 pitch = w * (fmt == FMT_RGB565 ? 2 : 4);
 	u8 b[20];
 
@@ -130,24 +158,51 @@ static int fg_create_scanout(struct fpgagpu_device *fdev, u32 fourcc, u32 w, u32
 	if (fg_net_send_seq(&fdev->net, T_CREATE_IMAGE, b, sizeof(b), NULL, SEND_TIMEOUT_MS))
 		return -EIO;
 	fdev->kms.img_valid = true;
+	if (fdev->kms.shown == SCANOUT_HANDLE)
+		fdev->kms.shown = 0;			/* a new descriptor: board B must be told again */
 	fdev->kms.img_fourcc = fourcc;
 	fdev->kms.img_w = w;
 	fdev->kms.img_h = h;
 	return 0;
 }
 
-static void fg_present(struct fpgagpu_device *fdev)
+/* board B shows `handle` from its next frame on. wait: until it answers that it has (one round trip) */
+static void fg_present(struct fpgagpu_device *fdev, u16 handle, bool wait)
 {
 	struct fg_event ev;
 	u8 b[8];
 	u32 seq;
 
-	put_unaligned_le16(SCANOUT_HANDLE, b);
+	put_unaligned_le16(handle, b);
 	put_unaligned_le16(0, b + 2);
 	put_unaligned_le32(++fdev->kms.frame_id, b + 4);
-	if (fg_net_send_seq(&fdev->net, T_PRESENT, b, sizeof(b), &seq, SEND_TIMEOUT_MS) ||
-	    fg_net_wait_event(&fdev->net, seq, 0, &ev, PRESENT_TIMEOUT_MS) || ev.code != FG_EV_PRESENT)
-		drm_warn(&fdev->drm, "PRESENT of the scanout image got no PRESENT event\n");
+	if (fg_net_send_seq(&fdev->net, T_PRESENT, b, sizeof(b), &seq, SEND_TIMEOUT_MS)) {
+		drm_warn(&fdev->drm, "PRESENT of image 0x%04x was not sent\n", handle);
+		return;
+	}
+	fdev->kms.shown = handle;
+	if (wait && (fg_net_wait_event(&fdev->net, seq, 0, &ev, PRESENT_TIMEOUT_MS) || ev.code != FG_EV_PRESENT))
+		drm_warn(&fdev->drm, "PRESENT of image 0x%04x got no PRESENT event\n", handle);
+}
+
+/* the plane lets go of an image BO, which may be destroyed next: board B goes back to the scanout image (created at
+ * the mode's size if there is none, showing whatever its memory holds until the next copied framebuffer) */
+static void fg_unshow_bo(struct fpgagpu_device *fdev)
+{
+	u16 s = fdev->kms.shown;
+	unsigned int i;
+
+	if (!s || s == SCANOUT_HANDLE)
+		return;
+	if (!fdev->kms.img_valid) {
+		for (i = 0; i < ARRAY_SIZE(fg_modes); i++)
+			if (fg_modes[i].id == fdev->kms.mode_id)
+				break;
+		if (i == ARRAY_SIZE(fg_modes) ||
+		    fg_create_scanout(fdev, DRM_FORMAT_XRGB8888, fg_modes[i].w, fg_modes[i].h))
+			return;
+	}
+	fg_present(fdev, SCANOUT_HANDLE, false);
 }
 
 /* the rectangle r of the framebuffer (system memory at vaddr) into the scanout image, row-major, whole pixels per
@@ -155,7 +210,8 @@ static void fg_present(struct fpgagpu_device *fdev)
 static int fg_upload(struct fpgagpu_device *fdev, struct drm_framebuffer *fb, const u8 *vaddr, const struct drm_rect *r)
 {
 	u32 bpp = fb->format->cpp[0];
-	u8 tf = fb->format->format == DRM_FORMAT_RGB565 ? TF_RGB565 : TF_BGRX8888;
+	u32 fourcc = fb->format->format;
+	u8 tf = fourcc == DRM_FORMAT_RGB565 ? TF_RGB565 : fg_fourcc_bgr(fourcc) ? TF_RGBA8888 : TF_BGRX8888;
 	u32 w = drm_rect_width(r), h = drm_rect_height(r);
 	u32 total = w * h, per = MAX_DATA / bpp, p;
 	u8 *d = fdev->kms.upbuf;
@@ -194,10 +250,21 @@ static int fg_plane_atomic_check(struct drm_plane *plane, fg_atomic_t *state)
 {
 	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *cs = NULL;
+	struct drm_framebuffer *fb = ps->fb;
+	struct fg_bo *bo;
+	int r;
 
 	if (ps->crtc)
 		cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
-	return drm_atomic_helper_check_plane_state(ps, cs, 1 << 16, 1 << 16, false, false);	/* no scaling */
+	r = drm_atomic_helper_check_plane_state(ps, cs, 1 << 16, 1 << 16, false, false);	/* no scaling */
+	if (r || !ps->visible)
+		return r;
+	bo = fg_fb_image(fb);
+	if (bo && (bo->format != fg_fourcc_storage(fb->format->format) || fb->offsets[0] || fb->pitches[0] != bo->pitch ||
+		   fb->width != bo->width || fb->height != bo->height ||
+		   fb->width != cs->mode.hdisplay || fb->height != cs->mode.vdisplay))
+		return -EINVAL;				/* board B scans an image out whole, from its first pixel */
+	return 0;
 }
 
 static void fg_plane_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
@@ -207,6 +274,7 @@ static void fg_plane_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
 	struct drm_shadow_plane_state *sh = to_drm_shadow_plane_state(ps);
 	struct fpgagpu_device *fdev = kms_to_fdev(plane->dev);
 	struct drm_framebuffer *fb = ps->fb;
+	struct fg_bo *bo = fg_fb_image(fb);
 	struct drm_rect r;
 	bool whole = false;
 	int idx;
@@ -216,6 +284,13 @@ static void fg_plane_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
 	mutex_lock(&fdev->submit_lock);			/* not in the middle of a SUBMIT's frame */
+	if (bo) {
+		/* a flip: no wait for board B's answer, which comes with its next frame */
+		if (fdev->kms.shown != bo->board_handle || fdev->kms.need_present)
+			fg_present(fdev, bo->board_handle, false);
+		fdev->kms.need_present = false;
+		goto out;
+	}
 	if (!fdev->kms.img_valid || fdev->kms.img_fourcc != fb->format->format ||
 	    fdev->kms.img_w != fb->width || fdev->kms.img_h != fb->height) {
 		if (fg_create_scanout(fdev, fb->format->format, fb->width, fb->height)) {
@@ -224,6 +299,8 @@ static void fg_plane_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
 		}
 		whole = true;
 	}
+	if (fdev->kms.shown != SCANOUT_HANDLE)		/* an image BO was shown: the copy may be behind this framebuffer */
+		fdev->kms.need_present = true;
 	if (whole || fdev->kms.need_present) {
 		r.x1 = 0;
 		r.y1 = 0;
@@ -235,7 +312,7 @@ static void fg_plane_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
 	if (fg_upload(fdev, fb, sh->data[0].vaddr, &r))
 		dev_warn_ratelimited(plane->dev->dev, "WRITE_IMAGE of the damage failed\n");
 	if (whole || fdev->kms.need_present) {
-		fg_present(fdev);
+		fg_present(fdev, SCANOUT_HANDLE, true);
 		fdev->kms.need_present = false;
 	}
 out:
@@ -243,10 +320,52 @@ out:
 	drm_dev_exit(idx);
 }
 
+static void fg_plane_atomic_disable(struct drm_plane *plane, fg_atomic_t *state)
+{
+	struct fpgagpu_device *fdev = kms_to_fdev(plane->dev);
+	int idx;
+
+	if (!drm_dev_enter(plane->dev, &idx))
+		return;
+	mutex_lock(&fdev->submit_lock);
+	fg_unshow_bo(fdev);
+	mutex_unlock(&fdev->submit_lock);
+	drm_dev_exit(idx);
+}
+
+/* the CPU maps a copied framebuffer for the update; an image BO has nothing for it to map (Kbuild sets
+ * FG_HAVE_BEGIN_FB_ACCESS where the shadow-plane helpers map in begin_fb_access instead of prepare_fb) */
+#ifdef FG_HAVE_BEGIN_FB_ACCESS
+static int fg_plane_begin_fb_access(struct drm_plane *plane, struct drm_plane_state *ps)
+{
+	return fg_fb_image(ps->fb) ? 0 : drm_gem_begin_shadow_fb_access(plane, ps);
+}
+
+static void fg_plane_end_fb_access(struct drm_plane *plane, struct drm_plane_state *ps)
+{
+	if (!fg_fb_image(ps->fb))
+		drm_gem_end_shadow_fb_access(plane, ps);
+}
+#define FG_PLANE_FB_ACCESS .begin_fb_access = fg_plane_begin_fb_access, .end_fb_access = fg_plane_end_fb_access
+#else
+static int fg_plane_prepare_fb(struct drm_plane *plane, struct drm_plane_state *ps)
+{
+	return fg_fb_image(ps->fb) ? 0 : drm_gem_prepare_shadow_fb(plane, ps);
+}
+
+static void fg_plane_cleanup_fb(struct drm_plane *plane, struct drm_plane_state *ps)
+{
+	if (!fg_fb_image(ps->fb))
+		drm_gem_cleanup_shadow_fb(plane, ps);
+}
+#define FG_PLANE_FB_ACCESS .prepare_fb = fg_plane_prepare_fb, .cleanup_fb = fg_plane_cleanup_fb
+#endif
+
 static const struct drm_plane_helper_funcs fg_plane_helper_funcs = {
-	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+	FG_PLANE_FB_ACCESS,
 	.atomic_check	= fg_plane_atomic_check,
 	.atomic_update	= fg_plane_atomic_update,
+	.atomic_disable	= fg_plane_atomic_disable,
 };
 
 static const struct drm_plane_funcs fg_plane_funcs = {
@@ -288,6 +407,15 @@ static void fg_crtc_atomic_enable(struct drm_crtc *crtc, fg_atomic_t *state)
 
 static void fg_crtc_atomic_disable(struct drm_crtc *crtc, fg_atomic_t *state)
 {
+	struct fpgagpu_device *fdev = kms_to_fdev(crtc->dev);
+	int idx;
+
+	if (!drm_dev_enter(crtc->dev, &idx))
+		return;
+	mutex_lock(&fdev->submit_lock);
+	fg_unshow_bo(fdev);
+	mutex_unlock(&fdev->submit_lock);
+	drm_dev_exit(idx);
 }
 
 /* the boards send no vblank interrupt: a flip completes once its upload is sent */

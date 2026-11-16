@@ -7,6 +7,7 @@
  * pixels on unmap as WRITE_IMAGE commands (whole pixels, at most 1440 data bytes each) in SUBMITs.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,15 +150,13 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
 
    f = fg_format_info(templ->format);
    if (!f || templ->width0 < 1 || templ->width0 > 2048 || templ->height0 < 1 || templ->height0 > 2048 ||
-       templ->depth0 != 1 || levels > 12 || layers < 1 || layers > 255 || templ->nr_samples > 1)
-      goto fail;
-   switch (templ->target) {
-   case PIPE_TEXTURE_1D:
-   case PIPE_TEXTURE_2D:
-   case PIPE_TEXTURE_RECT:
-   case PIPE_TEXTURE_CUBE:
-      break;
-   default:
+       templ->depth0 != 1 || levels > 12 || layers < 1 || layers > 255 || templ->nr_samples > 1 ||
+       (templ->target != PIPE_TEXTURE_1D && templ->target != PIPE_TEXTURE_2D && templ->target != PIPE_TEXTURE_RECT &&
+        templ->target != PIPE_TEXTURE_CUBE)) {
+      if (screen->debug)
+         fprintf(stderr, "fpgagpu: no image for %s %ux%ux%u, %u levels, %u layers, %u samples, target %d, bind 0x%x\n",
+                 util_format_name(templ->format), templ->width0, templ->height0, templ->depth0, levels, layers,
+                 templ->nr_samples, templ->target, templ->bind);
       goto fail;
    }
 
@@ -172,6 +171,8 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
 
    c.kind = FPGAGPU_BO_B_IMAGE;
    c.usage = FG_USE_SAMPLED | FG_USE_RT | FG_USE_TRANSFER;
+   if (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED))
+      c.usage |= FG_USE_SCANOUT;	/* board B shows it (a KMS framebuffer, PRESENT) */
    c.pitch = (uint16_t)pitch;
    c.width = (uint16_t)templ->width0;
    c.height = (uint16_t)templ->height0;
@@ -189,6 +190,10 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    rsc->pitch = pitch;
    rsc->bo_size = c.size;
    p_atomic_inc(&screen->img_gen);	/* the handle may be one a cached draw state names */
+   if (screen->debug && (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED)))
+      fprintf(stderr, "fpgagpu: shown image %s %ux%u pitch %u, bind 0x%x: GEM %u, board 0x%04x\n",
+              util_format_name(templ->format), templ->width0, templ->height0, pitch, templ->bind, c.handle,
+              c.board_handle);
    return &rsc->base;
 
 fail:
@@ -218,20 +223,62 @@ fg_resource_from_handle(struct pipe_screen *pscreen, const struct pipe_resource 
    return NULL;
 }
 
-/* a board-B image is named by its GEM handle on this device; it has no host pages to export as a dma-buf */
+/* a board-B image by its GEM handle on this device, or as a dma-buf for another user of the device (it has no host
+ * pages: only this device can take it) */
 static bool
 fg_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx, struct pipe_resource *prsc,
                        struct winsys_handle *whandle, unsigned usage)
 {
    struct fg_resource *rsc = fg_resource(prsc);
 
-   if (!rsc->gem || whandle->type != WINSYS_HANDLE_TYPE_KMS)
+   if (!rsc->gem)
       return false;
-   whandle->handle = rsc->gem;
+   if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+      int prime;
+
+      if (drmPrimeHandleToFD(fg_screen(pscreen)->fd, rsc->gem, DRM_CLOEXEC | DRM_RDWR, &prime))
+         return false;
+      whandle->handle = (unsigned)prime;
+   } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+      whandle->handle = rsc->gem;
+   } else {
+      return false;
+   }
    whandle->stride = rsc->pitch;
    whandle->offset = 0;
    whandle->size = rsc->bo_size;
    return true;
+}
+
+/* what GBM and the DRI frontend ask of a buffer: one linear plane, its pitch, its GEM handle */
+static bool
+fg_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx, struct pipe_resource *prsc,
+                      unsigned plane, unsigned layer, unsigned level, enum pipe_resource_param param,
+                      unsigned handle_usage, uint64_t *value)
+{
+   struct fg_resource *rsc = fg_resource(prsc);
+
+   if (!rsc->gem)
+      return false;
+   switch (param) {
+   case PIPE_RESOURCE_PARAM_NPLANES:
+      *value = 1;
+      return true;
+   case PIPE_RESOURCE_PARAM_STRIDE:
+      *value = rsc->pitch;
+      return true;
+   case PIPE_RESOURCE_PARAM_OFFSET:
+      *value = 0;
+      return true;
+   case PIPE_RESOURCE_PARAM_MODIFIER:
+      *value = 0; /* DRM_FORMAT_MOD_LINEAR */
+      return true;
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS:
+      *value = rsc->gem;
+      return true;
+   default:
+      return false;
+   }
 }
 
 void
@@ -241,6 +288,7 @@ fg_resource_screen_init(struct pipe_screen *pscreen)
    pscreen->resource_destroy = fg_resource_destroy;
    pscreen->resource_from_handle = fg_resource_from_handle;
    pscreen->resource_get_handle = fg_resource_get_handle;
+   pscreen->resource_get_param = fg_resource_get_param;
 }
 
 /* ------------------------------------------------------------------ transfers */

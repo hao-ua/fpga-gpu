@@ -65,5 +65,10 @@ blend of white at alpha 0.5 over black. `host/linux/tools/fg_egl_gl.c` (linked w
 with `glDrawElements(GL_UNSIGNED_INT)` and two texture units, alpha test, depth test with `glDepthRange`, a mip chain
 uploaded level by level.
 
-`FPGAGPU_DEBUG=1` prints the boards' flags when the screen is created and, for each read map, the time spent on the
-submission, the wait and the `READ`. `FPGAGPU_SHADERS=1` prints each compiled program's assembler text.
+`host/linux/tools/fg_kms_flip.c`: a GBM surface on the card (DRM master needed, no X on it), an EGL window surface,
+frames cleared and flipped onto board B's HDMI with KMS the way SDL's kmsdrm driver runs a game; the buffers are
+board-B images, shown without a copy.
+
+`FPGAGPU_DEBUG=1` prints the boards' flags when the screen is created, every image created to be shown, any image
+refused, what a framebuffer without a colour buffer holds and, for each read map, the time spent on the submission,
+the wait and the `READ`. `FPGAGPU_SHADERS=1` prints each compiled program's assembler text.

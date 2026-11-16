@@ -302,6 +302,13 @@ fg_set_target(struct fg_context *ctx)
 
    if (!c) {
       FG_NOTE_ONCE("rendering without a colour buffer");
+      if (ctx->debug) {
+         static unsigned shown;
+
+         if (shown++ < 8)
+            fprintf(stderr, "fpgagpu: framebuffer %ux%u with %u colour buffers (first %p), depth-stencil %p\n",
+                    fb->width, fb->height, fb->nr_cbufs, (void *)c, (void *)z);
+      }
       return false;
    }
    if (fb->cbufs[0].level || fb->cbufs[0].first_layer || c->width0 > FG_FLUSH_MAX_WIDTH ||

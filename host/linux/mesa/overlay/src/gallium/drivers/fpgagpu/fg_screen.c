@@ -313,9 +313,10 @@ fg_init_screen_caps(struct fg_screen *screen)
    /* texture transfers map the image (READ_IMAGE / WRITE_IMAGE), they are not blits */
    caps->texture_transfer_modes = 0;
 
-   /* board B's memory is not host memory and is not exported */
+   /* board B's memory is not host memory. Its BOs export as dma-bufs (DRM PRIME) for other users of this device:
+    * without the export bit GBM gives every surface a host-memory dumb buffer instead of an image */
    caps->uma = false;
-   caps->dmabuf = 0;
+   caps->dmabuf = DRM_PRIME_CAP_EXPORT;
 
    caps->min_line_width = caps->min_line_width_aa = 1.0f;
    caps->max_line_width = caps->max_line_width_aa = 64.0f;

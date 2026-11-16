@@ -37,6 +37,7 @@ struct pipe_screen_config;
 /* image usage bits */
 #define FG_USE_SAMPLED		0x1
 #define FG_USE_RT		0x2
+#define FG_USE_SCANOUT		0x4
 #define FG_USE_TRANSFER		0x8
 
 /* FLUSH flags */

@@ -208,7 +208,23 @@ counters and the last STATUS.
   - Keyboard and mouse: Deskflow. The server runs on Windows, the client (`deskflow-client`, Debian's 1.22) in the VM's
     X, started by `start-x-fpgagpu.sh` with `DESKFLOW_SERVER=172.20.96.1` (the Default Switch's Windows address); the
     pointer crosses from the Windows screen onto board B's monitor and back. X itself opens no input devices.
-  - GNOME through GDM (the display manager; Debian 13's GNOME 48): `x11/20-fpgagpu.conf` in
+  - **The desktop now: XFCE through LightDM** (GDM and GNOME Shell removed; GNOME's other packages stay). LightDM
+    logs `debian` into XFCE (`x11/lightdm-fpgagpu.conf` in `/etc/lightdm/lightdm.conf.d/`); X runs on the boards by
+    `x11/20-fpgagpu.conf`, which also turns X's blanking off (each blank is a modeset of board B) and **MIT-SHM off**:
+    glamor keeps a shared-memory pixmap in host memory and uploads it again for every operation that reads it, so
+    with the extension XFCE's desktop kept X uploading a screen-sized image (about 2 MB) over and over and X stopped
+    answering clients (Deskflow among them); without it clients send ordinary pixmaps, uploaded once. XFCE's
+    compositor is off for `debian` (`x11/xfwm4-no-compositing.xml` as `~/.config/xfce4/xfconf/xfce-perchannel-xml/
+    xfwm4.xml`). The Deskflow client runs in a loop with `--no-restart` (`x11/deskflow-client.desktop`): its own
+    reconnecting hung after the Windows server restarted.
+  - fpgagpu does not load at boot: after a VM reboot, `modprobe fpgagpu` and `systemctl restart lightdm` put X on
+    board B (until then LightDM's X runs on Hyper-V's display).
+  - Board B once stopped taking commands (board A waiting on B's credit, its queue still) after X servers were killed
+    in the middle of frames while display managers stopped. Resetting B alone was not enough: board A kept waiting for
+    the old frame. Both boards had to be power-cycled, and the module reloaded for a new session (HELLO). The kernel
+    now ends a frame a closing file left open (a FLUSH to an image that does not exist: board A refuses the target,
+    board B drops the frame); seen working when LightDM restarted X.
+  - Before XFCE: GNOME through GDM (the display manager; Debian 13's GNOME 48): `x11/20-fpgagpu.conf` in
     `/etc/X11/xorg.conf.d` makes the fpgagpu card the primary GPU with glamor whenever the module is loaded (Hyper-V's
     display is not added); `/etc/gdm3/daemon.conf` has `WaylandEnable=false`, `AutomaticLoginEnable=true`,
     `AutomaticLogin=debian` (the VM's user, whose password is locked); its session starts the Deskflow client from

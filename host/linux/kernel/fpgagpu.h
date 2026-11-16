@@ -193,6 +193,8 @@ struct fpgagpu_device {
 	struct fg_kms kms;
 	struct fg_mem mem;
 	struct mutex submit_lock;		/* one command stream at a time: SUBMIT, READ, the display's uploads */
+	struct drm_file *frame_owner;		/* under submit_lock: the file whose SUBMITs left a frame open on the
+						 * boards (a FRAME_BEGIN not yet followed by its FLUSH) */
 	struct mutex pass_lock;			/* the two below */
 	struct drm_file *pass_owner;		/* the file holding the boards' render state for a pass (PASS), or NULL */
 	struct drm_file *last_owner;		/* the file that held it last */

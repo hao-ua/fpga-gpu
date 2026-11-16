@@ -184,6 +184,44 @@ static int fg_check_stream(const struct fg_allow *al, const u8 *c, u32 bytes)
 	return 0;
 }
 
+/* a checked stream's effect on the boards' frame: 1 it leaves one open (its last FRAME_BEGIN / FLUSH is a
+ * FRAME_BEGIN), 0 it closes it, -1 it has neither */
+static int fg_stream_frame(const u8 *c, u32 bytes)
+{
+	u32 p = 0;
+	int f = -1;
+
+	while (p + 4 <= bytes) {
+		if (c[p] == T_FRAME_BEGIN)
+			f = 1;
+		else if (c[p] == FG_T_FLUSH)
+			f = 0;
+		p += 4 + ALIGN(get_unaligned_le16(c + p + 2), 4);
+	}
+	return f;
+}
+
+/* a file closed with a frame of its own open on the boards (its process died between the FRAME_BEGIN and the
+ * FLUSH): a FLUSH into an image that does not exist ends it. Board A refuses that target and board B drops the
+ * frame, so the next process's frame does not land inside it. Called with submit_lock held */
+static void fg_discard_frame(struct fpgagpu_device *fdev)
+{
+	unsigned long idx;
+	u8 b[28] = { 0 };
+
+	mutex_lock(&fdev->mem.lock);
+	idx = find_next_zero_bit(fdev->mem.b_img, FG_HANDLES, 16);
+	mutex_unlock(&fdev->mem.lock);
+	if (idx >= FG_HANDLES)
+		idx = 1000;				/* every entry in use: the scanout image takes the frame */
+	put_unaligned_le32(0xC000 | (u32)idx, b);	/* the target, no clears */
+	if (fg_net_send_seq(&fdev->net, FG_T_FLUSH, b, sizeof(b), NULL, SEND_TIMEOUT_MS))
+		dev_warn(fdev->drm.dev, "a closed file's open frame could not be ended\n");
+	else
+		dev_info_ratelimited(fdev->drm.dev, "a closed file left a frame open: ended (FLUSH to image 0x%04lx)\n",
+				     0xC000 | idx);
+}
+
 static int fg_send_stream(struct fpgagpu_device *fdev, const u8 *c, u32 bytes)
 {
 	u8 *batch = kmalloc(BATCH_MAX, GFP_KERNEL);
@@ -287,8 +325,15 @@ int fpgagpu_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *fi
 	}
 	mutex_lock(&fdev->submit_lock);
 	r = fg_send_stream(fdev, cmds, a->cmds_bytes);
-	if (!r)
+	if (!r) {
+		int f = fg_stream_frame(cmds, a->cmds_bytes);
+
+		if (f == 1)
+			fdev->frame_owner = file;
+		else if (f == 0)
+			fdev->frame_owner = NULL;
 		r = fg_send_fence(fdev, &fence);
+	}
 	mutex_unlock(&fdev->submit_lock);
 	drm_dev_exit(idx);
 	if (!r) {
@@ -396,7 +441,17 @@ int fpgagpu_ioctl_pass(struct drm_device *drm, void *data, struct drm_file *file
 void fpgagpu_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	struct fpgagpu_device *fdev = to_fpgagpu(drm);
+	int idx;
 
+	mutex_lock(&fdev->submit_lock);
+	if (fdev->frame_owner == file) {
+		if (drm_dev_enter(drm, &idx)) {
+			fg_discard_frame(fdev);
+			drm_dev_exit(idx);
+		}
+		fdev->frame_owner = NULL;
+	}
+	mutex_unlock(&fdev->submit_lock);
 	mutex_lock(&fdev->pass_lock);
 	if (fdev->pass_owner == file)
 		fdev->pass_owner = NULL;

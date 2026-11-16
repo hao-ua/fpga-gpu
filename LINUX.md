@@ -202,9 +202,10 @@ counters and the last STATUS.
   `ip=192.168.1.10 port=5000`. The fpgagpu Mesa is the VM's system GL: `/etc/ld.so.conf.d/00-fpgagpu-mesa.conf`
   names `/opt/fpgagpu-mesa/lib/x86_64-linux-gnu` ahead of the system's directory (`ldconfig`), so every program loads
   it with no `LD_LIBRARY_PATH`; Debian's own Mesa answers "failed to load driver: fpgagpu".
-  - The driver reports desktop OpenGL 1.3 (no ARB_shadow: no depth compare yet), so ioquake3 games need
-    `cl_renderer opengl1`; their default, `opengl2`, wants OpenGL 2.0 and stops. WSL does not reach the Default Switch, Windows does: ssh from WSL goes through a
-  Windows-side TCP pipe as its ProxyCommand.
+  - ioquake3 games need `cl_renderer opengl1`: their default, `opengl2`, writes GLSL 1.20 (see the OpenGL 2.0 note
+    below).
+  - WSL does not reach the Default Switch, Windows does: ssh from WSL goes through a Windows-side TCP pipe as its
+    ProxyCommand.
   - Keyboard and mouse: Deskflow. The server runs on Windows, the client (`deskflow-client`, Debian's 1.22) in the VM's
     X, started by `start-x-fpgagpu.sh` with `DESKFLOW_SERVER=172.20.96.1` (the Default Switch's Windows address); the
     pointer crosses from the Windows screen onto board B's monitor and back. X itself opens no input devices.
@@ -221,6 +222,12 @@ counters and the last STATUS.
     by the TMU through an RGBA8 alias (the kernel's BO_CREATE alias flag); Mesa's OpenGL 2.0 context kept at the
     driver's GLSL 1.10 (`apply.sh` patches `version.c` and `getstring.c`). ioquake3's default `opengl2` renderer needs
     GLSL 1.20 and stays out; `opengl1` is set for `debian` (profile and menu launcher).
+  - glxgears' gears came out smeared sideways (2026-11-16): its 300-pixel back buffer (DRI3, scan-out) has rows of
+    1216 bytes (a pitch a multiple of 32), and X draws the window from it through the TMU, which reads tight rows
+    (1200 bytes): each row started 4 pixels further on. Mesa now samples such an image from a copy with tight rows
+    (see `host/linux/mesa/README.md`), a depth texture of a width no multiple of 8 likewise. Fixed with it: when a
+    context's 8191 draw ids ran out, the pass restarted after the draw had put its images on the old pass's list, and
+    the kernel refused the draw's state (EACCES, once in the VM's log).
   - fpgagpu does not load at boot: after a VM reboot, `modprobe fpgagpu` and `systemctl restart lightdm` put X on
     board B (until then LightDM's X runs on Hyper-V's display).
   - Board B once stopped taking commands (board A waiting on B's credit, its queue still) after X servers were killed

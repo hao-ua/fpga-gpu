@@ -224,6 +224,8 @@ uint32_t fg_stream(struct fg_context *ctx, const void *data, uint32_t bytes, uin
 void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
                   unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
                   unsigned w, unsigned h);
+/* the handle the TMU reads the image by: its tight-row copy when its rows are padded */
+uint16_t fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc);
 
 /* draws (fg_draw.c) */
 void fg_draw_init(struct pipe_context *pctx);

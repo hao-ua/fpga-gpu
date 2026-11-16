@@ -172,7 +172,8 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
 
    /* the TMU's descriptor has no pitch: what is sampled has tight rows, and so has a mip chain or a layered image.
     * A single level that is only rendered into or scanned out gets a pitch that is a multiple of 32 bytes. A texture
-    * that is also a render target keeps tight rows (the two agree when a row is a multiple of 32 bytes anyway) */
+    * that is also a render target keeps tight rows (the two agree when a row is a multiple of 32 bytes anyway); an
+    * image with padded rows that is sampled after all (shared, scanned out, depth) is read from a tight-row copy */
    row = templ->width0 * fg_storage_bpp(f);
    pitch = (levels > 1 || layers > 1 ||
             ((templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
@@ -259,6 +260,7 @@ fg_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
    struct fg_resource *rsc = fg_resource(prsc);
 
    pipe_resource_reference(&rsc->shadow, NULL);
+   pipe_resource_reference(&rsc->tight, NULL);
    if (rsc->sample_gem)
       fg_gem_unref(fg_screen(pscreen), rsc->sample_gem);
    if (rsc->gem)
@@ -309,6 +311,7 @@ fg_resource_from_handle(struct pipe_screen *pscreen, const struct pipe_resource 
    rsc->pitch = info.pitch;
    rsc->bo_size = info.size;
    rsc->initialized = true;
+   rsc->shared = true;
    fg_gem_ref(screen, gem);
    return &rsc->base;
 }
@@ -337,6 +340,7 @@ fg_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx, s
    whandle->stride = rsc->pitch;
    whandle->offset = 0;
    whandle->size = rsc->bo_size;
+   rsc->shared = true;
    return true;
 }
 
@@ -463,6 +467,7 @@ fg_write_image(struct fg_context *ctx, struct fg_resource *rsc, const struct fg_
    free(cmds);
    if (ok)
       rsc->initialized = true;
+   rsc->tight_stale = true;
    return ok;
 }
 

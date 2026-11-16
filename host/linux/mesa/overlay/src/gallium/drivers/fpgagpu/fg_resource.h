@@ -68,6 +68,14 @@ struct fg_resource {
    struct pipe_resource *shadow;
    bool shadow_stale;		/* the image changed since the shadow was copied from it */
 
+   /* the other way round: an image with padded rows (one board B renders into or shows) that is sampled is read from
+    * a copy with tight rows, taken before a pass that samples it when the image changed. Another process may write a
+    * shared image (imported or handed out): its copy is taken again in every pass that samples it */
+   struct pipe_resource *tight;
+   bool tight_stale;		/* the image changed since tight was copied from it */
+   bool shared;
+   uint32_t tight_seq;		/* the screen's pass count when tight was copied */
+
    /* PIPE_BUFFER */
    void *data;
 };

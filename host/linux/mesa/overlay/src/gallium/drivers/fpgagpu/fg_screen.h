@@ -80,6 +80,9 @@ struct fg_screen {
    /* image BOs created or destroyed: a draw state names images by handle, and board B turns a handle into an
     * address when the state arrives, so a handle given again starts a new generation of draw ids */
    uint32_t img_gen;
+   /* passes ended by this screen's contexts: a shared image's tight-row copy is taken again in each pass that samples
+    * it */
+   uint32_t pass_seq;
 };
 
 static inline struct fg_screen *

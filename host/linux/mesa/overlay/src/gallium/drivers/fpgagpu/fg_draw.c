@@ -735,6 +735,27 @@ fg_fnv(uint64_t h, const void *p, size_t n)
    return h;
 }
 
+/* every draw id is taken: the open pass may still name them, so it ends and the ids start again. The draw being made
+ * has put its images on the pass's list already (its sampled images, their copies): they go on the next pass's list */
+static void
+fg_ids_restart(struct fg_context *ctx)
+{
+   unsigned n = ctx->npass_res;
+   struct pipe_resource **keep = n ? calloc(n, sizeof(*keep)) : NULL;
+
+   for (unsigned i = 0; keep && i < n; i++)
+      pipe_resource_reference(&keep[i], ctx->pass_res[i]);
+   fg_end_pass(ctx);
+   memset(ctx->ids, 0, sizeof(ctx->ids));
+   ctx->next_id = 1;
+   for (unsigned i = 0; keep && i < n; i++) {
+      fg_use_resource(ctx, keep[i]);
+      pipe_resource_reference(&keep[i], NULL);
+   }
+   free(keep);
+   fg_use_bo(ctx, ctx->prog_b.gem);
+}
+
 /* the id of a DRAW_STATE with these words and uniforms, sent when it is new */
 static uint32_t
 fg_draw_id(struct fg_context *ctx, const uint32_t h[23], const uint32_t *uni, uint32_t nuni)
@@ -758,11 +779,9 @@ fg_draw_id(struct fg_context *ctx, const uint32_t h[23], const uint32_t *uni, ui
       i = (i + 1) & (FG_ID_SLOTS - 1);
    }
    if (ctx->next_id >= FG_MAX_IDS || n == FG_ID_SLOTS) {
-      /* every id taken: the open pass may still need them, so it ends first */
-      fg_end_pass(ctx);
+      /* (fg_hw_draw restarts the ids before a draw sends anything: not reached) */
+      fg_ids_restart(ctx);
       fg_pass_open(ctx);
-      memset(ctx->ids, 0, sizeof(ctx->ids));
-      ctx->next_id = 1;
       i = (uint32_t)hash & (FG_ID_SLOTS - 1);
    }
    ctx->ids[i].hash = hash;
@@ -815,6 +834,10 @@ fg_hw_draw(struct fg_context *ctx, const struct fg_hw_draw *d, unsigned mode, ui
    nf = fs->prog.const_base + fs->prog.nconsts;
    if (nv > FG_VS_PARAMS || nf > FG_FS_PARAMS)
       return;
+   /* the draw may need a new id: when none is left the ids start again here, before the draw sends anything (its
+    * board-A state then goes in the pass its DRAW is in, which another process cannot come between) */
+   if (ctx->next_id >= FG_MAX_IDS)
+      fg_ids_restart(ctx);
    fg_claim_boards(ctx);
    fg_pass_open(ctx);
    if (!fg_place(ctx, &ctx->prog_a, &vs->prog, &vs_off, &vs_gen) ||
@@ -1015,7 +1038,6 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
    for (unsigned u = 0; u < FG_MAX_SAMPLERS; u++) {
       struct pipe_sampler_view *view = ctx->views[u];
       const struct fg_sampler_state *s = ctx->samplers[u];
-      struct fg_resource *r;
       uint32_t filter;
 
       if (!(fs->prog.samplers & (1u << u)))
@@ -1024,16 +1046,8 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
          h[15 + u] = 1u << 24; /* incomplete: the TMU reads (0, 0, 0, 1) */
          continue;
       }
-      r = fg_resource(view->texture);
-      if (r->pitch != view->texture->width0 * fg_storage_bpp(r->fmt) && ctx->debug) {
-         static unsigned shown;
-
-         if (shown++ < 16)
-            fprintf(stderr, "fpgagpu: sampling a %ux%u %s image whose rows are padded (pitch %u): the TMU reads tight rows\n",
-                    view->texture->width0, view->texture->height0, util_format_name(view->texture->format), r->pitch);
-      }
       filter = view->u.tex.last_level > view->u.tex.first_level ? s->filter : s->filter_nomip;
-      h[15 + u] = (r->sample_handle ? r->sample_handle : r->board_handle) | filter << 16 | s->wrap;
+      h[15 + u] = fg_sample_handle(ctx, view->texture) | filter << 16 | s->wrap;
       fg_use_resource(ctx, view->texture);
    }
 

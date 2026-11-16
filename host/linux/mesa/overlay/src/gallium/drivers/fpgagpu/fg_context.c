@@ -314,6 +314,14 @@ fg_end_pass(struct fg_context *ctx)
       if (ctx->tgt.ds)
          fg_resource(ctx->tgt.ds)->initialized = true;
    }
+   /* what the pass wrote: a tight-row copy of it is taken again before it is sampled */
+   if (ctx->tgt.color)
+      fg_resource(ctx->tgt.color)->tight_stale = true;
+   if (ctx->tgt.shadow_of)
+      fg_resource(ctx->tgt.shadow_of)->tight_stale = true;
+   if (ctx->tgt.ds)
+      fg_resource(ctx->tgt.ds)->tight_stale = true;
+   p_atomic_inc(&fg_screen(ctx->base.screen)->pass_seq);
    for (unsigned i = 0; i < ctx->npass_res; i++)
       pipe_resource_reference(&ctx->pass_res[i], NULL);
    ctx->npass_res = 0;
@@ -614,6 +622,7 @@ fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, un
                    src_box->width, src_box->height);
    d->initialized = true;
    d->shadow_stale = true;
+   d->tight_stale = true;
    if (!ctx->pass_open)
       fg_submit_stream(ctx);
 }
@@ -621,16 +630,16 @@ fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, un
 /* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key. Both
  * images are held until the stream is submitted: the frontend often lets go of a source right after a copy */
 static void
-fg_emit_copy_scaled(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
-                    unsigned sy, unsigned sw, unsigned sh, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer,
-                    unsigned dx, unsigned dy, unsigned dw, unsigned dh, uint32_t flags)
+fg_emit_copy_handles(struct fg_context *ctx, uint16_t src, unsigned slevel, unsigned slayer, unsigned sx, unsigned sy,
+                     unsigned sw, unsigned sh, uint16_t dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
+                     unsigned dw, unsigned dh, uint32_t flags)
 {
    uint8_t b[36];
 
-   fg_put16(b + 0, fg_resource(src)->board_handle);
+   fg_put16(b + 0, src);
    b[2] = (uint8_t)slevel;
    b[3] = (uint8_t)slayer;
-   fg_put16(b + 4, fg_resource(dst)->board_handle);
+   fg_put16(b + 4, dst);
    b[6] = (uint8_t)dlevel;
    b[7] = (uint8_t)dlayer;
    fg_put16(b + 8, sx);
@@ -645,8 +654,56 @@ fg_emit_copy_scaled(struct fg_context *ctx, struct pipe_resource *src, unsigned 
    fg_put32(b + 28, 0);
    fg_put32(b + 32, 0);
    fg_emit(ctx, FG_T_COPY_IMAGE, b, sizeof(b), NULL, 0);
+}
+
+static void
+fg_emit_copy_scaled(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
+                    unsigned sy, unsigned sw, unsigned sh, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer,
+                    unsigned dx, unsigned dy, unsigned dw, unsigned dh, uint32_t flags)
+{
+   fg_emit_copy_handles(ctx, fg_resource(src)->board_handle, slevel, slayer, sx, sy, sw, sh,
+                        fg_resource(dst)->board_handle, dlevel, dlayer, dx, dy, dw, dh, flags);
    fg_use_resource(ctx, src);
    fg_use_resource(ctx, dst);
+}
+
+/* the handle the TMU reads an image by. The TMU reads tight rows: an image whose rows are padded is read from its
+ * tight-row copy, taken here when the image changed (every pass for a shared image). Board B copies at once and
+ * renders at the FLUSH, so the copy lands under the pass's draws. A sampled D24S8 image is copied through its RGBA8
+ * alias into an RGBA8 copy, which the fragment program reads the same way */
+uint16_t
+fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc)
+{
+   struct fg_resource *r = fg_resource(prsc), *t;
+   uint16_t src = r->sample_handle ? r->sample_handle : r->board_handle;
+   uint32_t seq = p_atomic_read(&fg_screen(ctx->base.screen)->pass_seq);
+
+   if (r->pitch == prsc->width0 * fg_storage_bpp(r->fmt))
+      return src;
+   if (!r->tight) {
+      struct pipe_resource templ = *prsc;
+
+      templ.target = PIPE_TEXTURE_2D;
+      templ.format = r->sample_handle ? PIPE_FORMAT_R8G8B8A8_UNORM : prsc->format;
+      templ.bind = PIPE_BIND_SAMPLER_VIEW;
+      templ.last_level = 0;
+      templ.array_size = 1;
+      r->tight = prsc->screen->resource_create(prsc->screen, &templ);
+      if (!r->tight)
+         return src;
+      r->tight_stale = true;
+   }
+   t = fg_resource(r->tight);
+   if (r->tight_stale || (r->shared && r->tight_seq != seq)) {
+      fg_emit_copy_handles(ctx, src, 0, 0, 0, 0, prsc->width0, prsc->height0, t->board_handle, 0, 0, 0, 0,
+                           prsc->width0, prsc->height0, 0);
+      fg_use_resource(ctx, prsc);
+      r->tight_stale = false;
+      r->tight_seq = seq;
+      t->initialized = true;
+   }
+   fg_use_resource(ctx, r->tight);
+   return t->board_handle;
 }
 
 void
@@ -733,6 +790,7 @@ fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
                           info->dst.box.z + z, dx, dy, dw, dh, flags);
    d->initialized = true;
    d->shadow_stale = true;
+   d->tight_stale = true;
    if (!ctx->pass_open)
       fg_submit_stream(ctx);
 }

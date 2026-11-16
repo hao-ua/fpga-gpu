@@ -18,7 +18,7 @@
   kmsro), the dril entry point. Running it again changes nothing; it stops if an anchor line is missing.
 
 Tested on the boards (`../tools/fg_egl_clear.c`, `fg_egl_draw.c`, `fg_egl_gl.c`): an OpenGL ES 2.0 context and a
-desktop OpenGL 1.3 compatibility context on the device, chosen by the loader from the kernel driver's name (no
+desktop OpenGL 2.0 compatibility context on the device, chosen by the loader from the kernel driver's name (no
 `MESA_LOADER_DRIVER_OVERRIDE`); vertex and fragment shaders compiled for the two cores, fixed function included;
 triangles with vertices streamed into a ring on board A, `glDrawElements` with 32-bit indices far from 0 (rebased to
 16 bits), quads through Gallium's primitive converter, interpolated varyings, textures (RGBA, RGB; nearest; mip
@@ -42,9 +42,19 @@ OpenGL 2.0 with GLSL 1.10, the version the hardware supports (as the Windows `op
 gives the version string for it. ARB_shadow, the one thing Mesa missed for 2.0, is done in the fragment program: the
 TMU reads a D24S8 image through an RGBA8 alias of its bytes (BO_CREATE with FPGAGPU_BO_CREATE_ALIAS; the TMU has no
 D24S8 format) and the program decodes the depth and compares it with the clamped reference by the sampler's function
-(`fg_egl_gl` tests 9 and 10). Such a depth texture is sampled right only when its rows are a multiple of 32 bytes
-(a width a multiple of 8): a depth target's pitch is aligned, and the TMU has none. ioquake3's `opengl2` renderer
-writes GLSL 1.20 and is refused; its `opengl1` renderer is the one for these boards.
+(`fg_egl_gl` tests 9 and 10). ioquake3's `opengl2` renderer writes GLSL 1.20 and is refused; its `opengl1`
+renderer is the one for these boards.
+
+Pitches: the TMU's descriptor has none (it reads tight rows), and board B renders into and shows images whose pitch
+is a multiple of 32 bytes. A texture that is also rendered into keeps tight rows and is rendered in an aligned shadow,
+copied back after the pass. The other way round, an image with padded rows that is sampled (a DRI3 or scan-out buffer
+X draws a window from, a depth texture whose width is no multiple of 8) is read from a copy with tight rows, taken
+before a pass that samples it when the image changed, and in every such pass for an image shared with another process
+(`fg_egl_gl` test 11). Without it glxgears' 300-pixel window came out smeared sideways, each row 4 pixels further on.
+
+Draw states: board B keeps 8191 of a context's draw states by id. When they run out the pass ends and the ids start
+again, before the next draw sends anything, with the images the draw reads on the next pass's list (`fg_egl_gl` test
+12).
 
 Blits (`glBlitFramebuffer`) are board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors, the
 scissor when nothing stretches (`fg_egl_gl` test 8); blended blits and blits between storage formats are not done.

@@ -16,7 +16,13 @@
  *   7. rendering into a 50 x 30 texture (rows no multiple of 32 bytes: a render shadow), read back and sampled;
  *   8. glBlitFramebuffer from a texture: a copy, a mirror in x, a 2x stretch;
  *   9. a depth texture with ARB_shadow's compare (GL_LEQUAL against r) through fixed function; GL_VERSION printed;
- *  10. a GLSL 1.10 program (OpenGL 2.0 with GLSL 1.10, the hardware's) drawing a quad; #version 120 refused.
+ *  10. a GLSL 1.10 program (OpenGL 2.0 with GLSL 1.10, the hardware's) drawing a quad; #version 120 refused;
+ *  11. images with padded rows sampled (the TMU reads tight rows): a 50 x 30 scan-out GBM buffer imported as a dma-buf
+ *      EGLImage, rendered red | green and drawn from as a texture (the way X draws a client's window from its DRI3
+ *      buffer); a depth texture with a step half way across, compared: 40 wide (rows as rendered) and 36 wide
+ *      (rows of 144 bytes, padded to 160);
+ *  12. 8400 textured quads with blend constants of their own: the draw ids (8191) run out and start again, the
+ *      quad that starts them alone in its pass (its texture must be on the next SUBMIT's list).
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -521,6 +527,192 @@ int main(int argc, char **argv)
 		check(&fails, near(at(4, 4), 0, 0, 0, 1), "(4, 4) outside: black", at(4, 4));
 		glDeleteTextures(1, &tw);
 		glDeleteProgram(prog);
+	}
+
+	printf("11. padded rows sampled: a 50 x 30 scan-out buffer rendered red | green and drawn from; depth textures\n"
+	       "    40 and 36 wide with a step half way across, compared:\n");
+	{
+		typedef void (*image_target_fn)(GLenum target, void *image);
+		PFNEGLCREATEIMAGEKHRPROC create_image = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+		PFNEGLDESTROYIMAGEKHRPROC destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+		image_target_fn tex_image = (image_target_fn)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+		image_target_fn rb_image = (image_target_fn)eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES");
+		struct gbm_bo *bo = gbm_bo_create(gbm, 50, 30, GBM_FORMAT_ARGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+		int bfd = bo ? gbm_bo_get_fd(bo) : -1;
+		EGLImageKHR img = EGL_NO_IMAGE_KHR;
+		GLuint rb5, fbo5, t_img, t_z, rb6, fbo6;
+
+		if (bfd >= 0 && create_image) {
+			EGLint attr[] = {
+				EGL_WIDTH, 50, EGL_HEIGHT, 30, EGL_LINUX_DRM_FOURCC_EXT, GBM_FORMAT_ARGB8888,
+				EGL_DMA_BUF_PLANE0_FD_EXT, bfd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+				EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)gbm_bo_get_stride(bo), EGL_NONE
+			};
+
+			img = create_image(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attr);
+		}
+		printf("  buffer pitch %u bytes (its tight rows: 200)\n", bo ? gbm_bo_get_stride(bo) : 0);
+		check(&fails, img != EGL_NO_IMAGE_KHR && tex_image && rb_image, "the buffer imported as an EGLImage",
+		      (const uint8_t *)"\0\0\0\0");
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_ALPHA_TEST);
+		if (img != EGL_NO_IMAGE_KHR && tex_image && rb_image) {
+			glGenRenderbuffersEXT(1, &rb5);
+			glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb5);
+			rb_image(GL_RENDERBUFFER_EXT, img);
+			glGenFramebuffersEXT(1, &fbo5);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo5);
+			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rb5);
+			if (glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) != GL_FRAMEBUFFER_COMPLETE_EXT)
+				printf("  the buffer's framebuffer is incomplete (0x%04x)\n", glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT));
+			glViewport(0, 0, 50, 30);
+			glMatrixMode(GL_PROJECTION);
+			glPushMatrix();
+			glLoadIdentity();
+			glOrtho(0, 50, 0, 30, -1, 1);
+			glMatrixMode(GL_MODELVIEW);
+			glClearColor(1, 0, 0, 1);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glColor3f(0, 1, 0);
+			quad(25, 0, 50, 30, 0);
+			glColor3f(1, 1, 1);
+			glMatrixMode(GL_PROJECTION);
+			glPopMatrix();
+			glMatrixMode(GL_MODELVIEW);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+			glViewport(0, 0, W, H);
+			glClearColor(0, 0, 0, 1);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glGenTextures(1, &t_img);
+			glBindTexture(GL_TEXTURE_2D, t_img);
+			tex_image(GL_TEXTURE_2D, img);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glEnable(GL_TEXTURE_2D);
+			glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+			quad(0, 0, 50, 30, 0);
+			glDisable(GL_TEXTURE_2D);
+			read_back();
+			check(&fails, near(at(20, 2), 255, 0, 0, 1), "(20, 2) the buffer's left: red", at(20, 2));
+			check(&fails, near(at(30, 2), 0, 255, 0, 1), "(30, 2) the buffer's right: green", at(30, 2));
+			check(&fails, near(at(20, 27), 255, 0, 0, 1), "(20, 27) the buffer's left: red", at(20, 27));
+			check(&fails, near(at(30, 27), 0, 255, 0, 1), "(30, 27) the buffer's right: green", at(30, 27));
+			glDeleteTextures(1, &t_img);
+			glDeleteFramebuffersEXT(1, &fbo5);
+			glDeleteRenderbuffersEXT(1, &rb5);
+		}
+		if (img != EGL_NO_IMAGE_KHR && destroy_image)
+			destroy_image(dpy, img);
+		if (bfd >= 0)
+			close(bfd);
+		if (bo)
+			gbm_bo_destroy(bo);
+
+		/* 40 wide: rows of 160 bytes, as rendered; 36 wide: rows of 144 bytes, padded to 160 */
+		for (int zw = 40; zw >= 36; zw -= 4) {
+			char what[64];
+
+			glGenTextures(1, &t_z);
+			glBindTexture(GL_TEXTURE_2D, t_z);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, zw, zw, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+			glGenRenderbuffersEXT(1, &rb6);
+			glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb6);
+			glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, zw, zw);
+			glGenFramebuffersEXT(1, &fbo6);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo6);
+			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rb6);
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D, t_z, 0);
+			if (glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) != GL_FRAMEBUFFER_COMPLETE_EXT)
+				printf("  the depth framebuffer is incomplete (0x%04x)\n", glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT));
+			glViewport(0, 0, zw, zw);
+			glMatrixMode(GL_PROJECTION);
+			glPushMatrix();
+			glLoadIdentity();
+			glOrtho(0, zw, 0, zw, -1, 1);
+			glMatrixMode(GL_MODELVIEW);
+			glDepthRange(0, 1);
+			glDepthMask(GL_TRUE);
+			glClearDepth(1.0);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+			glEnable(GL_DEPTH_TEST);
+			glDepthFunc(GL_ALWAYS);
+			quad(0, 0, zw / 2, zw, 0.5f);     /* z_ndc -0.5, depth 0.25 on the left; 1.0 (the clear) on the right */
+			glDepthFunc(GL_LESS);
+			glDisable(GL_DEPTH_TEST);
+			glMatrixMode(GL_PROJECTION);
+			glPopMatrix();
+			glMatrixMode(GL_MODELVIEW);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+			glViewport(0, 0, W, H);
+			glClearColor(0.5f, 0, 0.5f, 1);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glBindTexture(GL_TEXTURE_2D, t_z);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE_ARB, GL_COMPARE_R_TO_TEXTURE_ARB);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC_ARB, GL_LEQUAL);
+			glTexParameteri(GL_TEXTURE_2D, GL_DEPTH_TEXTURE_MODE_ARB, GL_LUMINANCE);
+			glEnable(GL_TEXTURE_2D);
+			glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+			glBegin(GL_QUADS);
+			glTexCoord3f(0, 0, 0.5f); glVertex2f(0, 0);
+			glTexCoord3f(1, 0, 0.5f); glVertex2f(zw, 0);
+			glTexCoord3f(1, 1, 0.5f); glVertex2f(zw, zw);
+			glTexCoord3f(0, 1, 0.5f); glVertex2f(0, zw);
+			glEnd();
+			glDisable(GL_TEXTURE_2D);
+			read_back();
+			snprintf(what, sizeof(what), "%d wide: (8, 2) 0.5 > 0.25: black", zw);
+			check(&fails, near(at(8, 2), 0, 0, 0, 1), what, at(8, 2));
+			snprintf(what, sizeof(what), "%d wide: (%d, 2) 0.5 <= 1.0: white", zw, zw - 8);
+			check(&fails, near(at(zw - 8, 2), 255, 255, 255, 1), what, at(zw - 8, 2));
+			snprintf(what, sizeof(what), "%d wide: (8, %d) 0.5 > 0.25: black", zw, zw - 3);
+			check(&fails, near(at(8, zw - 3), 0, 0, 0, 1), what, at(8, zw - 3));
+			snprintf(what, sizeof(what), "%d wide: (%d, %d) 0.5 <= 1.0: white", zw, zw - 8, zw - 3);
+			check(&fails, near(at(zw - 8, zw - 3), 255, 255, 255, 1), what, at(zw - 8, zw - 3));
+			glClearColor(0, 0, 0, 1);
+			glDeleteFramebuffersEXT(1, &fbo6);
+			glDeleteRenderbuffersEXT(1, &rb6);
+			glDeleteTextures(1, &t_z);
+		}
+	}
+
+	printf("12. 8400 one-pixel textured quads, each with its own blend constant (a new draw state each: the draw ids\n"
+	       "    run out and start again); from the 7600th on each quad is flushed on its own:\n");
+	{
+		static const uint8_t white[4] = { 255, 255, 255, 255 };
+		GLuint tw = texture(1, 1, GL_RGBA, white, GL_NEAREST);
+		const int nq = 8400;
+		int bad = 0, first_bad = 0;
+
+		glClear(GL_COLOR_BUFFER_BIT);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_CONSTANT_COLOR, GL_ZERO);
+		for (int i = 1; i <= nq; i++) {
+			int p = (i - 1) % (W * H);
+
+			glBlendColor((i & 255) / 255.0f, (i >> 8) / 255.0f, 0.5f, 1);
+			quad(p % W, p / W, p % W + 1, p / W + 1, 0);
+			if (i >= 7600)
+				glFlush();
+		}
+		glDisable(GL_BLEND);
+		glDisable(GL_TEXTURE_2D);
+		read_back();
+		/* each pixel holds the last quad drawn on it: those of quads nq - W * H + 1 .. nq */
+		for (int i = nq - W * H + 1; i <= nq; i++) {
+			int p = (i - 1) % (W * H);
+
+			if (!near(at(p % W, p / W), i & 255, i >> 8, 128, 1) && !bad++)
+				first_bad = i;
+		}
+		if (bad)
+			printf("  %d quads lost, the first quad %d\n", bad, first_bad);
+		check(&fails, !bad, "the last 4096 quads, each on its pixel", at((nq - 1) % W, (nq - 1) % (W * H) / W));
+		glDeleteTextures(1, &tw);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

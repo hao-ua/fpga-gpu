@@ -52,6 +52,18 @@ X draws a window from, a depth texture whose width is no multiple of 8) is read 
 before a pass that samples it when the image changed, and in every such pass for an image shared with another process
 (`fg_egl_gl` test 11). Without it glxgears' 300-pixel window came out smeared sideways, each row 4 pixels further on.
 
+Region passes: a pass costs board B about 33 ns for every pixel of the image its FLUSH names, whatever it draws
+(board A walks every band, board B loads and stores each): 16 ms on an 800 x 600 screen. A pass into a target without
+a depth-stencil image (and of at least 128 x 128) therefore renders into the rows it reaches only: the FLUSH names an
+alias of those rows (BO_CREATE's alias at `alias_offset`, cached per image), board A gets their count as the target
+size, and every coordinate of the pass (viewport, scissor, the draw's rectangle, the clear's scissor) is relative to
+the first row. Whole rows, because board B writes each line of a FLUSH's image to its pitch. What a draw reaches is
+its viewport and scissor, narrowed to its vertices' window positions where the vertex program's position can be
+worked out on the CPU (`fg_eval`: the position's slice of the SSA form, kept at compile time; up to 2048 vertices a
+draw). The first draw fixes the first row (a multiple of 8); a draw or clear above it ends the pass; after four such
+passes in a row the next covers the whole target. `FPGAGPU_NOREGION=1` turns region passes off. A one-quad pass on
+800 x 600 costs 0.35 ms instead of 16 (`fg_egl_gl` test 13).
+
 Draw states: board B keeps 8191 of a context's draw states by id. When they run out the pass ends and the ids start
 again, before the next draw sends anything, with the images the draw reads on the next pass's list (`fg_egl_gl` test
 12).

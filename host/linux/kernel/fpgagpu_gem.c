@@ -85,7 +85,7 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 	u64 size, addr;
 	int r, idx;
 
-	if ((a->flags & ~FPGAGPU_BO_CREATE_ALIAS) || a->pad || a->pad2)
+	if ((a->flags & ~FPGAGPU_BO_CREATE_ALIAS) || a->pad || (a->alias_offset && !(a->flags & FPGAGPU_BO_CREATE_ALIAS)))
 		return -EINVAL;
 	switch (a->kind) {
 	case FPGAGPU_BO_A_BUFFER:
@@ -106,11 +106,18 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 		return -EINVAL;
 	}
 	if (a->flags & FPGAGPU_BO_CREATE_ALIAS) {
-		/* another descriptor of an image's bytes: no memory of its own, at most the image's size */
+		/* another descriptor of an image's bytes: no memory of its own, at most the image's size. One at an offset is
+		 * a rectangle (one level, one layer): its last row ends at offset + (height - 1) x pitch + width x bpp, inside
+		 * the image. Board B checks base + height x pitch against its heap's end: the heap's top guard covers the
+		 * rest of that last pitch */
 		struct drm_gem_object *o = a->kind == FPGAGPU_BO_B_IMAGE ? drm_gem_object_lookup(file, a->alias) : NULL;
+		u64 end = a->alias_offset ? a->alias_offset + (u64)(a->height - 1) * a->pitch +
+					    (u64)a->width * fg_format_bpp(a->format) : size;
 
 		orig = o ? to_fg_bo(o) : NULL;
-		if (!orig || orig->kind != FPGAGPU_BO_B_IMAGE || orig->alias_of || size > orig->size) {
+		if (!orig || orig->kind != FPGAGPU_BO_B_IMAGE || orig->alias_of || end > orig->size ||
+		    (a->alias_offset && ((a->alias_offset & 31) || a->levels != 1 || a->layers != 1 || a->vol ||
+					 a->img_flags))) {
 			if (o)
 				drm_gem_object_put(o);
 			return -EINVAL;
@@ -144,7 +151,7 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 		kfree(bo);
 		return r;
 	}
-	addr = orig ? orig->node.start : bo->node.start;
+	addr = orig ? orig->node.start + a->alias_offset : bo->node.start;
 
 	if (a->kind == FPGAGPU_BO_B_IMAGE) {
 		type = T_CREATE_IMAGE;

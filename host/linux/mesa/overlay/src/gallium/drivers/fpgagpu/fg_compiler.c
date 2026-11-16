@@ -118,7 +118,328 @@ static bool fg_optimize_once(nir_shader *s)
    return progress;
 }
 
-void fg_nir_lower(nir_shader *s)
+/* ------------------------------------------------------------------ the position on the CPU */
+
+enum { EV_CONST, EV_INPUT, EV_UNIFORM, EV_ALU, EV_POS };
+
+struct fg_eval_op {
+   uint8_t kind;
+   uint8_t nc;                  /* components of the value it defines (EV_POS: of the value it stores) */
+   uint8_t nsrc;
+   uint8_t mask;                /* EV_POS: the components it stores */
+   uint16_t op;                 /* EV_ALU: the nir_op */
+   uint32_t dst;                /* the value it defines (SSA index) */
+   uint32_t src[3];
+   uint8_t swz[3][4];
+   int base;                    /* EV_INPUT: the attribute; EV_UNIFORM: the vec4 slot; EV_POS: the first component */
+   uint8_t comp;                /* EV_INPUT: the attribute's first component */
+   float k[4];                  /* EV_CONST */
+};
+
+struct fg_eval {
+   struct fg_eval_op *ops;
+   unsigned nops;
+   float (*v)[4];               /* one vec4 per SSA value (scratch) */
+   uint32_t inputs;
+};
+
+static bool
+fg_eval_op_ok(nir_op op)
+{
+   switch (op) {
+   case nir_op_mov: case nir_op_fneg: case nir_op_fabs: case nir_op_fsat: case nir_op_fadd: case nir_op_fsub:
+   case nir_op_fmul: case nir_op_ffma: case nir_op_fmin: case nir_op_fmax: case nir_op_frcp: case nir_op_frsq:
+   case nir_op_fsqrt: case nir_op_fdiv: case nir_op_ffloor: case nir_op_fceil: case nir_op_ffract:
+   case nir_op_ftrunc: case nir_op_fround_even: case nir_op_fsign: case nir_op_fexp2: case nir_op_flog2:
+   case nir_op_fpow: case nir_op_fsin: case nir_op_fcos: case nir_op_slt: case nir_op_sge: case nir_op_seq:
+   case nir_op_sne: case nir_op_fcsel: case nir_op_flrp: case nir_op_b2f32: case nir_op_fdot2: case nir_op_fdot3:
+   case nir_op_fdot4: case nir_op_fdph: case nir_op_vec2: case nir_op_vec3: case nir_op_vec4:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* the instructions the position depends on, from the SSA form of a vertex program (one block, after the optimising
+ * passes); NULL when it depends on something else: control flow, a uniform at a computed index, an operation above */
+struct fg_eval *
+fg_eval_create(nir_shader *s)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   struct fg_eval *e = NULL;
+   BITSET_WORD *need = NULL;
+   nir_instr **kept = NULL;
+   unsigned nkept = 0, n = 0;
+   bool pos = false;
+
+   if (!impl || s->info.stage != MESA_SHADER_VERTEX || exec_list_length(&impl->body) != 1)
+      return NULL;
+   nir_index_ssa_defs(impl);
+   nir_foreach_instr(instr, nir_start_block(impl))
+      n++;
+   need = calloc(BITSET_WORDS(impl->ssa_alloc) + 1, sizeof(BITSET_WORD));
+   kept = calloc(n + 1, sizeof(*kept));
+   if (!need || !kept)
+      goto fail;
+   nir_foreach_instr_reverse(instr, nir_start_block(impl)) {
+      nir_def *def = nir_instr_def(instr);
+      bool needed = def && BITSET_TEST(need, def->index);
+
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+
+         if (in->intrinsic == nir_intrinsic_store_output &&
+             nir_intrinsic_io_semantics(in).location == VARYING_SLOT_POS) {
+            if (!nir_src_is_const(in->src[1]) || nir_src_as_uint(in->src[1]) || in->src[0].ssa->bit_size != 32)
+               goto fail;
+            BITSET_SET(need, in->src[0].ssa->index);
+            kept[nkept++] = instr;
+            pos = true;
+            continue;
+         }
+         if (!needed)
+            continue;
+         if (in->intrinsic == nir_intrinsic_load_input) {
+            if (!nir_src_is_const(in->src[0]) || nir_src_as_uint(in->src[0]) ||
+                nir_intrinsic_base(in) >= 16 || nir_intrinsic_component(in) + in->def.num_components > 4)
+               goto fail;
+         } else if (in->intrinsic != nir_intrinsic_load_uniform || !nir_src_is_const(in->src[0])) {
+            goto fail;
+         }
+         kept[nkept++] = instr;
+         continue;
+      }
+      if (!needed)
+         continue;
+      if (def->bit_size != 32 || def->num_components > 4)
+         goto fail;
+      if (instr->type == nir_instr_type_load_const || instr->type == nir_instr_type_undef) {
+         kept[nkept++] = instr;
+      } else if (instr->type == nir_instr_type_alu && fg_eval_op_ok(nir_instr_as_alu(instr)->op)) {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+            BITSET_SET(need, alu->src[i].src.ssa->index);
+         kept[nkept++] = instr;
+      } else {
+         goto fail;
+      }
+   }
+   if (!pos)
+      goto fail;
+   e = calloc(1, sizeof(*e));
+   if (!e || !(e->ops = calloc(nkept, sizeof(*e->ops))) || !(e->v = calloc(impl->ssa_alloc + 1, sizeof(*e->v))))
+      goto fail;
+   /* in program order */
+   for (unsigned i = nkept; i-- > 0;) {
+      nir_instr *instr = kept[i];
+      struct fg_eval_op *o = &e->ops[e->nops++];
+      nir_def *def = nir_instr_def(instr);
+
+      if (def) {
+         o->dst = def->index;
+         o->nc = def->num_components;
+      }
+      switch (instr->type) {
+      case nir_instr_type_load_const:
+         o->kind = EV_CONST;
+         for (unsigned c = 0; c < o->nc; c++)
+            o->k[c] = nir_instr_as_load_const(instr)->value[c].f32;
+         break;
+      case nir_instr_type_undef:
+         o->kind = EV_CONST;
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+
+         if (in->intrinsic == nir_intrinsic_store_output) {
+            o->kind = EV_POS;
+            o->nc = in->src[0].ssa->num_components;
+            o->src[0] = in->src[0].ssa->index;
+            o->base = nir_intrinsic_component(in);
+            o->mask = nir_intrinsic_write_mask(in);
+         } else if (in->intrinsic == nir_intrinsic_load_input) {
+            o->kind = EV_INPUT;
+            o->base = nir_intrinsic_base(in);
+            o->comp = nir_intrinsic_component(in);
+            e->inputs |= 1u << o->base;
+         } else {
+            /* integers are floats by now (nir_lower_int_to_float): the offset constant is a float, as the compiler
+             * reads it */
+            o->kind = EV_UNIFORM;
+            o->base = nir_intrinsic_base(in) + (int)nir_src_as_float(in->src[0]);
+            if (o->base < 0)
+               goto fail;
+         }
+         break;
+      }
+      default: {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+         o->kind = EV_ALU;
+         o->op = alu->op;
+         o->nsrc = nir_op_infos[alu->op].num_inputs;
+         for (unsigned j = 0; j < o->nsrc && j < 3; j++) {
+            o->src[j] = alu->src[j].src.ssa->index;
+            for (unsigned c = 0; c < 4; c++)
+               o->swz[j][c] = alu->src[j].swizzle[c] & 3;
+         }
+         if (alu->op == nir_op_vec4) {
+            /* the fourth source (one component) is kept in base / comp */
+            o->base = (int)alu->src[3].src.ssa->index;
+            o->comp = alu->src[3].swizzle[0] & 3;
+         }
+         break;
+      }
+      }
+   }
+   free(need);
+   free(kept);
+   return e;
+
+fail:
+   free(need);
+   free(kept);
+   fg_eval_destroy(e);
+   return NULL;
+}
+
+void
+fg_eval_destroy(struct fg_eval *e)
+{
+   if (!e)
+      return;
+   free(e->ops);
+   free(e->v);
+   free(e);
+}
+
+uint32_t
+fg_eval_inputs(const struct fg_eval *e)
+{
+   return e ? e->inputs : 0;
+}
+
+static float
+fg_eval_alu1(nir_op op, float a, float b, float c)
+{
+   switch (op) {
+   case nir_op_mov: case nir_op_b2f32: return a;
+   case nir_op_fneg: return -a;
+   case nir_op_fabs: return fabsf(a);
+   case nir_op_fsat: return a != a ? a : a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a;
+   case nir_op_fadd: return a + b;
+   case nir_op_fsub: return a - b;
+   case nir_op_fmul: return a * b;
+   case nir_op_ffma: return a * b + c;
+   case nir_op_fmin: return (a != a || b != b) ? NAN : a < b ? a : b;
+   case nir_op_fmax: return (a != a || b != b) ? NAN : a > b ? a : b;
+   case nir_op_frcp: return 1.0f / a;
+   case nir_op_frsq: return 1.0f / sqrtf(a);
+   case nir_op_fsqrt: return sqrtf(a);
+   case nir_op_fdiv: return a / b;
+   case nir_op_ffloor: return floorf(a);
+   case nir_op_fceil: return ceilf(a);
+   case nir_op_ffract: return a - floorf(a);
+   case nir_op_ftrunc: return truncf(a);
+   case nir_op_fround_even: return rintf(a);
+   case nir_op_fsign: return a > 0.0f ? 1.0f : a < 0.0f ? -1.0f : a;
+   case nir_op_fexp2: return exp2f(a);
+   case nir_op_flog2: return log2f(a);
+   case nir_op_fpow: return powf(a, b);
+   case nir_op_fsin: return sinf(a);
+   case nir_op_fcos: return cosf(a);
+   case nir_op_slt: return (a != a || b != b) ? NAN : a < b ? 1.0f : 0.0f;
+   case nir_op_sge: return (a != a || b != b) ? NAN : a >= b ? 1.0f : 0.0f;
+   case nir_op_seq: return (a != a || b != b) ? NAN : a == b ? 1.0f : 0.0f;
+   case nir_op_sne: return (a != a || b != b) ? NAN : a != b ? 1.0f : 0.0f;
+   case nir_op_fcsel: return a != a ? NAN : a != 0.0f ? b : c;
+   case nir_op_flrp: return a * (1.0f - c) + b * c;
+   default: return NAN;
+   }
+}
+
+bool
+fg_eval_position(struct fg_eval *e, const float (*in)[4], const float *uni, unsigned nvec, float pos[4])
+{
+   unsigned have = 0;
+
+   for (unsigned i = 0; i < e->nops; i++) {
+      const struct fg_eval_op *o = &e->ops[i];
+      float *d = e->v[o->dst];
+
+      switch (o->kind) {
+      case EV_CONST:
+         memcpy(d, o->k, sizeof(o->k));
+         break;
+      case EV_INPUT:
+         for (unsigned c = 0; c < o->nc; c++)
+            d[c] = in[o->base][o->comp + c];
+         break;
+      case EV_UNIFORM:
+         if ((unsigned)o->base >= nvec)
+            return false;
+         for (unsigned c = 0; c < o->nc; c++)
+            d[c] = uni[4 * o->base + c];
+         break;
+      case EV_POS:
+         for (unsigned c = 0; c < o->nc && o->base + c < 4; c++) {
+            if (o->mask & (1u << c)) {
+               pos[o->base + c] = e->v[o->src[0]][c];
+               have |= 1u << (o->base + c);
+            }
+         }
+         break;
+      default: {
+         const float *s0 = e->v[o->src[0]], *s1 = e->v[o->src[1]], *s2 = e->v[o->src[2]];
+         float r[4];
+
+         switch (o->op) {
+         case nir_op_vec2:
+         case nir_op_vec3:
+            for (unsigned c = 0; c < o->nc; c++)
+               r[c] = e->v[o->src[c]][o->swz[c][0]];
+            break;
+         case nir_op_vec4:
+            for (unsigned c = 0; c < 3; c++)
+               r[c] = e->v[o->src[c]][o->swz[c][0]];
+            r[3] = e->v[o->base][o->comp];
+            break;
+         case nir_op_fdot2:
+         case nir_op_fdot3:
+         case nir_op_fdot4:
+         case nir_op_fdph: {
+            unsigned n = o->op == nir_op_fdot2 ? 2 : o->op == nir_op_fdot4 ? 4 : 3;
+            float sum = 0.0f;
+
+            for (unsigned c = 0; c < n; c++)
+               sum += s0[o->swz[0][c]] * s1[o->swz[1][c]];
+            if (o->op == nir_op_fdph)
+               sum += s1[o->swz[1][3]];
+            for (unsigned c = 0; c < o->nc; c++)
+               r[c] = sum;
+            break;
+         }
+         default:
+            for (unsigned c = 0; c < o->nc; c++)
+               r[c] = fg_eval_alu1((nir_op)o->op, s0[o->swz[0][c]], o->nsrc > 1 ? s1[o->swz[1][c]] : 0.0f,
+                                   o->nsrc > 2 ? s2[o->swz[2][c]] : 0.0f);
+            break;
+         }
+         memcpy(d, r, o->nc * sizeof(float));
+         break;
+      }
+      }
+   }
+   if (have != 0xF)
+      return false;
+   for (unsigned c = 0; c < 4; c++)
+      if (!isfinite(pos[c]))
+         return false;
+   return true;
+}
+
+void fg_nir_lower(nir_shader *s, struct fg_eval **eval)
 {
    bool progress;
 
@@ -147,6 +468,10 @@ void fg_nir_lower(nir_shader *s)
    NIR_PASS(_, s, nir_opt_algebraic_late);
    NIR_PASS(_, s, nir_opt_copy_prop);
    NIR_PASS(_, s, nir_opt_dce);
+
+   /* the last SSA form: a vertex program's position, for working out on the CPU what a draw can cover */
+   if (eval)
+      *eval = fg_eval_create(s);
 
    NIR_PASS(_, s, nir_convert_from_ssa, true, false);
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);

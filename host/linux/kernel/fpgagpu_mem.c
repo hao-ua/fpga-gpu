@@ -25,6 +25,9 @@
 #define B_IMG_FIRST	16
 #define B_IMG_SCANOUT	1000
 #define BO_ALIGN	256			/* the boards want 32-byte aligned bases; 256 keeps bursts aligned */
+#define HEAP_B_GUARD	8192			/* never allocated: a rectangle alias's descriptor reaches up to one pitch
+						 * (at most 2048 x 4 bytes) past its image, and board B checks it against
+						 * the heap's end */
 
 int fg_format_bpp(u8 format)
 {
@@ -152,7 +155,7 @@ int fg_mem_init(struct fpgagpu_device *fdev)
 
 	mutex_init(&m->lock);
 	drm_mm_init(&m->heap_a, HEAP_A_START, HEAP_A_END - HEAP_A_START);
-	drm_mm_init(&m->heap_b, HEAP_B_START, HEAP_B_END - HEAP_B_START);
+	drm_mm_init(&m->heap_b, HEAP_B_START, HEAP_B_END - HEAP_B_START - HEAP_B_GUARD);
 	set_bit(B_IMG_SCANOUT, m->b_img);
 	return drmm_add_action_or_reset(&fdev->drm, fg_mem_release, m);
 }

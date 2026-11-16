@@ -44,6 +44,7 @@ struct fg_ctx_bo {
 /* shaders */
 struct fg_vs_state {
    nir_shader *nir;           /* lowered (fg_nir_lower) */
+   struct fg_eval *eval;      /* its position on the CPU (NULL: not to be had) */
    struct fg_program prog;
    bool ok;
    uint64_t vmask;            /* fg_varying_mask of its outputs */
@@ -114,6 +115,19 @@ struct fg_id_entry {
    uint32_t id;
 };
 
+/* A region pass renders into the rows of its target its draws and clears reach: a pass costs board B time for every
+ * pixel of what the FLUSH names (board A walks its bands, board B loads and stores them), so a pass that draws little
+ * names an alias of those rows. Whole rows: board B loads and stores a FLUSH image's lines to their pitch. The first
+ * draw fixes the origin row (a multiple of 8): every coordinate the pass sends is relative to it, and the rows grow
+ * down with each draw. A draw above the origin ends the pass. Passes with a depth-stencil image, and small targets,
+ * cover the whole target */
+struct fg_region {
+   bool on;                   /* the origin is fixed */
+   bool full;                 /* the whole target (no alias) */
+   int ox, oy;                /* the origin, in the target (ox is 0: whole rows) */
+   int x1, y1;                /* the furthest pixel reached + 1, in the target */
+};
+
 struct fg_context {
    struct pipe_context base;
    struct primconvert_context *primconvert;
@@ -161,6 +175,10 @@ struct fg_context {
    uint32_t stencil_value;
    struct fg_vs_state clear_vs;          /* the quad of a clear inside a pass */
    struct fg_fs_variant clear_fs;
+   struct fg_region rg;                  /* the open pass's rectangle */
+   unsigned rg_splits;                   /* passes ended in a row by a draw above or left of the origin */
+   bool rg_split_end;                    /* the pass that just ended was ended so */
+   bool no_region;                       /* FPGAGPU_NOREGION=1: every pass covers its whole target */
 
    /* what the boards hold from this context (valid while it was the last to submit) */
    bool hw_valid;
@@ -227,6 +245,18 @@ void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned sl
 /* the handle the TMU reads the image by: its tight-row copy when its rows are padded */
 uint16_t fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc);
 
+/* region passes: whether the open target may have one; a draw's or clear's pixels b (x0, y0, x1, y1 in the target)
+ * admitted before anything of it is sent (it may end the pass first, or fix the origin); what it reached added after */
+bool fg_region_ok(const struct fg_context *ctx);
+void fg_region_admit(struct fg_context *ctx, const int b[4]);
+void fg_region_grow(struct fg_context *ctx, const int b[4]);
+
+/* the origin of the pass's coordinates in the target, and the size they span (the rest of the target past it) */
+static inline int fg_rg_ox(const struct fg_context *ctx) { return ctx->rg.on ? ctx->rg.ox : 0; }
+static inline int fg_rg_oy(const struct fg_context *ctx) { return ctx->rg.on ? ctx->rg.oy : 0; }
+static inline uint32_t fg_rg_w(const struct fg_context *ctx) { return ctx->tgt.width - fg_rg_ox(ctx); }
+static inline uint32_t fg_rg_h(const struct fg_context *ctx) { return ctx->tgt.height - fg_rg_oy(ctx); }
+
 /* draws (fg_draw.c) */
 void fg_draw_init(struct pipe_context *pctx);
 void fg_draw_fini(struct fg_context *ctx);
@@ -234,6 +264,7 @@ void fg_hw_invalidate(struct fg_context *ctx);
 void fg_hw_lost(struct fg_context *ctx);
 void fg_clear_quad(struct fg_context *ctx, uint32_t flags, const uint32_t c16[4], uint32_t depth, uint32_t stencil,
                    uint32_t smask, const uint32_t sc[4]);
+void fg_send_target_size(struct fg_context *ctx, uint32_t width, uint32_t height);
 
 uint32_t fg_c16(double f, unsigned bits);
 

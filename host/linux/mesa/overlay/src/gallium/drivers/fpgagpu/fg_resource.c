@@ -261,12 +261,62 @@ fg_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
 
    pipe_resource_reference(&rsc->shadow, NULL);
    pipe_resource_reference(&rsc->tight, NULL);
+   for (unsigned i = 0; i < ARRAY_SIZE(rsc->ralias); i++)
+      if (rsc->ralias[i].gem)
+         fg_gem_unref(fg_screen(pscreen), rsc->ralias[i].gem);
    if (rsc->sample_gem)
       fg_gem_unref(fg_screen(pscreen), rsc->sample_gem);
    if (rsc->gem)
       fg_gem_unref(fg_screen(pscreen), rsc->gem);
    align_free(rsc->data);
    FREE(rsc);
+}
+
+uint16_t
+fg_rect_alias(struct pipe_screen *pscreen, struct fg_resource *rsc, unsigned x, unsigned y, unsigned width,
+              unsigned height, uint32_t *gem)
+{
+   struct fg_screen *screen = fg_screen(pscreen);
+   uint32_t off = y * rsc->pitch + x * fg_storage_bpp(rsc->fmt);
+   struct drm_fpgagpu_bo_create a = { 0 };
+   struct fg_rect_alias *e;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(rsc->ralias); i++) {
+      e = &rsc->ralias[i];
+      if (e->gem && e->offset == off && e->width == width && e->height == height) {
+         *gem = e->gem;
+         return e->handle;
+      }
+   }
+   a.kind = FPGAGPU_BO_B_IMAGE;
+   a.flags = FPGAGPU_BO_CREATE_ALIAS;
+   a.alias = rsc->gem;
+   a.alias_offset = off;
+   a.usage = FG_USE_RT;
+   a.pitch = (uint16_t)rsc->pitch;
+   a.width = (uint16_t)width;
+   a.height = (uint16_t)height;
+   a.format = rsc->fmt->storage;
+   a.levels = 1;
+   a.layers = 1;
+   if (drmIoctl(screen->fd, DRM_IOCTL_FPGAGPU_BO_CREATE, &a)) {
+      if (screen->debug)
+         fprintf(stderr, "fpgagpu: no %ux%u alias at %u, %u of a %ux%u image: %s\n", width, height, x, y,
+                 rsc->base.width0, rsc->base.height0, strerror(errno));
+      return 0;
+   }
+   /* the oldest goes: every pass that named it was submitted when it ended */
+   e = &rsc->ralias[rsc->ralias_next++ % ARRAY_SIZE(rsc->ralias)];
+   if (e->gem)
+      fg_gem_unref(screen, e->gem);
+   e->gem = a.handle;
+   e->handle = (uint16_t)a.board_handle;
+   e->offset = off;
+   e->width = (uint16_t)width;
+   e->height = (uint16_t)height;
+   fg_gem_ref(screen, a.handle);
+   *gem = e->gem;
+   return e->handle;
 }
 
 /* a board-B image from a dma-buf (another process's, through PRIME) or a GEM handle of this fd: the kernel says what

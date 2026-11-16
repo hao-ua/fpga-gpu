@@ -22,7 +22,11 @@
  *      buffer); a depth texture with a step half way across, compared: 40 wide (rows as rendered) and 36 wide
  *      (rows of 144 bytes, padded to 160);
  *  12. 8400 textured quads with blend constants of their own: the draw ids (8191) run out and start again, the
- *      quad that starts them alone in its pass (its texture must be on the next SUBMIT's list).
+ *      quad that starts them alone in its pass (its texture must be on the next SUBMIT's list);
+ *  13. region passes (a pass renders only the rectangle its draws and clears reach): quads that grow a region and one
+ *      above-left of it (a new pass), a quad in the corner (the rectangle ends at the image's end), scissored clears
+ *      alone and inside a region pass, a textured quad, a 250-wide texture (a shadow); then 200 one-quad passes on an
+ *      800 x 600 target timed (the whole target would cost about 16 ms a pass).
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -35,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <EGL/egl.h>
@@ -713,6 +718,151 @@ int main(int argc, char **argv)
 			printf("  %d quads lost, the first quad %d\n", bad, first_bad);
 		check(&fails, !bad, "the last 4096 quads, each on its pixel", at((nq - 1) % W, (nq - 1) % (W * H) / W));
 		glDeleteTextures(1, &tw);
+	}
+
+	printf("13. region passes (a pass renders only the rectangle its draws and clears reach), 256 x 256 targets:\n");
+	{
+		static const struct { int x, y, r, g, b; const char *what; } pt[] = {
+			{ 210, 160, 255, 0, 0, "(210, 160) the first quad: red" },
+			{ 235, 205, 255, 0, 0, "(235, 205) the second, below-right: red" },
+			{ 15, 15, 255, 0, 0, "(15, 15) the third, above-left (a new pass): red" },
+			{ 199, 160, 0, 0, 255, "(199, 160) left of the first: blue" },
+			{ 225, 165, 0, 0, 255, "(225, 165) between them: blue" },
+			{ 100, 100, 0, 0, 255, "(100, 100) untouched: blue" },
+			{ 250, 250, 0, 255, 0, "(250, 250) the corner quad: green" },
+			{ 239, 245, 0, 0, 255, "(239, 245) left of the corner quad: blue" },
+			{ 110, 70, 255, 255, 0, "(110, 70) a scissored clear alone: yellow" },
+			{ 120, 70, 0, 0, 255, "(120, 70) right of it: blue" },
+			{ 205, 185, 255, 0, 255, "(205, 185) a clear inside a region pass: magenta" },
+			{ 64, 186, 255, 255, 255, "(64, 186) a textured quad: white" },
+			{ 72, 186, 0, 0, 255, "(72, 186) right of it: blue" },
+		};
+		static const uint8_t white[4] = { 255, 255, 255, 255 };
+		uint8_t *p = malloc(256 * 256 * 4);
+		GLuint rb7, fbo7, t_sh, fbo8, tw = texture(1, 1, GL_RGBA, white, GL_NEAREST);
+		double t0, t1;
+		struct timespec ts;
+
+		glGenRenderbuffersEXT(1, &rb7);
+		glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb7);
+		glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, 256, 256);
+		glGenFramebuffersEXT(1, &fbo7);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo7);
+		glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rb7);
+		glViewport(0, 0, 256, 256);
+		glMatrixMode(GL_PROJECTION);
+		glPushMatrix();
+		glLoadIdentity();
+		glOrtho(0, 256, 0, 256, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glDisable(GL_TEXTURE_2D);
+		glDisable(GL_BLEND);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_SCISSOR_TEST);
+		glClearColor(0, 0, 1, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glFlush();
+		glColor3f(1, 0, 0);
+		quad(200, 150, 220, 170, 0);
+		quad(230, 200, 240, 210, 0);
+		quad(10, 10, 20, 20, 0);
+		glFlush();
+		glColor3f(0, 1, 0);
+		quad(240, 240, 256, 256, 0);
+		glFlush();
+		glEnable(GL_SCISSOR_TEST);
+		glScissor(100, 60, 20, 20);
+		glClearColor(1, 1, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glDisable(GL_SCISSOR_TEST);
+		glFlush();
+		glColor3f(0, 0, 0);
+		quad(196, 176, 200, 180, 0);       /* a region pass, then a clear inside it (a quad) */
+		glEnable(GL_SCISSOR_TEST);
+		glScissor(200, 180, 10, 10);
+		glClearColor(1, 0, 1, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glDisable(GL_SCISSOR_TEST);
+		glEnable(GL_TEXTURE_2D);
+		glBindTexture(GL_TEXTURE_2D, tw);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+		quad(60, 180, 68, 192, 0);
+		glDisable(GL_TEXTURE_2D);
+		glClearColor(0, 0, 0, 1);
+		memset(p, 0xA5, 256 * 256 * 4);
+		glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, p);
+		for (unsigned i = 0; i < sizeof(pt) / sizeof(pt[0]); i++) {
+			const uint8_t *q = p + 4 * (pt[i].y * 256 + pt[i].x);
+
+			check(&fails, near(q, pt[i].r, pt[i].g, pt[i].b, 1), pt[i].what, q);
+		}
+
+		/* a 250-wide texture: rows of 1000 bytes, rendered in an aligned shadow and copied back */
+		glGenTextures(1, &t_sh);
+		glBindTexture(GL_TEXTURE_2D, t_sh);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 250, 250, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glGenFramebuffersEXT(1, &fbo8);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo8);
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_sh, 0);
+		glViewport(0, 0, 250, 250);
+		glMatrixMode(GL_PROJECTION);
+		glLoadIdentity();
+		glOrtho(0, 250, 0, 250, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glClearColor(0, 0, 1, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glFlush();
+		glColor3f(1, 0, 0);
+		quad(150, 100, 160, 110, 0);
+		glFlush();
+		glClearColor(0, 0, 0, 1);
+		memset(p, 0xA5, 250 * 250 * 4);
+		glReadPixels(0, 0, 250, 250, GL_RGBA, GL_UNSIGNED_BYTE, p);
+		check(&fails, near(p + 4 * (105 * 250 + 155), 255, 0, 0, 1), "250 wide (a shadow): (155, 105) the quad: red",
+		      p + 4 * (105 * 250 + 155));
+		check(&fails, near(p + 4 * (105 * 250 + 145), 0, 0, 255, 1), "250 wide: (145, 105) left of it: blue",
+		      p + 4 * (105 * 250 + 145));
+		check(&fails, near(p + 4 * (200 * 250 + 200), 0, 0, 255, 1), "250 wide: (200, 200): blue",
+		      p + 4 * (200 * 250 + 200));
+
+		/* what a pass of one small quad costs on an 800 x 600 target (a whole-target pass: about 16 ms) */
+		glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb7);
+		glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, 800, 600);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo7);
+		glViewport(0, 0, 800, 600);
+		glMatrixMode(GL_PROJECTION);
+		glLoadIdentity();
+		glOrtho(0, 800, 0, 600, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glFinish();
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
+		for (int i = 0; i < 200; i++) {
+			glColor3f((i & 7) / 7.0f, 1, 0);
+			quad(100 + (i * 13) % 600, 100 + (i * 7) % 400, 108 + (i * 13) % 600, 108 + (i * 7) % 400, 0);
+			glFlush();
+		}
+		glFinish();
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
+		printf("  200 passes of an 8 x 8 quad on 800 x 600: %.2f ms a pass\n", (t1 - t0) * 1e3 / 200);
+		check(&fails, (t1 - t0) * 1e3 / 200 < 3.0, "a small quad's pass costs its rectangle", (const uint8_t *)"\0\0\0\0");
+
+		glMatrixMode(GL_PROJECTION);
+		glPopMatrix();
+		glLoadIdentity();
+		glOrtho(0, W, 0, H, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glDeleteFramebuffersEXT(1, &fbo7);
+		glDeleteFramebuffersEXT(1, &fbo8);
+		glDeleteRenderbuffersEXT(1, &rb7);
+		glDeleteTextures(1, &t_sh);
+		glDeleteTextures(1, &tw);
+		free(p);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

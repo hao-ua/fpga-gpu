@@ -76,6 +76,15 @@ struct fg_resource {
    bool shared;
    uint32_t tight_seq;		/* the screen's pass count when tight was copied */
 
+   /* rectangles of it that region passes rendered into (aliases at an offset), the last few kept */
+   struct fg_rect_alias {
+      uint32_t gem;		/* 0: free */
+      uint16_t handle;
+      uint32_t offset;
+      uint16_t width, height;
+   } ralias[8];
+   unsigned ralias_next;
+
    /* PIPE_BUFFER */
    void *data;
 };
@@ -92,6 +101,11 @@ struct fg_transfer {
 };
 
 const struct fg_format *fg_format_info(enum pipe_format format);
+
+/* the board handle of the rectangle (x, y, width, height) of a single-level image, an alias of its memory made the
+ * first time (x a multiple of 32 bytes); *gem its GEM handle for the SUBMIT's list. 0: none could be made */
+uint16_t fg_rect_alias(struct pipe_screen *pscreen, struct fg_resource *rsc, unsigned x, unsigned y, unsigned width,
+                       unsigned height, uint32_t *gem);
 bool fg_vertex_format_supported(enum pipe_format format);
 
 void fg_resource_screen_init(struct pipe_screen *pscreen);

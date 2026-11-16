@@ -212,22 +212,154 @@ fg_ctx_bo_destroy(struct fg_context *ctx, struct fg_ctx_bo *bo)
    bo->gem = 0;
 }
 
+/* ------------------------------------------------------------------ region passes */
+
+bool
+fg_region_ok(const struct fg_context *ctx)
+{
+   return !ctx->no_region && ctx->have_tgt && ctx->tgt.color && !ctx->tgt.ds && fg_resource(ctx->tgt.color)->gem &&
+          ctx->tgt.width * ctx->tgt.height >= 128u * 128u;
+}
+
+void
+fg_region_grow(struct fg_context *ctx, const int b[4])
+{
+   if (!ctx->rg.on || ctx->rg.full || b[2] <= b[0] || b[3] <= b[1])
+      return;
+   ctx->rg.x1 = MAX2(ctx->rg.x1, MIN2(b[2], (int)ctx->tgt.width));
+   ctx->rg.y1 = MAX2(ctx->rg.y1, MIN2(b[3], (int)ctx->tgt.height));
+}
+
+void
+fg_region_admit(struct fg_context *ctx, const int b[4])
+{
+   int y0 = b[1];
+
+   if (ctx->rg.on) {
+      if (ctx->rg.full || y0 >= ctx->rg.oy || b[2] <= b[0] || b[3] <= b[1])
+         return;
+      /* above the origin: this pass ends here, the draw starts the next one */
+      ctx->rg_splits++;
+      ctx->rg_split_end = true;
+      fg_end_pass(ctx);
+   }
+   if (!ctx->rg_split_end)
+      ctx->rg_splits = 0;
+   ctx->rg_split_end = false;
+   ctx->rg.on = true;
+   /* draws that keep landing above each other: the whole target from here */
+   ctx->rg.full = !fg_region_ok(ctx) || ctx->rg_splits >= 4;
+   /* a clear already in the pass is part of it: the whole target for one without a scissor */
+   if (ctx->cl_flags) {
+      if (!(ctx->cl_flags & FG_FL_CLEAR_SCISSOR))
+         ctx->rg.full = true;
+      else
+         y0 = MIN2(y0, (int)ctx->cl_sc[1]);
+   }
+   if (ctx->rg.full) {
+      ctx->rg.ox = ctx->rg.oy = 0;
+      ctx->rg.x1 = ctx->tgt.width;
+      ctx->rg.y1 = ctx->tgt.height;
+      return;
+   }
+   /* whole rows: board B loads and stores each line of a FLUSH's image to its pitch, so a narrower rectangle with the
+    * target's pitch would write past its right edge into the next row */
+   y0 = CLAMP(y0, 0, (int)ctx->tgt.height - 1);
+   ctx->rg.ox = 0;
+   ctx->rg.oy = y0 & ~7;
+   ctx->rg.x1 = ctx->tgt.width;
+   ctx->rg.y1 = ctx->rg.oy;
+   if (ctx->cl_flags & FG_FL_CLEAR_SCISSOR) {
+      const int c[4] = { (int)ctx->cl_sc[0], (int)ctx->cl_sc[1], (int)ctx->cl_sc[2], (int)ctx->cl_sc[3] };
+
+      fg_region_grow(ctx, c);
+   }
+}
+
+/* what the ending pass's FLUSH names: the target, or the alias of the rectangle its draws and clears reached */
+struct fg_flush_rect {
+   int x, y;
+   uint32_t w, h;
+   uint16_t handle;
+};
+
+static void
+fg_region_finish(struct fg_context *ctx, struct fg_flush_rect *r)
+{
+   struct pipe_screen *pscreen = ctx->base.screen;
+   struct fg_resource *c = fg_resource(ctx->tgt.color);
+   const int W = ctx->tgt.width, H = ctx->tgt.height;
+   int x0 = 0, y0, x1 = W, y1;
+   uint32_t gem = 0;
+   uint16_t h;
+
+   r->x = r->y = 0;
+   r->w = W;
+   r->h = H;
+   r->handle = ctx->tgt.color_handle;
+   if (!fg_region_ok(ctx) || (ctx->rg.on && ctx->rg.full))
+      return;
+   if (ctx->rg.on) {
+      y0 = ctx->rg.oy;
+      y1 = ctx->rg.y1;
+   } else if (ctx->cl_flags & FG_FL_CLEAR_SCISSOR) {
+      /* a clear alone: its rows (the FLUSH's clear is made relative to them) */
+      y0 = (int)ctx->cl_sc[1] & ~7;
+      y1 = ctx->cl_sc[3];
+   } else if (!ctx->cl_flags) {
+      y0 = y1 = 0;                        /* nothing reached: the fewest rows */
+   } else {
+      return;
+   }
+   /* whole bands of 8 rows, which lets the aliases be used again */
+   y1 = MIN2(MAX2(y1, y0 + 1), H);
+   y1 = MIN2(y0 + (int)align(y1 - y0, 8), H);
+   if (y0 == 0 && y1 == H)
+      return;
+   h = fg_rect_alias(pscreen, c, x0, y0, x1 - x0, y1 - y0, &gem);
+   if (!h) {
+      /* the handles may have run out: this image's other rectangles go, then once more */
+      for (unsigned i = 0; i < ARRAY_SIZE(c->ralias); i++) {
+         if (c->ralias[i].gem)
+            fg_gem_unref(fg_screen(pscreen), c->ralias[i].gem);
+         c->ralias[i].gem = 0;
+      }
+      h = fg_rect_alias(pscreen, c, x0, y0, x1 - x0, y1 - y0, &gem);
+   }
+   if (!h) {
+      /* the draws were sent relative to the origin: they land there in the target (seen as misplaced) */
+      fprintf(stderr, "fpgagpu: no alias for a %dx%d rectangle at %d, %d; the pass renders into the whole target\n",
+              x1 - x0, y1 - y0, x0, y0);
+      return;
+   }
+   fg_use_bo(ctx, gem);
+   r->x = x0;
+   r->y = y0;
+   r->w = x1 - x0;
+   r->h = y1 - y0;
+   r->handle = h;
+}
+
 /* ------------------------------------------------------------------ passes */
 
 /* FLUSH: {target, flags}, clear colour {R, G} and {B, A} (13 bits each), {depth 24, stencil 8}, the clear's
- * scissor {x0, y0}, {x1, y1}, {depth-stencil image, stencil write mask} */
+ * scissor {x0, y0}, {x1, y1}, {depth-stencil image, stencil write mask}. The target is r's (its clear scissor made
+ * relative to it) */
 static void
-fg_emit_flush(struct fg_context *ctx, uint32_t flags)
+fg_emit_flush(struct fg_context *ctx, uint32_t flags, const struct fg_flush_rect *r)
 {
    uint8_t b[28];
 
-   fg_put32(b + 0, (uint32_t)ctx->tgt.color_handle | (flags & 0xFFFFu) << 16);
+   fg_put32(b + 0, (uint32_t)r->handle | (flags & 0xFFFFu) << 16);
    fg_put32(b + 4, (ctx->cl_c16[0] & 0x1FFFu) | (ctx->cl_c16[1] & 0x1FFFu) << 13);
    fg_put32(b + 8, (ctx->cl_c16[2] & 0x1FFFu) | (ctx->cl_c16[3] & 0x1FFFu) << 13);
    fg_put32(b + 12, (ctx->cl_depth & 0xFFFFFFu) | (ctx->cl_stencil & 0xFFu) << 24);
    if (flags & FG_FL_CLEAR_SCISSOR) {
-      fg_put32(b + 16, (ctx->cl_sc[0] & 0x1FFFu) | (ctx->cl_sc[1] & 0x1FFFu) << 16);
-      fg_put32(b + 20, (ctx->cl_sc[2] & 0x1FFFu) | (ctx->cl_sc[3] & 0x1FFFu) << 16);
+      uint32_t sx0 = (uint32_t)MAX2((int)ctx->cl_sc[0] - r->x, 0), sy0 = (uint32_t)MAX2((int)ctx->cl_sc[1] - r->y, 0);
+      uint32_t sx1 = (uint32_t)MAX2((int)ctx->cl_sc[2] - r->x, 0), sy1 = (uint32_t)MAX2((int)ctx->cl_sc[3] - r->y, 0);
+
+      fg_put32(b + 16, (sx0 & 0x1FFFu) | (sy0 & 0x1FFFu) << 16);
+      fg_put32(b + 20, (MIN2(sx1, r->w) & 0x1FFFu) | (MIN2(sy1, r->h) & 0x1FFFu) << 16);
    } else {
       fg_put32(b + 16, 0);
       fg_put32(b + 20, 0);
@@ -268,19 +400,22 @@ fg_pass_open(struct fg_context *ctx)
    ctx->pass_draws = 0;
 }
 
-void fg_send_target_size(struct fg_context *ctx);
-
 void
 fg_end_pass(struct fg_context *ctx)
 {
+   struct fg_flush_rect r;
    uint32_t fl;
 
    if (!ctx->pass_open) {
-      if (!ctx->cl_flags || !ctx->have_tgt)
+      if (!ctx->cl_flags || !ctx->have_tgt) {
+         ctx->rg.on = false;
          return;
+      }
       fg_pass_open(ctx);
    }
-   fg_send_target_size(ctx);
+   /* board A ends the frame's bands by the size the last VS_STATE gave: the rectangle's */
+   fg_region_finish(ctx, &r);
+   fg_send_target_size(ctx, r.w, r.h);
    if (ctx->discard_color && ctx->discard_color == ctx->tgt.color) {
       /* the colour is undefined: a clear costs nothing, loading the band does */
       if (!(ctx->cl_flags & (FG_FL_CLEAR_COLOR | FG_FL_CLEAR_SCISSOR))) {
@@ -298,10 +433,10 @@ fg_end_pass(struct fg_context *ctx)
       ctx->cl_smask = 0xFF;
    }
    fl = ctx->cl_flags | (ctx->tgt.depth16 ? FG_FL_DEPTH16 : 0);
-   fg_emit_flush(ctx, fl);
+   fg_emit_flush(ctx, fl, &r);
    if (ctx->tgt.shadow_of) {
-      /* rendered in the shadow: back into the image, after the FLUSH that rendered it */
-      fg_emit_copy(ctx, ctx->tgt.color, 0, 0, 0, 0, ctx->tgt.shadow_of, 0, 0, 0, 0, ctx->tgt.width, ctx->tgt.height);
+      /* rendered in the shadow: back into the image (what the FLUSH covered), after the FLUSH that rendered it */
+      fg_emit_copy(ctx, ctx->tgt.color, 0, 0, r.x, r.y, ctx->tgt.shadow_of, 0, 0, r.x, r.y, r.w, r.h);
       fg_resource(ctx->tgt.shadow_of)->initialized = true;
    }
    fg_submit_stream(ctx);
@@ -332,6 +467,7 @@ fg_end_pass(struct fg_context *ctx)
    ctx->cl_flags = 0;
    ctx->cl_depth = 0xFFFFFF;
    ctx->cl_smask = 0xFF;
+   ctx->rg.on = false;
 }
 
 /* the pass's target images are held while they are the target: the frontend may let go of a framebuffer's image while
@@ -528,6 +664,11 @@ fg_clear(struct pipe_context *pctx, unsigned buffers, uint32_t color_clear_mask,
       }
    }
 
+   /* a region pass takes a clear inside its coordinates only (right of and below its origin) */
+   if (ctx->pass_draws && ctx->rg.on && !ctx->rg.full &&
+       (!(flags & FG_FL_CLEAR_SCISSOR) || (int)sc[0] < ctx->rg.ox || (int)sc[1] < ctx->rg.oy))
+      fg_end_pass(ctx);
+
    /* inside a pass that has draws: a quad, unless it is a whole-target colour clear (that one ends the pass, and the
     * next starts with the FLUSH's fast clear). A quad reaches depth 0 and all ones exactly */
    if (ctx->pass_draws && (!(want & FG_FL_CLEAR_COLOR) || (flags & FG_FL_CLEAR_SCISSOR)) &&
@@ -540,7 +681,7 @@ fg_clear(struct pipe_context *pctx, unsigned buffers, uint32_t color_clear_mask,
    have = ctx->cl_flags & kinds;
    same_sc = (ctx->cl_flags & FG_FL_CLEAR_SCISSOR) == (flags & FG_FL_CLEAR_SCISSOR) &&
              (!(flags & FG_FL_CLEAR_SCISSOR) || !memcmp(ctx->cl_sc, sc, sizeof(sc)));
-   if (ctx->pass_draws || (have && (!same_sc || (have & want))))
+   if (ctx->pass_draws || ctx->rg.on || (have && (!same_sc || (have & want))))
       fg_end_pass(ctx);
    if (want & FG_FL_CLEAR_COLOR)
       memcpy(ctx->cl_c16, c16, sizeof(c16));
@@ -1028,6 +1169,7 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->screen = pscreen;
    pctx->priv = priv;
    ctx->debug = fg_screen(pscreen)->debug;
+   ctx->no_region = debug_get_bool_option("FPGAGPU_NOREGION", false);
    ctx->cl_depth = 0xFFFFFF;
    ctx->cl_smask = 0xFF;
    ctx->next_id = 1;

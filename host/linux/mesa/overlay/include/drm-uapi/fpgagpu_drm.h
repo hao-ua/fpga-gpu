@@ -72,7 +72,8 @@ enum drm_fpgagpu_bo_kind {
 /* BO_CREATE flags */
 #define FPGAGPU_BO_CREATE_ALIAS	(1u << 0)	/* an image over the memory of the image `alias` (no memory of its own):
 						 * another descriptor of the same bytes, e.g. a D24S8 image read by the
-						 * TMU as RGBA8. It keeps that image's memory while it exists */
+						 * TMU as RGBA8, or a rectangle of it (alias_offset). It keeps that
+						 * image's memory while it exists */
 
 struct drm_fpgagpu_bo_create {
 	__u32 kind;		/* in: enum drm_fpgagpu_bo_kind */
@@ -94,7 +95,8 @@ struct drm_fpgagpu_bo_create {
 	__u64 board_addr;	/* its byte address in the board's DDR */
 	/* in, with FPGAGPU_BO_CREATE_ALIAS */
 	__u32 alias;		/* the GEM handle of the image whose memory the new one describes */
-	__u32 pad2;		/* must be 0 */
+	__u32 alias_offset;	/* where in that memory it starts, a multiple of 32 bytes (0 without the flag): a
+				 * rectangle of the image (one level, one layer) whose last row ends inside it */
 };
 
 /*

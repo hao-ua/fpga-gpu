@@ -43,8 +43,19 @@ struct fg_program {
 /* the varying locations a vertex stage passes on (VARYING_SLOT_* bits of its outputs_written); slot i is the i-th bit set */
 uint64_t fg_varying_mask(uint64_t outputs_written);
 
-/* the passes fg_compile needs first, on the driver's own copy of a shader (once per shader) */
-void fg_nir_lower(nir_shader *s);
+/* a vertex program's clip position worked out on the CPU: the instructions of its SSA form the position depends on
+ * (inputs, uniforms, constants, arithmetic). fg_eval_create gives NULL when it depends on anything else (control
+ * flow, a uniform at a computed index, an operation the evaluator does not do) */
+struct fg_eval;
+struct fg_eval *fg_eval_create(nir_shader *s);
+void fg_eval_destroy(struct fg_eval *e);
+uint32_t fg_eval_inputs(const struct fg_eval *e);   /* the attributes it reads */
+/* in[i]: attribute i; uni: nvec vec4s (constant buffer 0); false: no finite position */
+bool fg_eval_position(struct fg_eval *e, const float (*in)[4], const float *uni, unsigned nvec, float pos[4]);
+
+/* the passes fg_compile needs first, on the driver's own copy of a shader (once per shader); eval, when not NULL,
+ * gets the position's evaluator from the last SSA form (NULL for other stages or when it cannot be had) */
+void fg_nir_lower(nir_shader *s, struct fg_eval **eval);
 
 /* 0, or -1 with the reason in err */
 int fg_compile(nir_shader *s, const struct fg_compile_key *key, struct fg_program *out, char *err, size_t errsize);

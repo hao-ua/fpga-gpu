@@ -70,7 +70,7 @@ can be compared byte by byte with the Python reference.
 | ioctl | does |
 |---|---|
 | `GET_PARAM` | board builds, STATUS layout, the flags (absent units, extensions), the latest STATUS words |
-| `BO_CREATE` | a board BO: heap, size, kind (buffer / image) and the image descriptor (format, size, pitch, levels) |
+| `BO_CREATE` | a board BO: heap, size, kind (buffer / image) and the image descriptor (format, size, pitch, levels); or an alias: another descriptor of an image's bytes, from an offset |
 | `BO_INFO` | a BO's board handle, address and size |
 | `SUBMIT` | a stream of protocol messages that names BOs by GEM handle. The kernel checks every message's type, sizes and ranges, writes in the board handles and addresses, sends it in order and returns a syncobj signalled by the stream's FENCE. |
 | `WRITE` / `READ` | copy between user memory and a board BO (WRITE_BUFFER / WRITE_IMAGE, READ_BUFFER / READ_IMAGE / MEM_READ) |
@@ -228,6 +228,14 @@ counters and the last STATUS.
     (see `host/linux/mesa/README.md`), a depth texture of a width no multiple of 8 likewise. Fixed with it: when a
     context's 8191 draw ids ran out, the pass restarted after the draw had put its images on the old pass's list, and
     the kernel refused the draw's state (EACCES, once in the VM's log).
+  - Resizing and moving windows lagged (2026-11-16): a render pass costs board B ~33 ns per pixel of its target
+    whatever it draws (16 ms on the 800 x 600 screen), and X ends ~10 screen passes per resize step (xfwm4's frame
+    pieces drawn in small pixmaps in between), ~3 per move step. Mesa now renders a pass that reaches few rows into an
+    alias of those rows only (region passes, `host/linux/mesa/README.md`; the kernel's alias takes an offset, and
+    heap B keeps an 8 KB guard at its top). Measured with the same 30 steps: moves 1.5 s -> 0.7 s of board time;
+    during resizes glxgears kept 181 fps (4 fps before). What remains is window-sized copies (a moved window,
+    glxgears' frames): board B's COPY_IMAGE would do those at ~9 ns per copied pixel. The boards give no vblank, so
+    X's Present does not pace windowed clients: glxgears presents as fast as the board takes it.
   - fpgagpu does not load at boot: after a VM reboot, `modprobe fpgagpu` and `systemctl restart lightdm` put X on
     board B (until then LightDM's X runs on Hyper-V's display).
   - Board B once stopped taking commands (board A waiting on B's credit, its queue still) after X servers were killed

@@ -54,6 +54,7 @@ struct fg_hw_draw {
    uint32_t attr[FG_MAX_ATTRIBS][8]; /* VERTEX_ATTR bodies */
    const uint32_t *vs_uni;    /* FP24, vs->prog.const_base vectors */
    const uint32_t *fs_uni;    /* FP24, fs->prog.const_base vectors */
+   int bnd[4];                /* the pixels it can touch in the target, x0, y0, x1, y1 (a region pass grows by them) */
 };
 
 /* ------------------------------------------------------------------ board A's attribute formats */
@@ -409,7 +410,7 @@ fg_create_vs_state(struct pipe_context *pctx, const struct pipe_shader_state *cs
       return so;
    }
    so->nir = cso->ir.nir;
-   fg_nir_lower(so->nir);
+   fg_nir_lower(so->nir, &so->eval);
    so->vmask = fg_varying_mask(so->nir->info.outputs_written);
    key.noops = fg_noops(screen->a_flags);
    if (fg_compile(so->nir, &key, &so->prog, err, sizeof(err)))
@@ -438,6 +439,7 @@ fg_delete_vs_state(struct pipe_context *pctx, void *hwcso)
    if (ctx->hw_prog == so)
       ctx->hw_prog = NULL;
    fg_program_free(&so->prog);
+   fg_eval_destroy(so->eval);
    ralloc_free(so->nir);
    FREE(so);
 }
@@ -454,7 +456,7 @@ fg_create_fs_state(struct pipe_context *pctx, const struct pipe_shader_state *cs
       return so;
    }
    so->nir = cso->ir.nir;
-   fg_nir_lower(so->nir);
+   fg_nir_lower(so->nir, NULL);
    return so;
 }
 
@@ -686,19 +688,18 @@ fg_send_vs_state(struct fg_context *ctx, const uint8_t b[60])
 }
 
 /* board A learns the target's size from VS_STATE and ends a frame's bands by it: a pass that is only a clear
- * would cover the last target's rows */
-void fg_send_target_size(struct fg_context *ctx);
+ * would cover the last target's rows; a region pass's FLUSH names a rectangle of that size */
 void
-fg_send_target_size(struct fg_context *ctx)
+fg_send_target_size(struct fg_context *ctx, uint32_t width, uint32_t height)
 {
-   double vp[4] = { ctx->tgt.width * 8.0, ctx->tgt.width * 8.0, ctx->tgt.height * 8.0, ctx->tgt.height * 8.0 };
+   double vp[4] = { width * 8.0, width * 8.0, height * 8.0, height * 8.0 };
    uint8_t b[60];
 
    fg_claim_boards(ctx);
-   if (ctx->hw_vs_state_ok && (ctx->hw_vs_state[20] | ctx->hw_vs_state[21] << 8) == ctx->tgt.width &&
-       (ctx->hw_vs_state[22] | ctx->hw_vs_state[23] << 8) == ctx->tgt.height)
+   if (ctx->hw_vs_state_ok && (ctx->hw_vs_state[20] | ctx->hw_vs_state[21] << 8) == width &&
+       (ctx->hw_vs_state[22] | ctx->hw_vs_state[23] << 8) == height)
       return;
-   fg_vs_state_bytes(b, vp, 0, false, 1.0, 0, false, FG_ZC_LAZY, ctx->tgt.width, ctx->tgt.height, 0, 0.5, 0.5, NULL);
+   fg_vs_state_bytes(b, vp, 0, false, 1.0, 0, false, FG_ZC_LAZY, width, height, 0, 0.5, 0.5, NULL);
    fg_send_vs_state(ctx, b);
 }
 
@@ -742,10 +743,19 @@ fg_ids_restart(struct fg_context *ctx)
 {
    unsigned n = ctx->npass_res;
    struct pipe_resource **keep = n ? calloc(n, sizeof(*keep)) : NULL;
+   struct fg_region rg = ctx->rg;
 
    for (unsigned i = 0; keep && i < n; i++)
       pipe_resource_reference(&keep[i], ctx->pass_res[i]);
    fg_end_pass(ctx);
+   /* the draw was made relative to the region's origin: the next pass keeps it */
+   if (rg.on) {
+      ctx->rg = rg;
+      if (!rg.full) {
+         ctx->rg.x1 = rg.ox;
+         ctx->rg.y1 = rg.oy;
+      }
+   }
    memset(ctx->ids, 0, sizeof(ctx->ids));
    ctx->next_id = 1;
    for (unsigned i = 0; keep && i < n; i++) {
@@ -892,7 +902,7 @@ fg_hw_draw(struct fg_context *ctx, const struct fg_hw_draw *d, unsigned mode, ui
       uint32_t rect[4] = { h[7] & 0xFFFFu, h[7] >> 16, h[8] & 0xFFFFu, h[8] >> 16 };
 
       fg_vs_state_bytes(b, d->vp, d->cull, d->front_cw, d->line_width, fs->prog.varyings, d->z01, zc,
-                        ctx->tgt.width, ctx->tgt.height, id, d->dscale, d->doffset, (h[0] & 256u) ? rect : NULL);
+                        fg_rg_w(ctx), fg_rg_h(ctx), id, d->dscale, d->doffset, (h[0] & 256u) ? rect : NULL);
    }
    fg_send_vs_state(ctx, b);
 
@@ -912,6 +922,7 @@ fg_hw_draw(struct fg_context *ctx, const struct fg_hw_draw *d, unsigned mode, ui
    }
    fg_use_bo(ctx, ctx->ring.gem);
    ctx->pass_draws++;
+   fg_region_grow(ctx, d->bnd);
 }
 
 /* ------------------------------------------------------------------ clears inside a pass */
@@ -937,6 +948,15 @@ fg_clear_quad(struct fg_context *ctx, uint32_t flags, const uint32_t c16[4], uin
    if (x1 <= x0 || y1 <= y0)
       return;
    memset(&d, 0, sizeof(d));
+   d.bnd[0] = x0;
+   d.bnd[1] = y0;
+   d.bnd[2] = x1;
+   d.bnd[3] = y1;
+   /* relative to a region pass's origin (fg_clear ended the pass for a clear above or left of it) */
+   x0 = MAX2((int)x0 - fg_rg_ox(ctx), 0);
+   x1 = MAX2((int)x1 - fg_rg_ox(ctx), 0);
+   y0 = MAX2((int)y0 - fg_rg_oy(ctx), 0);
+   y1 = MAX2((int)y1 - fg_rg_oy(ctx), 0);
    d.vs = &ctx->clear_vs;
    d.fs = &ctx->clear_fs;
    /* the quad's viewport is the clear's rectangle: no pixel outside it is walked or shaded */
@@ -999,6 +1019,8 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
    static const struct fg_dsa_state no_dsa;
    const struct fg_dsa_state *dsa = ctx->dsa ? ctx->dsa : &no_dsa;
    const struct pipe_viewport_state *vp = &ctx->viewport;
+   /* coordinates relative to the region's origin (0, 0 outside region passes), within what the pass spans */
+   const int ox = fg_rg_ox(ctx), oy = fg_rg_oy(ctx), tw = (int)fg_rg_w(ctx), th = (int)fg_rg_h(ctx);
    int b[4];
 
    if (!rs || !ctx->blend)
@@ -1025,14 +1047,16 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
    h[14] = fg_c16(ctx->blend_color.color[3], t->bits[0]) | fg_c16(ctx->blend_color.color[3], t->bits[1]) << 13;
    b[0] = 0;
    b[1] = 0;
-   b[2] = t->width;
-   b[3] = t->height;
+   b[2] = tw;
+   b[3] = th;
    if (rs->scissor) {
-      b[0] = MIN2(ctx->scissor.minx, t->width);
-      b[1] = MIN2(ctx->scissor.miny, t->height);
-      b[2] = MIN2(ctx->scissor.maxx, t->width);
-      b[3] = MIN2(ctx->scissor.maxy, t->height);
+      b[0] = CLAMP((int)ctx->scissor.minx - ox, 0, tw);
+      b[1] = CLAMP((int)ctx->scissor.miny - oy, 0, th);
+      b[2] = CLAMP((int)ctx->scissor.maxx - ox, 0, tw);
+      b[3] = CLAMP((int)ctx->scissor.maxy - oy, 0, th);
    }
+   if (ctx->rg.on && !ctx->rg.full)
+      h[0] |= 256u; /* a region pass keeps every draw inside the target's part it spans */
    h[9] = fg_fp24(rs->offset_scale);
    h[10] = (uint32_t)(int32_t)rs->offset_units;
    for (unsigned u = 0; u < FG_MAX_SAMPLERS; u++) {
@@ -1055,10 +1079,10 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
     * and far only) */
    if (mode != MESA_PRIM_POINTS) {
       double sx = fabs(vp->scale[0]), sy = fabs(vp->scale[1]);
-      int x0 = (int)ceil(vp->translate[0] - sx - 0.5), y0 = (int)ceil(vp->translate[1] - sy - 0.5);
-      int x1 = (int)ceil(vp->translate[0] + sx - 0.5), y1 = (int)ceil(vp->translate[1] + sy - 0.5);
+      int x0 = (int)ceil(vp->translate[0] - sx - 0.5) - ox, y0 = (int)ceil(vp->translate[1] - sy - 0.5) - oy;
+      int x1 = (int)ceil(vp->translate[0] + sx - 0.5) - ox, y1 = (int)ceil(vp->translate[1] + sy - 0.5) - oy;
 
-      if (x0 > 0 || y0 > 0 || x1 < (int)t->width || y1 < (int)t->height) {
+      if (x0 > 0 || y0 > 0 || x1 < tw || y1 < th) {
          b[0] = MAX2(b[0], x0);
          b[1] = MAX2(b[1], y0);
          b[2] = MIN2(b[2], x1);
@@ -1074,9 +1098,9 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
    h[8] = (uint32_t)b[2] | (uint32_t)b[3] << 16;
 
    d->vp[0] = vp->scale[0] * 16.0;
-   d->vp[1] = vp->translate[0] * 16.0;
+   d->vp[1] = (vp->translate[0] - ox) * 16.0;
    d->vp[2] = vp->scale[1] * 16.0;
-   d->vp[3] = vp->translate[1] * 16.0;
+   d->vp[3] = (vp->translate[1] - oy) * 16.0;
    d->dscale = vp->scale[2];
    d->doffset = vp->translate[2];
    d->z01 = rs->clip_halfz;
@@ -1165,6 +1189,120 @@ fg_stream_vertices(struct fg_context *ctx, struct fg_hw_draw *d, int lo, int hi,
    return true;
 }
 
+/* the pixels a draw can touch in the target (x0, y0, x1, y1): its rectangle (target, viewport, scissor), narrowed to
+ * its vertices' window positions when the vertex program's position can be worked out on the CPU and the draw has
+ * few vertices. A vertex behind the eye (w <= 0: clipping) keeps the rectangle */
+static void
+fg_draw_bounds(struct fg_context *ctx, const struct pipe_draw_info *info, const struct pipe_draw_start_count_bias *draws,
+               unsigned num_draws, int b[4])
+{
+   const struct pipe_rasterizer_state *rs = ctx->rast;
+   const struct pipe_viewport_state *vp = &ctx->viewport;
+   const struct fg_velems_state *ve = ctx->velems;
+   struct fg_eval *e = ctx->vs ? ctx->vs->eval : NULL;
+   double sx = fabs(vp->scale[0]), sy = fabs(vp->scale[1]), pad = 1.0;
+   double mnx = INFINITY, mny = INFINITY, mxx = -INFINITY, mxy = -INFINITY;
+   const uint8_t *ib = NULL;
+   unsigned total = 0;
+   uint32_t need;
+   float in[FG_MAX_ATTRIBS][4], pos[4];
+
+   b[0] = 0;
+   b[1] = 0;
+   b[2] = ctx->tgt.width;
+   b[3] = ctx->tgt.height;
+   if (info->mode != MESA_PRIM_POINTS) {
+      b[0] = MAX2(b[0], (int)ceil(vp->translate[0] - sx - 0.5));
+      b[1] = MAX2(b[1], (int)ceil(vp->translate[1] - sy - 0.5));
+      b[2] = MIN2(b[2], (int)ceil(vp->translate[0] + sx - 0.5));
+      b[3] = MIN2(b[3], (int)ceil(vp->translate[1] + sy - 0.5));
+   }
+   if (rs && rs->scissor) {
+      b[0] = MAX2(b[0], (int)ctx->scissor.minx);
+      b[1] = MAX2(b[1], (int)ctx->scissor.miny);
+      b[2] = MIN2(b[2], (int)ctx->scissor.maxx);
+      b[3] = MIN2(b[3], (int)ctx->scissor.maxy);
+   }
+   if (b[2] <= b[0] || b[3] <= b[1]) {
+      b[2] = b[0];
+      b[3] = b[1];
+      return;
+   }
+   if (!e || !ve || !rs)
+      return;
+   for (unsigned k = 0; k < num_draws; k++)
+      total += draws[k].count;
+   if (total > 2048)
+      return;
+   if (info->mode == MESA_PRIM_POINTS) {
+      if (ctx->vs->nir->info.outputs_written & VARYING_BIT_PSIZ)
+         return;
+      pad += rs->point_size / 2.0;
+   } else if (info->mode == MESA_PRIM_LINES || info->mode == MESA_PRIM_LINE_STRIP || info->mode == MESA_PRIM_LINE_LOOP) {
+      pad += rs->line_width / 2.0;
+   }
+   if (info->index_size) {
+      ib = info->has_user_indices ? info->index.user :
+           (info->index.resource ? fg_resource(info->index.resource)->data : NULL);
+      if (!ib)
+         return;
+   }
+   need = fg_eval_inputs(e);
+   for (unsigned k = 0; k < num_draws; k++) {
+      for (unsigned j = 0; j < draws[k].count; j++) {
+         int64_t idx = (int64_t)draws[k].start + j;
+
+         if (ib) {
+            const uint8_t *p = ib + (size_t)(draws[k].start + j) * info->index_size;
+
+            idx = info->index_size == 1 ? *p : info->index_size == 2 ? *(const uint16_t *)p : *(const uint32_t *)p;
+            idx += draws[k].index_bias;
+            if (idx < 0)
+               return;
+         }
+         for (unsigned a = 0; a < FG_MAX_ATTRIBS; a++) {
+            in[a][0] = in[a][1] = in[a][2] = 0.0f;
+            in[a][3] = 1.0f;
+            if (!(need & (1u << a)) || a >= ve->count || !ve->v[a].bytes)
+               continue;
+            {
+               const struct fg_velem *v = &ve->v[a];
+               const struct pipe_vertex_buffer *vb = &ctx->vb[v->e.vertex_buffer_index];
+               const uint8_t *base = v->e.vertex_buffer_index < ctx->nvb ? fg_vb_data(vb) : NULL;
+               int64_t at = v->e.instance_divisor ? 0 : idx;
+
+               if (!base)
+                  return;
+               util_format_unpack_rgba(v->e.src_format, in[a],
+                                       base + vb->buffer_offset + v->e.src_offset + at * v->e.src_stride, 1);
+            }
+         }
+         if (!fg_eval_position(e, (const float (*)[4])in, (const float *)ctx->cb[0], ctx->cb_size[0] / 16, pos) ||
+             pos[3] < 1e-6f)
+            return;
+         {
+            double wx = pos[0] / pos[3] * vp->scale[0] + vp->translate[0];
+            double wy = pos[1] / pos[3] * vp->scale[1] + vp->translate[1];
+
+            mnx = MIN2(mnx, wx);
+            mxx = MAX2(mxx, wx);
+            mny = MIN2(mny, wy);
+            mxy = MAX2(mxy, wy);
+         }
+      }
+   }
+   if (!(mnx <= mxx && mny <= mxy))
+      return;
+   b[0] = MAX2(b[0], (int)MAX2(floor(mnx - pad), -1e6));
+   b[1] = MAX2(b[1], (int)MAX2(floor(mny - pad), -1e6));
+   b[2] = MIN2(b[2], (int)MIN2(ceil(mxx + pad), 1e6));
+   b[3] = MIN2(b[3], (int)MIN2(ceil(mxy + pad), 1e6));
+   if (b[2] <= b[0] || b[3] <= b[1]) {
+      b[2] = b[0];
+      b[3] = b[1];
+   }
+}
+
 static void
 fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsigned drawid_offset,
             const struct pipe_draw_indirect_info *indirect, const struct pipe_draw_start_count_bias *draws,
@@ -1198,6 +1336,14 @@ fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsign
       return;
 
    memset(&d, 0, sizeof(d));
+   /* what it can touch, before anything of it is sent: a region pass may end here, or take its origin from it */
+   if (fg_region_ok(ctx) && !(ctx->rg.on && ctx->rg.full)) {
+      fg_draw_bounds(ctx, info, draws, num_draws, d.bnd);
+   } else {
+      d.bnd[2] = ctx->tgt.width;
+      d.bnd[3] = ctx->tgt.height;
+   }
+   fg_region_admit(ctx, d.bnd);
    d.vs = vs;
    d.fs = fs;
    if (!fg_fill_state(ctx, &d, fs, info->mode))

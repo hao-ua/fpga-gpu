@@ -116,7 +116,13 @@ static int fpgagpu_ioctl_get_status(struct drm_device *drm, void *data, struct d
 static const struct drm_ioctl_desc fpgagpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(FPGAGPU_GET_PARAM, fpgagpu_ioctl_get_param, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(FPGAGPU_GET_STATUS, fpgagpu_ioctl_get_status, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(FPGAGPU_BO_CREATE, fpgagpu_ioctl_bo_create, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(FPGAGPU_SUBMIT, fpgagpu_ioctl_submit, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(FPGAGPU_WAIT, fpgagpu_ioctl_wait, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(FPGAGPU_READ, fpgagpu_ioctl_read, DRM_RENDER_ALLOW),
 };
+
+struct workqueue_struct *fg_wq;
 
 DEFINE_DRM_GEM_FOPS(fpgagpu_fops);
 
@@ -163,6 +169,13 @@ static int fpgagpu_probe(struct platform_device *pdev)
 	if (IS_ERR(fdev))
 		return PTR_ERR(fdev);
 	platform_set_drvdata(pdev, fdev);
+	mutex_init(&fdev->submit_lock);
+	spin_lock_init(&fdev->free_lock);
+	INIT_LIST_HEAD(&fdev->bo_free);
+	INIT_WORK(&fdev->free_work, fg_bo_free_work);
+	r = fg_mem_init(fdev);
+	if (r)
+		return r;
 
 	r = fg_net_init(&fdev->net, &pdev->dev, ip, port);
 	if (r)
@@ -229,22 +242,32 @@ static struct platform_device *fpgagpu_pdev;
 
 static int __init fpgagpu_init(void)
 {
-	int r = platform_driver_register(&fpgagpu_platform_driver);
+	int r;
 
+	fg_wq = alloc_workqueue("fpgagpu", 0, 0);
+	if (!fg_wq)
+		return -ENOMEM;
+	r = platform_driver_register(&fpgagpu_platform_driver);
 	if (r)
-		return r;
+		goto fail_wq;
 	fpgagpu_pdev = platform_device_register_simple("fpgagpu", -1, NULL, 0);
 	if (IS_ERR(fpgagpu_pdev)) {
-		platform_driver_unregister(&fpgagpu_platform_driver);
-		return PTR_ERR(fpgagpu_pdev);
+		r = PTR_ERR(fpgagpu_pdev);
+		goto fail_drv;
 	}
 	return 0;
+fail_drv:
+	platform_driver_unregister(&fpgagpu_platform_driver);
+fail_wq:
+	destroy_workqueue(fg_wq);
+	return r;
 }
 
 static void __exit fpgagpu_exit(void)
 {
 	platform_device_unregister(fpgagpu_pdev);
 	platform_driver_unregister(&fpgagpu_platform_driver);
+	destroy_workqueue(fg_wq);			/* runs the frees still queued */
 }
 
 module_init(fpgagpu_init);

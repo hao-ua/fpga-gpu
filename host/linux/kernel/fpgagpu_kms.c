@@ -215,6 +215,7 @@ static void fg_plane_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
 		return;
 	if (!drm_dev_enter(plane->dev, &idx))
 		return;
+	mutex_lock(&fdev->submit_lock);			/* not in the middle of a SUBMIT's frame */
 	if (!fdev->kms.img_valid || fdev->kms.img_fourcc != fb->format->format ||
 	    fdev->kms.img_w != fb->width || fdev->kms.img_h != fb->height) {
 		if (fg_create_scanout(fdev, fb->format->format, fb->width, fb->height)) {
@@ -238,6 +239,7 @@ static void fg_plane_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
 		fdev->kms.need_present = false;
 	}
 out:
+	mutex_unlock(&fdev->submit_lock);
 	drm_dev_exit(idx);
 }
 
@@ -274,7 +276,9 @@ static void fg_crtc_atomic_enable(struct drm_crtc *crtc, fg_atomic_t *state)
 
 	if (id < 0 || !drm_dev_enter(crtc->dev, &idx))
 		return;
+	mutex_lock(&fdev->submit_lock);
 	r = fg_set_mode(fdev, id);
+	mutex_unlock(&fdev->submit_lock);
 	if (r)
 		drm_warn(crtc->dev, "SET_MODE %d (%dx%d) failed: %d\n", id, cs->mode.hdisplay, cs->mode.vdisplay, r);
 	fdev->kms.mode_id = id;

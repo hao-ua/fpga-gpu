@@ -75,12 +75,17 @@ static void rtt_sample(struct fg_net *n, s64 s)
 
 u32 fg_net_rtt_us(struct fg_net *n)
 {
+	return (u32)div_s64(fg_net_srtt_ns(n), NSEC_PER_USEC);
+}
+
+s64 fg_net_srtt_ns(struct fg_net *n)
+{
 	s64 v;
 
 	mutex_lock(&n->lock);
 	v = n->srtt_ns;
 	mutex_unlock(&n->lock);
-	return (u32)div_s64(v, NSEC_PER_USEC);
+	return v;
 }
 
 /* the credit a datagram takes in board A's ingress queue (fbproto: 32 + the body rounded up to 32 bytes) */
@@ -227,6 +232,33 @@ static void fg_on_ack(struct fg_net *n, u32 exp, u32 flags, u32 free_bytes)
 	}
 }
 
+/* a READ_DATA chunk of the READ in progress (fpgagpu_submit.c); called with the lock held */
+static void fg_rx_read_data(struct fg_net *n, u32 tag, u32 off, const u8 *d, u32 len)
+{
+	struct fg_read *rd = n->rd;
+	unsigned int i;
+	u32 p;
+
+	for (i = 0; i < rd->ntags; i++)
+		if (rd->tags[i].tag == tag)
+			break;
+	if (i == rd->ntags)				/* a chunk of another read, or of none */
+		return;
+	if (rd->rel) {
+		p = rd->tags[i].start + off;
+	} else {
+		if (off < rd->base)
+			return;
+		p = off - rd->base;
+	}
+	if (p >= rd->total || p % FG_RD_CHUNK)
+		return;
+	memcpy(rd->buf + p, d, min(len, rd->total - p));
+	if (!test_and_set_bit(p / FG_RD_CHUNK, rd->got))
+		rd->remaining--;
+	rd->last_data = ktime_get();
+}
+
 static void fg_rx(struct fg_net *n, const u8 *d, int len)
 {
 	const u8 *b = d + FG_HDR_BYTES;
@@ -272,11 +304,19 @@ static void fg_rx(struct fg_net *n, const u8 *d, int len)
 		ev->a2 = get_unaligned_le32(b + 12);
 		ev->valid = true;
 		n->ev_next++;
+		if (ev->code == FG_EV_FENCE && (!n->fence_valid || (s32)(seq - n->fence_done) > 0)) {
+			WRITE_ONCE(n->fence_done, seq);		/* the boards answer in order: newer means passed */
+			WRITE_ONCE(n->fence_valid, true);
+		}
 		if (ev->code == FG_EV_ERROR)
 			dev_warn_ratelimited(n->dev, "board error event: seq %u sub-message %u, error %u, type %02x, detail %08x\n",
 					     seq, ev->idx, ev->a0, ev->a1, ev->a2);
 		break;
-	default:						/* READ_DATA and register replies: later phases */
+	case FG_R_READ_DATA:
+		if (bl >= 8 && n->rd)
+			fg_rx_read_data(n, get_unaligned_le32(b), get_unaligned_le32(b + 4), b + 8, bl - 8);
+		break;
+	default:						/* register replies: not used */
 		break;
 	}
 	mutex_unlock(&n->lock);
@@ -432,6 +472,28 @@ int fg_net_wait_event(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, un
 		if (left == 0)
 			return -ETIMEDOUT;
 	}
+}
+
+/* lockless: a wait condition must not sleep on the mutex */
+bool fg_net_fence_passed(struct fg_net *n, u32 seq)
+{
+	return READ_ONCE(n->fence_valid) && (s32)(READ_ONCE(n->fence_done) - seq) >= 0;
+}
+
+int fg_net_wait_fence(struct fg_net *n, u32 seq, long timeout_jiffies)
+{
+	long r = wait_event_interruptible_timeout(n->wq, fg_net_fence_passed(n, seq), timeout_jiffies);
+
+	if (r < 0)
+		return (int)r;
+	return r ? 0 : -ETIMEDOUT;
+}
+
+void fg_net_read_attach(struct fg_net *n, struct fg_read *rd)
+{
+	mutex_lock(&n->lock);
+	n->rd = rd;
+	mutex_unlock(&n->lock);
 }
 
 /* ------------------------------------------------------------------ set-up */

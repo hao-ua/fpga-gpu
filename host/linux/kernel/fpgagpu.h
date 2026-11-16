@@ -125,6 +125,7 @@ void fg_net_fini(struct fg_net *n);
 int fg_net_hello(struct fg_net *n, unsigned int timeout_ms);
 int fg_net_status(struct fg_net *n, u32 *words, u32 room, u32 *got, u64 *serial, unsigned int timeout_ms);
 int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *seq, unsigned int timeout_ms);
+int fg_net_send_unseq(struct fg_net *n, u8 type, const void *body, u32 len);
 int fg_net_wait_event(struct fg_net *n, u32 seq, u8 idx, struct fg_event *ev, unsigned int timeout_ms);
 int fg_net_wait_fence(struct fg_net *n, u32 seq, long timeout_jiffies);
 bool fg_net_fence_passed(struct fg_net *n, u32 seq);
@@ -142,6 +143,7 @@ typedef struct drm_atomic_state fg_atomic_t;
 /* the display (fpgagpu_kms.c): board B's HDMI output */
 struct fg_kms {
 	struct drm_plane plane;
+	struct drm_plane cursor;		/* board B's hardware cursor */
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 	struct drm_connector connector;
@@ -152,6 +154,10 @@ struct fg_kms {
 	u32 img_fourcc, img_w, img_h;
 	u32 frame_id;
 	int mode_id;
+	bool cur_shown;				/* board B shows the hardware cursor */
+	s16 cur_x, cur_y;			/* its top-left corner on the screen */
+	struct delayed_work cur_work;		/* the last position once more, a while after the last move */
+	bool cur_work_ready;
 };
 
 /* the boards' memory and handle tables (fpgagpu_mem.c) */
@@ -198,6 +204,7 @@ struct fpgagpu_device {
 };
 
 int fg_kms_init(struct fpgagpu_device *fdev);
+void fg_kms_fini(struct fpgagpu_device *fdev);
 
 int fg_mem_init(struct fpgagpu_device *fdev);
 void fg_mem_fini(struct fpgagpu_device *fdev);

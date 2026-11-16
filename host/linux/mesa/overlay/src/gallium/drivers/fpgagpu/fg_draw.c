@@ -498,9 +498,15 @@ fg_fs_variant(struct fg_context *ctx, struct fg_fs_state *fs, const struct fg_vs
    for (unsigned u = 0; u < FG_MAX_SAMPLERS; u++) {
       struct pipe_sampler_view *view = ctx->views[u];
 
-      if (view && view->texture && util_format_is_depth_or_stencil(view->texture->format) &&
-          (fs->nir->info.textures_used[0] & (1u << u)))
+      if (!view || !view->texture || !(fs->nir->info.textures_used[0] & (1u << u)))
+         continue;
+      if (util_format_is_depth_or_stencil(view->texture->format))
          key.depth_samplers |= 1u << u;
+      unsigned sw = view->swizzle_r | view->swizzle_g << 3 | view->swizzle_b << 6 | view->swizzle_a << 9;
+      if (sw != (PIPE_SWIZZLE_X | PIPE_SWIZZLE_Y << 3 | PIPE_SWIZZLE_Z << 6 | PIPE_SWIZZLE_W << 9)) {
+         key.swizzled |= 1u << u;
+         key.swizzle[u] = sw;
+      }
    }
    for (v = fs->variants; v; v = v->next)
       if (!memcmp(&v->key, &key, sizeof(key)))

@@ -121,5 +121,12 @@ edit("src/gallium/targets/dril/dril_target.c",
      "DEFINE_LOADER_DRM_ENTRYPOINT(lima)",
      ["DEFINE_LOADER_DRM_ENTRYPOINT(fpgagpu)"],
      "after")
+
+# texture swizzle in OpenGL ES 2.0 contexts too: X's glamor keeps alpha-only pictures (glyphs) in GL_R8 textures and
+# reads their alpha through GL_TEXTURE_SWIZZLE_A = GL_RED on any GLES; without it every glyph samples alpha 1
+edit("src/mesa/main/extensions_table.h",
+     "EXT(EXT_texture_swizzle                     , EXT_texture_swizzle                    , GLL, GLC,  x ,  x , 2008)",
+     ["EXT(EXT_texture_swizzle                     , EXT_texture_swizzle                    , GLL, GLC,  x , ES2, 2008)"],
+     "replace")
 PY
 echo "done: configure with -Dgallium-drivers=fpgagpu,..."

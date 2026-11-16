@@ -125,6 +125,12 @@ static int fg_send_unseq(struct fg_net *n, u8 type, const void *body, u32 len)
 	return fg_sendto(n, d, FG_HDR_BYTES + len);
 }
 
+/* an unsequenced message (the cursor's fast path): not acknowledged, not resent */
+int fg_net_send_unseq(struct fg_net *n, u8 type, const void *body, u32 len)
+{
+	return fg_send_unseq(n, type, body, len);
+}
+
 static bool fg_room(struct fg_net *n, u32 need)
 {
 	unsigned int w = READ_ONCE(n->win_n);

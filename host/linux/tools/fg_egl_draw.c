@@ -5,7 +5,8 @@
  *   1. a red triangle over the lower left half (GL's window coordinates), a map of the result printed;
  *   2. a triangle with red, green and blue corners: the colour near each corner;
  *   3. a 2 x 2 texture (red, green, blue, white; nearest) on a quad over the target: each quarter;
- *   4. a white quad of alpha 0.5 blended (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) over black: 128 +-2.
+ *   4. a white quad of alpha 0.5 blended (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) over black: 128 +-2;
+ *   5. a 2 x 2 R8 texture with GL_TEXTURE_SWIZZLE_A = GL_RED (X's glamor reads glyphs so): alpha = red.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_draw.c -o fg_egl_draw -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGLESv2 -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_draw [render node, default /dev/dri/renderD129]
@@ -25,6 +26,10 @@
 #include <GLES2/gl2ext.h>
 #include <gbm.h>
 #include <xf86drm.h>
+
+#ifndef GL_TEXTURE_SWIZZLE_A
+#define GL_TEXTURE_SWIZZLE_A 0x8E45
+#endif
 
 #define W 64
 #define H 64
@@ -246,6 +251,39 @@ int main(int argc, char **argv)
 	glDisable(GL_BLEND);
 	read_back();
 	check(&fails, abs(at(32, 32)[0] - 128) <= 2 && abs(at(32, 32)[1] - 128) <= 2, "(32, 32): about 128", at(32, 32));
+
+	printf("5. a 2 x 2 R8 texture with its alpha swizzled from red (X's glamor reads glyphs so):\n");
+	{
+		static const uint8_t r8[4] = { 64, 128, 192, 255 };
+		static const int xy[4][2] = { { 16, 16 }, { 48, 16 }, { 16, 48 }, { 48, 48 } };
+		GLuint t8;
+		GLenum e;
+
+		glGetError();
+		glGenTextures(1, &t8);
+		glBindTexture(GL_TEXTURE_2D, t8);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_RED_EXT);
+		e = glGetError();
+		printf("  glTexParameteri(GL_TEXTURE_SWIZZLE_A, GL_RED): GL error 0x%04x %s\n", e, e ? "BAD" : "ok");
+		fails += e != 0;
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8_EXT, 2, 2, 0, GL_RED_EXT, GL_UNSIGNED_BYTE, r8);
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		glUseProgram(pt);
+		glClear(GL_COLOR_BUFFER_BIT);
+		draw(GL_TRIANGLE_STRIP, quad, uv4, 4);
+		read_back();
+		for (int i = 0; i < 4; i++) {
+			const uint8_t *p = at(xy[i][0], xy[i][1]);
+			char what[64];
+
+			snprintf(what, sizeof(what), "(%d, %d): red %d, green 0, alpha %d", xy[i][0], xy[i][1], r8[i], r8[i]);
+			check(&fails, near(p, r8[i], 0, 0, r8[i], 1), what, p);
+		}
+		glDeleteTextures(1, &t8);
+	}
 
 	printf("GL error 0x%04x\n", glGetError());
 	eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

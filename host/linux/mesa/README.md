@@ -29,8 +29,9 @@ the PC (board B has no such storage).
 
 Also tested: face culling, Quake 3's sky state (`glDepthRange(1, 1)`), rendering into a texture whose tight rows are
 no multiple of 32 bytes (board B renders into a shadow image with an aligned pitch, copied back after the pass), X's
-glamor (OpenGL ES 2.0: A8, R8 and RG8 render targets kept as RGBA8 with masked writes), and dma-buf import for DRI3
-(BO_INFO). Every render pass holds the boards' render state for its process (the kernel's PASS ioctl), so X and a
+glamor (OpenGL ES 2.0: A8, R8 and RG8 render targets kept as RGBA8 with masked writes; text, whose glyphs glamor
+keeps in R8 textures read through `GL_TEXTURE_SWIZZLE_A = GL_RED`), texture swizzle (the driver applies a sampler
+view's swizzle after the TEX; `apply.sh` lets GLES 2.0 contexts set it), and dma-buf import for DRI3 (BO_INFO). Every render pass holds the boards' render state for its process (the kernel's PASS ioctl), so X and a
 game can share the boards.
 
 Written, not tested yet: points and lines, stencil, scissor, polygon offset, cube maps, linear filtering, clears
@@ -51,6 +52,10 @@ nice -n 19 ionice -c3 ninja -C /root/fpgagpu/build/mesa-fg -j2
 ninja -C /root/fpgagpu/build/mesa-fg install
 ```
 
+On Debian 13 use `-Dplatforms=x11`: its `wayland-scanner` rejects the Wayland protocols Mesa 26.3 takes as a
+subproject. Stop an X server that runs on `/opt/fpgagpu-mesa` before `ninja install`, which rewrites the libraries it
+has mapped.
+
 ## Test
 
 `host/linux/tools/fg_egl_clear.c`: GBM + EGL (no surface) on `/dev/dri/renderD129`, an ES 2.0 context, a 64 x 64
@@ -65,8 +70,9 @@ LD_LIBRARY_PATH=$L ./fg_egl_clear
 ```
 
 `host/linux/tools/fg_egl_draw.c` (built the same way): draws in the same context, read back and checked: a solid
-triangle (with a map of the target), a triangle with interpolated colours, a 2 x 2 texture over the target, and a
-blend of white at alpha 0.5 over black. `host/linux/tools/fg_egl_gl.c` (linked with `-lGL` instead of
+triangle (with a map of the target), a triangle with interpolated colours, a 2 x 2 texture over the target, a
+blend of white at alpha 0.5 over black, and a 2 x 2 R8 texture whose alpha is swizzled from red (as glamor reads
+glyphs). `host/linux/tools/fg_egl_gl.c` (linked with `-lGL` instead of
 `-lGLESv2`): desktop OpenGL with fixed function the way Quake 3 engines draw: `glBegin(GL_QUADS)`, client arrays
 with `glDrawElements(GL_UNSIGNED_INT)` and two texture units, alpha test, depth test with `glDepthRange`, a mip chain
 uploaded level by level.

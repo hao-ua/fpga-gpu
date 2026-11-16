@@ -9,7 +9,7 @@ document is the plan.
 
 | question | choice |
 |---|---|
-| where Linux runs | the Linux host 192.168.53.1, a VPS reached over WireGuard, which builds everything and reaches the boards through a UDP relay on the PC (section 6). A Hyper-V VM bridged onto board A's network may follow. |
+| where Linux runs | a Hyper-V VM on the PC (Debian 13, Hyper-V's Default Switch, section 6). Before it: the Linux host 192.168.53.1, a VPS reached over WireGuard, which reached the boards through a UDP relay on the PC. |
 | kernel driver | a DRM driver, `fpgagpu`, with the board protocol's UDP transport inside the kernel; packaged for DKMS |
 | OpenGL | a Mesa Gallium driver, `fpgagpu`, with a new shader-compiler back end from NIR to the board's ISA |
 | the board's HDMI | a KMS connector: the Linux console, X and Wayland desktops and page flips show on the board's monitor |
@@ -92,7 +92,12 @@ counters and the last STATUS.
     so damage tracking matters. Consoles and desktops mostly update small areas.
 - **Scanout from a board BO** (GL rendering through GBM): PRESENT the BO's image directly, with no copy. The flip
   completes on the PRESENT event.
-- **Cursor plane:** CURSOR (shape) and CURSOR_POS (position) messages.
+- **Cursor plane** (ARGB8888, up to 64 × 64): board B's hardware cursor. A new cursor framebuffer sends its shape
+  (CURSOR SHAPE, sequenced, premultiplied) and CURSOR SHOW. A move sends only CURSOR_POS, unsequenced: board A passes
+  it to board B ahead of every queued command, so the pointer never waits behind rendering. The last position goes
+  once more 50 ms after the last move, in case one was lost. The mode config's minimum framebuffer size is 1 × 1:
+  DRM checks it for every framebuffer, and a 640 × 480 minimum made it refuse X's 64 × 64 cursor, which then fell
+  back to a software cursor drawn on the boards for every move.
 - **Vblank:** the boards send no vblank interrupt, so vblank is emulated with a 60 Hz hrtimer. Flips complete on the
   PRESENT event.
 - **fbdev emulation** (`drm_fbdev_shmem`) puts the Linux console on the board's monitor.
@@ -190,8 +195,15 @@ counters and the last STATUS.
   - The round trip is 62–131 ms (about 70 ms), so the boards work but slowly: 64 datagrams per round trip is about
     1–2 MB/s.
   - Proven 2026-11-15: `fb_status.py --ip 127.0.0.1` on the VPS read both boards' STATUS (A 154, link trained, B alive).
-- **A VM, if one comes:** Hyper-V generation 2, an external virtual switch on the NIC cabled to board A (shared with
-  the management OS so Windows keeps 192.168.1.112), the VM at 192.168.1.113/24, `modprobe fpgagpu` with no relay.
+- **The VM (since 2026-11-16):** Hyper-V generation 2 on the PC cabled to board A, Debian 13 (kernel 6.12) from
+  Debian's generic cloud image, set up by cloud-init (the WSL ssh key, build tools, headers, DKMS), Secure Boot off
+  for the unsigned module. It sits on Hyper-V's Default Switch (NAT): it reaches board A through Windows the way WSL
+  does, round trip about 0.3 ms, with no change to the PC's network. `/etc/modprobe.d/fpgagpu.conf` holds
+  `ip=192.168.1.10 port=5000`. WSL does not reach the Default Switch, Windows does: ssh from WSL goes through a
+  Windows-side TCP pipe as its ProxyCommand.
+  - Keyboard and mouse: Deskflow. The server runs on Windows, the client (`deskflow-client`, Debian's 1.22) in the VM's
+    X, started by `start-x-fpgagpu.sh` with `DESKFLOW_SERVER=172.20.96.1` (the Default Switch's Windows address); the
+    pointer crosses from the Windows screen onto board B's monitor and back. X itself opens no input devices.
 - **One sender:** while the module or the relay is in use it is the boards' sender. The Windows libraries and the
   `host/fb` tools on the PC must not run at the same time; stop the relay first.
 - **Not in scope yet:** the one-board build (its memory map and STATUS flags bit 29); a different heap layout.
@@ -219,11 +231,24 @@ counters and the last STATUS.
 | phase | state |
 |---|---|
 | 1 | written: transport (HELLO, STATUS, the sequenced window, the resend rules, events), the DRM device with a render node, `GET_PARAM` / `GET_STATUS`, `fpgagpu_status` (the check), Kbuild and `dkms.conf`. It compiles without warnings against 6.1.0-45, and `dkms add / build / install` work on the VPS. It has not been loaded yet. |
-| 2 | written (`fpgagpu_kms.c`):<br>- the KMS pipe (CRTC, primary plane, encoder, HDMI-A connector with board B's five modes, 800×600 preferred);<br>- shmem dumb buffers;<br>- damage → WRITE_IMAGE into one scanout image at board B's heap start (handle 0xC3E8), PRESENT after a modeset or a new size or format;<br>- SET_MODE on modeset, flips completed at once (no vblank);<br>- fbdev for the console.<br>Compiles against 6.1.0-45 and 7.3.4, DKMS-installed. Not loaded. Still to do: double buffering (an update now draws into the image being scanned out) and the cursor plane. |
+| 2 | written (`fpgagpu_kms.c`):<br>- the KMS pipe (CRTC, primary plane, encoder, HDMI-A connector with board B's five modes, 800×600 preferred);<br>- shmem dumb buffers;<br>- damage → WRITE_IMAGE into one scanout image at board B's heap start (handle 0xC3E8), PRESENT after a modeset or a new size or format;<br>- SET_MODE on modeset, flips completed at once (no vblank);<br>- fbdev for the console.<br>Compiles against 6.1.0-45 and 7.3.4, DKMS-installed. Not loaded. Still to do: double buffering (an update now draws into the image being scanned out). The cursor plane came later (section 3.6). |
 | 3 | written:<br>- `fpgagpu_mem.c`: heaps (`drm_mm`) and handle tables; an image's footprint computed by board B's own formula;<br>- `fpgagpu_gem.c`: board BOs, CREATE_* on `BO_CREATE`, DESTROY from a worker when the last reference goes;<br>- `fpgagpu_submit.c`: `SUBMIT` with an exact type list and a handle-ownership check per command, BATCH packing, one stream at a time, a FENCE per submission; `WAIT` on a fence or a BO; `READ` with chunk reassembly and re-requests.<br>The display's uploads take the same submit lock. `fpgagpu_selftest` checks it end to end (fill + read an image, write + read a buffer, two refusals). Compiles against 6.1.0-45 and 7.3.4, DKMS-installed. Not loaded: the VPS has `kernel.modules_disabled=1` until its next reboot. |
 | 4 | the Mesa Gallium driver and winsys (`host/linux/mesa`, an overlay on Mesa 26.3.0 with `apply.sh`): an ES 2.0 context on the render node clears on board B and reads back exactly (`fg_egl_clear`). GBM surfaces are board-B images (the screen exports dma-bufs), flipped with KMS without a copy (`fg_kms_flip`, 23 frames a second through the relay). |
 | 5 | shaders (NIR to the Windows libraries' compiler's back end), state, draws, textures, passes and clears (`host/linux/mesa/README.md`): `fg_egl_draw` (ES 2.0) and `fg_egl_gl` (desktop GL 1.3, fixed function the way Quake 3 engines draw) pass on the boards. OpenArena runs through SDL's kmsdrm on card1 and renders on board B, the whole scene and HUD with the sky, at about 0.7 frames a second through the relay (about 1 MB/s to the boards; every draw's vertices are streamed). It is not started from X: X has no glamor yet, so a GL program in X would render in software. |
 | 6 | X on board B: lightdm's X kept off card1 (`x11/90-no-autoadd-gpu.conf`). X :1 on card1 (`x11/start-x-fpgagpu.sh`) either with software rendering shown through the copied-framebuffer path, or with glamor on the fpgagpu Mesa driver (`start glamor`, OpenGL ES 2.0): X renders on the boards into a GBM buffer shown without a copy. OpenArena started as a client of that X renders on the boards through DRI3 (buffers shared by dma-buf, BO_INFO; passes kept whole between processes by PASS). Glamor draws core-font text and logic ops in software, each a read back from the board: through the relay that makes such clients (xterm, xclock) take minutes. |
+
+**2026-11-16, in the Hyper-V VM** (module and relay on the VPS stopped):
+- The module from DKMS for 6.12.116 and 6.12.117: probe round trip about 0.3 ms; `fpgagpu_selftest` passes in 21 ms.
+- Mesa 26.3.0 built in the VM (`-Dplatforms=x11`: Debian 13's `wayland-scanner` rejects the Wayland protocols Mesa
+  takes as a subproject). `fg_egl_clear`, `fg_egl_draw`, `fg_egl_gl` and `fg_kms_flip` pass, each in about 40 ms.
+- X :1 with glamor, Openbox and an xterm on board B, Deskflow for keyboard and mouse.
+  - Text was solid blocks: glamor keeps glyphs (alpha-only pictures) in GL_R8 textures and reads their alpha through
+    texture swizzle, which Mesa allowed only on desktop GL and GLES 3. `apply.sh` now enables EXT_texture_swizzle in
+    GLES 2.0 contexts too, and the driver applies a sampler view's swizzle in the fragment program
+    (`fg_egl_draw` test 5).
+  - The pointer lagged and looked half transparent while moving: X drew it in software, each move a few render passes
+    on the boards into the image being shown. The cursor plane above fixed it.
+- `xwd -root` reads the whole 800×600 screen back from board B in about 0.4 s, colours exact.
 
 **2026-11-16, later:** the module was reloaded with the zero-copy flips (1d67aa3). During a Mesa rebuild the VPS's kernel
 oopsed in ext4 (`ext4_mb_load_buddy_gfp`, a NULL dereference while meson deleted a file); filesystem operations hung

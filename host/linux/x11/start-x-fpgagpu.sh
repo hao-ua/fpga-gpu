@@ -4,6 +4,9 @@
 # glamor: X renders through the fpgagpu Mesa driver on the boards (FPGAGPU_MESA, default /opt/fpgagpu-mesa); without
 # it X renders in software and the module copies its changes to board B.
 # Needs the fpgagpu module loaded and card1 free of other DRM masters (see 90-no-autoadd-gpu.conf).
+# X_WM=<window manager> starts one (openbox, say). DESKFLOW_SERVER=<host[:port]> starts a Deskflow client that takes
+# keyboard and mouse from that server (X itself reads no input devices); DESKFLOW_NAME is this screen's name in the
+# server's layout (default: the host name); DESKFLOW_TLS=0 for a server without TLS.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 run=/run/fpgagpu-x
@@ -38,6 +41,17 @@ start)
 	for i in $(seq 1 60); do xset -display $disp q > /dev/null 2>&1 && break; sleep 1; done
 	xset -display $disp q > /dev/null 2>&1 || { echo "X $disp did not come up; see $run/Xorg.log"; exit 1; }
 	DISPLAY=$disp xsetroot -solid '#203050'
+	if [ -n "${X_WM:-}" ]; then
+		DISPLAY=$disp $X_WM > "$run/wm.out" 2>&1 &
+		echo $! > "$run/wm.pid"
+	fi
+	if [ -n "${DESKFLOW_SERVER:-}" ]; then
+		tls="--enable-crypto"
+		[ "${DESKFLOW_TLS:-1}" = 0 ] && tls=""
+		deskflow-client --no-daemon --name "${DESKFLOW_NAME:-$(hostname)}" $tls --display $disp \
+			--log "$run/deskflow.log" "$DESKFLOW_SERVER" > "$run/deskflow.out" 2>&1 &
+		echo $! > "$run/deskflow.pid"
+	fi
 	if [ "${X_CLIENTS:-1}" = 0 ]; then
 		echo "X $disp is up on fpgagpu (no clients)"
 		exit 0

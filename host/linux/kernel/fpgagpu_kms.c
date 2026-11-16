@@ -14,6 +14,11 @@
  *
  * Over Gigabit Ethernet a whole 800 x 600 RGBA8 frame is 1.9 MB (about 55 frames a second at best); through the
  * relay to a remote host it takes seconds. Consoles and desktops mostly update small rectangles.
+ *
+ * The cursor plane is board B's hardware cursor: a 64 x 64 premultiplied ARGB shape over the scanout. A new cursor
+ * framebuffer sends its shape (sequenced, after what was drawn before); a move sends only the position on the
+ * unsequenced fast path, which board A passes to board B ahead of every queued command, so the pointer does not wait
+ * behind rendering. A fast-path message is not resent: the last position goes again a while after the last move.
  */
 #include <linux/slab.h>
 #include <linux/version.h>
@@ -48,6 +53,15 @@
 #define T_WRITE_IMAGE		0x22
 #define T_SET_MODE		0x30
 #define T_PRESENT		0x31
+#define T_CURSOR		0x32
+#define T_CURSOR_POS		0x33		/* unsequenced: the cursor's position, ahead of the queue */
+#define CUR_SHAPE		1
+#define CUR_SHOW		2
+#define CUR_HIDE		3
+#define CUR_PREMUL		2		/* CUR_SHOW mode: premultiplied 0xAARRGGBB words */
+#define CUR_DIM			64
+#define CUR_WORDS		340		/* shape words per CURSOR datagram */
+#define CUR_HEAL_MS		50
 #define FMT_RGBA8		0x00
 #define FMT_RGB565		0x04
 #define TF_RGBA8888		0x01
@@ -77,6 +91,8 @@ static const struct { u16 w, h; u8 id; } fg_modes[] = {
 static const u32 fg_formats[] = {
 	DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_RGB565,
 };
+
+static const u32 fg_cursor_formats[] = { DRM_FORMAT_ARGB8888 };
 
 static bool fg_fourcc_bgr(u32 fourcc)
 {
@@ -375,6 +391,156 @@ static const struct drm_plane_funcs fg_plane_funcs = {
 	DRM_GEM_SHADOW_PLANE_FUNCS,
 };
 
+/* ------------------------------------------------------------------ cursor plane */
+
+/* the shape: 64 x 64 words, the framebuffer's pixels from the top-left corner, transparent past them; called with
+ * submit_lock held (upbuf) */
+static int fg_cursor_shape(struct fpgagpu_device *fdev, const struct drm_framebuffer *fb, const u8 *vaddr)
+{
+	u32 w = min_t(u32, fb->width, CUR_DIM), h = min_t(u32, fb->height, CUR_DIM);
+	u8 *d = fdev->kms.upbuf;
+	u32 k, i;
+	int r;
+
+	for (k = 0; k < CUR_DIM * CUR_DIM; k += CUR_WORDS) {
+		u32 n = min_t(u32, CUR_WORDS, CUR_DIM * CUR_DIM - k);
+
+		d[0] = CUR_SHAPE;
+		d[1] = 0;
+		put_unaligned_le16(0, d + 2);
+		put_unaligned_le16(k, d + 4);		/* the first word's index */
+		put_unaligned_le16(0, d + 6);
+		for (i = 0; i < n; i++) {
+			u32 x = (k + i) % CUR_DIM, y = (k + i) / CUR_DIM, v = 0;
+
+			if (x < w && y < h)
+				v = get_unaligned_le32(vaddr + fb->offsets[0] + y * fb->pitches[0] + x * 4);
+			put_unaligned_le32(v, d + 8 + 4 * i);
+		}
+		r = fg_net_send_seq(&fdev->net, T_CURSOR, d, 8 + 4 * n, NULL, SEND_TIMEOUT_MS);
+		if (r)
+			return r;
+	}
+	return 0;
+}
+
+/* show the shape just sent, its top-left corner at (x, y) */
+static int fg_cursor_show(struct fpgagpu_device *fdev, s16 x, s16 y)
+{
+	u8 b[12];
+
+	b[0] = CUR_SHOW;
+	b[1] = CUR_PREMUL;
+	b[2] = 1 | 2;					/* take the new shape, at this position */
+	b[3] = 0;
+	b[4] = 0;					/* hot spot: the position is the corner already */
+	b[5] = 0;
+	put_unaligned_le16(0, b + 6);
+	put_unaligned_le16((u16)x, b + 8);
+	put_unaligned_le16((u16)y, b + 10);
+	return fg_net_send_seq(&fdev->net, T_CURSOR, b, sizeof(b), NULL, SEND_TIMEOUT_MS);
+}
+
+static void fg_cursor_pos(struct fpgagpu_device *fdev, s16 x, s16 y)
+{
+	u8 b[4];
+
+	put_unaligned_le16((u16)x, b);
+	put_unaligned_le16((u16)y, b + 2);
+	fg_net_send_unseq(&fdev->net, T_CURSOR_POS, b, sizeof(b));
+}
+
+static void fg_cursor_hide(struct fpgagpu_device *fdev)
+{
+	u8 b[4] = { CUR_HIDE, 0, 0, 0 };
+
+	if (!fdev->kms.cur_shown)
+		return;
+	mutex_lock(&fdev->submit_lock);
+	fg_net_send_seq(&fdev->net, T_CURSOR, b, sizeof(b), NULL, SEND_TIMEOUT_MS);
+	mutex_unlock(&fdev->submit_lock);
+	WRITE_ONCE(fdev->kms.cur_shown, false);
+	cancel_delayed_work(&fdev->kms.cur_work);
+}
+
+/* the last position once more: a fast-path message lost on the way is healed when the pointer rests */
+static void fg_cursor_heal(struct work_struct *w)
+{
+	struct fg_kms *k = container_of(to_delayed_work(w), struct fg_kms, cur_work);
+	struct fpgagpu_device *fdev = container_of(k, struct fpgagpu_device, kms);
+	int idx;
+
+	if (!drm_dev_enter(&fdev->drm, &idx))
+		return;
+	if (READ_ONCE(k->cur_shown))
+		fg_cursor_pos(fdev, READ_ONCE(k->cur_x), READ_ONCE(k->cur_y));
+	drm_dev_exit(idx);
+}
+
+static int fg_cursor_atomic_check(struct drm_plane *plane, fg_atomic_t *state)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *cs = NULL;
+	int r;
+
+	if (ps->crtc)
+		cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
+	r = drm_atomic_helper_check_plane_state(ps, cs, 1 << 16, 1 << 16, true, true);
+	if (r || !ps->visible)
+		return r;
+	if (fg_fb_image(ps->fb) || ps->fb->width > CUR_DIM || ps->fb->height > CUR_DIM)
+		return -EINVAL;				/* a shape in host memory, at most 64 x 64 */
+	return 0;
+}
+
+static void fg_cursor_atomic_update(struct drm_plane *plane, fg_atomic_t *state)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
+	struct drm_shadow_plane_state *sh = to_drm_shadow_plane_state(ps);
+	struct fpgagpu_device *fdev = kms_to_fdev(plane->dev);
+	struct fg_kms *k = &fdev->kms;
+	s16 x = clamp_t(int, ps->crtc_x, S16_MIN, S16_MAX), y = clamp_t(int, ps->crtc_y, S16_MIN, S16_MAX);
+	int idx;
+
+	if (!drm_dev_enter(plane->dev, &idx))
+		return;
+	if (!ps->fb || !ps->visible) {
+		fg_cursor_hide(fdev);
+	} else if (ps->fb != old->fb || !k->cur_shown) {
+		mutex_lock(&fdev->submit_lock);
+		if (!fg_cursor_shape(fdev, ps->fb, sh->data[0].vaddr) && !fg_cursor_show(fdev, x, y))
+			WRITE_ONCE(k->cur_shown, true);
+		else
+			dev_warn_ratelimited(plane->dev->dev, "the cursor's shape was not sent\n");
+		mutex_unlock(&fdev->submit_lock);
+	} else if (x != k->cur_x || y != k->cur_y) {
+		fg_cursor_pos(fdev, x, y);
+		mod_delayed_work(system_wq, &k->cur_work, msecs_to_jiffies(CUR_HEAL_MS));
+	}
+	WRITE_ONCE(k->cur_x, x);
+	WRITE_ONCE(k->cur_y, y);
+	drm_dev_exit(idx);
+}
+
+static void fg_cursor_atomic_disable(struct drm_plane *plane, fg_atomic_t *state)
+{
+	struct fpgagpu_device *fdev = kms_to_fdev(plane->dev);
+	int idx;
+
+	if (!drm_dev_enter(plane->dev, &idx))
+		return;
+	fg_cursor_hide(fdev);
+	drm_dev_exit(idx);
+}
+
+static const struct drm_plane_helper_funcs fg_cursor_helper_funcs = {
+	FG_PLANE_FB_ACCESS,
+	.atomic_check	= fg_cursor_atomic_check,
+	.atomic_update	= fg_cursor_atomic_update,
+	.atomic_disable	= fg_cursor_atomic_disable,
+};
+
 /* ------------------------------------------------------------------ CRTC */
 
 static int fg_crtc_atomic_check(struct drm_crtc *crtc, fg_atomic_t *state)
@@ -510,13 +676,19 @@ int fg_kms_init(struct fpgagpu_device *fdev)
 	r = drmm_mode_config_init(drm);
 	if (r)
 		return r;
-	drm->mode_config.min_width = 640;
-	drm->mode_config.min_height = 480;
+	/* the limits of every framebuffer, the cursor's 64 x 64 one included; the primary plane's check keeps its
+	 * framebuffer covering the mode */
+	drm->mode_config.min_width = 1;
+	drm->mode_config.min_height = 1;
 	drm->mode_config.max_width = 1280;
 	drm->mode_config.max_height = 800;
 	drm->mode_config.preferred_depth = 24;
+	drm->mode_config.cursor_width = CUR_DIM;
+	drm->mode_config.cursor_height = CUR_DIM;
 	drm->mode_config.funcs = &fg_mode_config_funcs;
 	drm->mode_config.helper_private = &fg_mode_config_helper_funcs;
+	INIT_DELAYED_WORK(&k->cur_work, fg_cursor_heal);
+	k->cur_work_ready = true;
 
 	r = drm_universal_plane_init(drm, &k->plane, 0, &fg_plane_funcs, fg_formats, ARRAY_SIZE(fg_formats),
 				     NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
@@ -525,7 +697,13 @@ int fg_kms_init(struct fpgagpu_device *fdev)
 	drm_plane_helper_add(&k->plane, &fg_plane_helper_funcs);
 	drm_plane_enable_fb_damage_clips(&k->plane);
 
-	r = drm_crtc_init_with_planes(drm, &k->crtc, &k->plane, NULL, &fg_crtc_funcs, NULL);
+	r = drm_universal_plane_init(drm, &k->cursor, 0, &fg_plane_funcs, fg_cursor_formats,
+				     ARRAY_SIZE(fg_cursor_formats), NULL, DRM_PLANE_TYPE_CURSOR, NULL);
+	if (r)
+		return r;
+	drm_plane_helper_add(&k->cursor, &fg_cursor_helper_funcs);
+
+	r = drm_crtc_init_with_planes(drm, &k->crtc, &k->plane, &k->cursor, &fg_crtc_funcs, NULL);
 	if (r)
 		return r;
 	drm_crtc_helper_add(&k->crtc, &fg_crtc_helper_funcs);
@@ -545,4 +723,11 @@ int fg_kms_init(struct fpgagpu_device *fdev)
 
 	drm_mode_config_reset(drm);
 	return 0;
+}
+
+/* before the transport goes: nothing may send the cursor's position after it */
+void fg_kms_fini(struct fpgagpu_device *fdev)
+{
+	if (fdev->kms.cur_work_ready)
+		cancel_delayed_work_sync(&fdev->kms.cur_work);
 }

@@ -847,6 +847,23 @@ static void emit_tex(fgc *c, nir_tex_instr *tex)
       emit(c, "MOV.w r%d r%d", d, kf(c, 1.0));
       r = d;
    }
+   if (c->key->swizzled & (1u << u)) {
+      /* the sampler view's swizzle: each component from a texel component, zero or one */
+      int d = vreg(c, false);
+
+      emit(c, "MOV r%d r%d", d, r);
+      for (i = 0; i < 4; i++) {
+         unsigned s = c->key->swizzle[u] >> (3 * i) & 7;
+
+         if (s == (unsigned)i)
+            continue;
+         if (s < 4)
+            emit(c, "MOV.%c r%d r%d.%c", "xyzw"[i], d, r, "xyzw"[s]);
+         else
+            emit(c, "MOV.%c r%d r%d", "xyzw"[i], d, kf(c, s == 4 ? 0.0 : 1.0));
+      }
+      r = d;
+   }
    set_def(c, &tex->def, r);
 }
 

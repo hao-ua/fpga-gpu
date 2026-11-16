@@ -362,6 +362,8 @@ fg_init_screen_caps(struct fg_screen *screen)
    caps->clip_planes = 0;
    caps->texture_shadow_map = false;
    caps->native_fp32_depth = false;
+   /* a sampler view's swizzle: the fragment program rearranges the texel after the TEX (fg_compile_key.swizzle) */
+   caps->texture_swizzle = true;
 
    /* texture transfers map the image (READ_IMAGE / WRITE_IMAGE), they are not blits */
    caps->texture_transfer_modes = 0;

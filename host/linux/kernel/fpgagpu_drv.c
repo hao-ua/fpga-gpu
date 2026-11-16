@@ -209,6 +209,7 @@ static int fpgagpu_probe(struct platform_device *pdev)
 	fpgagpu_fbdev_setup(&fdev->drm);
 	return 0;
 fail:
+	fg_kms_fini(fdev);
 	fg_net_fini(&fdev->net);
 	return r;
 }
@@ -219,6 +220,7 @@ static void fpgagpu_remove_device(struct platform_device *pdev)
 
 	drm_dev_unplug(&fdev->drm);
 	drm_atomic_helper_shutdown(&fdev->drm);
+	fg_kms_fini(fdev);
 	fg_net_fini(&fdev->net);
 }
 

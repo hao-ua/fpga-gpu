@@ -10,7 +10,9 @@
  *   4. depth test: a near quad drawn first, a far one after it with GL_LEQUAL, then glDepthRange(0, 0.3) for a
  *      quad that must win over the near one;
  *   5. a mipmapped texture (each level its own colour, uploaded level by level as Quake 3 does) drawn small enough
- *      to take level 2 (nearest mip), and magnified (level 0, which survives the chain's reallocation).
+ *      to take level 2 (nearest mip), and magnified (level 0, which survives the chain's reallocation);
+ *   6. the state Quake 3 draws its sky with (glDepthRange(1, 1), GL_LEQUAL, no depth writes, back faces culled), and
+ *      culling: a clockwise quad with back faces culled and a counter-clockwise one with front faces culled vanish.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -292,6 +294,34 @@ int main(int argc, char **argv)
 		check(&fails, near(at(30, 30), 0, 0, 255, 1), "(30, 30): level 2's blue", at(30, 30));
 		check(&fails, near(at(52, 52), 255, 0, 0, 1), "(52, 52): level 0's red", at(52, 52));
 	}
+
+	printf("6. the sky's state: glDepthRange(1, 1), GL_LEQUAL, no depth writes, back faces culled:\n");
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	glEnable(GL_DEPTH_TEST);
+	glDepthFunc(GL_LEQUAL);
+	glDepthMask(GL_FALSE);
+	glEnable(GL_CULL_FACE);
+	glCullFace(GL_BACK);
+	glDepthRange(1, 1);
+	glColor3f(0, 1, 1);
+	quad(8, 8, 56, 56, 0.9f);        /* counter-clockwise: front facing, drawn at depth 1 (= the clear) */
+	glDepthRange(0, 1);
+	glDepthMask(GL_TRUE);
+	read_back();
+	check(&fails, near(at(32, 32), 0, 255, 255, 1), "(32, 32) depth range (1, 1) over a cleared depth: cyan", at(32, 32));
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	glColor3f(1, 1, 0);
+	glBegin(GL_QUADS);               /* clockwise: a back face, culled */
+	glVertex3f(8, 8, 0); glVertex3f(8, 56, 0); glVertex3f(56, 56, 0); glVertex3f(56, 8, 0);
+	glEnd();
+	glCullFace(GL_FRONT);
+	glColor3f(1, 0, 1);
+	quad(20, 20, 44, 44, 0);         /* counter-clockwise with front faces culled: culled */
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_DEPTH_TEST);
+	read_back();
+	check(&fails, near(at(12, 12), 0, 0, 0, 1), "(12, 12) a clockwise quad, back faces culled: black", at(12, 12));
+	check(&fails, near(at(32, 32), 0, 0, 0, 1), "(32, 32) a counter-clockwise quad, front culled: black", at(32, 32));
 
 	printf("GL error 0x%04x\n", glGetError());
 	{

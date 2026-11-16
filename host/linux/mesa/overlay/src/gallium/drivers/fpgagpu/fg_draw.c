@@ -1034,7 +1034,9 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
    d->z01 = rs->clip_halfz;
    d->cull = rs->cull_face == PIPE_FACE_BACK ? 1 : rs->cull_face == PIPE_FACE_FRONT ? 2 :
              rs->cull_face == PIPE_FACE_FRONT_AND_BACK ? 3 : 0;
-   d->front_cw = !rs->front_ccw;
+   /* Gallium gives the winding in window coordinates with y down, board A takes it with y up (GL's, as the Windows
+    * libraries send it): Gallium's counter-clockwise is the board's clockwise */
+   d->front_cw = rs->front_ccw;
    d->line_width = rs->line_width;
    return true;
 }

@@ -23,8 +23,22 @@ struct fg_format {
    uint8_t expand;		/* FG_EXPAND_*: one board B has no storage for, kept as RGBA8 and converted on the PC */
 };
 
-/* L8, A8 and LA88 are stored as RGBA8 (L, L, L, 1), (0, 0, 0, A), (L, L, L, A): what the TMU reads is the format's */
-enum { FG_EXPAND_NONE, FG_EXPAND_L, FG_EXPAND_A, FG_EXPAND_LA };
+/* L8, A8, LA88, R8 and RG8 are stored as RGBA8 (L, L, L, 1), (0, 0, 0, A), (L, L, L, A), (R, 0, 0, 1), (R, G, 0, 1):
+ * what the TMU reads is the format's */
+enum { FG_EXPAND_NONE, FG_EXPAND_L, FG_EXPAND_A, FG_EXPAND_LA, FG_EXPAND_R, FG_EXPAND_RG };
+
+/* the channels of an expanded format that rendering writes (Gallium's mask order: R 1, G 2, B 4, A 8); the others
+ * keep the values the format reads as */
+static inline unsigned
+fg_format_wmask(const struct fg_format *f)
+{
+   switch (f->expand) {
+   case FG_EXPAND_A: return 0x8;
+   case FG_EXPAND_R: return 0x1;
+   case FG_EXPAND_RG: return 0x3;
+   default: return 0xF;
+   }
+}
 
 /* bytes per pixel in board memory */
 static inline unsigned
@@ -46,6 +60,11 @@ struct fg_resource {
    uint32_t pitch;
    uint64_t bo_size;
    bool initialized;		/* a clear or a write has reached it */
+
+   /* board B renders into a pitch that is a multiple of 32, the TMU reads tight rows: an image whose tight rows are
+    * not that is rendered in a copy (shadow), copied back after each pass */
+   struct pipe_resource *shadow;
+   bool shadow_stale;		/* the image changed since the shadow was copied from it */
 
    /* PIPE_BUFFER */
    void *data;

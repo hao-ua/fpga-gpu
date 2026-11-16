@@ -18,6 +18,8 @@ extern "C" {
 #define DRM_FPGAGPU_SUBMIT		0x03
 #define DRM_FPGAGPU_WAIT		0x04
 #define DRM_FPGAGPU_READ		0x05
+#define DRM_FPGAGPU_BO_INFO		0x06
+#define DRM_FPGAGPU_PASS		0x07
 
 #define DRM_IOCTL_FPGAGPU_GET_PARAM	DRM_IOWR(DRM_COMMAND_BASE + DRM_FPGAGPU_GET_PARAM, struct drm_fpgagpu_get_param)
 #define DRM_IOCTL_FPGAGPU_GET_STATUS	DRM_IOWR(DRM_COMMAND_BASE + DRM_FPGAGPU_GET_STATUS, struct drm_fpgagpu_get_status)
@@ -25,6 +27,8 @@ extern "C" {
 #define DRM_IOCTL_FPGAGPU_SUBMIT	DRM_IOWR(DRM_COMMAND_BASE + DRM_FPGAGPU_SUBMIT, struct drm_fpgagpu_submit)
 #define DRM_IOCTL_FPGAGPU_WAIT		DRM_IOW(DRM_COMMAND_BASE + DRM_FPGAGPU_WAIT, struct drm_fpgagpu_wait)
 #define DRM_IOCTL_FPGAGPU_READ		DRM_IOW(DRM_COMMAND_BASE + DRM_FPGAGPU_READ, struct drm_fpgagpu_read)
+#define DRM_IOCTL_FPGAGPU_BO_INFO	DRM_IOWR(DRM_COMMAND_BASE + DRM_FPGAGPU_BO_INFO, struct drm_fpgagpu_bo_info)
+#define DRM_IOCTL_FPGAGPU_PASS		DRM_IOWR(DRM_COMMAND_BASE + DRM_FPGAGPU_PASS, struct drm_fpgagpu_pass)
 
 /* GET_PARAM: one value, from the latest STATUS the boards sent or from the transport */
 enum drm_fpgagpu_param {
@@ -124,6 +128,38 @@ struct drm_fpgagpu_read {
 	__u8 pad;		/* must be 0 */
 	__u32 first;		/* the first pixel of the rectangle to read (row-major) */
 	__u32 pad2;		/* must be 0 */
+};
+
+/* BO_INFO: what a BO is; the way to learn it for one imported through PRIME from another process */
+struct drm_fpgagpu_bo_info {
+	__u32 handle;		/* in: the GEM handle */
+	__u32 kind;		/* out: enum drm_fpgagpu_bo_kind */
+	__u64 size;		/* out: the bytes the board object covers */
+	__u32 board_handle;	/* out */
+	__u16 width, height;	/* out, images: level 0 */
+	__u16 pitch;		/* out, images: level 0's row pitch */
+	__u8 format;		/* out, images: the storage format */
+	__u8 levels, layers;	/* out, images */
+	__u8 pad;		/* 0 */
+	__u16 pad2;		/* 0 */
+};
+
+/*
+ * PASS: the boards hold one render state: board A's program, attributes, uniforms and frame, board B's draw states. A
+ * process takes them for a render pass (FRAME_BEGIN .. FLUSH, which may take several SUBMITs) and gives them back
+ * after it; while one process holds them, another's BEGIN waits, at most timeout_ns, after which it takes them anyway.
+ * Closing the file gives them back too. state_lost: another process held them since this one last did, so nothing it
+ * sent before (programs, attributes, uniforms, draw states) is on the boards any more.
+ */
+enum drm_fpgagpu_pass_op {
+	FPGAGPU_PASS_BEGIN	= 0,
+	FPGAGPU_PASS_END	= 1,
+};
+
+struct drm_fpgagpu_pass {
+	__u32 op;		/* in: enum drm_fpgagpu_pass_op */
+	__u32 state_lost;	/* out, BEGIN */
+	__s64 timeout_ns;	/* in, BEGIN */
 };
 
 #if defined(__cplusplus)

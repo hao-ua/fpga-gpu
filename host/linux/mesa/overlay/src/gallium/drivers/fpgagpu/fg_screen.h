@@ -11,12 +11,14 @@
 
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
+#include "util/simple_mtx.h"
 
 struct renderonly;
 struct pipe_screen_config;
 
 /* command types of a SUBMIT stream (BATCH sub-messages: {u8 type, u8 flags = 0, u16 body bytes, body padded to 4}) */
 #define FG_T_WRITE_IMAGE	0x22
+#define FG_T_FILL_IMAGE		0x24
 #define FG_T_FLUSH		0x41
 #define FG_T_VS_STATE		0x54
 #define FG_T_FRAME_BEGIN	0x56
@@ -69,6 +71,12 @@ struct fg_screen {
 
    /* the boards hold one context's state at a time: its programs, attributes, uniforms and draw states */
    void *last_ctx;
+
+   /* the GEM handles of this fd and how many resources name each: importing a BO the fd already has (one of its own
+    * exports, a buffer shared twice) gives the same handle, closed once the last resource goes */
+   simple_mtx_t gem_lock;
+   struct { uint32_t gem; uint32_t refs; } *gems;
+   unsigned ngems, gemcap;
    /* image BOs created or destroyed: a draw state names images by handle, and board B turns a handle into an
     * address when the state arrives, so a handle given again starts a new generation of draw ids */
    uint32_t img_gen;
@@ -101,6 +109,8 @@ int fg_submit(struct fg_screen *screen, const void *cmds, uint32_t bytes, const 
               uint64_t *fence);
 int fg_wait_fence(struct fg_screen *screen, uint64_t fence, int64_t timeout_ns);
 int fg_wait_bo(struct fg_screen *screen, uint32_t gem, int64_t timeout_ns);
+void fg_gem_ref(struct fg_screen *screen, uint32_t gem);
+void fg_gem_unref(struct fg_screen *screen, uint32_t gem);
 
 static inline void
 fg_put32(uint8_t *p, uint32_t v)

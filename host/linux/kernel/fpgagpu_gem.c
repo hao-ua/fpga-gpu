@@ -114,6 +114,8 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 		bo->width = a->width;
 		bo->height = a->height;
 		bo->pitch = a->pitch;
+		bo->levels = a->levels;
+		bo->layers = a->layers;
 	}
 	bo->size = size;
 	r = fg_mem_alloc(fdev, bo, size);
@@ -165,4 +167,30 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 put:
 	drm_gem_object_put(&bo->base);		/* the handle holds its own reference */
 	return r;
+}
+
+int fpgagpu_ioctl_bo_info(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct drm_fpgagpu_bo_info *a = data;
+	struct drm_gem_object *obj = drm_gem_object_lookup(file, a->handle);
+	struct fg_bo *bo = obj ? to_fg_bo(obj) : NULL;
+
+	if (!bo) {
+		if (obj)
+			drm_gem_object_put(obj);
+		return obj ? -EINVAL : -ENOENT;		/* a host-memory (dumb) object is no board BO */
+	}
+	a->kind = bo->kind;
+	a->size = bo->size;
+	a->board_handle = bo->board_handle;
+	a->width = bo->width;
+	a->height = bo->height;
+	a->pitch = bo->pitch;
+	a->format = bo->format;
+	a->levels = bo->levels;
+	a->layers = bo->layers;
+	a->pad = 0;
+	a->pad2 = 0;
+	drm_gem_object_put(obj);
+	return 0;
 }

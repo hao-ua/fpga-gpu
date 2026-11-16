@@ -97,11 +97,13 @@ struct fg_velems_state {
 /* the target of the open pass */
 struct fg_target {
    struct pipe_resource *color, *ds;
+   struct pipe_resource *shadow_of; /* color is this image's render shadow: copied back after the FLUSH */
    uint16_t color_handle, ds_handle;
    uint32_t width, height;
    bool depth16, has_stencil;
    uint8_t bits[4];           /* colour channel widths: the clear colour's and blend constant's units */
    bool no_alpha;             /* the colour format has no alpha (X): its alpha stays 1.0 */
+   uint8_t wmask;             /* the channels rendering writes (Gallium's order): fewer for A8, R8, RG8 */
 };
 
 struct fg_id_entry {
@@ -213,6 +215,9 @@ void fg_end_pass(struct fg_context *ctx);
 bool fg_set_target(struct fg_context *ctx);
 void fg_write_buffer(struct fg_context *ctx, struct fg_ctx_bo *bo, uint32_t offset, const void *data, uint32_t len);
 uint32_t fg_stream(struct fg_context *ctx, const void *data, uint32_t bytes, uint32_t align);
+void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
+                  unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
+                  unsigned w, unsigned h);
 
 /* draws (fg_draw.c) */
 void fg_draw_init(struct pipe_context *pctx);

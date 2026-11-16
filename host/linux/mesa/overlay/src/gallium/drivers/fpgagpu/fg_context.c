@@ -226,6 +226,22 @@ fg_emit_flush(struct fg_context *ctx, uint32_t flags)
       fg_use_resource(ctx, ctx->tgt.ds);
 }
 
+/* the boards' render state for this process until the pass ends (another process's pass would land in the middle of
+ * one that takes several SUBMITs); what another process sent since this one last held it replaced its state */
+static void
+fg_pass_take(struct fg_context *ctx, bool take)
+{
+   struct drm_fpgagpu_pass p = {
+      .op = take ? FPGAGPU_PASS_BEGIN : FPGAGPU_PASS_END,
+      .timeout_ns = 5ll * 1000 * 1000 * 1000,
+   };
+
+   if (drmIoctl(fg_screen(ctx->base.screen)->fd, DRM_IOCTL_FPGAGPU_PASS, &p))
+      return;
+   if (take && p.state_lost)
+      fg_hw_invalidate(ctx);
+}
+
 void
 fg_pass_open(struct fg_context *ctx)
 {
@@ -233,6 +249,7 @@ fg_pass_open(struct fg_context *ctx)
 
    if (ctx->pass_open)
       return;
+   fg_pass_take(ctx, true);
    fg_emit(ctx, FG_T_FRAME_BEGIN, z, sizeof(z), NULL, 0);
    ctx->pass_open = true;
    ctx->pass_draws = 0;
@@ -269,6 +286,11 @@ fg_end_pass(struct fg_context *ctx)
    }
    fl = ctx->cl_flags | (ctx->tgt.depth16 ? FG_FL_DEPTH16 : 0);
    fg_emit_flush(ctx, fl);
+   if (ctx->tgt.shadow_of) {
+      /* rendered in the shadow: back into the image, after the FLUSH that rendered it */
+      fg_emit_copy(ctx, ctx->tgt.color, 0, 0, 0, 0, ctx->tgt.shadow_of, 0, 0, 0, 0, ctx->tgt.width, ctx->tgt.height);
+      fg_resource(ctx->tgt.shadow_of)->initialized = true;
+   }
    fg_submit_stream(ctx);
    if (ctx->cl_flags & FG_FL_CLEAR_COLOR)
       fg_resource(ctx->tgt.color)->initialized = true;
@@ -283,10 +305,30 @@ fg_end_pass(struct fg_context *ctx)
       pipe_resource_reference(&ctx->pass_res[i], NULL);
    ctx->npass_res = 0;
    ctx->pass_open = false;
+   fg_pass_take(ctx, false);
    ctx->pass_draws = 0;
    ctx->cl_flags = 0;
    ctx->cl_depth = 0xFFFFFF;
    ctx->cl_smask = 0xFF;
+}
+
+/* the image board B renders into in place of c (pitch a multiple of 32, one level, one layer), made the first time */
+static struct pipe_resource *
+fg_render_shadow(struct pipe_resource *c)
+{
+   struct fg_resource *r = fg_resource(c);
+
+   if (!r->shadow) {
+      struct pipe_resource templ = *c;
+
+      templ.target = PIPE_TEXTURE_2D;
+      templ.bind = PIPE_BIND_RENDER_TARGET;
+      templ.last_level = 0;
+      templ.array_size = 1;
+      r->shadow = c->screen->resource_create(c->screen, &templ);
+      r->shadow_stale = true;
+   }
+   return r->shadow;
 }
 
 /* the framebuffer's first colour buffer and depth-stencil buffer as the pass's target; a change ends the pass.
@@ -295,7 +337,7 @@ bool
 fg_set_target(struct fg_context *ctx)
 {
    struct pipe_framebuffer_state *fb = &ctx->fb;
-   struct pipe_resource *c = fb->nr_cbufs ? fb->cbufs[0].texture : NULL;
+   struct pipe_resource *c = fb->nr_cbufs ? fb->cbufs[0].texture : NULL, *rt;
    struct pipe_resource *z = fb->zsbuf.texture;
    struct fg_target t;
    const struct fg_format *f;
@@ -319,10 +361,17 @@ fg_set_target(struct fg_context *ctx)
    f = fg_resource(c)->fmt;
    if (!fg_format_renderable(f))
       return false;
+   rt = c;
+   if (fg_resource(c)->pitch % 32) {
+      rt = fg_render_shadow(c);
+      if (!rt)
+         return false;
+   }
    memset(&t, 0, sizeof(t));
-   t.color = c;
+   t.color = rt;
+   t.shadow_of = rt != c ? c : NULL;
    t.ds = z;
-   t.color_handle = fg_resource(c)->board_handle;
+   t.color_handle = fg_resource(rt)->board_handle;
    t.ds_handle = z ? fg_resource(z)->board_handle : 0;
    t.width = c->width0;
    t.height = c->height0;
@@ -330,11 +379,18 @@ fg_set_target(struct fg_context *ctx)
    t.has_stencil = z && util_format_has_stencil(util_format_description(z->format));
    memcpy(t.bits, f->bits, sizeof(t.bits));
    t.no_alpha = f->force_alpha;
-   if (ctx->have_tgt && !memcmp(&ctx->tgt, &t, sizeof(t)))
-      return true;
-   fg_end_pass(ctx);
-   ctx->tgt = t;
-   ctx->have_tgt = true;
+   t.wmask = (uint8_t)fg_format_wmask(f);
+   if (!ctx->have_tgt || memcmp(&ctx->tgt, &t, sizeof(t))) {
+      fg_end_pass(ctx);
+      ctx->tgt = t;
+      ctx->have_tgt = true;
+   }
+   if (t.shadow_of && fg_resource(c)->shadow_stale) {
+      /* the image changed (an upload, a copy, a first use): the shadow takes it before the pass renders. Board B
+       * copies at once and renders at the FLUSH, so this lands under the pass's draws whenever it is sent */
+      fg_emit_copy(ctx, c, 0, 0, 0, 0, rt, 0, 0, 0, 0, t.width, t.height);
+      fg_resource(c)->shadow_stale = false;
+   }
    return true;
 }
 
@@ -345,7 +401,8 @@ fg_context_pending_uses(struct fg_context *ctx, struct pipe_resource *prsc)
       return false;
    if (ctx->cl_flags && ctx->have_tgt && (ctx->tgt.color == prsc || ctx->tgt.ds == prsc))
       return true;
-   if (ctx->pass_open && ctx->have_tgt && (ctx->tgt.color == prsc || ctx->tgt.ds == prsc))
+   if ((ctx->pass_open || ctx->cl_flags) && ctx->have_tgt &&
+       (ctx->tgt.color == prsc || ctx->tgt.ds == prsc || ctx->tgt.shadow_of == prsc))
       return true;
    for (unsigned i = 0; i < ctx->npass_res; i++)
       if (ctx->pass_res[i] == prsc)
@@ -376,7 +433,7 @@ fg_clear(struct pipe_context *pctx, unsigned buffers, uint32_t color_clear_mask,
    if (!fg_set_target(ctx))
       return;
    t = &ctx->tgt;
-   cmask = color_clear_mask & 0xF;
+   cmask = color_clear_mask & t->wmask;
    if (t->no_alpha)
       cmask = cmask ? cmask | 0x8 : 0;
    else if (!t->bits[3])
@@ -518,35 +575,44 @@ fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, un
    /* board B copies at once and renders at a FLUSH: a pass that reads or writes either image ends first */
    if (fg_context_pending_uses(ctx, src) || fg_context_pending_uses(ctx, dst))
       fg_end_pass(ctx);
-   for (int z = 0; z < src_box->depth; z++) {
-      uint8_t b[36];
-
-      /* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key */
-      fg_put16(b + 0, s->board_handle);
-      b[2] = (uint8_t)src_level;
-      b[3] = (uint8_t)(src_box->z + z);
-      fg_put16(b + 4, d->board_handle);
-      b[6] = (uint8_t)dst_level;
-      b[7] = (uint8_t)(dstz + z);
-      fg_put16(b + 8, src_box->x);
-      fg_put16(b + 10, src_box->y);
-      fg_put16(b + 12, src_box->width);
-      fg_put16(b + 14, src_box->height);
-      fg_put16(b + 16, dstx);
-      fg_put16(b + 18, dsty);
-      fg_put16(b + 20, src_box->width);
-      fg_put16(b + 22, src_box->height);
-      fg_put32(b + 24, 0);
-      fg_put32(b + 28, 0);
-      fg_put32(b + 32, 0);
-      fg_emit(ctx, FG_T_COPY_IMAGE, b, sizeof(b), NULL, 0);
-      /* held until submitted: the frontend often lets go of the source right after the copy */
-      fg_use_resource(ctx, src);
-      fg_use_resource(ctx, dst);
-   }
+   for (int z = 0; z < src_box->depth; z++)
+      fg_emit_copy(ctx, src, src_level, src_box->z + z, src_box->x, src_box->y, dst, dst_level, dstz + z, dstx, dsty,
+                   src_box->width, src_box->height);
    d->initialized = true;
+   d->shadow_stale = true;
    if (!ctx->pass_open)
       fg_submit_stream(ctx);
+}
+
+/* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key. Both
+ * images are held until the stream is submitted: the frontend often lets go of a source right after a copy */
+void
+fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
+             unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
+             unsigned w, unsigned h)
+{
+   uint8_t b[36];
+
+   fg_put16(b + 0, fg_resource(src)->board_handle);
+   b[2] = (uint8_t)slevel;
+   b[3] = (uint8_t)slayer;
+   fg_put16(b + 4, fg_resource(dst)->board_handle);
+   b[6] = (uint8_t)dlevel;
+   b[7] = (uint8_t)dlayer;
+   fg_put16(b + 8, sx);
+   fg_put16(b + 10, sy);
+   fg_put16(b + 12, w);
+   fg_put16(b + 14, h);
+   fg_put16(b + 16, dx);
+   fg_put16(b + 18, dy);
+   fg_put16(b + 20, w);
+   fg_put16(b + 22, h);
+   fg_put32(b + 24, 0);
+   fg_put32(b + 28, 0);
+   fg_put32(b + 32, 0);
+   fg_emit(ctx, FG_T_COPY_IMAGE, b, sizeof(b), NULL, 0);
+   fg_use_resource(ctx, src);
+   fg_use_resource(ctx, dst);
 }
 
 static void

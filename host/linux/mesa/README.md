@@ -27,8 +27,14 @@ with `glDepthRange`; render passes ending in a FLUSH with the hardware's clear; 
 through `READ`, writes (`glTexImage2D`) through `WRITE_IMAGE`. L8, A8 and LA88 are stored as RGBA8 and converted on
 the PC (board B has no such storage).
 
-Written, not tested yet: points and lines, stencil, scissor, polygon offset, culling, cube maps, linear filtering,
-clears inside a pass drawn as quads, draws whose indices span more than 16 bits.
+Also tested: face culling, Quake 3's sky state (`glDepthRange(1, 1)`), rendering into a texture whose tight rows are
+no multiple of 32 bytes (board B renders into a shadow image with an aligned pitch, copied back after the pass), X's
+glamor (OpenGL ES 2.0: A8, R8 and RG8 render targets kept as RGBA8 with masked writes), and dma-buf import for DRI3
+(BO_INFO). Every render pass holds the boards' render state for its process (the kernel's PASS ioctl), so X and a
+game can share the boards.
+
+Written, not tested yet: points and lines, stencil, scissor, polygon offset, cube maps, linear filtering, clears
+inside a pass drawn as quads, draws whose indices span more than 16 bits.
 
 Not yet: blits, copies between buffers and images, mipmap generation, queries, instancing, importing buffers,
 rendering into a level or layer above 0 or a target wider than 1280, more than one context drawing at a time.

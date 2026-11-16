@@ -20,6 +20,7 @@
 #include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "util/u_inlines.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_transfer.h"
 
@@ -35,8 +36,10 @@ static const struct fg_format fg_formats[] = {
    { PIPE_FORMAT_B5G6R5_UNORM, FG_FMT_RGB565, FG_TF_RGB565, 2, { 5, 6, 5, 0 }, false, false },
    /* sampled only, stored as RGBA8 */
    { PIPE_FORMAT_L8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 1, { 0, 0, 0, 0 }, false, false, FG_EXPAND_L },
-   { PIPE_FORMAT_A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 1, { 0, 0, 0, 0 }, false, false, FG_EXPAND_A },
+   { PIPE_FORMAT_A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 1, { 0, 0, 0, 8 }, false, false, FG_EXPAND_A },
    { PIPE_FORMAT_L8A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 2, { 0, 0, 0, 0 }, false, false, FG_EXPAND_LA },
+   { PIPE_FORMAT_R8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 1, { 8, 0, 0, 0 }, false, false, FG_EXPAND_R },
+   { PIPE_FORMAT_R8G8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 2, { 8, 8, 0, 0 }, false, false, FG_EXPAND_RG },
    { PIPE_FORMAT_Z24_UNORM_S8_UINT, FG_FMT_D24S8, FG_TF_RAW, 4, { 0, 0, 0, 0 }, false, true },
    { PIPE_FORMAT_Z16_UNORM, FG_FMT_D16, FG_TF_RAW, 2, { 0, 0, 0, 0 }, false, true },
 };
@@ -46,10 +49,15 @@ static const struct fg_format fg_rgba8_wire = {
    PIPE_FORMAT_R8G8B8A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 4, { 8, 8, 8, 8 }, false, false, FG_EXPAND_NONE,
 };
 
+/* RGBA8 and RGB565; and A8, R8, RG8, rendered with their own channels' writes into their RGBA8 storage, whose other
+ * channels keep the values the format reads as */
 bool
 fg_format_renderable(const struct fg_format *f)
 {
-   return f && !f->expand && !f->depth && (f->storage == FG_FMT_RGBA8 || f->storage == FG_FMT_RGB565);
+   return f && !f->depth &&
+          (f->expand == FG_EXPAND_NONE || f->expand == FG_EXPAND_A || f->expand == FG_EXPAND_R ||
+           f->expand == FG_EXPAND_RG) &&
+          (f->storage == FG_FMT_RGBA8 || f->storage == FG_FMT_RGB565);
 }
 
 /* n pixels of an expanded format to RGBA8, and back */
@@ -57,14 +65,15 @@ static void
 fg_expand(const struct fg_format *f, const uint8_t *src, uint8_t *dst, size_t n)
 {
    for (size_t i = 0; i < n; i++) {
-      uint8_t l = src[i * f->bpp], a = f->expand == FG_EXPAND_LA ? src[i * 2 + 1] : 255;
+      const uint8_t *s = src + i * f->bpp;
+      uint8_t *d = dst + 4 * i;
 
-      if (f->expand == FG_EXPAND_A) {
-         dst[4 * i] = dst[4 * i + 1] = dst[4 * i + 2] = 0;
-         dst[4 * i + 3] = l;
-      } else {
-         dst[4 * i] = dst[4 * i + 1] = dst[4 * i + 2] = l;
-         dst[4 * i + 3] = a;
+      switch (f->expand) {
+      case FG_EXPAND_A: d[0] = d[1] = d[2] = 0; d[3] = s[0]; break;
+      case FG_EXPAND_L: d[0] = d[1] = d[2] = s[0]; d[3] = 255; break;
+      case FG_EXPAND_LA: d[0] = d[1] = d[2] = s[0]; d[3] = s[1]; break;
+      case FG_EXPAND_R: d[0] = s[0]; d[1] = d[2] = 0; d[3] = 255; break;
+      default: d[0] = s[0]; d[1] = s[1]; d[2] = 0; d[3] = 255; break;
       }
    }
 }
@@ -73,13 +82,14 @@ static void
 fg_pack(const struct fg_format *f, const uint8_t *src, uint8_t *dst, size_t n)
 {
    for (size_t i = 0; i < n; i++) {
-      if (f->expand == FG_EXPAND_A) {
-         dst[i] = src[4 * i + 3];
-      } else if (f->expand == FG_EXPAND_L) {
-         dst[i] = src[4 * i];
-      } else {
-         dst[2 * i] = src[4 * i];
-         dst[2 * i + 1] = src[4 * i + 3];
+      const uint8_t *s = src + 4 * i;
+      uint8_t *d = dst + i * f->bpp;
+
+      switch (f->expand) {
+      case FG_EXPAND_A: d[0] = s[3]; break;
+      case FG_EXPAND_L: case FG_EXPAND_R: d[0] = s[0]; break;
+      case FG_EXPAND_LA: d[0] = s[0]; d[1] = s[3]; break;
+      default: d[0] = s[0]; d[1] = s[1]; break;
       }
    }
 }
@@ -186,10 +196,33 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    }
    rsc->fmt = f;
    rsc->gem = c.handle;
+   fg_gem_ref(screen, c.handle);
    rsc->board_handle = (uint16_t)c.board_handle;
    rsc->pitch = pitch;
    rsc->bo_size = c.size;
    p_atomic_inc(&screen->img_gen);	/* the handle may be one a cached draw state names */
+   if (fg_format_wmask(f) != 0xF && (templ->bind & PIPE_BIND_RENDER_TARGET)) {
+      /* the channels rendering leaves alone must read as the format says: A8 (0, 0, 0, .), R8 / RG8 (., ., 0, 1).
+       * FILL_IMAGE: handle, level, layer, transfer format, channel mask, 0, x, y, w, h, value (bytes R, G, B, A) */
+      const uint32_t value = f->expand == FG_EXPAND_A ? 0 : 0xFF000000u;
+      uint8_t cmd[4 + 20], b[20] = { 0 };
+      uint64_t fence;
+
+      for (unsigned l = 0; l < levels; l++) {
+         for (unsigned z = 0; z < layers; z++) {
+            fg_put16(b, rsc->board_handle);
+            b[2] = (uint8_t)l;
+            b[3] = (uint8_t)z;
+            b[4] = FG_TF_RGBA8888;
+            b[5] = 0xF;
+            fg_put16(b + 12, u_minify(templ->width0, l));
+            fg_put16(b + 14, u_minify(templ->height0, l));
+            fg_put32(b + 16, value);
+            fg_put_cmd(cmd, FG_T_FILL_IMAGE, b, sizeof(b), NULL, 0);
+            fg_submit(screen, cmd, sizeof(cmd), &rsc->gem, 1, &fence);
+         }
+      }
+   }
    if (screen->debug && (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED)))
       fprintf(stderr, "fpgagpu: shown image %s %ux%u pitch %u, bind 0x%x: GEM %u, board 0x%04x\n",
               util_format_name(templ->format), templ->width0, templ->height0, pitch, templ->bind, c.handle,
@@ -206,21 +239,57 @@ fg_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
 {
    struct fg_resource *rsc = fg_resource(prsc);
 
-   if (rsc->gem) {
-      struct drm_gem_close c = { .handle = rsc->gem };
-
-      drmIoctl(fg_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &c);
-   }
+   pipe_resource_reference(&rsc->shadow, NULL);
+   if (rsc->gem)
+      fg_gem_unref(fg_screen(pscreen), rsc->gem);
    align_free(rsc->data);
    FREE(rsc);
 }
 
+/* a board-B image from a dma-buf (another process's, through PRIME) or a GEM handle of this fd: the kernel says what
+ * it is (BO_INFO), the template what it is used as */
 static struct pipe_resource *
 fg_resource_from_handle(struct pipe_screen *pscreen, const struct pipe_resource *templ,
                         struct winsys_handle *whandle, unsigned usage)
 {
-   FG_NOTE_ONCE("importing a resource from a handle");
-   return NULL;
+   struct fg_screen *screen = fg_screen(pscreen);
+   struct drm_fpgagpu_bo_info info = { 0 };
+   const struct fg_format *f = fg_format_info(templ->format);
+   struct fg_resource *rsc;
+   uint32_t gem;
+
+   if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+      if (drmPrimeFDToHandle(screen->fd, (int)whandle->handle, &gem))
+         return NULL;
+   } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+      gem = whandle->handle;
+   } else {
+      return NULL;
+   }
+   info.handle = gem;
+   if (drmIoctl(screen->fd, DRM_IOCTL_FPGAGPU_BO_INFO, &info) || info.kind != FPGAGPU_BO_B_IMAGE || !f ||
+       f->storage != info.format || templ->width0 > info.width || templ->height0 > info.height || whandle->offset ||
+       (whandle->stride && whandle->stride != info.pitch)) {
+      if (screen->debug)
+         fprintf(stderr, "fpgagpu: no import of GEM %u as %s %ux%u (pitch %u): kind %u format 0x%02x %ux%u pitch %u\n",
+                 gem, util_format_name(templ->format), templ->width0, templ->height0, whandle->stride, info.kind,
+                 info.format, info.width, info.height, info.pitch);
+      return NULL;
+   }
+   rsc = CALLOC_STRUCT(fg_resource);
+   if (!rsc)
+      return NULL;
+   rsc->base = *templ;
+   rsc->base.screen = pscreen;
+   pipe_reference_init(&rsc->base.reference, 1);
+   rsc->fmt = f;
+   rsc->gem = gem;
+   rsc->board_handle = (uint16_t)info.board_handle;
+   rsc->pitch = info.pitch;
+   rsc->bo_size = info.size;
+   rsc->initialized = true;
+   fg_gem_ref(screen, gem);
+   return &rsc->base;
 }
 
 /* a board-B image by its GEM handle on this device, or as a dma-buf for another user of the device (it has no host
@@ -483,6 +552,7 @@ fg_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptransfer)
       if (fg_context_pending_uses(ctx, ptransfer->resource))
          fg_context_flush_pending(ctx);
       fg_submit_stream(ctx);
+      rsc->shadow_stale = true;
       if (rsc->fmt->expand) {
          const struct pipe_box *b = &ptransfer->box;
          size_t n = (size_t)b->width * b->height * b->depth;

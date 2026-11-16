@@ -957,6 +957,7 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
    cmask = ctx->blend->h0 >> 16 & 0xF;
    if (t->no_alpha)
       cmask &= 14; /* the board's order: an X format's alpha stays the 1.0 it was given */
+   cmask &= fg_board_cmask(t->wmask); /* A8, R8, RG8: their own channels */
    h[0] = (ctx->blend->h0 & (64u | 128u)) | cmask << 16;
    if (t->ds)
       h[0] |= dsa->h0 & (1u | 2u | 0x1Cu);

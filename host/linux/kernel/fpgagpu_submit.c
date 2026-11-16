@@ -322,6 +322,65 @@ int fpgagpu_ioctl_wait(struct drm_device *drm, void *data, struct drm_file *file
 	return fg_net_wait_fence(&fdev->net, fence, tmo);
 }
 
+/* ------------------------------------------------------------------ PASS */
+
+static bool fg_pass_free_for(struct fpgagpu_device *fdev, struct drm_file *file)
+{
+	struct drm_file *o = READ_ONCE(fdev->pass_owner);
+
+	return !o || o == file;
+}
+
+int fpgagpu_ioctl_pass(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct fpgagpu_device *fdev = to_fpgagpu(drm);
+	struct drm_fpgagpu_pass *a = data;
+	ktime_t end;
+
+	if (a->op == FPGAGPU_PASS_END) {
+		mutex_lock(&fdev->pass_lock);
+		if (fdev->pass_owner == file)
+			fdev->pass_owner = NULL;
+		mutex_unlock(&fdev->pass_lock);
+		wake_up_all(&fdev->pass_wq);
+		return 0;
+	}
+	if (a->op != FPGAGPU_PASS_BEGIN)
+		return -EINVAL;
+	end = ktime_add_ns(ktime_get(), a->timeout_ns > 0 ? a->timeout_ns : 0);
+	for (;;) {
+		s64 left = ktime_to_ns(ktime_sub(end, ktime_get()));
+		long r;
+
+		mutex_lock(&fdev->pass_lock);
+		if (fg_pass_free_for(fdev, file) || left <= 0)
+			break;				/* free, or waited long enough: taken anyway */
+		mutex_unlock(&fdev->pass_lock);
+		r = wait_event_interruptible_timeout(fdev->pass_wq, fg_pass_free_for(fdev, file),
+						     max_t(long, 1, nsecs_to_jiffies(left)));
+		if (r < 0)
+			return (int)r;
+	}
+	a->state_lost = fdev->last_owner != file;
+	fdev->pass_owner = file;
+	fdev->last_owner = file;
+	mutex_unlock(&fdev->pass_lock);
+	return 0;
+}
+
+void fpgagpu_postclose(struct drm_device *drm, struct drm_file *file)
+{
+	struct fpgagpu_device *fdev = to_fpgagpu(drm);
+
+	mutex_lock(&fdev->pass_lock);
+	if (fdev->pass_owner == file)
+		fdev->pass_owner = NULL;
+	if (fdev->last_owner == file)
+		fdev->last_owner = NULL;	/* a file opened later at the same address is another process */
+	mutex_unlock(&fdev->pass_lock);
+	wake_up_all(&fdev->pass_wq);
+}
+
 /* ------------------------------------------------------------------ READ */
 
 static u32 fg_tformat_bpp(u8 tf, u8 storage)

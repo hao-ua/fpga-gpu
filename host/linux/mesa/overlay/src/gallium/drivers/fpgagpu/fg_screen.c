@@ -74,6 +74,57 @@ fg_wait_bo(struct fg_screen *screen, uint32_t gem, int64_t timeout_ns)
    return drmIoctl(screen->fd, DRM_IOCTL_FPGAGPU_WAIT, &w) ? -errno : 0;
 }
 
+void
+fg_gem_ref(struct fg_screen *screen, uint32_t gem)
+{
+   unsigned i;
+
+   simple_mtx_lock(&screen->gem_lock);
+   for (i = 0; i < screen->ngems && screen->gems[i].gem != gem; i++)
+      ;
+   if (i < screen->ngems) {
+      screen->gems[i].refs++;
+   } else {
+      if (screen->ngems == screen->gemcap) {
+         unsigned cap = screen->gemcap ? 2 * screen->gemcap : 256;
+         void *n = realloc(screen->gems, cap * sizeof(*screen->gems));
+
+         if (!n) {
+            simple_mtx_unlock(&screen->gem_lock);
+            return;
+         }
+         screen->gems = n;
+         screen->gemcap = cap;
+      }
+      screen->gems[screen->ngems].gem = gem;
+      screen->gems[screen->ngems].refs = 1;
+      screen->ngems++;
+   }
+   simple_mtx_unlock(&screen->gem_lock);
+}
+
+void
+fg_gem_unref(struct fg_screen *screen, uint32_t gem)
+{
+   unsigned i;
+   bool close = true;
+
+   simple_mtx_lock(&screen->gem_lock);
+   for (i = 0; i < screen->ngems && screen->gems[i].gem != gem; i++)
+      ;
+   if (i < screen->ngems) {
+      close = --screen->gems[i].refs == 0;
+      if (close)
+         screen->gems[i] = screen->gems[--screen->ngems];
+   }
+   simple_mtx_unlock(&screen->gem_lock);
+   if (close) {
+      struct drm_gem_close c = { .handle = gem };
+
+      drmIoctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &c);
+   }
+}
+
 static int
 fg_get_param(int fd, uint32_t param, uint32_t *value)
 {
@@ -131,6 +182,8 @@ fg_screen_destroy(struct pipe_screen *pscreen)
    struct fg_screen *screen = fg_screen(pscreen);
 
    close(screen->fd);
+   free(screen->gems);
+   simple_mtx_destroy(&screen->gem_lock);
    FREE(screen);
 }
 
@@ -313,10 +366,11 @@ fg_init_screen_caps(struct fg_screen *screen)
    /* texture transfers map the image (READ_IMAGE / WRITE_IMAGE), they are not blits */
    caps->texture_transfer_modes = 0;
 
-   /* board B's memory is not host memory. Its BOs export as dma-bufs (DRM PRIME) for other users of this device:
-    * without the export bit GBM gives every surface a host-memory dumb buffer instead of an image */
+   /* board B's memory is not host memory. Its BOs travel between users of this device as dma-bufs (DRM PRIME): without
+    * the export bit GBM gives every surface a host-memory dumb buffer instead of an image; imports are how X and its
+    * clients share buffers (DRI3) */
    caps->uma = false;
-   caps->dmabuf = DRM_PRIME_CAP_EXPORT;
+   caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
 
    caps->min_line_width = caps->min_line_width_aa = 1.0f;
    caps->max_line_width = caps->max_line_width_aa = 64.0f;
@@ -342,6 +396,7 @@ fg_screen_create(int fd, const struct pipe_screen_config *config, struct rendero
       return NULL;
    }
    screen->fd = fd;
+   simple_mtx_init(&screen->gem_lock, mtx_plain);
 
    version = drmGetVersion(fd);
    ours = version && version->name && strcmp(version->name, "fpgagpu") == 0;

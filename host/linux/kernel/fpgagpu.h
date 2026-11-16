@@ -171,6 +171,7 @@ struct fg_bo {
 	u16 board_handle;
 	u8 format;				/* images: the storage format */
 	u16 width, height, pitch;		/* images: level 0 */
+	u8 levels, layers;			/* images */
 	bool created;				/* CREATE_* was sent: DESTROY it when freed */
 	u64 size;				/* the bytes the board object covers */
 	struct drm_mm_node node;		/* its range in the board heap */
@@ -185,6 +186,10 @@ struct fpgagpu_device {
 	struct fg_kms kms;
 	struct fg_mem mem;
 	struct mutex submit_lock;		/* one command stream at a time: SUBMIT, READ, the display's uploads */
+	struct mutex pass_lock;			/* the two below */
+	struct drm_file *pass_owner;		/* the file holding the boards' render state for a pass (PASS), or NULL */
+	struct drm_file *last_owner;		/* the file that held it last */
+	wait_queue_head_t pass_wq;
 	u32 fence_id;				/* the id in the next FENCE body */
 	u32 read_tag;				/* the tag of the last READ request */
 	spinlock_t free_lock;
@@ -212,6 +217,9 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 int fpgagpu_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *file);
 int fpgagpu_ioctl_wait(struct drm_device *drm, void *data, struct drm_file *file);
 int fpgagpu_ioctl_read(struct drm_device *drm, void *data, struct drm_file *file);
+int fpgagpu_ioctl_bo_info(struct drm_device *drm, void *data, struct drm_file *file);
+int fpgagpu_ioctl_pass(struct drm_device *drm, void *data, struct drm_file *file);
+void fpgagpu_postclose(struct drm_device *drm, struct drm_file *file);
 
 static inline struct fpgagpu_device *to_fpgagpu(struct drm_device *drm)
 {

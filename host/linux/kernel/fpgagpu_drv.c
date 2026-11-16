@@ -120,6 +120,8 @@ static const struct drm_ioctl_desc fpgagpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(FPGAGPU_SUBMIT, fpgagpu_ioctl_submit, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(FPGAGPU_WAIT, fpgagpu_ioctl_wait, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(FPGAGPU_READ, fpgagpu_ioctl_read, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(FPGAGPU_BO_INFO, fpgagpu_ioctl_bo_info, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(FPGAGPU_PASS, fpgagpu_ioctl_pass, DRM_RENDER_ALLOW),
 };
 
 struct workqueue_struct *fg_wq;
@@ -132,6 +134,7 @@ static const struct drm_driver fpgagpu_drm_driver = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
 #endif
+	.postclose		= fpgagpu_postclose,	/* a pass the file held is given back */
 	.ioctls			= fpgagpu_ioctls,
 	.num_ioctls		= ARRAY_SIZE(fpgagpu_ioctls),
 	.fops			= &fpgagpu_fops,
@@ -170,6 +173,8 @@ static int fpgagpu_probe(struct platform_device *pdev)
 		return PTR_ERR(fdev);
 	platform_set_drvdata(pdev, fdev);
 	mutex_init(&fdev->submit_lock);
+	mutex_init(&fdev->pass_lock);
+	init_waitqueue_head(&fdev->pass_wq);
 	spin_lock_init(&fdev->free_lock);
 	INIT_LIST_HEAD(&fdev->bo_free);
 	INIT_WORK(&fdev->free_work, fg_bo_free_work);

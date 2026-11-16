@@ -323,6 +323,50 @@ int main(int argc, char **argv)
 	check(&fails, near(at(12, 12), 0, 0, 0, 1), "(12, 12) a clockwise quad, back faces culled: black", at(12, 12));
 	check(&fails, near(at(32, 32), 0, 0, 0, 1), "(32, 32) a counter-clockwise quad, front culled: black", at(32, 32));
 
+	printf("7. rendering into a 50 x 30 texture (rows of 200 bytes, no multiple of 32), then sampling it:\n");
+	{
+		static uint8_t small[50 * 30 * 4];
+		GLuint t_rt, fbo2;
+
+		glGenTextures(1, &t_rt);
+		glBindTexture(GL_TEXTURE_2D, t_rt);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 50, 30, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glGenFramebuffersEXT(1, &fbo2);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo2);
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_rt, 0);
+		glViewport(0, 0, 50, 30);
+		glMatrixMode(GL_PROJECTION);
+		glLoadIdentity();
+		glOrtho(0, 50, 0, 30, -1, 1);
+		glClearColor(1, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glColor3f(0, 1, 0);
+		quad(0, 0, 25, 30, 0);           /* left half green, right half the clear's red */
+		memset(small, 0xA5, sizeof(small));
+		glReadPixels(0, 0, 50, 30, GL_RGBA, GL_UNSIGNED_BYTE, small);
+		check(&fails, small[4 * (15 * 50 + 10) + 1] == 255 && small[4 * (15 * 50 + 10)] == 0,
+		      "texture (10, 15) read back: green", small + 4 * (15 * 50 + 10));
+		check(&fails, small[4 * (15 * 50 + 40)] == 255 && small[4 * (15 * 50 + 40) + 1] == 0,
+		      "texture (40, 15) read back: red", small + 4 * (15 * 50 + 40));
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glLoadIdentity();
+		glOrtho(0, W, 0, H, -1, 1);
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+		quad(0, 0, 64, 64, 0);
+		glDisable(GL_TEXTURE_2D);
+		read_back();
+		check(&fails, near(at(16, 32), 0, 255, 0, 1), "(16, 32) the texture sampled: its green half", at(16, 32));
+		check(&fails, near(at(48, 32), 255, 0, 0, 1), "(48, 32) the texture sampled: its red half", at(48, 32));
+		glDeleteFramebuffersEXT(1, &fbo2);
+		glDeleteTextures(1, &t_rt);
+	}
+
 	printf("GL error 0x%04x\n", glGetError());
 	{
 		GLuint t[4] = { t_rgb, t_mod, t_alpha, t_mip };

@@ -158,8 +158,10 @@ static int fg_check_stream(const struct fg_allow *al, const u8 *c, u32 bytes)
 		if (c[p + 1] || bytes - p - 4 < padded || blen > FG_DGRAM_MAX - FG_HDR_BYTES)
 			return -EINVAL;
 		r = fg_check_cmd(al, c[p], c + p + 4, blen);
-		if (r)
+		if (r) {
+			pr_warn_ratelimited("fpgagpu: SUBMIT refused: command 0x%02x at byte %u of %u: %d\n", c[p], p, bytes, r);
 			return r;
+		}
 		p += 4 + padded;
 	}
 	return 0;

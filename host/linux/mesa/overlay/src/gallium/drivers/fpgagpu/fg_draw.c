@@ -527,13 +527,14 @@ fg_fs_variant(struct fg_context *ctx, struct fg_fs_state *fs, const struct fg_vs
    return v->ok ? v : NULL;
 }
 
-/* a program's words into the context's program buffer the first time it is drawn with; false: no room */
+/* a program's words into the context's program buffer the first time it is drawn with (in this placement
+ * generation); false: no room */
 static bool
-fg_place(struct fg_context *ctx, struct fg_ctx_bo *bo, const struct fg_program *p, uint32_t *off)
+fg_place(struct fg_context *ctx, struct fg_ctx_bo *bo, const struct fg_program *p, uint32_t *off, uint32_t *gen)
 {
    uint32_t a = (bo->used + 31) & ~31u, bytes = p->nwords * 8;
 
-   if (*off != ~0u)
+   if (*off != ~0u && *gen == ctx->prog_gen)
       return true;
    if (a + bytes > bo->size) {
       FG_NOTE_ONCE("reusing program memory (the context's program buffer is full)");
@@ -542,6 +543,7 @@ fg_place(struct fg_context *ctx, struct fg_ctx_bo *bo, const struct fg_program *
    fg_write_buffer(ctx, bo, a, p->words, bytes);
    bo->used = a + bytes;
    *off = a;
+   *gen = ctx->prog_gen;
    return true;
 }
 
@@ -611,6 +613,17 @@ fg_hw_invalidate(struct fg_context *ctx)
    ctx->hw_vs_state_ok = false;
    memset(ctx->ids, 0, sizeof(ctx->ids));
    ctx->next_id = 1;
+}
+
+/* a SUBMIT failed: the boards did not get what it carried, so every program is placed again (from the start of the
+ * program buffers) and every cached state is sent again */
+void
+fg_hw_lost(struct fg_context *ctx)
+{
+   fg_hw_invalidate(ctx);
+   ctx->prog_a.used = 0;
+   ctx->prog_b.used = 0;
+   ctx->prog_gen++;
 }
 
 /* the boards hold one context's state: taking them from another forgets what this one sent before */
@@ -792,7 +805,7 @@ fg_hw_draw(struct fg_context *ctx, const struct fg_hw_draw *d, unsigned mode, ui
    const struct fg_fs_variant *fs = d->fs;
    uint32_t vu[4 * FG_VS_PARAMS], fu[4 * FG_FS_PARAMS], h[23], id, zc, nv, nf, i;
    uint8_t b[60];
-   uint32_t vs_off = vs->off, fs_off = fs->off;
+   uint32_t vs_off = vs->off, fs_off = fs->off, vs_gen = vs->off_gen, fs_gen = fs->off_gen;
 
    nv = vs->prog.const_base + vs->prog.nconsts;
    nf = fs->prog.const_base + fs->prog.nconsts;
@@ -800,10 +813,13 @@ fg_hw_draw(struct fg_context *ctx, const struct fg_hw_draw *d, unsigned mode, ui
       return;
    fg_claim_boards(ctx);
    fg_pass_open(ctx);
-   if (!fg_place(ctx, &ctx->prog_a, &vs->prog, &vs_off) || !fg_place(ctx, &ctx->prog_b, &fs->prog, &fs_off))
+   if (!fg_place(ctx, &ctx->prog_a, &vs->prog, &vs_off, &vs_gen) ||
+       !fg_place(ctx, &ctx->prog_b, &fs->prog, &fs_off, &fs_gen))
       return;
    ((struct fg_vs_state *)vs)->off = vs_off;
+   ((struct fg_vs_state *)vs)->off_gen = vs_gen;
    ((struct fg_fs_variant *)fs)->off = fs_off;
+   ((struct fg_fs_variant *)fs)->off_gen = fs_gen;
    if (d->h[0] & 32u)
       ctx->stencil_known = false; /* a draw may write the stencil */
 

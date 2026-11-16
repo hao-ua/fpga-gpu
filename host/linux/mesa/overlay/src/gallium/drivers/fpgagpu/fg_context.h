@@ -48,6 +48,7 @@ struct fg_vs_state {
    bool ok;
    uint64_t vmask;            /* fg_varying_mask of its outputs */
    uint32_t off;              /* its words in the vertex program buffer; ~0 = not placed yet */
+   uint32_t off_gen;          /* the context's prog_gen it was placed under */
    unsigned id;
 };
 
@@ -56,6 +57,7 @@ struct fg_fs_variant {
    struct fg_program prog;
    bool ok;
    uint32_t off;
+   uint32_t off_gen;
    struct fg_fs_variant *next;
 };
 
@@ -174,6 +176,8 @@ struct fg_context {
    uint32_t next_id;
    uint32_t id_gen;
 
+   uint32_t prog_gen;         /* programs placed under an older one are placed again (a SUBMIT carrying them failed) */
+
    unsigned next_vs_id;
    bool submitted;            /* last_fence is valid */
    uint64_t last_fence;
@@ -223,6 +227,7 @@ void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned sl
 void fg_draw_init(struct pipe_context *pctx);
 void fg_draw_fini(struct fg_context *ctx);
 void fg_hw_invalidate(struct fg_context *ctx);
+void fg_hw_lost(struct fg_context *ctx);
 void fg_clear_quad(struct fg_context *ctx, uint32_t flags, const uint32_t c16[4], uint32_t depth, uint32_t stencil,
                    uint32_t smask, const uint32_t sc[4]);
 

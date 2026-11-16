@@ -99,14 +99,19 @@ fg_submit_stream(struct fg_context *ctx)
    if (!ctx->ncmd)
       return;
    r = fg_submit(screen, ctx->cmd, ctx->ncmd, ctx->bos, ctx->nbos, &fence);
-   if (r)
+   if (r) {
+      /* nothing of it reached the boards: what it sent (programs, state, draw ids) is sent again */
       fprintf(stderr, "fpgagpu: SUBMIT of %u bytes failed: %s\n", ctx->ncmd, strerror(-r));
-   else
+      fg_hw_lost(ctx);
+   } else {
       fg_context_fenced(ctx, fence);
+   }
    ctx->ncmd = 0;
-   ctx->nbos = 0;
+   /* in an open pass the list stays: a draw names its images and programs before the commands that use them, so a
+    * cut in between must not leave them out of the next SUBMIT; the pass holds every image on the list */
    if (!ctx->pass_open) {
       /* no pass waits for a FLUSH: what the stream named is in the kernel's hands now */
+      ctx->nbos = 0;
       for (unsigned i = 0; i < ctx->npass_res; i++)
          pipe_resource_reference(&ctx->pass_res[i], NULL);
       ctx->npass_res = 0;
@@ -304,6 +309,7 @@ fg_end_pass(struct fg_context *ctx)
    for (unsigned i = 0; i < ctx->npass_res; i++)
       pipe_resource_reference(&ctx->pass_res[i], NULL);
    ctx->npass_res = 0;
+   ctx->nbos = 0;
    ctx->pass_open = false;
    fg_pass_take(ctx, false);
    ctx->pass_draws = 0;

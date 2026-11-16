@@ -255,6 +255,13 @@ counters and the last STATUS.
 - OpenArena as a client of that X (SDL x11, GLX through DRI3): the timedemo `demo088-test1` (640×480 windowed,
   `cl_renderer opengl1`) runs at 15.4 frames a second (3398 frames in 220 s; through the relay it was 0.7, the Windows
   libraries do about 31). Full screen at 800×600 it is playable with Deskflow's relative moves and Scroll Lock.
+- After a match, X's text came out as pieces of the wrong glyphs. The game's log showed 20 SUBMITs refused by the
+  kernel (EACCES; the timedemo had 13): the driver cut its stream at 3 MB and emptied the SUBMIT's BO list, but a
+  draw names its textures and program buffer before it emits the DRAW_STATE that uses them, so a cut in between left
+  them off the next list. The list now stays for the whole render pass (the pass holds every image on it). A refused
+  SUBMIT also no longer leaves the driver believing its programs and state reached the boards: it places every program
+  again and resends its state. The kernel logs which command it refused. The timedemo: 0 refused, 15.3 frames a
+  second, the worst frame 149 ms (305 ms before), X's text right after it.
 
 **2026-11-16, later:** the module was reloaded with the zero-copy flips (1d67aa3). During a Mesa rebuild the VPS's kernel
 oopsed in ext4 (`ext4_mb_load_buddy_gfp`, a NULL dereference while meson deleted a file); filesystem operations hung

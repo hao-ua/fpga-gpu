@@ -216,8 +216,11 @@ counters and the last STATUS.
     with the extension XFCE's desktop kept X uploading a screen-sized image (about 2 MB) over and over and X stopped
     answering clients (Deskflow among them); without it clients send ordinary pixmaps, uploaded once. XFCE's
     compositor is off for `debian` (`x11/xfwm4-no-compositing.xml` as `~/.config/xfce4/xfconf/xfce-perchannel-xml/
-    xfwm4.xml`). The Deskflow client runs in a loop with `--no-restart` (`x11/deskflow-client.desktop`): its own
-    reconnecting hung after the Windows server restarted.
+    xfwm4.xml`). The Deskflow client runs in a loop with `--no-restart` (`x11/fpgagpu-deskflow-client` in
+    `/usr/local/bin`, started by `x11/deskflow-client.desktop`): its own reconnecting hung after the Windows server
+    restarted. The loop ends when its X stops answering, and first stops (by the PIDs it recorded) a loop or client an
+    earlier session left behind: Debian keeps a user's processes after the session ends, and two clients of one name
+    took turns at the server.
   - OpenGL 2.0 with GLSL 1.10 (2026-11-16): ARB_shadow (depth compare) in the fragment program, the D24S8 image read
     by the TMU through an RGBA8 alias (the kernel's BO_CREATE alias flag); Mesa's OpenGL 2.0 context kept at the
     driver's GLSL 1.10 (`apply.sh` patches `version.c` and `getstring.c`). ioquake3's default `opengl2` renderer needs
@@ -236,8 +239,14 @@ counters and the last STATUS.
     during resizes glxgears kept 181 fps (4 fps before). What remains is window-sized copies (a moved window,
     glxgears' frames): board B's COPY_IMAGE would do those at ~9 ns per copied pixel. The boards give no vblank, so
     X's Present does not pace windowed clients: glxgears presents as fast as the board takes it.
-  - fpgagpu does not load at boot: after a VM reboot, `modprobe fpgagpu` and `systemctl restart lightdm` put X on
-    board B (until then LightDM's X runs on Hyper-V's display).
+  - fpgagpu loads at boot (`kernel/fpgagpu-load.conf` as `/etc/modules-load.d/fpgagpu.conf`). While board A does not
+    answer (the boards off; at boot, the network not up yet) the module stays loaded and greets it again every 5 s;
+    the DRM device appears once it answers. LightDM waits up to 10 s for the card at its start
+    (`x11/lightdm-wait-fpgagpu.conf` as `/etc/systemd/system/lightdm.service.d/fpgagpu.conf`), so X starts on the
+    boards when they are on; otherwise on Hyper-V's display, and `x11/99-fpgagpu-display.rules` (udev) restarts LightDM
+    when the card appears later (only once it is running: a restart in the middle of its wait left it failed - seen at
+    the first reboot). Checked 2026-11-16: two VM reboots (attached on the 2nd try, X on the boards ~4 s after LightDM
+    started), and board A made unreachable (a blackhole route) then reachable again (X moved from card0 to the boards).
   - Board B once stopped taking commands (board A waiting on B's credit, its queue still) after X servers were killed
     in the middle of frames while display managers stopped. Resetting B alone was not enough: board A kept waiting for
     the old frame. Both boards had to be power-cycled, and the module reloaded for a new session (HELLO). The kernel

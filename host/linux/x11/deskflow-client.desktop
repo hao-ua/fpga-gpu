@@ -1,11 +1,11 @@
 [Desktop Entry]
 # ~/.config/autostart/deskflow-client.desktop: the session takes keyboard and mouse from the Deskflow server on the
 # Windows PC (Hyper-V's Default Switch address; screen name as in the server's layout). The client's certificate and
-# the server's trusted fingerprint live in ~/.config/Deskflow/tls (deskflow.pem, trusted-servers). The client gives up
-# when its connection dies (--no-restart) and the loop starts it again: its own reconnecting can hang after the server
-# restarts.
+# the server's trusted fingerprint live in ~/.config/Deskflow/tls (deskflow.pem, trusted-servers).
+# fpgagpu-deskflow-client (in /usr/local/bin) starts the client again whenever it stops, while the session's X
+# answers, and first stops a client an earlier session left behind.
 Type=Application
 Name=Deskflow client
-Exec=sh -c 'while :; do deskflow-client --no-daemon --no-restart --name fpgagpu-vm --enable-crypto 172.20.96.1; sleep 2; done'
+Exec=/usr/local/bin/fpgagpu-deskflow-client fpgagpu-vm 172.20.96.1
 X-GNOME-Autostart-enabled=true
 NoDisplay=true

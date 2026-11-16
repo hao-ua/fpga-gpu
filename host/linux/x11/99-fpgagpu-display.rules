@@ -1,0 +1,5 @@
+# /etc/udev/rules.d/99-fpgagpu-display.rules: the boards' display card appeared. If the display manager is running
+# (it started on another card before board A answered), it starts again and X takes the boards (20-fpgagpu.conf).
+# Not while it is starting: its own wait (lightdm-wait-fpgagpu.conf) takes the card then, and a restart in the middle
+# of that wait leaves it failed
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="fpgagpu", RUN+="/bin/sh -c 'systemctl is-active -q display-manager.service && systemctl --no-block restart display-manager.service'"

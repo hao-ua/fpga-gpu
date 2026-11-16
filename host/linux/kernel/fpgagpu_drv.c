@@ -5,6 +5,8 @@
  * The boards are on no bus the kernel probes, so the module registers a platform device "fpgagpu" and binds its own
  * platform driver to it. Probing opens the UDP transport (fpgagpu_net.c), greets board A, reads both boards' STATUS
  * and registers the DRM device: a render node with the GET_PARAM and GET_STATUS ioctls (include/uapi/drm/fpgagpu_drm.h).
+ * While board A does not answer (the boards off, the network not up yet at boot) the module stays loaded and greets
+ * it again every few seconds; the DRM device appears once it answers.
  *   modprobe fpgagpu ip=192.168.1.10          board A on this host's network
  *   modprobe fpgagpu ip=127.0.0.1             through host/linux/tools/g2_relay.py from a remote host
  */
@@ -161,11 +163,66 @@ static void fpgagpu_fbdev_setup(struct drm_device *drm)
 
 /* ------------------------------------------------------------------ the platform device */
 
+#define ATTACH_RETRY_S		5		/* while board A does not answer: HELLO again this often */
+#define ATTACH_HELLO_MS		1500		/* each try: three HELLOs */
+
+/* greets board A; once it answers: the display and the DRM device (render node, card, console). -EAGAIN: no answer
+ * (the boards are off, or the network is not up yet) */
+static int fpgagpu_attach(struct fpgagpu_device *fdev)
+{
+	struct device *dev = fdev->drm.dev;
+	u32 *w;
+	u32 got = 0;
+	int r;
+
+	r = fg_net_hello(&fdev->net, ATTACH_HELLO_MS);
+	if (r)
+		return -EAGAIN;
+	w = kmalloc_array(FG_STATUS_WORDS, sizeof(u32), GFP_KERNEL);
+	if (w && !fg_net_status(&fdev->net, w, FG_STATUS_WORDS, &got, NULL, STATUS_TIMEOUT_MS) &&
+	    got > FG_ST_LINK_FLAGS)
+		dev_info(dev, "board A build %u, STATUS layout %u, flags %08x; board B flags %08x; link %s, B %s; round trip %u us\n",
+			 w[FG_ST_BUILD], w[FG_ST_LAYOUT], w[FG_ST_FLAGS], w[FG_ST_B_FLAGS],
+			 FG_LINK_TRAINED(w[FG_ST_LINK_FLAGS]) ? "trained" : "NOT trained",
+			 FG_LINK_B_ALIVE(w[FG_ST_LINK_FLAGS]) ? "alive" : "NOT alive", fg_net_rtt_us(&fdev->net));
+	else
+		dev_warn(dev, "no STATUS from %s:%u\n", ip, port);
+	kfree(w);
+
+	r = fg_kms_init(fdev);
+	if (r)
+		goto fail;
+	r = drm_dev_register(&fdev->drm, 0);
+	if (r)
+		goto fail;
+	fpgagpu_fbdev_setup(&fdev->drm);
+	fdev->attached = true;
+	return 0;
+fail:
+	fg_kms_fini(fdev);
+	return r;
+}
+
+static void fpgagpu_attach_work(struct work_struct *work)
+{
+	struct fpgagpu_device *fdev = container_of(to_delayed_work(work), struct fpgagpu_device, attach_work);
+	int r = fpgagpu_attach(fdev);
+
+	fdev->attach_tries++;
+	if (r == -EAGAIN) {
+		queue_delayed_work(fg_wq, &fdev->attach_work, ATTACH_RETRY_S * HZ);
+		return;
+	}
+	if (r)
+		dev_err(fdev->drm.dev, "board A answered after %u tries, but the device could not be set up (%d)\n",
+			fdev->attach_tries, r);
+	else
+		dev_info(fdev->drm.dev, "board A answered after %u tries\n", fdev->attach_tries);
+}
+
 static int fpgagpu_probe(struct platform_device *pdev)
 {
 	struct fpgagpu_device *fdev;
-	u32 *w;
-	u32 got = 0;
 	int r;
 
 	fdev = devm_drm_dev_alloc(&pdev->dev, &fpgagpu_drm_driver, struct fpgagpu_device, drm);
@@ -178,6 +235,7 @@ static int fpgagpu_probe(struct platform_device *pdev)
 	spin_lock_init(&fdev->free_lock);
 	INIT_LIST_HEAD(&fdev->bo_free);
 	INIT_WORK(&fdev->free_work, fg_bo_free_work);
+	INIT_DELAYED_WORK(&fdev->attach_work, fpgagpu_attach_work);
 	r = fg_mem_init(fdev);
 	if (r)
 		return r;
@@ -185,32 +243,18 @@ static int fpgagpu_probe(struct platform_device *pdev)
 	r = fg_net_init(&fdev->net, &pdev->dev, ip, port);
 	if (r)
 		return r;
-	r = fg_net_hello(&fdev->net, 3000);
+	/* the module may load before the network is up (at boot) or with the boards off: it keeps trying, and the DRM
+	 * device appears once board A answers */
+	r = fpgagpu_attach(fdev);
+	if (r == -EAGAIN) {
+		dev_info(&pdev->dev, "board A at %s:%u does not answer; trying again every %d s\n", ip, port,
+			 ATTACH_RETRY_S);
+		fdev->attach_tries = 1;
+		queue_delayed_work(fg_wq, &fdev->attach_work, ATTACH_RETRY_S * HZ);
+		return 0;
+	}
 	if (r)
-		dev_warn(&pdev->dev, "no ACK to HELLO from %s:%u (%d); the device is registered anyway\n", ip, port, r);
-
-	w = kmalloc_array(FG_STATUS_WORDS, sizeof(u32), GFP_KERNEL);
-	if (w && !fg_net_status(&fdev->net, w, FG_STATUS_WORDS, &got, NULL, STATUS_TIMEOUT_MS) &&
-	    got > FG_ST_LINK_FLAGS)
-		dev_info(&pdev->dev, "board A build %u, STATUS layout %u, flags %08x; board B flags %08x; link %s, B %s; round trip %u us\n",
-			 w[FG_ST_BUILD], w[FG_ST_LAYOUT], w[FG_ST_FLAGS], w[FG_ST_B_FLAGS],
-			 FG_LINK_TRAINED(w[FG_ST_LINK_FLAGS]) ? "trained" : "NOT trained",
-			 FG_LINK_B_ALIVE(w[FG_ST_LINK_FLAGS]) ? "alive" : "NOT alive", fg_net_rtt_us(&fdev->net));
-	else
-		dev_warn(&pdev->dev, "no STATUS from %s:%u\n", ip, port);
-	kfree(w);
-
-	r = fg_kms_init(fdev);
-	if (r)
-		goto fail;
-	r = drm_dev_register(&fdev->drm, 0);
-	if (r)
-		goto fail;
-	fpgagpu_fbdev_setup(&fdev->drm);
-	return 0;
-fail:
-	fg_kms_fini(fdev);
-	fg_net_fini(&fdev->net);
+		fg_net_fini(&fdev->net);
 	return r;
 }
 
@@ -218,9 +262,12 @@ static void fpgagpu_remove_device(struct platform_device *pdev)
 {
 	struct fpgagpu_device *fdev = platform_get_drvdata(pdev);
 
-	drm_dev_unplug(&fdev->drm);
-	drm_atomic_helper_shutdown(&fdev->drm);
-	fg_kms_fini(fdev);
+	cancel_delayed_work_sync(&fdev->attach_work);
+	if (fdev->attached) {
+		drm_dev_unplug(&fdev->drm);
+		drm_atomic_helper_shutdown(&fdev->drm);
+		fg_kms_fini(fdev);
+	}
 	fg_net_fini(&fdev->net);
 }
 

@@ -205,6 +205,9 @@ struct fpgagpu_device {
 	spinlock_t free_lock;
 	struct list_head bo_free;		/* BOs whose memory goes back once DESTROY is sent */
 	struct work_struct free_work;
+	struct delayed_work attach_work;	/* while board A does not answer: HELLO again every few seconds */
+	unsigned int attach_tries;
+	bool attached;				/* board A answered: the display and the DRM device are set up */
 };
 
 int fg_kms_init(struct fpgagpu_device *fdev);

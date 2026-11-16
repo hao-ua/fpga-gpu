@@ -199,7 +199,11 @@ counters and the last STATUS.
   Debian's generic cloud image, set up by cloud-init (the WSL ssh key, build tools, headers, DKMS), Secure Boot off
   for the unsigned module. It sits on Hyper-V's Default Switch (NAT): it reaches board A through Windows the way WSL
   does, round trip about 0.3 ms, with no change to the PC's network. `/etc/modprobe.d/fpgagpu.conf` holds
-  `ip=192.168.1.10 port=5000`. WSL does not reach the Default Switch, Windows does: ssh from WSL goes through a
+  `ip=192.168.1.10 port=5000`. The fpgagpu Mesa is the VM's system GL: `/etc/ld.so.conf.d/00-fpgagpu-mesa.conf`
+  names `/opt/fpgagpu-mesa/lib/x86_64-linux-gnu` ahead of the system's directory (`ldconfig`), so every program loads
+  it with no `LD_LIBRARY_PATH`; Debian's own Mesa answers "failed to load driver: fpgagpu".
+  - The driver reports desktop OpenGL 1.3 (no ARB_shadow: no depth compare yet), so ioquake3 games need
+    `cl_renderer opengl1`; their default, `opengl2`, wants OpenGL 2.0 and stops. WSL does not reach the Default Switch, Windows does: ssh from WSL goes through a
   Windows-side TCP pipe as its ProxyCommand.
   - Keyboard and mouse: Deskflow. The server runs on Windows, the client (`deskflow-client`, Debian's 1.22) in the VM's
     X, started by `start-x-fpgagpu.sh` with `DESKFLOW_SERVER=172.20.96.1` (the Default Switch's Windows address); the

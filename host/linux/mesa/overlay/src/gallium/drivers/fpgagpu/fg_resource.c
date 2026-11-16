@@ -32,9 +32,56 @@ static const struct fg_format fg_formats[] = {
    { PIPE_FORMAT_B8G8R8A8_UNORM, FG_FMT_RGBA8, FG_TF_BGRA8888, 4, { 8, 8, 8, 8 }, false, false },
    { PIPE_FORMAT_B8G8R8X8_UNORM, FG_FMT_RGBA8, FG_TF_BGRX8888, 4, { 8, 8, 8, 0 }, true, false },
    { PIPE_FORMAT_B5G6R5_UNORM, FG_FMT_RGB565, FG_TF_RGB565, 2, { 5, 6, 5, 0 }, false, false },
+   /* sampled only, stored as RGBA8 */
+   { PIPE_FORMAT_L8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 1, { 0, 0, 0, 0 }, false, false, FG_EXPAND_L },
+   { PIPE_FORMAT_A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 1, { 0, 0, 0, 0 }, false, false, FG_EXPAND_A },
+   { PIPE_FORMAT_L8A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 2, { 0, 0, 0, 0 }, false, false, FG_EXPAND_LA },
    { PIPE_FORMAT_Z24_UNORM_S8_UINT, FG_FMT_D24S8, FG_TF_RAW, 4, { 0, 0, 0, 0 }, false, true },
    { PIPE_FORMAT_Z16_UNORM, FG_FMT_D16, FG_TF_RAW, 2, { 0, 0, 0, 0 }, false, true },
 };
+
+/* what an expanded format travels as */
+static const struct fg_format fg_rgba8_wire = {
+   PIPE_FORMAT_R8G8B8A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 4, { 8, 8, 8, 8 }, false, false, FG_EXPAND_NONE,
+};
+
+bool
+fg_format_renderable(const struct fg_format *f)
+{
+   return f && !f->expand && !f->depth && (f->storage == FG_FMT_RGBA8 || f->storage == FG_FMT_RGB565);
+}
+
+/* n pixels of an expanded format to RGBA8, and back */
+static void
+fg_expand(const struct fg_format *f, const uint8_t *src, uint8_t *dst, size_t n)
+{
+   for (size_t i = 0; i < n; i++) {
+      uint8_t l = src[i * f->bpp], a = f->expand == FG_EXPAND_LA ? src[i * 2 + 1] : 255;
+
+      if (f->expand == FG_EXPAND_A) {
+         dst[4 * i] = dst[4 * i + 1] = dst[4 * i + 2] = 0;
+         dst[4 * i + 3] = l;
+      } else {
+         dst[4 * i] = dst[4 * i + 1] = dst[4 * i + 2] = l;
+         dst[4 * i + 3] = a;
+      }
+   }
+}
+
+static void
+fg_pack(const struct fg_format *f, const uint8_t *src, uint8_t *dst, size_t n)
+{
+   for (size_t i = 0; i < n; i++) {
+      if (f->expand == FG_EXPAND_A) {
+         dst[i] = src[4 * i + 3];
+      } else if (f->expand == FG_EXPAND_L) {
+         dst[i] = src[4 * i];
+      } else {
+         dst[2 * i] = src[4 * i];
+         dst[2 * i + 1] = src[4 * i + 3];
+      }
+   }
+}
 
 const struct fg_format *
 fg_format_info(enum pipe_format format)
@@ -117,7 +164,7 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    /* the TMU's descriptor has no pitch: what is sampled has tight rows, and so has a mip chain or a layered image.
     * A single level that is only rendered into or scanned out gets a pitch that is a multiple of 32 bytes. A texture
     * that is also a render target keeps tight rows (the two agree when a row is a multiple of 32 bytes anyway) */
-   row = templ->width0 * f->bpp;
+   row = templ->width0 * fg_storage_bpp(f);
    pitch = (levels > 1 || layers > 1 ||
             ((templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
              !(templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SHARED))))
@@ -222,13 +269,13 @@ fg_buffer_unmap(struct pipe_context *pctx, struct pipe_transfer *ptransfer)
    FREE(ptransfer);
 }
 
-/* the staged pixels of one map as WRITE_IMAGE commands, as few SUBMITs as the kernel's stream limit allows */
+/* the staged pixels of one map, in format f, as WRITE_IMAGE commands, as few SUBMITs as the kernel's stream limit
+ * allows */
 static bool
-fg_write_image(struct fg_context *ctx, struct fg_resource *rsc, unsigned level, const struct pipe_box *box,
-               uint8_t *data, uintptr_t layer_stride)
+fg_write_image(struct fg_context *ctx, struct fg_resource *rsc, const struct fg_format *f, unsigned level,
+               const struct pipe_box *box, uint8_t *data, uintptr_t layer_stride)
 {
    struct fg_screen *screen = fg_screen(ctx->base.screen);
-   const struct fg_format *f = rsc->fmt;
    const uint32_t npix = box->width * box->height, per = FG_MAX_DATA / f->bpp;
    const uint32_t cmd_max = 4 + 24 + per * f->bpp, cmds_per_submit = FG_SUBMIT_MAX / cmd_max;
    const uint32_t total = DIV_ROUND_UP(npix, per) * box->depth;
@@ -299,9 +346,10 @@ fg_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc, unsigned l
    if (!f || box->width <= 0 || box->height <= 0 || box->depth <= 0)
       return NULL;
 
-   /* what is pending on the image goes first, reads or writes */
+   /* what is pending on the image goes first, reads or writes; and what the stream holds (a copy into it) */
    if (fg_context_pending_uses(ctx, prsc))
       fg_context_flush_pending(ctx);
+   fg_submit_stream(ctx);
    if (screen->debug)
       t1 = os_time_get_nano();
 
@@ -331,11 +379,20 @@ fg_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc, unsigned l
    }
 
    if (read) {
+      size_t npix = (size_t)box->width * box->height;
+      uint8_t *wide = f->expand ? malloc(npix * 4) : NULL;
+
+      if (f->expand && !wide) {
+         free(t->staging);
+         FREE(t);
+         return NULL;
+      }
       for (int z = 0; z < box->depth; z++) {
+         uint8_t *dst = (uint8_t *)t->staging + z * t->base.layer_stride;
          struct drm_fpgagpu_read rd = {
             .handle = rsc->gem,
-            .data = (uintptr_t)((uint8_t *)t->staging + z * t->base.layer_stride),
-            .size = t->base.layer_stride,
+            .data = (uintptr_t)(wide ? wide : dst),
+            .size = wide ? npix * 4 : t->base.layer_stride,
             .x = (uint16_t)box->x,
             .y = (uint16_t)box->y,
             .w = (uint16_t)box->width,
@@ -347,11 +404,15 @@ fg_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc, unsigned l
 
          if (drmIoctl(screen->fd, DRM_IOCTL_FPGAGPU_READ, &rd)) {
             fprintf(stderr, "fpgagpu: READ of a %dx%d box failed: %s\n", box->width, box->height, strerror(errno));
+            free(wide);
             free(t->staging);
             FREE(t);
             return NULL;
          }
+         if (wide)
+            fg_pack(f, wide, dst, npix);
       }
+      free(wide);
       if (screen->debug)
          fprintf(stderr, "fpgagpu: read map %dx%dx%d: submit %.1f ms, wait %.1f ms, READ %.1f ms\n", box->width,
                  box->height, box->depth, (t1 - t0) / 1e6, (t2 - t1) / 1e6, (os_time_get_nano() - t2) / 1e6);
@@ -373,7 +434,20 @@ fg_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptransfer)
 
       if (fg_context_pending_uses(ctx, ptransfer->resource))
          fg_context_flush_pending(ctx);
-      fg_write_image(ctx, rsc, ptransfer->level, &ptransfer->box, t->staging, ptransfer->layer_stride);
+      fg_submit_stream(ctx);
+      if (rsc->fmt->expand) {
+         const struct pipe_box *b = &ptransfer->box;
+         size_t n = (size_t)b->width * b->height * b->depth;
+         uint8_t *wide = malloc(n * 4);
+
+         if (wide) {
+            fg_expand(rsc->fmt, t->staging, wide, n);
+            fg_write_image(ctx, rsc, &fg_rgba8_wire, ptransfer->level, b, wide, (uintptr_t)b->width * b->height * 4);
+            free(wide);
+         }
+      } else {
+         fg_write_image(ctx, rsc, rsc->fmt, ptransfer->level, &ptransfer->box, t->staging, ptransfer->layer_stride);
+      }
    }
    free(t->staging);
    pipe_resource_reference(&ptransfer->resource, NULL);

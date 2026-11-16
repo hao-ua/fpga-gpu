@@ -210,6 +210,9 @@ fg_screen_is_format_supported(struct pipe_screen *pscreen, enum pipe_format form
       return false;
    if (f->depth)
       return !(usage & colour_binds);
+   if (!fg_format_renderable(f) &&
+       (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT)))
+      return false; /* board B renders into RGBA8 and RGB565 only */
    return !(usage & PIPE_BIND_DEPTH_STENCIL);
 }
 

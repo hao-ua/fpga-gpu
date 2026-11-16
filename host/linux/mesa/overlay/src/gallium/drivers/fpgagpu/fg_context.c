@@ -29,6 +29,7 @@
 #include "fg_screen.h"
 
 #define FG_T_WRITE_BUFFER 0x20
+#define FG_T_COPY_IMAGE   0x25
 #define FG_STREAM_CUT     (3u << 20) /* a SUBMIT is sent once its stream passes this (the kernel takes 4 MB) */
 #define FG_PROG_A_BYTES   (4u << 20)
 #define FG_PROG_B_BYTES   (16u << 20)
@@ -104,6 +105,12 @@ fg_submit_stream(struct fg_context *ctx)
       fg_context_fenced(ctx, fence);
    ctx->ncmd = 0;
    ctx->nbos = 0;
+   if (!ctx->pass_open) {
+      /* no pass waits for a FLUSH: what the stream named is in the kernel's hands now */
+      for (unsigned i = 0; i < ctx->npass_res; i++)
+         pipe_resource_reference(&ctx->pass_res[i], NULL);
+      ctx->npass_res = 0;
+   }
 }
 
 void
@@ -303,7 +310,7 @@ fg_set_target(struct fg_context *ctx)
       return false;
    }
    f = fg_resource(c)->fmt;
-   if (!f || f->depth)
+   if (!fg_format_renderable(f))
       return false;
    memset(&t, 0, sizeof(t));
    t.color = c;
@@ -489,12 +496,50 @@ fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, un
                         unsigned dsty, unsigned dstz, struct pipe_resource *src, unsigned src_level,
                         const struct pipe_box *src_box)
 {
+   struct fg_context *ctx = fg_context(pctx);
+   struct fg_resource *s = fg_resource(src), *d = fg_resource(dst);
+
    if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
-      memcpy((uint8_t *)fg_resource(dst)->data + dstx, (uint8_t *)fg_resource(src)->data + src_box->x,
-             src_box->width);
+      memcpy((uint8_t *)d->data + dstx, (uint8_t *)s->data + src_box->x, src_box->width);
       return;
    }
-   FG_NOTE_ONCE("resource_copy_region of images");
+   if (dst->target == PIPE_BUFFER || src->target == PIPE_BUFFER || !s->fmt || !d->fmt ||
+       s->fmt->storage != d->fmt->storage || s->fmt->depth || src_box->width <= 0 || src_box->height <= 0) {
+      FG_NOTE_ONCE("resource_copy_region between a buffer and an image, of depth, or between storage formats");
+      return;
+   }
+   /* board B copies at once and renders at a FLUSH: a pass that reads or writes either image ends first */
+   if (fg_context_pending_uses(ctx, src) || fg_context_pending_uses(ctx, dst))
+      fg_end_pass(ctx);
+   for (int z = 0; z < src_box->depth; z++) {
+      uint8_t b[36];
+
+      /* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key */
+      fg_put16(b + 0, s->board_handle);
+      b[2] = (uint8_t)src_level;
+      b[3] = (uint8_t)(src_box->z + z);
+      fg_put16(b + 4, d->board_handle);
+      b[6] = (uint8_t)dst_level;
+      b[7] = (uint8_t)(dstz + z);
+      fg_put16(b + 8, src_box->x);
+      fg_put16(b + 10, src_box->y);
+      fg_put16(b + 12, src_box->width);
+      fg_put16(b + 14, src_box->height);
+      fg_put16(b + 16, dstx);
+      fg_put16(b + 18, dsty);
+      fg_put16(b + 20, src_box->width);
+      fg_put16(b + 22, src_box->height);
+      fg_put32(b + 24, 0);
+      fg_put32(b + 28, 0);
+      fg_put32(b + 32, 0);
+      fg_emit(ctx, FG_T_COPY_IMAGE, b, sizeof(b), NULL, 0);
+      /* held until submitted: the frontend often lets go of the source right after the copy */
+      fg_use_resource(ctx, src);
+      fg_use_resource(ctx, dst);
+   }
+   d->initialized = true;
+   if (!ctx->pass_open)
+      fg_submit_stream(ctx);
 }
 
 static void

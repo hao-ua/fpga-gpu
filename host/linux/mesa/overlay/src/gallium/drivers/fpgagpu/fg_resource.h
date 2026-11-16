@@ -20,7 +20,21 @@ struct fg_format {
    uint8_t bits[4];		/* R, G, B, A widths of the stored colour; 0 = no such channel */
    bool force_alpha;		/* an X channel: the stored alpha is kept at 1.0 */
    bool depth;
+   uint8_t expand;		/* FG_EXPAND_*: one board B has no storage for, kept as RGBA8 and converted on the PC */
 };
+
+/* L8, A8 and LA88 are stored as RGBA8 (L, L, L, 1), (0, 0, 0, A), (L, L, L, A): what the TMU reads is the format's */
+enum { FG_EXPAND_NONE, FG_EXPAND_L, FG_EXPAND_A, FG_EXPAND_LA };
+
+/* bytes per pixel in board memory */
+static inline unsigned
+fg_storage_bpp(const struct fg_format *f)
+{
+   return f->expand ? 4 : f->bpp;
+}
+
+/* whether board B can render into it */
+bool fg_format_renderable(const struct fg_format *f);
 
 struct fg_resource {
    struct pipe_resource base;

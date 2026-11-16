@@ -17,18 +17,21 @@
   `drm_helper.h` descriptor (before kmsro), the pipe loader's table (before kmsro, else the device falls back to
   kmsro), the dril entry point. Running it again changes nothing; it stops if an anchor line is missing.
 
-Tested on the boards (`../tools/fg_egl_clear.c`, `../tools/fg_egl_draw.c`): an OpenGL ES 2.0 context on the device,
-chosen by the loader from the kernel driver's name (no `MESA_LOADER_DRIVER_OVERRIDE`); vertex and fragment shaders
-compiled for the two cores; triangles with vertices streamed into a ring on board A, interpolated varyings, a
-nearest-filtered 2D texture, alpha blending; render passes ending in a FLUSH with the hardware's clear; reads of
-images (`glReadPixels`) through `READ`, writes (`glTexImage2D`) through `WRITE_IMAGE`.
+Tested on the boards (`../tools/fg_egl_clear.c`, `fg_egl_draw.c`, `fg_egl_gl.c`): an OpenGL ES 2.0 context and a
+desktop OpenGL 1.3 compatibility context on the device, chosen by the loader from the kernel driver's name (no
+`MESA_LOADER_DRIVER_OVERRIDE`); vertex and fragment shaders compiled for the two cores, fixed function included;
+triangles with vertices streamed into a ring on board A, `glDrawElements` with 32-bit indices far from 0 (rebased to
+16 bits), quads through Gallium's primitive converter, interpolated varyings, textures (RGBA, RGB; nearest; mip
+levels uploaded one by one, the chain grown with `COPY_IMAGE`), multitexture, alpha blending, alpha test, depth test
+with `glDepthRange`; render passes ending in a FLUSH with the hardware's clear; reads of images (`glReadPixels`)
+through `READ`, writes (`glTexImage2D`) through `WRITE_IMAGE`. L8, A8 and LA88 are stored as RGBA8 and converted on
+the PC (board B has no such storage).
 
-Written, not tested yet: indexed draws (16-bit indices in the ring), points and lines, quads and polygons through
-Gallium's primitive converter, depth, stencil, scissor, polygon offset, culling, cube maps, mipmaps, linear filtering,
-clears inside a pass drawn as quads.
+Written, not tested yet: points and lines, stencil, scissor, polygon offset, culling, cube maps, linear filtering,
+clears inside a pass drawn as quads, draws whose indices span more than 16 bits.
 
-Not yet: blits, image copies, mipmap generation, queries, instancing, importing buffers, rendering into a level or
-layer above 0 or a target wider than 1280, more than one context drawing at a time.
+Not yet: blits, copies between buffers and images, mipmap generation, queries, instancing, importing buffers,
+rendering into a level or layer above 0 or a target wider than 1280, more than one context drawing at a time.
 
 ## Apply and build
 
@@ -57,7 +60,10 @@ LD_LIBRARY_PATH=$L ./fg_egl_clear
 
 `host/linux/tools/fg_egl_draw.c` (built the same way): draws in the same context, read back and checked: a solid
 triangle (with a map of the target), a triangle with interpolated colours, a 2 x 2 texture over the target, and a
-blend of white at alpha 0.5 over black.
+blend of white at alpha 0.5 over black. `host/linux/tools/fg_egl_gl.c` (linked with `-lGL` instead of
+`-lGLESv2`): desktop OpenGL with fixed function the way Quake 3 engines draw: `glBegin(GL_QUADS)`, client arrays
+with `glDrawElements(GL_UNSIGNED_INT)` and two texture units, alpha test, depth test with `glDepthRange`, a mip chain
+uploaded level by level.
 
 `FPGAGPU_DEBUG=1` prints the boards' flags when the screen is created and, for each read map, the time spent on the
 submission, the wait and the `READ`. `FPGAGPU_SHADERS=1` prints each compiled program's assembler text.

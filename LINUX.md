@@ -206,9 +206,15 @@ counters and the last STATUS.
   - a board-B image created, filled with `SUBMIT`, fenced and read back (every pixel);
   - a board-A buffer written and read back byte-exact;
   - `MEM_WRITE` refused with EPERM, and a handle missing from the BO list refused with EACCES.
-- KMS registers card1 with HDMI-A-1 connected and the five modes. The VPS's X server (lightdm's Xorg) took card1 as a
-  GPU screen and holds DRM master, so `modetest` cannot set a mode, and nothing has been shown on board B's monitor
-  yet.
+- KMS registers card1 with HDMI-A-1 connected and the five modes.
+  - The VPS's X server (lightdm's Xorg) takes card1 as a GPU screen and holds DRM master.
+  - X cannot be extended onto it: X there runs without glamor (llvmpipe), so its main screen cannot feed a second GPU
+    (both providers are "Sink Output" only).
+  - With lightdm stopped for a minute, `modetest -M fpgagpu -s 35:800x600` set the mode and held its pattern 30 s.
+    Board B's STATUS then showed mode 1 (800×600) presenting image 1000 (the driver's scanout image), 0 underruns,
+    0 mode errors, 0 command errors.
+  - About 6 full screens (12.5 MB) crossed the relay in that minute: the pattern, and fbdev restoring its console
+    whenever a client let go.
 
 | phase | state |
 |---|---|

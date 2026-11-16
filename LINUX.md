@@ -204,6 +204,9 @@ counters and the last STATUS.
   - Keyboard and mouse: Deskflow. The server runs on Windows, the client (`deskflow-client`, Debian's 1.22) in the VM's
     X, started by `start-x-fpgagpu.sh` with `DESKFLOW_SERVER=172.20.96.1` (the Default Switch's Windows address); the
     pointer crosses from the Windows screen onto board B's monitor and back. X itself opens no input devices.
+  - Games (OpenArena): turn on the server's relative mouse moves and lock the pointer to the VM's screen with Scroll
+    Lock. Otherwise the absolute pointer reaches the screen's edge and crosses to Windows, and on every crossing the
+    Deskflow client takes X's keyboard focus, so the game loses its focus and its mouse grab.
 - **One sender:** while the module or the relay is in use it is the boards' sender. The Windows libraries and the
   `host/fb` tools on the PC must not run at the same time; stop the relay first.
 - **Not in scope yet:** the one-board build (its memory map and STATUS flags bit 29); a different heap layout.
@@ -249,6 +252,9 @@ counters and the last STATUS.
   - The pointer lagged and looked half transparent while moving: X drew it in software, each move a few render passes
     on the boards into the image being shown. The cursor plane above fixed it.
 - `xwd -root` reads the whole 800×600 screen back from board B in about 0.4 s, colours exact.
+- OpenArena as a client of that X (SDL x11, GLX through DRI3): the timedemo `demo088-test1` (640×480 windowed,
+  `cl_renderer opengl1`) runs at 15.4 frames a second (3398 frames in 220 s; through the relay it was 0.7, the Windows
+  libraries do about 31). Full screen at 800×600 it is playable with Deskflow's relative moves and Scroll Lock.
 
 **2026-11-16, later:** the module was reloaded with the zero-copy flips (1d67aa3). During a Mesa rebuild the VPS's kernel
 oopsed in ext4 (`ext4_mb_load_buddy_gfp`, a NULL dereference while meson deleted a file); filesystem operations hung

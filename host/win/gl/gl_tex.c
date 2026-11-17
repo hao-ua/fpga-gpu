@@ -133,7 +133,9 @@ static uint16_t rt_bind(gl_tex *t, int level, int face, int w, int h, int ds)
     if (t->rt && (t->rt_w != w || t->rt_h != h)) { gl_tex_resolve(t); gl_tex_rt_drop(t); }
     if (t->rt && (t->rt_level != level || t->rt_face != face)) { gl_tex_resolve(t); load = 1; }
     if (!t->rt) {
-        if (g2r_image_create(D.r, &t->rt, &t->rt_base, (uint32_t)w, (uint32_t)h, t->hwfmt, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER) < 0) { t->rt = 0; return 0; }
+        /* a depth texture's: its D24S8 alias renders depth and stencil, at the rows board B needs */
+        if ((ds ? g2r_image_create_ds_rows(D.r, &t->rt, &t->rt_base, (uint32_t)w, (uint32_t)h, t->hwfmt, 1, G2_USE_RT | G2_USE_TRANSFER)
+                : g2r_image_create(D.r, &t->rt, &t->rt_base, (uint32_t)w, (uint32_t)h, t->hwfmt, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER)) < 0) { t->rt = 0; return 0; }
         t->rt_w = w; t->rt_h = h;
         load = 1;
     }
@@ -142,7 +144,7 @@ static uint16_t rt_bind(gl_tex *t, int level, int face, int w, int h, int ds)
         rt_copy(t, 0);
         t->rt_rev = t->rev;
     }
-    if (ds && !t->rt_ds && g2r_image_alias(D.r, &t->rt_ds, t->rt_base, (uint32_t)w, (uint32_t)h, G2_FMT_D24S8, ((uint32_t)w * 4 + 31) & ~31u, 1, 1, G2_USE_RT) < 0) { t->rt_ds = 0; return 0; }
+    if (ds && !t->rt_ds && g2r_image_alias(D.r, &t->rt_ds, t->rt_base, (uint32_t)w, (uint32_t)h, G2_FMT_D24S8, g2r_ds_pitch((uint32_t)w), 1, 1, G2_USE_RT) < 0) { t->rt_ds = 0; return 0; }
     t->rt_dirty = 1;
     return t->rt;
 }
@@ -1567,7 +1569,7 @@ static GLenum fbo_status(gl_fbo *f, g2r_target *t, int bind)
     } else if (dt) {                                            /* a depth texture is the memory of a D24S8 target: the same bytes under a second name, which needs B's pitch */
         if ((uint32_t)dl->w != t->width || (uint32_t)dl->h != t->height) return GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS_EXT;
         if (dl->w > 1280) return GL_FRAMEBUFFER_UNSUPPORTED_EXT;
-        if (tex_direct(dt, f->depth_level)) {
+        if (tex_direct(dt, f->depth_level) && (uint32_t)dt->w * 4 == g2r_ds_pitch((uint32_t)dt->w)) {     /* its tight rows are long enough */
             if (!dt->ds_alias) {
                 uint16_t hd;
                 if (g2r_image_alias(D.r, &hd, dt->base, (uint32_t)dt->w, (uint32_t)dt->h, G2_FMT_D24S8, (uint32_t)dt->w * 4, 1, 1, G2_USE_RT) < 0) return GL_FRAMEBUFFER_UNSUPPORTED_EXT;

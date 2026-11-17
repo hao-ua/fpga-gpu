@@ -484,12 +484,14 @@ static void tex_drop_rt(es_tex *t)
     t->rt = 0; t->rt_dirty = t->rt_stale = 0;
 }
 
-/* what a framebuffer renders in when it cannot be the texture: another level, another layer, a pitch that is no multiple of 32 */
-static int tex_rt(es_tex *x, int face, int level, int w, int h)
+/* what a framebuffer renders in when it cannot be the texture: another level, another layer, a pitch that is no multiple of 32; for a depth
+   texture (ds) rows as long as board B loads a depth row, which its D24S8 alias renders through */
+static int tex_rt(es_tex *x, int face, int level, int w, int h, int ds)
 {
     if (x->rt && (x->rt_w != w || x->rt_h != h)) { tex_resolve(x); if (x->rt_ds) { g2r_end_pass(S.r); g2r_alias_destroy(S.r, x->rt_ds); x->rt_ds = 0; } g2r_end_pass(S.r); g2r_image_destroy(S.r, x->rt, x->rt_base); x->rt = 0; x->rt_stale = 0; }
     if (!x->rt) {
-        if (g2r_image_create(S.r, &x->rt, &x->rt_base, (uint32_t)w, (uint32_t)h, x->g2fmt, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER) < 0) { x->rt = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
+        if ((ds ? g2r_image_create_ds_rows(S.r, &x->rt, &x->rt_base, (uint32_t)w, (uint32_t)h, x->g2fmt, 1, G2_USE_RT | G2_USE_TRANSFER)
+                : g2r_image_create(S.r, &x->rt, &x->rt_base, (uint32_t)w, (uint32_t)h, x->g2fmt, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER)) < 0) { x->rt = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
         x->rt_stale = 1; x->rt_face = face; x->rt_level = level; x->rt_w = w; x->rt_h = h;
     }
     if (x->rt_face != face || x->rt_level != level) { tex_resolve(x); x->rt_face = face; x->rt_level = level; x->rt_stale = 1; }
@@ -502,14 +504,14 @@ static int bind_target(es_tg *g)
 {
     if (fb_target(g) != GL_FRAMEBUFFER_COMPLETE) { SET_ERR(GL_INVALID_FRAMEBUFFER_OPERATION); return -1; }
     if (g->tex && (tex_needs_rt(g->tex) || g->level)) {
-        if (tex_rt(g->tex, g->face, g->level, (int)g->t.width, (int)g->t.height) < 0) return -1;
+        if (tex_rt(g->tex, g->face, g->level, (int)g->t.width, (int)g->t.height, 0) < 0) return -1;
         g->t.color = g->tex->rt;
     }
     if (g->dtex) {
         es_tex *x = g->dtex;
-        if (tex_needs_rt(x)) {
-            if (tex_rt(x, 0, 0, x->w, x->h) < 0) return -1;
-            if (!x->rt_ds && g2r_image_alias(S.r, &x->rt_ds, x->rt_base, (uint32_t)x->w, (uint32_t)x->h, G2_FMT_D24S8, ((uint32_t)x->w * 4 + 31) & ~31u, 1, 1, G2_USE_RT) < 0) { x->rt_ds = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
+        if (tex_needs_rt(x) || (uint32_t)x->w * 4 != g2r_ds_pitch((uint32_t)x->w)) {     /* its tight rows are shorter than a depth row of board B */
+            if (tex_rt(x, 0, 0, x->w, x->h, 1) < 0) return -1;
+            if (!x->rt_ds && g2r_image_alias(S.r, &x->rt_ds, x->rt_base, (uint32_t)x->w, (uint32_t)x->h, G2_FMT_D24S8, g2r_ds_pitch((uint32_t)x->w), 1, 1, G2_USE_RT) < 0) { x->rt_ds = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
             g->t.ds = x->rt_ds;
         } else {
             if (!x->ds_alias && g2r_image_alias(S.r, &x->ds_alias, x->base, (uint32_t)x->w, (uint32_t)x->h, G2_FMT_D24S8, (uint32_t)x->w * 4, 1, 1, G2_USE_RT) < 0) { x->ds_alias = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }

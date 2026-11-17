@@ -2744,6 +2744,101 @@ static void test_depth_textures(void)
     err(GL_NO_ERROR, "depth textures");
 }
 
+/* every pixel of a 200 x 40 target: the left half (x < 100) one colour, the right half another */
+static void halves(const char *what, int r0, int g0, int b0, int r1, int g1, int b1)
+{
+    static uint8_t c[4 * 200 * 40];
+    int i, bad = 0, first = -1;
+    memset(c, 0x5A, sizeof c);
+    glReadPixels(0, 0, 200, 40, GL_RGBA, GL_UNSIGNED_BYTE, c);
+    for (i = 0; i < 200 * 40; i++) {
+        const uint8_t *q = c + 4 * i;
+        int l = i % 200 < 100, r = l ? r0 : r1, g = l ? g0 : g1, b = l ? b0 : b1;
+        if (abs(q[0] - r) > 2 || abs(q[1] - g) > 2 || abs(q[2] - b) > 2) { if (first < 0) first = i; bad++; }
+    }
+    g_checks++;
+    if (bad) {
+        g_bad++;
+        printf("FAIL %s: %d of 8000 pixels wrong, the first (%d, %d) = %d %d %d\n", what, bad, first % 200, first / 200, c[4 * first], c[4 * first + 1], c[4 * first + 2]);
+    }
+}
+
+/* a depth-stencil image beside an RGB565 target whose rows are no multiple of 16 pixels: board B loads a depth row in twice the colour row's
+   bursts (200 pixels: 13 bursts of colour, 26 of depth = 832 bytes, more than 200 x 4) and refuses a shorter pitch */
+static void test_ds_rows(void)
+{
+    static const char FS_R[] = "precision mediump float; varying vec2 v_uv; uniform sampler2D t; void main() { gl_FragColor = vec4(texture2D(t, v_uv).rrr, 1.0); }\n";
+    GLuint fb, rc, rd, c, d, p;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glViewport(0, 0, 200, 40);
+
+    /* renderbuffers: RGB565 and DEPTH24_STENCIL8 */
+    glGenRenderbuffers(1, &rc);
+    glBindRenderbuffer(GL_RENDERBUFFER, rc);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB565, 200, 40);
+    glGenRenderbuffers(1, &rd);
+    glBindRenderbuffer(GL_RENDERBUFFER, rd);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 200, 40);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rc);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rd);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rd);
+    ieq((int)glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE, "RGB565 200 x 40 with DEPTH24_STENCIL8");
+    glClearColor(0, 0, 0, 1); glClearDepthf(1.0f); glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST); glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_ALWAYS, 1, 255); glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    zcolor(0.0f, 1, 0, 0, 1);                                   /* depth 0.5, stencil 1 everywhere */
+    full(g_zcol_prog);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    zcolor(0.5f, 0, 1, 0, 1);                                   /* behind: nowhere */
+    full(g_zcol_prog);
+    glStencilFunc(GL_EQUAL, 1, 255);
+    zcolor(-0.5f, 0, 0, 1, 1);                                  /* in front, where the stencil is 1: the left half */
+    rect(g_zcol_prog, -1, -1, 0, 1);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST);
+    glStencilFunc(GL_ALWAYS, 0, 255);
+    halves("RGB565 200 wide, depth and stencil renderbuffer", 0, 0, 255, 255, 0, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+
+    /* textures: RGB565 colour (rendered in an image of its own: 400-byte rows) and a depth texture whose own rows (800 bytes) are short */
+    c = make_tex(GL_RGB, GL_UNSIGNED_SHORT_5_6_5, 200, 40, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
+    d = make_tex(GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 200, 40, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, d, 0);
+    ieq((int)glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE, "RGB565 texture 200 x 40 with a depth texture");
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    zcolor(0.0f, 1, 0, 0, 1);
+    full(g_zcol_prog);
+    zcolor(0.5f, 0, 1, 0, 1);
+    full(g_zcol_prog);
+    zcolor(-0.5f, 0, 0, 1, 1);
+    rect(g_zcol_prog, -1, -1, 0, 1);
+    glDisable(GL_DEPTH_TEST);
+    halves("RGB565 texture 200 wide, depth texture", 0, 0, 255, 255, 0, 0);
+    /* the depth texture as rendered: 0.25 on the left, 0.5 on the right */
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, rc);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 200, 40);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rc);
+    p = prog(VS, FS_R);
+    glBindTexture(GL_TEXTURE_2D, d);
+    full(p);
+    halves("the depth texture 200 wide sampled", 64, 64, 64, 128, 128, 128);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, W, H);
+    glDeleteProgram(p);
+    glDeleteTextures(1, &c);
+    glDeleteTextures(1, &d);
+    glDeleteRenderbuffers(1, &rc);
+    glDeleteRenderbuffers(1, &rd);
+    glDeleteFramebuffers(1, &fb);
+    err(GL_NO_ERROR, "depth rows beside RGB565");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -2823,6 +2918,7 @@ int main(void)
     test_etc1();
     test_tex3d();
     test_depth_textures();
+    test_ds_rows();
     test_blit();
     test_program_binary();
     test_queries_and_stack();

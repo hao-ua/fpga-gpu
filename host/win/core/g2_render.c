@@ -172,12 +172,19 @@ static int handle_take(g2r *r, uint16_t *hd)
     return g2_handle_alloc(&r->h_img, G2_HK_IMG_B, hd);
 }
 
+/* board B loads and stores a depth-stencil row in as many 32-byte bursts as its colour target's row takes, times the bursts of a 16-pixel group
+   (two for a 16-bit colour format), and refuses a FLUSH whose depth-stencil pitch is shorter. A multiple of 64 bytes holds that for a colour
+   target of the same width in any format, at the pitch g2r_image_create gives it or at tight rows */
+uint32_t g2r_ds_pitch(uint32_t w) { return (w * 4 + 63) & ~63u; }
+
 static int image_alloc(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage, int tight, int bump)
 {
     uint32_t bpp = g2_storage_bpp(fmt), pitch, bytes, a;
     uint16_t hd;
-    /* a mip chain has tight rows; a single level gets a pitch that is a multiple of 32, as render targets and scanout need */
-    pitch = tight || levels > 1 || layers > 1 ? w * bpp : (w * bpp + 31) & ~31u;
+    /* a mip chain has tight rows; a single level gets a pitch that is a multiple of 32, as render targets and scanout need, and a depth-stencil
+       image (or the image whose bytes one aliases: tight 2) the pitch board B loads its rows at */
+    if (tight == 2 || (fmt == G2_FMT_D24S8 && !tight && levels == 1 && layers == 1)) pitch = g2r_ds_pitch(w);
+    else pitch = tight || levels > 1 || layers > 1 ? w * bpp : (w * bpp + 31) & ~31u;
     bytes = levels > 1 || layers > 1 ? g2_image_bytes(w, h, bpp, levels, layers) : pitch * h;
     if (handle_take(r, &hd) < 0) return -1;
     /* board B renders in bands of up to 8 rows and loads and stores every row of the last band (b_rop), also past an image
@@ -205,6 +212,11 @@ int g2r_image_create(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint3
 int g2r_image_create_tight(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage)
 {
     return image_create(r, handle, base, w, h, fmt, levels, layers, origin, usage, 1);
+}
+
+int g2r_image_create_ds_rows(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, int origin, uint32_t usage)
+{
+    return image_create(r, handle, base, w, h, fmt, 1, 1, origin, usage, 2);
 }
 
 int g2r_a_build(g2r *r)
@@ -289,8 +301,8 @@ void g2r_image_retire(g2r *r, uint16_t handle, uint32_t base)
 }
 
 /* A copy of the image under a new handle, which the caller then changes: draws of the open pass keep sampling the old one, which is retired.
-   Every level in level_mask (bit l: level l; levels the caller rewrites whole need no copy) of every layer is copied on board B. tight: the
-   layout of g2r_image_create_tight. The new handle starts no new draw-id generation: it is one no draw state of this generation names.
+   Every level in level_mask (bit l: level l; levels the caller rewrites whole need no copy) of every layer is copied on board B. tight: 1 the
+   layout of g2r_image_create_tight, 2 that of g2r_image_create_ds_rows. The new handle starts no new draw-id generation: it is one no draw state of this generation names.
    <0: no room (the caller ends the pass instead) */
 int g2r_image_rename(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage, int tight,
                      uint32_t level_mask)

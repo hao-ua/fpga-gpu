@@ -72,6 +72,11 @@ void g2r_free_a(g2r *r, uint32_t base);
 int g2r_image_create(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage);
 /* tight rows on a single level: what a texture needs, the TMU's descriptor has no pitch. g2r_image_create gives a single level a pitch that is a multiple of 32, for render targets and scanout */
 int g2r_image_create_tight(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage);
+/* the pitch of a depth-stencil image w wide (g2r_image_create gives a D24S8 image this one): board B loads and stores a depth row in as many bursts
+   as the colour row times the bursts of a 16-pixel group, twice for a 16-bit colour format. A D24S8 alias over other memory needs rows this long */
+uint32_t g2r_ds_pitch(uint32_t w);
+/* a single level whose rows are g2r_ds_pitch(w) long: a 4-byte image (RGBA8) whose bytes a D24S8 alias renders as depth and stencil */
+int g2r_image_create_ds_rows(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, int origin, uint32_t usage);
 /* 3D textures in the TMU (a board B built with them); GPU2_NO_3D=1 says no whatever the board. Limits G2R_VOL_WH, G2R_VOL_D. Destroy with g2r_image_destroy, an alias with g2r_alias_destroy */
 #define G2R_VOL_WH 256
 #define G2R_VOL_D 255
@@ -82,7 +87,7 @@ int g2r_volume_alias(g2r *r, uint16_t *handle, uint32_t base, uint32_t w, uint32
 void g2r_image_destroy(g2r *r, uint16_t handle, uint32_t base);
 /* an image the open pass may still sample: its descriptor goes now, its memory once the pass's FLUSH is sent (draws already given keep their texels) */
 void g2r_image_retire(g2r *r, uint16_t handle, uint32_t base);
-/* copy-on-write: the image (made by g2r_image_create, or g2r_image_create_tight when tight, with these parameters) copied on board B under a new
+/* copy-on-write: the image (made by g2r_image_create, or g2r_image_create_tight when tight is 1, g2r_image_create_ds_rows when 2, with these parameters) copied on board B under a new
    handle, the old one retired — what an application changes after the pass sampled it, without ending the pass. level_mask: bit l = copy level l
    (of every layer); a level the caller rewrites whole needs none. <0: no room */
 int g2r_image_rename(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage, int tight,

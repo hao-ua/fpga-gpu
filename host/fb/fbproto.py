@@ -43,6 +43,8 @@ AT_GL = {0x1400: AT_BYTE, 0x1401: AT_UBYTE, 0x1402: AT_SHORT, 0x1403: AT_USHORT,
 CUR_SHAPE, CUR_SHOW, CUR_HIDE, CUR_MOVE = 1, 2, 3, 4          # CURSOR ops
 CUR_COLOR, CUR_ANDXOR, CUR_PREMUL = 0, 1, 2                   # cursor modes
 COPY_MIRROR_X, COPY_MIRROR_Y, COPY_KEY = 1, 2, 4               # COPY_IMAGE flags
+# (board B STATUS flags bit 14): alpha = 255, swizzle (selects in bits 15:8), a tile (phase in the key-low word), a list
+COPY_ALPHA_ONE, COPY_SWIZZLE, COPY_TILE, COPY_LIST = 8, 16, 32, 64
 MASK_R, MASK_G, MASK_B, MASK_A = 1, 2, 4, 8                    # FILL_IMAGE channel mask
 # board -> host
 R_ACK, R_STATUS, R_EVENT, R_READ_DATA, R_PHY_REG, R_REG = 0x81, 0x82, 0x83, 0x84, 0x85, 0x86
@@ -326,7 +328,8 @@ def format_ip(st):
 def decode_b_flags(f):
     return {"calib": f & 1, "mmcm_locked": (f >> 1) & 1, "video": (f >> 2) & 1, "mode_busy": (f >> 3) & 1,
             "mode": (f >> 4) & 7, "image_shown": (f >> 7) & 1, "fill_done": (f >> 8) & 1, "lock_fail": (f >> 11) & 1,
-            "cp_busy": (f >> 12) & 1, "band_next": (f >> 13) & 1, "cur_img": (f >> 16) & 1023, "render_busy": (f >> 26) & 1,
+            "cp_busy": (f >> 12) & 1, "band_next": (f >> 13) & 1, "copy_ext": (f >> 14) & 1, "cur_img": (f >> 16) & 1023,
+            "render_busy": (f >> 26) & 1,
             "fs_stack_err": (f >> 27) & 1, "xsfu": (f >> 28) & 1, "xclamp": (f >> 29) & 1,
             # the fragment core lacks the integer divider / SIN / COS (glslc noops for the fragment stage: (f >> 30) & 3)
             "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}
@@ -1007,15 +1010,29 @@ class Board:
                                                        x, y, w, h, value & 0xFFFFFFFF))
 
     def copy_image(self, src, dst, sx, sy, sw, sh, dx, dy, dw=None, dh=None, mirror_x=False, mirror_y=False,
-                   key=None, slevel=0, slayer=0, dlevel=0, dlayer=0):
+                   key=None, slevel=0, slayer=0, dlevel=0, dlayer=0, alpha_one=False, swizzle=None, tile=None, rects=None):
         """COPY_IMAGE (DirectDraw Blt): stretch when (dw, dh) != (sw, sh) (nearest, pixel centres), mirrors, source
-        colour key = (low, high) stored values, per channel inclusive (alpha ignored)."""
+        colour key = (low, high) stored values, per channel inclusive (alpha ignored). On a board B with STATUS flags bit
+        14 also: alpha_one (an RGBA8 destination's alpha = 255); swizzle = (r, g, b, a) source channels 0..3 for the
+        destination's R, G, B, A; tile = (px, py): the source rectangle repeats over the destination rectangle from that
+        phase (not with mirrors or a key); rects = [(dx, dy, w, h), ...]: more 1:1 rectangles, each from (dx, dy) + (sx - dx,
+        sy - dy) of the first (not with mirrors or a tile; alpha_one, swizzle and the key apply to all). Not alpha_one /
+        swizzle with RGBA4444 / RGBA5551 / P8 images."""
         dw = sw if dw is None else dw
         dh = sh if dh is None else dh
         flags = (COPY_MIRROR_X if mirror_x else 0) | (COPY_MIRROR_Y if mirror_y else 0) | (COPY_KEY if key else 0)
         lo, hi = key if key else (0, 0)
+        if alpha_one: flags |= COPY_ALPHA_ONE
+        if swizzle is not None:
+            flags |= COPY_SWIZZLE | sum((s & 3) << (8 + 2 * c) for c, s in enumerate(swizzle))
+        if tile is not None:
+            flags |= COPY_TILE; lo, hi = (tile[0] & 0x1FFF) | (tile[1] & 0x1FFF) << 16, 0
+        tail = b""
+        if rects is not None:
+            flags |= COPY_LIST
+            tail = b"".join(struct.pack("<HHHH", x, y, w, h) for x, y, w, h in rects)
         return self.send_seq(T_COPY_IMAGE, struct.pack("<HBBHBBHHHHHHHHIII", src, slevel, slayer, dst, dlevel, dlayer,
-                                                       sx, sy, sw, sh, dx, dy, dw, dh, flags, lo, hi))
+                                                       sx, sy, sw, sh, dx, dy, dw, dh, flags, lo, hi) + tail)
 
     # ------------------------------------------------------------------ palette and hardware cursor
     def set_palette(self, first, colors):

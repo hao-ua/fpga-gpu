@@ -132,6 +132,7 @@ module board_b_core
     wire [12:0] xf_sx, xf_sy, xf_sw, xf_sh, xf_dx, xf_dy, xf_dw, xf_dh, xf_hq, xf_hu0, xf_vq, xf_vu0, xf_j0, xf_i0;
     wire [13:0] xf_hr2, xf_ha0, xf_vr2, xf_va0; wire [31:0] xf_klo, xf_khi, xf_val, xo_d, xf_ops, xf_pixels;
     wire [3:0]  xf_mask; wire [7:0] xf_tf; wire [23:0] xf_np;
+    wire        xf_a1, xf_swz, xf_wrap; wire [7:0] xf_swz_sel; wire [12:0] xf_px, xf_py;
     img_xfer u_xf (
         .clk(clk_sys), .rst(rst_ddr), .cmd_valid(xf_cv), .cmd_ready(xf_crdy), .cmd_op(xf_op),
         .cmd_s_row0(xf_s0), .cmd_s_pitch(xf_sp), .cmd_s_fmt(xf_sf), .cmd_s_x(xf_sx), .cmd_s_y(xf_sy), .cmd_s_w(xf_sw),
@@ -140,6 +141,7 @@ module board_b_core
         .cmd_hr2(xf_hr2), .cmd_ha0(xf_ha0), .cmd_vr2(xf_vr2), .cmd_va0(xf_va0), .cmd_mir_x(xf_mx), .cmd_mir_y(xf_my),
         .cmd_bottom_up(xf_bup), .cmd_key(xf_key), .cmd_key_lo(xf_klo), .cmd_key_hi(xf_khi), .cmd_value(xf_val),
         .cmd_mask(xf_mask), .cmd_rmw(xf_rmw), .cmd_tfmt(xf_tf), .cmd_j0(xf_j0), .cmd_i0(xf_i0), .cmd_npix(xf_np),
+        .cmd_alpha1(xf_a1), .cmd_swz(xf_swz), .cmd_swz_sel(xf_swz_sel), .cmd_wrap(xf_wrap), .cmd_px(xf_px), .cmd_py(xf_py),
         .busy(xf_busy), .o_valid(xo_v), .o_data(xo_d), .o_ready(xo_rdy), .c_ops(xf_ops), .c_pixels(xf_pixels),
         .r_en(r_en[1]), .r_addr(r_addr[57:29]), .r_rdy(r_rdy[1]), .r_valid(r_valid[1]), .rd_data(rd_data),
         .w_req(w_req[2]), .w_en(w_en[2]), .w_addr(w_addr[86:58]), .w_data(w_data[767:512]), .w_mask(w_mask[95:64]),
@@ -315,6 +317,7 @@ module board_b_core
         .xf_vr2(xf_vr2), .xf_va0(xf_va0), .xf_mir_x(xf_mx), .xf_mir_y(xf_my), .xf_bottom_up(xf_bup), .xf_key(xf_key),
         .xf_rmw(xf_rmw), .xf_key_lo(xf_klo), .xf_key_hi(xf_khi), .xf_value(xf_val), .xf_mask(xf_mask), .xf_tfmt(xf_tf),
         .xf_j0(xf_j0), .xf_i0(xf_i0), .xf_npix(xf_np), .xf_busy(xf_busy), .xo_valid(xo_v), .xo_data(xo_d), .xo_ready(xo_rdy),
+        .xf_alpha1(xf_a1), .xf_swz(xf_swz), .xf_swz_sel(xf_swz_sel), .xf_wrap(xf_wrap), .xf_px(xf_px), .xf_py(xf_py),
         .set_mode(c_set_mode), .set_mode_id(c_set_mode_id), .mode_busy(mode_busy), .mode_done(mode_done),
         .mode_ok(mode_ok), .video_on(video_on), .frames(st_frames),
         .pres_valid(c_pres_valid), .pres_base(c_pres_base), .pres_pitch(c_pres_pitch), .pres_w(c_pres_w),
@@ -395,8 +398,9 @@ module board_b_core
     // [29] it has CLAMP (constants of the build; 0 on a board B built without them — a program with those opcodes
     // there issues them as no-ops); [30] / [31] the fragment core lacks the integer divider / SIN / COS (the libraries'
     // compilers then replace those ops): this core has both, so 0; [13] the band preload follows the next band a BAND item
-    // names (board A may then leave bands out: the libraries set FLUSH flags bit 10 only with it)
-    wire [31:0] flags = {2'h0, B3D_XCLAMP, B3D_XSFU, rd_err_stack, rd_busy, cur_tag[9:0], 2'h0, 1'b1, cp_busy, lock_fail, key_down, x_busy, fill_done, cur_valid, cur_mode,
+    // names (board A may then leave bands out: the libraries set FLUSH flags bit 10 only with it); [14] COPY_IMAGE takes
+    // flags 3..6 (alpha = 255, swizzle, tile, list) and runs one job while the next waits
+    wire [31:0] flags = {2'h0, B3D_XCLAMP, B3D_XSFU, rd_err_stack, rd_busy, cur_tag[9:0], 1'b0, 1'b1, 1'b1, cp_busy, lock_fail, key_down, x_busy, fill_done, cur_valid, cur_mode,
                          mode_busy, video_on, mmcm_locked, calib_done};
     wire [31:0] lflags = {l_eye, l_phase, 8'h0, 1'b0, l_guard_fail, l_tx_enabled, l_training, l_far_up, l_trained,
                           l_lock, 1'b0};

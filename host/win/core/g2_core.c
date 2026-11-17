@@ -1586,6 +1586,50 @@ g2_ref g2_copy_image(g2_board *b, uint16_t src, uint16_t dst, uint32_t sx, uint3
     return g2_send_seq(b, G2_T_COPY_IMAGE, d, sizeof d);
 }
 
+/* the 36-byte COPY_IMAGE body with the options' flags; the tile's phase in the key-low word */
+static void copy_head(pk *k, g2_board *b, uint16_t src, uint16_t dst, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint32_t dx,
+                      uint32_t dy, uint32_t dw, uint32_t dh, const g2_copy_opts *o, uint32_t extra)
+{
+    uint32_t f = (o->flags & 0x7Fu) | extra, lo = 0, hi = 0, c;
+    if (f & G2_COPY_SWIZZLE) for (c = 0; c < 4; c++) f |= (uint32_t)(o->swizzle[c] & 3u) << (8 + 2 * c);
+    if (f & G2_COPY_KEY) { lo = o->key_lo; hi = o->key_hi; }
+    if (f & G2_COPY_TILE) { lo = (o->tile_px & 0x1FFFu) | (o->tile_py & 0x1FFFu) << 16; hi = 0; }
+    src = phys_of(b, src); dst = phys_of(b, dst);
+    p16(k, src); p8(k, o->slevel); p8(k, o->slayer); p16(k, dst); p8(k, o->dlevel); p8(k, o->dlayer);
+    p16(k, sx); p16(k, sy); p16(k, sw); p16(k, sh); p16(k, dx); p16(k, dy); p16(k, dw); p16(k, dh);
+    p32(k, f); p32(k, lo); p32(k, hi);
+}
+
+g2_ref g2_copy_image_ex(g2_board *b, uint16_t src, uint16_t dst, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint32_t dx, uint32_t dy,
+                        uint32_t dw, uint32_t dh, const g2_copy_opts *o)
+{
+    uint8_t d[36];
+    pk k = { d };
+    b->vstamp++;
+    copy_head(&k, b, src, dst, sx, sy, sw, sh, dx, dy, dw, dh, o, 0);
+    return g2_send_seq(b, G2_T_COPY_IMAGE, d, sizeof d);
+}
+
+#define G2_COPY_LIST_MAX 160                       /* pairs per COPY_IMAGE: 36 + 8 * 159 bytes stay inside one datagram */
+g2_ref g2_copy_rects(g2_board *b, uint16_t src, uint16_t dst, int32_t ox, int32_t oy, const uint32_t *rects, uint32_t n, const g2_copy_opts *o)
+{
+    uint8_t d[36 + 8 * G2_COPY_LIST_MAX];
+    g2_ref ref = { 0, 0 };
+    uint32_t i = 0;
+    b->vstamp++;
+    while (i < n) {
+        uint32_t m = (n - i > G2_COPY_LIST_MAX) ? G2_COPY_LIST_MAX : n - i, j;
+        const uint32_t *r = rects + 4 * i;
+        pk k = { d };
+        copy_head(&k, b, src, dst, (uint32_t)((int32_t)r[0] + ox), (uint32_t)((int32_t)r[1] + oy), r[2], r[3], r[0], r[1], r[2], r[3], o,
+                  m > 1 ? (uint32_t)G2_COPY_LIST : 0u);
+        for (j = 1; j < m; j++) { p16(&k, r[4 * j]); p16(&k, r[4 * j + 1]); p16(&k, r[4 * j + 2]); p16(&k, r[4 * j + 3]); }
+        ref = g2_send_seq(b, G2_T_COPY_IMAGE, d, (size_t)(k.p - d));
+        i += m;
+    }
+    return ref;
+}
+
 /* ---------------------------------------------------------------- palette and hardware cursor */
 g2_ref g2_set_palette(g2_board *b, uint32_t first, const uint32_t *colors, uint32_t count)
 {

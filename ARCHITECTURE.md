@@ -86,7 +86,12 @@ texture unit.
 - **Images:**
   - `img_table` holds 1024 image descriptors.
   - `img_write` does WRITE_IMAGE with format conversion.
-  - `img_xfer` does READ / FILL / COPY, with colour key and stretch.
+  - `img_xfer` does READ / FILL / COPY, with colour key, stretch, mirrors, a channel swizzle, alpha = 255 and repeated
+    tiles. A 1:1 copy of one format without a key moves whole 32-byte bursts instead of a pixel a cycle (in simulation
+    2.6 RGBA8 pixels a cycle against 0.96, the DDR's read and write traffic being the limit); overlapping copies stay
+    exact. One COPY_IMAGE can carry a list of 1:1 rectangles.
+  - COPY and FILL_IMAGE end once their job is handed over: one job runs while the next waits, and the command processor
+    goes on with commands that do not touch images (FLUSH, FENCE, PRESENT and the transfers wait for the engine).
   - `img_geom` checks the rectangles.
 - **Display:** `disp_b`, `scan_reader`, `disp_post` (8-bit palette, 64×64 cursor), `disp_out_b`, `video_mmcm` (mode
   switching by DRP) and the TMDS encoder and serializer.

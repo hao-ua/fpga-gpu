@@ -99,7 +99,10 @@ def model_fill(img, tf, value, x, y, w, h, mask):
             img.px[k] = nv & 0xFFFFFFFF
 
 
-def model_copy(src, dst, sx, sy, sw, sh, dx, dy, dw, dh, mx=False, my=False, key=None):
+def model_copy(src, dst, sx, sy, sw, sh, dx, dy, dw, dh, mx=False, my=False, key=None, alpha_one=False, swizzle=None,
+               tile=None):
+    """COPY_IMAGE on the bench's pixels: stretch (pixel centres), mirrors, key; alpha_one / swizzle (r, g, b, a source
+    channels) on the RGBA8 values; tile = (px, py): the source rectangle repeated from that phase"""
     snap = [src.px[(sy + v) * src.w + sx + u] for v in range(sh) for u in range(sw)]
     for j in range(dh):
         for i in range(dw):
@@ -109,6 +112,8 @@ def model_copy(src, dst, sx, sy, sw, sh, dx, dy, dw, dh, mx=False, my=False, key
                 u = sw - 1 - u
             if my:
                 v = sh - 1 - v
+            if tile is not None:
+                u, v = (tile[0] + i) % sw, (tile[1] + j) % sh
             s = snap[v * sw + u]
             if key:
                 lo, hi = key
@@ -124,7 +129,12 @@ def model_copy(src, dst, sx, sy, sw, sh, dx, dy, dw, dh, mx=False, my=False, key
             if src.fmt == fp.FMT_P8:
                 d = s
             else:
-                d = enc(dst.fmt, *dec(src.fmt, s))
+                c = list(dec(src.fmt, s))
+                if swizzle is not None:
+                    c = [c[swizzle[k]] for k in range(4)]
+                if alpha_one:
+                    c[3] = 255
+                d = enc(dst.fmt, *c)
             dst.px[(dy + j) * dst.w + dx + i] = d
 
 
@@ -240,6 +250,23 @@ def main():
                 errors_check(b, "COPY_IMAGE")
             C.check("COPY_IMAGE stretch / mirror / key / RGB565 -> RGBA8"); R.check("COPY_IMAGE RGBA8 -> RGB565, overlapping")
             P.check("COPY_IMAGE P8 overlap + key")
+            # COPY_IMAGE flags 3..6 (board B STATUS flags bit 14): alpha = 255, swizzle, tiles, lists; queued back to back
+            if fp.decode_b_flags(st0["b_flags"]).get("copy_ext"):
+                ext = [(B, C, 0, 0, 200, 120, 0, 0, 200, 120, dict(alpha_one=True)),         # RGB565 -> RGBA8, alpha = 255
+                       (C, C, 5, 5, 150, 100, 20, 10, 150, 100, {}),                          # one surface (bursts)
+                       (A, C, 10, 10, 60, 40, 30, 30, 60, 40, dict(swizzle=(3, 2, 1, 0))),    # R G B A <- A B G R
+                       (R, C, 4, 4, 9, 7, 0, 60, 200, 60, dict(tile=(2, 3), alpha_one=True))]  # a 9 x 7 tile
+                for s, d, sx, sy, sw, sh, dx, dy, dw, dh, kw in ext:
+                    b.copy_image(s.handle, d.handle, sx, sy, sw, sh, dx, dy, dw, dh, **kw)
+                    model_copy(s, d, sx, sy, sw, sh, dx, dy, dw, dh, **kw)
+                rects = [(40, 20, 30, 10), (15, 50, 60, 8), (90, 60, 25, 15)]                 # a list, source offset (-10, -5)
+                b.copy_image(B.handle, R.handle, 0, 0, 20, 10, 10, 5, rects=rects)
+                model_copy(B, R, 0, 0, 20, 10, 10, 5, 20, 10)
+                for x, y, rw, rh in rects:
+                    model_copy(B, R, x - 10, y - 5, rw, rh, x, y, rw, rh)
+                errors_check(b, "COPY_IMAGE flags 3..6")
+                C.check("COPY_IMAGE alpha = 255 / swizzle / tile"); R.check("COPY_IMAGE list")
+                print("ok: COPY_IMAGE alpha = 255, swizzle, tile, list")
             # rejects
             b.copy_image(P.handle, A.handle, 0, 0, 4, 4, 0, 0)               # P8 -> RGBA8
             b.fence(timeout=10.0)

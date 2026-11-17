@@ -91,6 +91,8 @@ only what the hardware can do exactly, or what the PC can do exactly beside it; 
 ### 2D and display (board B)
 - **Image operations:** READ, FILL and COPY_IMAGE.
   - They convert between RGBA8 and RGB565 and copy 8-bit palette images.
+  - COPY_IMAGE also swizzles channels, sets alpha to 255, repeats a tile over a rectangle and takes a list of rectangles
+    (clip regions); 1:1 copies of one format move whole bursts.
   - They do nearest-neighbour stretch, mirror and source colour-key ranges, and overlap-safe 1:1 copies.
   - FILL takes a channel mask.
 - **Scanout:**

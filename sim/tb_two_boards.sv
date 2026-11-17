@@ -544,6 +544,63 @@ module tb_two_boards;
                                 le16(16'(dw)), le16(16'(dh)), le32({29'h0, flags}), le32(klo), le32(khi)}, s);
         n_fwd++; n_xops++;
     endtask
+    // COPY_IMAGE with flags 3..6 (board B STATUS flags bit 14): flags[6:0] (mirror x, mirror y, key, alpha = 255, swizzle,
+    // tile, list), the swizzle selects, the tile's phase, the list's further 1:1 rectangles (x, y, w, h each; the source
+    // offset of the first). Modelled rectangle by rectangle, each source read whole before its writes; nok: the
+    // rectangles B carries out (all but the ones from the first bad pair on, which B answers with ERR_RANGE)
+    typedef struct { int x, y, w, h; } rect_t;
+    function automatic bq copy_body(input int si, input int di, input int sx, input int sy, input int sw, input int sh,
+                                    input int dx, input int dy, input int dw, input int dh, input [6:0] flags, input [7:0] sel,
+                                    input [31:0] lo, input [31:0] hi, input rect_t rl [$], input int pad = 0);
+        bq b;
+        b = {le16(16'hC000 | 16'(si)), 8'd0, 8'd0, le16(16'hC000 | 16'(di)), 8'd0, 8'd0,
+             le16(16'(sx)), le16(16'(sy)), le16(16'(sw)), le16(16'(sh)), le16(16'(dx)), le16(16'(dy)),
+             le16(16'(dw)), le16(16'(dh)), le32({16'h0, sel, 1'b0, flags}), le32(lo), le32(hi)};
+        foreach (rl[k]) b = {b, le16(16'(rl[k].x)), le16(16'(rl[k].y)), le16(16'(rl[k].w)), le16(16'(rl[k].h))};
+        for (int k = 0; k < pad; k++) b.push_back(8'h00);
+        return b;
+    endfunction
+    task automatic copy_rect_model(input int si, input int di, input int sx, input int sy, input int sw, input int sh,
+                                   input int dx, input int dy, input int dw, input int dh, input [6:0] flags, input [7:0] sel,
+                                   input int px, input int py, input [31:0] klo, input [31:0] khi);
+        bit [31:0] snap [int]; int sf, df;
+        sf = himg[si].fmt; df = himg[di].fmt;
+        for (int v = 0; v < sh; v++) for (int u = 0; u < sw; u++) snap[v * sw + u] = cur_px(si, sy + v, sx + u);
+        for (int j = 0; j < dh; j++) for (int i = 0; i < dw; i++) begin
+            int u, v, ch[4], o[4]; bit [31:0] sv; bit tr;
+            u = ((2 * i + 1) * sw) / (2 * dw); v = ((2 * j + 1) * sh) / (2 * dh);
+            if (flags[0]) u = sw - 1 - u;
+            if (flags[1]) v = sh - 1 - v;
+            if (flags[5]) begin u = (px + i) % sw; v = (py + j) % sh; end
+            sv = snap[v * sw + u]; tr = 0;
+            if (flags[2]) begin
+                if (sf == 0) tr = sv[31:24] >= klo[31:24] && sv[31:24] <= khi[31:24] && sv[23:16] >= klo[23:16] &&
+                                  sv[23:16] <= khi[23:16] && sv[15:8] >= klo[15:8] && sv[15:8] <= khi[15:8];
+                else tr = sv[15:11] >= klo[15:11] && sv[15:11] <= khi[15:11] && sv[10:5] >= klo[10:5] &&
+                          sv[10:5] <= khi[10:5] && sv[4:0] >= klo[4:0] && sv[4:0] <= khi[4:0];
+            end
+            if (!tr) begin
+                dec(sf, sv, ch[0], ch[1], ch[2], ch[3]);
+                for (int q = 0; q < 4; q++) o[q] = flags[4] ? ch[sel[2*q +: 2]] : ch[q];
+                if (flags[3]) o[3] = 255;
+                set_px(di, dy + j, dx + i, enc(df, o[0], o[1], o[2], o[3]));
+            end
+        end
+    endtask
+    task automatic copy_ext(input int si, input int di, input int sx, input int sy, input int sw, input int sh,
+                            input int dx, input int dy, input int dw, input int dh, input [6:0] flags, input [7:0] sel,
+                            input int px, input int py, input rect_t rl [$], input int nok = -1,
+                            input [31:0] klo = 0, input [31:0] khi = 0);
+        bit [31:0] s, a1, a2, lo, hi;
+        lo = flags[5] ? {16'(py), 16'(px)} : klo; hi = flags[5] ? 32'h0 : khi;
+        copy_rect_model(si, di, sx, sy, sw, sh, dx, dy, dw, dh, flags, sel, px, py, klo, khi);
+        foreach (rl[k]) if (nok < 0 || k < nok)
+            copy_rect_model(si, di, rl[k].x + sx - dx, rl[k].y + sy - dy, rl[k].w, rl[k].h, rl[k].x, rl[k].y, rl[k].w, rl[k].h,
+                            flags, sel, 0, 0, klo, khi);
+        send_seq(T_COPY_IMAGE, copy_body(si, di, sx, sy, sw, sh, dx, dy, dw, dh, flags, sel, lo, hi, rl), s);
+        n_fwd++; n_xops += 1 + ((nok < 0) ? rl.size() : nok);              // (the engine counts a job per rectangle)
+        if (nok >= 0) begin n_bev++; n_berr++; expect_event(s, EV_ERROR, ERR_RANGE, 1, 3000, a1, a2); end
+    endtask
     // a command board B must reject with `code`
     task automatic expect_reject(input [7:0] t, input bq body, input [31:0] code);
         bit [31:0] s, a1, a2;
@@ -886,6 +943,46 @@ module tb_two_boards;
         present_eth(24, 16'h0, 32'd3100); wait_img_frames(24, 2);
         present_eth(25, 16'h0, 32'd3101); wait_img_frames(25, 2);
         $display("ok: COPY_IMAGE: RGB565 <-> RGBA8, stretch up / down, mirrors, colour key (RGBA8, P8), overlapping 1:1 copies, shown");
+        // ---- COPY_IMAGE's flags 3..6, back to back with FILLs and without fences (one job runs while the next waits) ----
+        begin
+            rect_t rl [$]; bit [31:0] s;
+            bit [31:0] bfl; bfl = bsw(3);
+            if (!bfl[14]) fail("board B's STATUS flags bit 14 (COPY_IMAGE flags 3..6) is not set");
+            present_eth(20, 16'h0, 32'd3110); wait_img_frames(20, 1);      // images 24 / 25 change below: not on the screen
+            copy_ext(21, 24, 0, 0, 64, 48, 0, 0, 64, 48, 7'b0001000, 8'h00, 0, 0, rl);            // RGB565 -> RGBA8, alpha = 255
+            copy_ext(24, 24, 3, 2, 50, 40, 9, 5, 50, 40, 7'b0001000, 8'h00, 0, 0, rl);            // one surface, burst path, alpha
+            fill_image(24, 8'h01, 4'hF, 40, 30, 12, 9, 32'h1122_3344);
+            copy_ext(20, 24, 1, 1, 30, 20, 2, 25, 30, 20, 7'b0010000, 8'b00_01_10_11, 0, 0, rl);  // swizzle: R G B A <- A B G R
+            copy_ext(20, 24, 0, 0, 20, 12, 30, 1, 33, 20, 7'b0011000, 8'b11_00_00_10, 0, 0, rl);  // stretch + swizzle + alpha
+            copy_ext(20, 25, 4, 4, 7, 5, 0, 0, 40, 30, 7'b0100000, 8'h00, 3, 2, rl);              // a 7 x 5 tile, phase (3, 2)
+            copy_ext(25, 24, 0, 0, 1, 1, 50, 40, 14, 8, 7'b0101000, 8'h00, 0, 0, rl);             // a 1 x 1 tile, alpha
+            rl = {}; rl.push_back('{15, 3, 8, 8}); rl.push_back('{2, 20, 30, 5}); rl.push_back('{33, 10, 7, 19});
+            copy_ext(21, 25, 0, 0, 10, 6, 1, 1, 10, 6, 7'b1000000, 8'h00, 0, 0, rl);               // a list, RGB565 burst path
+            rl = {}; rl.push_back('{30, 30, 10, 10}); rl.push_back('{2, 44, 60, 4});
+            copy_ext(24, 24, 10, 10, 20, 10, 12, 11, 20, 10, 7'b1010000, 8'b10_01_00_11, 0, 0, rl); // a list in one surface, swizzled
+            rl = {}; rl.push_back('{5, 30, 5, 5});
+            copy_ext(20, 24, 0, 0, 8, 8, 1, 1, 8, 8, 7'b1000100, 8'h00, 0, 0, rl, -1, 32'h0000_0000, 32'h80FF_FF00);   // a list with a key
+            fence_b(32'd60);
+            check_b_ddr(64'h2600_0000, 256 * 48, "COPY flags: image 24");
+            check_b_ddr(64'h2700_0000, 80 * 30, "COPY flags: image 25");
+            // rejected: flags bit 7, a tile with a mirror, a phase outside the tile, a list with a stretch, a list's pairs not
+            // a multiple of 8 bytes, a swizzle of P8; a list's bad pair after a good one (the pairs before it are carried out)
+            rl = {};
+            begin bq b; b = copy_body(20, 24, 0, 0, 4, 4, 0, 0, 4, 4, 7'b0000000, 8'h00, 32'h0, 32'h0, rl); b[24] = 8'h80;
+                  expect_reject(T_COPY_IMAGE, b, ERR_RANGE); end                                                          // bit 7
+            expect_reject(T_COPY_IMAGE, copy_body(20, 24, 0, 0, 4, 4, 0, 0, 9, 9, 7'b0100001, 8'h00, 32'h0, 32'h0, rl), ERR_RANGE);   // tile + mirror
+            expect_reject(T_COPY_IMAGE, copy_body(20, 24, 0, 0, 4, 4, 0, 0, 9, 9, 7'b0100000, 8'h00, 32'h0000_0004, 32'h0, rl), ERR_RANGE);   // px = sw
+            expect_reject(T_COPY_IMAGE, copy_body(20, 24, 0, 0, 4, 4, 0, 0, 8, 4, 7'b1000000, 8'h00, 32'h0, 32'h0, rl), ERR_RANGE);   // list, stretch
+            expect_reject(T_COPY_IMAGE, copy_body(20, 24, 0, 0, 4, 4, 0, 0, 4, 4, 7'b1000000, 8'h00, 32'h0, 32'h0, rl, 4), ERR_LEN);  // half a pair
+            expect_reject(T_COPY_IMAGE, copy_body(23, 23, 0, 0, 4, 4, 8, 8, 4, 4, 7'b0010000, 8'h1B, 32'h0, 32'h0, rl), ERR_RANGE);   // P8 swizzle
+            rl = {}; rl.push_back('{42, 41, 4, 4}); rl.push_back('{60, 2, 8, 4});                   // the second pair leaves image 24
+            copy_ext(20, 24, 0, 0, 6, 6, 40, 40, 6, 6, 7'b1000000, 8'h00, 0, 0, rl, 1);
+            fence_b(32'd61);
+            check_b_ddr(64'h2600_0000, 256 * 48, "COPY flags: image 24 after the rejected pair");
+            present_eth(25, 16'h0, 32'd3111); wait_img_frames(25, 2);
+            present_eth(24, 16'h0, 32'd3112); wait_img_frames(24, 2);
+            $display("ok: COPY_IMAGE flags 3..6: alpha = 255, swizzle, tiles, lists (burst and pixel paths, one surface), queued with FILLs; bad flags / lengths rejected");
+        end
         // ---- palette: P8 image shown through the hardware palette ----
         set_palette(0, 256, 50);
         fence_b(32'd38);

@@ -252,6 +252,16 @@ counters and the last STATUS.
     drag: the boards done 14-16 ms after the pointer stopped; 30 moves of that xterm one after another 303 ms (279
     before, with the backlog; without the wait 208). Depth 1 / 2 / 4 measured: 513 / 383 / 302 ms (the X server
     flushes a few times a move). Left a move: the uncovered strip's pass of ~613 x 428.
+  - Small black dashes on every window's title bar, at the top of each button (seen 2026-11-16 already; found
+    2026-11-17): board B loads and stores every row of a band (up to 8, b_rop), also past the last row of an image
+    whose height is no multiple of 8. xfwm4 makes its 21 x 29 button images by drawing into fresh pixmaps, rendered
+    in shadows of 96-byte rows: rows 29-31 of a shadow went into the next object, a button image, whose bytes came
+    back as they were except the three padding pixels of each 96-byte row, now zero: three black runs stepping
+    right by three pixels a row (a software X in Xephyr showed none). The kernel now gives every image the memory of
+    whole bands (its height rounded up to 8 rows, `fpgagpu_gem.c`); the size it reports and checks aliases against
+    stays the image's. `fg_egl_gl` test 15: 32 targets 21 x 29, each followed by an image: on the old module all 32
+    images changed (36 bytes each), now none. Padded images taller than a multiple of 8 (a 300 x 300 DRI3 back
+    buffer of rows of 1216 bytes) did the same to their neighbours.
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.

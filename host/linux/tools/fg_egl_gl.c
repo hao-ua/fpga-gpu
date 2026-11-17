@@ -33,7 +33,9 @@
  *      (alpha 1.0 survives), the same program magnified (drawn, not copied); with GL_NV_texture_barrier, two
  *      rectangles moved over themselves inside one image (copies in the move's order) and a draw magnifying rows
  *      of its own target into rows it reads (drawn from a copy taken before its pass); a copy into a whole-target
- *      pass with a draw (drawn in it); 40 moves of a 374 x 298 window (into a temporary image and back) timed.
+ *      pass with a draw (drawn in it); 40 moves of a 374 x 298 window (into a temporary image and back) timed;
+ *  15. 32 render targets 21 x 29 (rendered in shadows of 96-byte rows; board B stores whole bands of 8 rows), each
+ *      followed by an image with a pattern: the targets rendered again, every image must be unchanged.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -1229,6 +1231,80 @@ int main(int argc, char **argv)
 		glDeleteProgram(prog[1]);
 		free(pat);
 		free(p);
+	}
+
+	printf("15. images rendered with a height no multiple of 8 (board B stores whole bands of 8 rows) leave the next\n"
+	       "    object intact: 32 targets 21 x 29 (rendered in shadows of 96-byte rows), each followed by an image:\n");
+	{
+		enum { N = 32, TW = 21, TH = 29 };
+		GLuint tgt[N], vic[N], fbo15;
+		uint8_t *pat = malloc(TW * TH * 4), *got = malloc(TW * TH * 4);
+		int bad_imgs = 0, bad_px = 0, bad_tgt = 0;
+
+		for (int i = 0; i < TW * TH; i++) {
+			pat[4 * i] = (uint8_t)(i * 7 + 1);
+			pat[4 * i + 1] = (uint8_t)(i * 13 + 2);
+			pat[4 * i + 2] = (uint8_t)(i * 29 + 3);
+			pat[4 * i + 3] = 0xFF;
+		}
+		glGenFramebuffersEXT(1, &fbo15);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo15);
+		glViewport(0, 0, TW, TH);
+		glMatrixMode(GL_PROJECTION);
+		glPushMatrix();
+		glLoadIdentity();
+		glOrtho(0, TW, 0, TH, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glDisable(GL_TEXTURE_2D);
+		glDisable(GL_BLEND);
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_DEPTH_TEST);
+		/* each target rendered once (its render shadow is made then), the next image right after it */
+		for (int i = 0; i < N; i++) {
+			tgt[i] = texture(TW, TH, GL_RGBA, NULL, GL_NEAREST);
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, tgt[i], 0);
+			glColor3f(1, 0, 0);
+			quad(0, 0, TW, TH, 0);
+			glFinish();
+			vic[i] = texture(TW, TH, GL_RGBA, pat, GL_NEAREST);
+		}
+		/* every target rendered again: green */
+		for (int i = 0; i < N; i++) {
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, tgt[i], 0);
+			glColor3f(0, 1, 0);
+			quad(0, 0, TW, TH, 0);
+			glFlush();
+		}
+		for (int i = 0; i < N; i++) {
+			int n = 0;
+
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, vic[i], 0);
+			memset(got, 0xA5, TW * TH * 4);
+			glReadPixels(0, 0, TW, TH, GL_RGBA, GL_UNSIGNED_BYTE, got);
+			for (int k = 0; k < TW * TH * 4; k++)
+				n += got[k] != pat[k];
+			bad_px += n;
+			bad_imgs += n != 0;
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, tgt[i], 0);
+			glReadPixels(0, 0, TW, TH, GL_RGBA, GL_UNSIGNED_BYTE, got);
+			for (int k = 0; k < TW * TH; k++)
+				bad_tgt += !(got[4 * k] == 0 && got[4 * k + 1] == 255 && got[4 * k + 2] == 0);
+		}
+		if (bad_imgs || bad_tgt)
+			printf("  %d of %d images changed (%d bytes), %d target pixels wrong\n", bad_imgs, N, bad_px, bad_tgt);
+		check(&fails, !bad_imgs, "the images after the targets unchanged", (const uint8_t *)"\0\0\0\0");
+		check(&fails, !bad_tgt, "the targets green", (const uint8_t *)"\0\0\0\0");
+		glMatrixMode(GL_PROJECTION);
+		glPopMatrix();
+		glMatrixMode(GL_MODELVIEW);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glDeleteFramebuffersEXT(1, &fbo15);
+		glDeleteTextures(N, tgt);
+		glDeleteTextures(N, vic);
+		free(pat);
+		free(got);
+		glColor3f(1, 1, 1);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

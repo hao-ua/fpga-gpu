@@ -23,6 +23,7 @@
 #define T_DESTROY	0x12
 #define SEND_TIMEOUT_MS	10000
 #define BUFFER_MAX	(256u << 20)
+#define BAND_ROWS	8		/* the most rows of a band board B renders (b_rop's NLMAX) */
 
 static void fg_bo_gem_free(struct drm_gem_object *obj)
 {
@@ -168,7 +169,11 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 		bo->layers = a->layers;
 	}
 	bo->size = size;
-	r = fg_mem_alloc(fdev, bo, orig ? 0 : size);
+	/* board B renders in bands of up to 8 rows and loads and stores every row of the last band, past an image whose
+	 * height is no multiple of 8: those rows get memory of the image's own, or they would rewrite the next object's
+	 * bytes (and zero those that fall in the row padding of a pitch wider than the image) */
+	r = fg_mem_alloc(fdev, bo, orig ? 0 : size + (a->kind == FPGAGPU_BO_B_IMAGE ?
+						     (u64)(ALIGN(a->height, BAND_ROWS) - a->height) * a->pitch : 0));
 	if (r) {
 		if (orig)
 			drm_gem_object_put(&orig->base);

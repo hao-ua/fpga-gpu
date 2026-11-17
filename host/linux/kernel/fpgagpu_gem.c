@@ -207,6 +207,7 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 		r = -ENODEV;
 		goto put;
 	}
+	fg_net_wait_ok(&fdev->net, SEND_TIMEOUT_MS);
 	mutex_lock(&fdev->submit_lock);
 	r = fg_net_send_seq(&fdev->net, type, body, blen, NULL, SEND_TIMEOUT_MS);
 	if (!r) {

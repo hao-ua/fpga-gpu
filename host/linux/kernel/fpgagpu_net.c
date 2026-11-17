@@ -153,7 +153,9 @@ int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *s
 	mutex_lock(&n->lock);
 	while (!n->lost && (n->win_n >= FG_WINDOW || (n->win_n && n->inflight + need > n->credit))) {
 		mutex_unlock(&n->lock);
-		left = wait_event_interruptible_timeout(n->wq, fg_room(n, need), left);
+		/* only a fatal signal ends the wait: an ioctl started again after another signal would send the part
+		 * of its stream that went already once more (and, where signals keep coming, never get through it) */
+		left = wait_event_killable_timeout(n->wq, fg_room(n, need), left);
 		if (left < 0)
 			return (int)left;
 		if (left == 0)
@@ -330,6 +332,16 @@ void fg_net_set_lost(struct fg_net *n, unsigned int lost)
 	n->restarts++;
 	mutex_unlock(&n->lock);
 	wake_up_all(&n->wq);
+	if (n->on_lost)
+		n->on_lost(n);
+}
+
+/* a request that would send waits here while a board is lost, so that it does not fail in the moment between a
+ * restart being seen and the recovery (a request already sending when it is seen does fail) */
+void fg_net_wait_ok(struct fg_net *n, unsigned int timeout_ms)
+{
+	if (READ_ONCE(n->lost))
+		wait_event_killable_timeout(n->wq, !READ_ONCE(n->lost), msecs_to_jiffies(timeout_ms));
 }
 
 unsigned int fg_net_lost(struct fg_net *n, unsigned int *restarts)
@@ -349,6 +361,7 @@ static void fg_rx(struct fg_net *n, const u8 *d, int len)
 	const u8 *b = d + FG_HDR_BYTES;
 	int bl = len - FG_HDR_BYTES;
 	struct fg_event *ev;
+	unsigned int restarts;
 	u32 seq, cw;
 	u8 type;
 	int i, nw;
@@ -363,6 +376,7 @@ static void fg_rx(struct fg_net *n, const u8 *d, int len)
 	seq = get_unaligned_le32(d + 4);
 	mutex_lock(&n->lock);
 	n->n_rx++;
+	restarts = n->restarts;
 	switch (type) {
 	case FG_R_ACK:
 		if (bl >= 16)
@@ -406,8 +420,11 @@ static void fg_rx(struct fg_net *n, const u8 *d, int len)
 	default:						/* register replies: not used */
 		break;
 	}
+	restarts = n->restarts - restarts;
 	mutex_unlock(&n->lock);
 	wake_up_all(&n->wq);
+	if (restarts && n->on_lost)				/* a restart seen in this reply: the recovery, at once */
+		n->on_lost(n);
 }
 
 static int fg_rx_thread(void *arg)

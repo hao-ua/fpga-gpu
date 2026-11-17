@@ -230,6 +230,14 @@ static void fpgagpu_watch_work(struct work_struct *work)
 	queue_delayed_work(fg_wq, &fdev->watch_work, msecs_to_jiffies(WATCH_MS));
 }
 
+/* the transport saw a restart (its receive thread): the recovery now, not at the next second */
+static void fpgagpu_on_lost(struct fg_net *n)
+{
+	struct fpgagpu_device *fdev = container_of(n, struct fpgagpu_device, net);
+
+	mod_delayed_work(fg_wq, &fdev->watch_work, 0);
+}
+
 /* greets board A; once it answers: the display and the DRM device (render node, card, console). -EAGAIN: no answer
  * (the boards are off, or the network is not up yet) */
 static int fpgagpu_attach(struct fpgagpu_device *fdev)
@@ -261,6 +269,7 @@ static int fpgagpu_attach(struct fpgagpu_device *fdev)
 		goto fail;
 	fpgagpu_fbdev_setup(&fdev->drm);
 	fdev->attached = true;
+	fdev->net.on_lost = fpgagpu_on_lost;
 	queue_delayed_work(fg_wq, &fdev->watch_work, msecs_to_jiffies(WATCH_MS));
 	return 0;
 fail:
@@ -332,12 +341,12 @@ static void fpgagpu_remove_device(struct platform_device *pdev)
 
 	cancel_delayed_work_sync(&fdev->attach_work);
 	if (fdev->attached) {
-		drm_dev_unplug(&fdev->drm);
-		cancel_delayed_work_sync(&fdev->watch_work);	/* it does not queue itself again once unplugged */
+		drm_dev_unplug(&fdev->drm);			/* the watch work does nothing from here on */
 		drm_atomic_helper_shutdown(&fdev->drm);
 		fg_kms_fini(fdev);
 	}
-	fg_net_fini(&fdev->net);
+	fg_net_fini(&fdev->net);				/* its receive thread can no longer queue the watch work */
+	cancel_delayed_work_sync(&fdev->watch_work);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)

@@ -323,6 +323,7 @@ int fpgagpu_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *fi
 		r = -ENODEV;
 		goto out;
 	}
+	fg_net_wait_ok(&fdev->net, SEND_TIMEOUT_MS);
 	mutex_lock(&fdev->submit_lock);
 	r = fg_send_stream(fdev, cmds, a->cmds_bytes);
 	if (!r) {
@@ -561,7 +562,8 @@ static int fg_read_range(struct fpgagpu_device *fdev, struct fg_read *rd, const 
 	int r = fg_read_request(fdev, rd, q, s, n);
 
 	while (!r && !fg_read_range_done(rd, c0, c1)) {
-		long w = wait_event_interruptible_timeout(fdev->net.wq, fg_read_range_done(rd, c0, c1), quiet);
+		/* (only a fatal signal ends it: a READ started again asks for everything again) */
+		long w = wait_event_killable_timeout(fdev->net.wq, fg_read_range_done(rd, c0, c1), quiet);
 		u32 c;
 
 		if (w < 0)
@@ -653,6 +655,7 @@ int fpgagpu_ioctl_read(struct drm_device *drm, void *data, struct drm_file *file
 		r = -ENODEV;
 		goto free;
 	}
+	fg_net_wait_ok(&fdev->net, SEND_TIMEOUT_MS);
 	mutex_lock(&fdev->submit_lock);
 	fg_net_read_attach(&fdev->net, rd);
 	for (s = 0, r = 0; s < rd->total && !r; s += READ_REQ_MAX)

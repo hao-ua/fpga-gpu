@@ -257,7 +257,8 @@ counters and the last STATUS.
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.
     The module now recovers by itself. It asks for STATUS once a second: board A restarted when its uptime is short
     of the last one plus the time since, or the sequence number it expects is far behind ours; board B when its
-    frame count went back. Until it has recovered, commands fail at once (EIO) and fences count as passed. Recovery:
+    frame count went back. The recovery starts at once; until it is done a request that is sending fails (EIO), new
+    ones wait for it, and fences count as passed. Recovery:
     a new session with board A (the wire's sequence numbers start at 1, the driver's fences go on), the CREATE of
     every buffer object on the restarted boards again (contents lost), after board B's restart the display's mode,
     a hotplug event (the console redraws) and a change uevent `FPGAGPU_RESET=1`, on which
@@ -265,7 +266,17 @@ counters and the last STATUS.
     running: PASS's `state_lost` 2 tells Mesa to place its programs again. Checked with the test parameter
     (`echo 1` / `3` `> /sys/module/fpgagpu/parameters/restarted`: as if board A / both had restarted): A alone, X the
     same process and drawing, 2 buffer objects described again; both, 171 described again, X restarted by udev;
-    `fpgagpu_selftest` and `fg_egl_gl` pass after each without a reload. Not yet seen with a board really restarted.
+    `fpgagpu_selftest` and `fg_egl_gl` pass after each without a reload. And with board A really restarted, twice
+    (A 154 loaded again over JTAG while X ran): board A answers on the network again ~67 s after the load, and the
+    module had its new session and 2 buffer objects described again 0.5 ms after seeing it; X stayed the same process
+    and drew a new xterm correctly, both tests passed without a reload. (The first time recovery ran up to a second
+    after the restart was seen and 102 of X's BO_CREATE / SUBMIT calls failed in between: hence "at once" and the
+    waiting above; the second time none failed, X being idle.) Board B restarting alone has not been seen for real.
+  - X hung in one SUBMIT for minutes (2026-11-17, a nested X server putting 640 x 480 images: 1.25 MB of WRITE_IMAGE
+    a call): the wait for room in the send window was interruptible, X's timer signal ended it, the ioctl started
+    again and sent the whole stream once more, each time, while board A took ~80 000 datagrams a second. A restarted
+    SUBMIT also sent draws twice. The waits in sending and in READ now end only on a fatal signal; with the same
+    load X answers in ~10 ms.
   - fpgagpu loads at boot (`kernel/fpgagpu-load.conf` as `/etc/modules-load.d/fpgagpu.conf`). While board A does not
     answer (the boards off; at boot, the network not up yet) the module stays loaded and greets it again every 5 s;
     the DRM device appears once it answers. LightDM waits up to 10 s for the card at its start

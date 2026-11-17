@@ -130,6 +130,7 @@ struct fg_net {
 	bool b_frames_valid;
 	unsigned int lost;			/* FG_LOST_* */
 	unsigned int restarts;			/* restarts seen */
+	void (*on_lost)(struct fg_net *n);	/* called (no lock held) when one is seen */
 	u32 seq_base;				/* added to the wire's sequence numbers, which start at 1 again with every
 						 * session: the fences and events the driver sees go on from the last */
 
@@ -144,6 +145,7 @@ void fg_net_fini(struct fg_net *n);
 int fg_net_hello(struct fg_net *n, unsigned int timeout_ms);
 unsigned int fg_net_lost(struct fg_net *n, unsigned int *restarts);
 void fg_net_set_lost(struct fg_net *n, unsigned int lost);
+void fg_net_wait_ok(struct fg_net *n, unsigned int timeout_ms);
 int fg_net_recover(struct fg_net *n, unsigned int lost, unsigned int restarts, unsigned int timeout_ms);
 int fg_net_status(struct fg_net *n, u32 *words, u32 room, u32 *got, u64 *serial, unsigned int timeout_ms);
 int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *seq, unsigned int timeout_ms);

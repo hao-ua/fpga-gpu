@@ -7,13 +7,17 @@
  *   3. a 2 x 2 texture (red, green, blue, white; nearest) on a quad over the target: each quarter;
  *   4. a white quad of alpha 0.5 blended (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) over black: 128 +-2;
  *   5. a 2 x 2 R8 texture with GL_TEXTURE_SWIZZLE_A = GL_RED (X's glamor reads glyphs so): alpha = red;
- *   6. a 16-pixel point coloured by gl_PointCoord in the framebuffer object: s grows right, t down.
+ *   6. a 16-pixel point coloured by gl_PointCoord in the framebuffer object: s grows right, t down;
+ *   7. a function whose local variable has its parameter's name (GLSL ES 1.00 4.2.2: the body is a scope of its own);
+ *   8. texture2DProj on a mipmapped texture whose levels are one colour each: every pixel's level against the levels
+ *      the coordinate's derivatives at that pixel and its four neighbours allow (ES 2.0 3.7.7).
  *   cc -O2 -Wall -I<prefix>/include fg_egl_draw.c -o fg_egl_draw -L<libdir> -Wl,-rpath-link,<libdir> \
- *      -lEGL -lGLESv2 -lgbm $(pkg-config --cflags --libs libdrm)
+ *      -lEGL -lGLESv2 -lgbm -lm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_draw [render node, default /dev/dri/renderD129]
  */
 #include <execinfo.h>
 #include <fcntl.h>
+#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -316,6 +320,120 @@ int main(int argc, char **argv)
 		glDeleteProgram(pp);
 		glDeleteShader(sh[0]);
 		glDeleteShader(sh[1]);
+	}
+
+	printf("7. a local variable with its function's parameter's name (it hides the parameter):\n");
+	{
+		static const char *fs_scope =
+			"precision mediump float;\n"
+			"varying vec4 v;\n"
+			"float f(float x) { float x = 0.25; return x; }\n"
+			"float g(float y) { { float y = y * 0.5; return y; } }\n"
+			"void main() { gl_FragColor = vec4(f(1.0), g(1.0), v.x * 0.0, 1.0); }\n";
+		GLuint ps = program(fs_scope);
+		GLint ok = 0;
+
+		glGetProgramiv(ps, GL_LINK_STATUS, &ok);
+		printf("  the program compiles and links: %s\n", ok ? "ok" : "BAD");
+		fails += !ok;
+		glUseProgram(ps);
+		glClear(GL_COLOR_BUFFER_BIT);
+		draw(GL_TRIANGLE_STRIP, quad, uv4, 4);
+		read_back();
+		check(&fails, near(at(32, 32), 64, 128, 0, 255, 2), "(32, 32): the local's 0.25, the inner block's 0.5", at(32, 32));
+		glDeleteProgram(ps);
+	}
+
+	printf("8. texture2DProj on a mipmapped texture, the level of every pixel:\n");
+	{
+		static const char *fs_proj =
+			"precision mediump float;\n"
+			"varying vec4 v;\n"
+			"uniform sampler2D t;\n"
+			"void main() { gl_FragColor = texture2DProj(t, v.xyw); }\n";
+		/* s q, t q and q are affine over the target (X, Y in 0 .. 1): c + cx X + cy Y each. q grows 21 times from
+		 * the lower left corner to the upper right: by the first the level changes by a quarter with every pixel */
+		static const double sq[3] = { 0.05, 3.0, 0.4 }, tq[3] = { 0.1, 0.5, 3.5 }, qq[3] = { 0.25, 3.0, 2.0 };
+		static const double offs[5][2] = { { 0, 0 }, { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+		static uint8_t lvl[64 * 64 * 4];
+		const double tol = 1.0 / 64, size = 64.0;
+		float col[16];
+		GLuint pp = program(fs_proj), tm;
+		int bad = 0, seen = 0, fx = -1, fy = -1, flev = 0, flo = 0, fhi = 0;
+
+		for (int i = 0; i < 4; i++) {
+			double X = i & 1, Y = i >> 1;
+
+			col[4 * i + 0] = (float)(sq[0] + sq[1] * X + sq[2] * Y);
+			col[4 * i + 1] = (float)(tq[0] + tq[1] * X + tq[2] * Y);
+			col[4 * i + 2] = 0;
+			col[4 * i + 3] = (float)(qq[0] + qq[1] * X + qq[2] * Y);
+		}
+		glGenTextures(1, &tm);
+		glBindTexture(GL_TEXTURE_2D, tm);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+		for (int l = 0; l < 7; l++) {              /* level l: red 36 l, green 255 */
+			for (int k = 0; k < (64 >> l) * (64 >> l); k++) {
+				lvl[4 * k] = (uint8_t)(36 * l);
+				lvl[4 * k + 1] = 255;
+				lvl[4 * k + 2] = 0;
+				lvl[4 * k + 3] = 255;
+			}
+			glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA, 64 >> l, 64 >> l, 0, GL_RGBA, GL_UNSIGNED_BYTE, lvl);
+		}
+		glUseProgram(pp);
+		glUniform1i(glGetUniformLocation(pp, "t"), 0);
+		glClear(GL_COLOR_BUFFER_BIT);
+		draw(GL_TRIANGLE_STRIP, quad, col, 4);
+		read_back();
+		for (int y = 0; y < H; y++) {
+			for (int x = 0; x < W; x++) {
+				const uint8_t *p = at(x, y);
+				int lev = (p[0] + 18) / 36, lo, hi;
+				double llo = 1e9, lhi = -1e9;
+
+				for (int o = 0; o < 5; o++) {
+					double X = (x + 0.5 + offs[o][0]) / W, Y = (y + 0.5 + offs[o][1]) / H;
+					double S = sq[0] + sq[1] * X + sq[2] * Y, T = tq[0] + tq[1] * X + tq[2] * Y;
+					double Q = qq[0] + qq[1] * X + qq[2] * Y;
+					/* the texel coordinates' steps to the next pixel in x and in y */
+					double dudx = size / W * (sq[1] * Q - S * qq[1]) / (Q * Q), dudy = size / H * (sq[2] * Q - S * qq[2]) / (Q * Q);
+					double dvdx = size / W * (tq[1] * Q - T * qq[1]) / (Q * Q), dvdy = size / H * (tq[2] * Q - T * qq[2]) / (Q * Q);
+					double mu = fmax(fabs(dudx), fabs(dudy)), mv = fmax(fabs(dvdx), fabs(dvdy));
+
+					llo = fmin(llo, log2(fmax(mu, mv)));
+					lhi = fmax(lhi, log2(mu + mv));
+				}
+				llo -= tol;
+				lhi += tol;
+				/* GL_NEAREST_MIPMAP_NEAREST: level 0 up to lambda 1/2, then ceil(lambda + 1/2) - 1 */
+				lo = llo <= 0.5 ? 0 : (int)ceil(llo + 0.5) - 1;
+				hi = lhi <= 0.5 ? 0 : (int)ceil(lhi + 0.5) - 1;
+				lo = lo > 6 ? 6 : lo;
+				hi = hi > 6 ? 6 : hi;
+				seen |= 1 << lev;
+				if (p[1] != 255 || lev < lo || lev > hi) {
+					if (!bad) {
+						fx = x;
+						fy = y;
+						flev = lev;
+						flo = lo;
+						fhi = hi;
+					}
+					bad++;
+				}
+			}
+		}
+		printf("  levels drawn: mask 0x%02x; pixels at a level their derivatives do not allow: %d %s\n", seen, bad,
+		       bad || __builtin_popcount(seen) < 3 ? "BAD" : "ok");
+		if (bad)
+			printf("  the first: (%d, %d) level %d, allowed %d .. %d\n", fx, fy, flev, flo, fhi);
+		fails += bad != 0 || __builtin_popcount(seen) < 3;
+		glDeleteTextures(1, &tm);
+		glDeleteProgram(pp);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

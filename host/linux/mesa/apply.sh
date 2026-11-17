@@ -162,5 +162,19 @@ edit("src/mesa/main/fbobject.c",
       "      return GL_FALSE;",
       ""],
      "before")
+
+# GLSL ES 1.00, 4.2.2: "a function body has a scope nested inside the function's definition" — a local variable may
+# have a parameter's name and hides it. Mesa keeps one scope for both (the rule of the later versions) and calls the
+# local a redeclaration
+edit("src/compiler/glsl/ast_to_hir.cpp",
+     "   this->body->hir(&signature->body, state);",
+     ["   /* GLSL ES 1.00: the body is a scope of its own inside the parameters' (a local may hide a parameter) */",
+      "   const bool es100_body_scope = state->es_shader && state->language_version == 100;",
+      "   if (es100_body_scope)",
+      "      state->symbols->push_scope();",
+      "   this->body->hir(&signature->body, state);",
+      "   if (es100_body_scope)",
+      "      state->symbols->pop_scope();"],
+     "replace")
 PY
 echo "done: configure with -Dgallium-drivers=fpgagpu,..."

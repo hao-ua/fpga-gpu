@@ -34,8 +34,12 @@ keeps in R8 textures read through `GL_TEXTURE_SWIZZLE_A = GL_RED`), texture swiz
 view's swizzle after the TEX; `apply.sh` lets GLES 2.0 contexts set it), and dma-buf import for DRI3 (BO_INFO). Every render pass holds the boards' render state for its process (the kernel's PASS ioctl), so X and a
 game can share the boards.
 
-Written, not tested yet: points and lines, stencil, scissor, polygon offset, cube maps, linear filtering, clears
-inside a pass drawn as quads, draws whose indices span more than 16 bits.
+dEQP-GLES2 (VK-GL-CTS, the x11_egl target: pbuffers through X's fpgagpu device): of the 17 775 cases of info,
+capability, functional and accuracy, 17 158 pass, 492 are not supported (half-float textures, samplers in vertex
+programs: board A has no TMU, separate 16-bit depth and 8-bit stencil renderbuffers: board B keeps them in one D24S8
+word) and 125 fail, none of them crashes: 115 clipping cases (huge coordinates, clipped in board A's FP24), 8 projected
+mipmap cases (the TMU's level of a projected coordinate, a pixel or two off) and 2 scoping cases (Mesa's GLSL
+frontend). See LINUX.md for the run.
 
 OpenGL 2.0 with GLSL 1.10, the version the hardware supports (as the Windows `opengl32`): `apply.sh` keeps a
 2.0 context's GLSL at the driver's 1.10 (Mesa would raise it to 1.20, which is compiler work beyond the hardware) and
@@ -99,7 +103,29 @@ row), and takes a depth-stencil image of exactly the colour image's size: depth 
 of 64 bytes (a narrower one, as for a mip level, goes through a shadow), and a bigger one is named by an alias of its
 top left corner. Without two-sided stencil back faces take the front's state and reference (Mesa's clear quads set
 the front reference alone: scissored stencil clears replaced the stencil with 0 where the quad was back-facing).
-Points: board A draws 1 .. 64 pixels and clamps gl_PointSize to that, the range reported.
+Points: board A draws 1 .. 64 pixels and clamps gl_PointSize to that, the range reported. Like lines and triangles
+they are scissored to the viewport (board A clips them by near and far only): one whose centre is a little outside
+has its fragments inside the viewport and none outside, as dEQP's reference draws. gl_PointCoord: the board's t runs
+from the lower left of a surface's rows; where the rasterizer's sprite origin is the upper left (a window surface)
+the fragment program uses 1 - t.
+
+Logic ops (glLogicOp; board B has none), the Windows libraries' way: CLEAR, NOOP, COPY and INVERT by blending and the
+colour mask, SET and COPY_INVERTED by the colour the program writes (all ones, 1 - the colour); the other ten drawn
+over the target filled with zeros and with ones (blending off, depth and stencil tested, not written), the op worked
+out on the PC where the two agree, through the colour mask, the result written back, then drawn once more with the
+colour masked off for depth and stencil (`fg_egl_gl` test 18: all 16 exact). Slow: three reads of the target a draw.
+
+Texture state the TMU has not got, done in the fragment program (2D textures; a variant per state): the sampler's
+LOD bias (the texture's and the unit's, clamped to 15) is a read with BIAS, added to a program's own bias or level.
+GL_TEXTURE_MIN_LOD / MAX_LOD: the program works out the level from the coordinate's derivatives and the first level's
+size, clamps it and reads at that level. The border colour (GL_CLAMP_TO_BORDER; GL_CLAMP with a linear filter, where
+the coordinate stops at the edge and half a texel of border is the most) is mixed into what the TMU read clamped to
+the edge, by how far the coordinate is past the outer texel's middle: all of it past half a texel when nearest, its
+share of the filter when linear, in texels of the level read (`fg_egl_gl` tests 19 and 20).
+
+Programs: scalar constants share parameter vectors four to one (the fragment core has 64, uniforms included); a full
+program buffer starts again (the pass ends, the boards finish, every program is placed again; `FPGAGPU_PROG_KB` makes
+the buffers small to see it).
 
 Clears outside a pass (`clear_render_target`, `clear_depth_stencil`, `clear_texture`) are FILL_IMAGE: the colour as
 the format stores it (an X format's alpha 1.0, an L / A / LA / R / RG format's fixed channels), depth rounded to its

@@ -372,6 +372,10 @@ fg_init_screen_caps(struct fg_screen *screen)
    caps->native_fp32_depth = false;
    /* a sampler view's swizzle: the fragment program rearranges the texel after the TEX (fg_compile_key.swizzle) */
    caps->texture_swizzle = true;
+   /* the TMU reads with a bias (TEX ... BIAS); GL_TEXTURE_LOD_BIAS is clamped to this. GL_CLAMP (gl_clamp), the
+    * border colour and GL_TEXTURE_MIN_LOD / MAX_LOD the fragment program does (fg_compile_key.border, lod_clamp) */
+   caps->max_texture_lod_bias = 15.0f;
+   caps->gl_clamp = true;
 
    /* texture transfers map the image (READ_IMAGE / WRITE_IMAGE), they are not blits */
    caps->texture_transfer_modes = 0;

@@ -288,7 +288,7 @@ fg_wrap(enum pipe_tex_wrap w)
    switch (w) {
    case PIPE_TEX_WRAP_REPEAT: return 0;
    case PIPE_TEX_WRAP_MIRROR_REPEAT: return 2;
-   default: return 1; /* clamp to the edge: the TMU has no border colour */
+   default: return 1; /* clamp to the edge: the TMU has no border colour (the fragment program mixes it in) */
    }
 }
 
@@ -307,6 +307,18 @@ fg_create_sampler_state(struct pipe_context *pctx, const struct pipe_sampler_sta
    so->wrap = fg_wrap(cso->wrap_s) << 20 | fg_wrap(cso->wrap_t) << 22 | fg_wrap(cso->wrap_r) << 25;
    if (cso->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE)
       so->compare = (uint8_t)(cso->compare_func + 1);
+   so->lod_bias = cso->lod_bias;
+   so->min_lod = cso->min_lod;
+   so->max_lod = cso->max_lod;
+   /* the wraps with a border. GL_CLAMP stops the coordinate at the edge: nearest reads the edge texel (the TMU's
+    * clamp), a filter half a texel of border at most */
+   if (cso->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER || (cso->wrap_s == PIPE_TEX_WRAP_CLAMP && (mag || min)))
+      so->border |= cso->wrap_s == PIPE_TEX_WRAP_CLAMP ? FG_BORDER_S | FG_BORDER_S_HALF : FG_BORDER_S;
+   if (cso->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER || (cso->wrap_t == PIPE_TEX_WRAP_CLAMP && (mag || min)))
+      so->border |= cso->wrap_t == PIPE_TEX_WRAP_CLAMP ? FG_BORDER_T | FG_BORDER_T_HALF : FG_BORDER_T;
+   if (so->border && (mag || min))
+      so->border |= FG_BORDER_LINEAR;
+   memcpy(so->border_color, cso->border_color.f, sizeof(so->border_color));
    return so;
 }
 
@@ -548,6 +560,29 @@ fg_fs_variant(struct fg_context *ctx, struct fg_fs_state *fs, const struct fg_vs
          key.depth16_samplers |= 1u << u;
       if (ctx->samplers[u] && ctx->samplers[u]->compare)
          key.shadow_func |= (uint32_t)(ctx->samplers[u]->compare - 1) << (3 * u);
+      if (ctx->samplers[u] && u < ARRAY_SIZE(key.lod_bias) && view->texture->target != PIPE_TEXTURE_CUBE &&
+          view->texture->target != PIPE_TEXTURE_3D) {
+         const struct fg_sampler_state *s = ctx->samplers[u];
+         unsigned levels = view->u.tex.last_level - view->u.tex.first_level;
+         bool mip = levels && s->filter != s->filter_nomip;
+
+         key.lod_bias[u] = s->lod_bias;
+         if (mip && (s->min_lod > 0.0f || s->max_lod < (float)levels)) {
+            key.lod_clamp |= 1u << u;
+            key.lod_min[u] = s->min_lod;
+            key.lod_max[u] = s->max_lod;
+         }
+         if (s->border) {
+            key.border[u] = s->border | (mip ? FG_BORDER_MIP : 0);
+            memcpy(key.border_color[u], s->border_color, sizeof(key.border_color[u]));
+         }
+         if (key.lod_clamp >> u & 1 || s->border) {
+            key.tex_size[u][0] = (float)u_minify(view->texture->width0, view->u.tex.first_level);
+            key.tex_size[u][1] = (float)u_minify(view->texture->height0, view->u.tex.first_level);
+         }
+      } else if (ctx->samplers[u] && u < ARRAY_SIZE(key.lod_bias)) {
+         key.lod_bias[u] = ctx->samplers[u]->lod_bias;
+      }
       unsigned sw = view->swizzle_r | view->swizzle_g << 3 | view->swizzle_b << 6 | view->swizzle_a << 9;
       if (sw != (PIPE_SWIZZLE_X | PIPE_SWIZZLE_Y << 3 | PIPE_SWIZZLE_Z << 6 | PIPE_SWIZZLE_W << 9)) {
          key.swizzled |= 1u << u;

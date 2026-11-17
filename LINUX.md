@@ -282,6 +282,15 @@ counters and the last STATUS.
     `fg_egl_threads` and dEQP-GLES2 (built in the VM from VK-GL-CTS, the x11_egl target: pbuffers through X's
     fpgagpu device; the surfaceless target finds no device, libdrm lists no platform device without device-tree
     data).
+  - Conformance (2026-11-17): dEQP-GLES2 info, capability, functional and accuracy, 17 775 cases: 17 158 pass, 492
+    not supported, 125 fail, no crash. On the way: depth and stencil as board B takes them (one D24S8 word, the depth
+    row's bursts, the colour image's size), two-sided stencil's back reference, uniforms past the fragment core's 64
+    vectors (scalar constants packed four to one), program buffers that fill up, points kept to the viewport,
+    gl_PointCoord's origin, a vector select's write mask, logic ops. What fails: 115 clipping cases (huge coordinates,
+    board A's FP24 clipping), 8 projected mipmap cases (a pixel or two of the TMU's level), 2 scoping cases (Mesa's
+    GLSL frontend). Not supported: half-float textures, samplers in vertex programs (board A has no TMU), separate
+    16-bit depth and 8-bit stencil renderbuffers. The OpenGL 2.0 texture state the TMU has not got (LOD bias,
+    MIN_LOD / MAX_LOD, the border colour, GL_CLAMP) is done in the fragment program (`fg_egl_gl` tests 19, 20).
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.

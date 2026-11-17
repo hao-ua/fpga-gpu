@@ -42,7 +42,10 @@
  *      8 x 8 quad: every row around the quads kept, the passes timed (with band skipping a pass costs its bands);
  *  17. levels, faces and blits: mip level 2 rendered (level 0 unchanged), six cube faces cleared and one drawn on,
  *      glGenerateMipmap (each level the 2 x 2 average), GL_TEXTURE_BASE_LEVEL 1, a linear 2:1 blit, an RGBA8 ->
- *      RGB565 blit (drawn), occlusion queries (1 with a draw, 0 without).
+ *      RGB565 blit (drawn), occlusion queries (1 with a draw, 0 without);
+ *  18. the 16 logic ops over a pattern, every channel against the op worked out on the CPU;
+ *  19. GL_TEXTURE_LOD_BIAS of a texture and of a unit, and a GLSL bias on top of the texture's;
+ *  20. GL_TEXTURE_MIN_LOD / MAX_LOD, the border colour (GL_CLAMP_TO_BORDER nearest and linear, GL_CLAMP linear).
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -94,6 +97,16 @@ static const uint8_t *at(int x, int y)
 static int near(const uint8_t *p, int r, int g, int b, int tol)
 {
 	return abs(p[0] - r) <= tol && abs(p[1] - g) <= tol && abs(p[2] - b) <= tol;
+}
+
+static float fmx(float a, float b)
+{
+	return a > b ? a : b;
+}
+
+static float fmn(float a, float b)
+{
+	return a < b ? a : b;
 }
 
 static void check(int *fails, int ok, const char *what, const uint8_t *p)
@@ -1921,6 +1934,156 @@ int main(int argc, char **argv)
 		glColor3f(1, 1, 1);
 		glDeleteTextures(1, &t_p);
 		free(pat);
+	}
+
+	printf("19. LOD bias: a 16 x 16 texture, each level a colour of its own, drawn 1:1 (level 0) with nearest mipmaps:\n"
+	       "    GL_TEXTURE_LOD_BIAS of the texture, of the unit, and with a GLSL bias on top:\n");
+	{
+		static const uint8_t col[5][4] = {
+			{ 255, 0, 0, 255 }, { 0, 255, 0, 255 }, { 0, 0, 255, 255 }, { 255, 255, 255, 255 }, { 255, 255, 0, 255 }
+		};
+		static const char *vs =
+			"#version 110\n"
+			"void main() { gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }\n";
+		static const char *fs =
+			"#version 110\n"
+			"uniform sampler2D t;\n"
+			"void main() { gl_FragColor = texture2D(t, gl_TexCoord[0].st, 1.0); }\n";
+		uint8_t lvl[16 * 16 * 4];
+		GLuint t_b, sv = glCreateShader(GL_VERTEX_SHADER), sf = glCreateShader(GL_FRAGMENT_SHADER);
+		GLuint prog = glCreateProgram();
+		GLint ok = 0;
+
+		glGenTextures(1, &t_b);
+		glBindTexture(GL_TEXTURE_2D, t_b);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		for (int l = 0; l < 5; l++) {
+			for (int i = 0; i < (16 >> l) * (16 >> l); i++)
+				memcpy(lvl + 4 * i, col[l], 4);
+			glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA, 16 >> l, 16 >> l, 0, GL_RGBA, GL_UNSIGNED_BYTE, lvl);
+		}
+		glMatrixMode(GL_PROJECTION);
+		glPushMatrix();
+		glLoadIdentity();
+		glOrtho(0, W, 0, H, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_BLEND);
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glColor3f(1, 1, 1);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+		quad(0, 0, 16, 16, 0);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, 1.0f);
+		quad(16, 0, 32, 16, 0);
+		glTexEnvf(GL_TEXTURE_FILTER_CONTROL, GL_TEXTURE_LOD_BIAS, 1.0f);
+		quad(32, 0, 48, 16, 0);
+		glTexEnvf(GL_TEXTURE_FILTER_CONTROL, GL_TEXTURE_LOD_BIAS, 0.0f);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+		glDisable(GL_TEXTURE_2D);
+		glShaderSource(sv, 1, &vs, NULL);
+		glCompileShader(sv);
+		glShaderSource(sf, 1, &fs, NULL);
+		glCompileShader(sf);
+		glAttachShader(prog, sv);
+		glAttachShader(prog, sf);
+		glLinkProgram(prog);
+		glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+		if (ok) {
+			glUseProgram(prog);
+			glUniform1i(glGetUniformLocation(prog, "t"), 0);
+			quad(48, 0, 64, 16, 0);
+			glUseProgram(0);
+		}
+		read_back();
+		check(&fails, near(at(8, 8), 255, 0, 0, 0), "no bias: level 0 (red)", at(8, 8));
+		check(&fails, near(at(24, 8), 0, 255, 0, 0), "texture bias 1: level 1 (green)", at(24, 8));
+		check(&fails, near(at(40, 8), 0, 0, 255, 0), "texture 1 + unit 1: level 2 (blue)", at(40, 8));
+		check(&fails, ok && near(at(56, 8), 0, 0, 255, 0), "texture 1 + GLSL bias 1: level 2 (blue)", at(56, 8));
+
+		printf("20. GL_TEXTURE_MIN_LOD / MAX_LOD on that texture; an 8 x 8 red texture read from s, t = -0.5 .. 1.5 with a\n"
+		       "    green border: GL_CLAMP_TO_BORDER nearest and linear, GL_CLAMP linear (half border past the edge):\n");
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, 0.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, 2.0f);
+		quad(0, 0, 16, 16, 0);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, -1000.0f);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, 1.0f);
+		quad(16, 0, 20, 4, 0);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_LOD, 1000.0f);
+		quad(24, 0, 28, 4, 0);
+		read_back();
+		check(&fails, near(at(8, 8), 0, 0, 255, 0), "MIN_LOD 2, drawn 1:1: level 2 (blue)", at(8, 8));
+		check(&fails, near(at(17, 1), 0, 255, 0, 0), "MAX_LOD 1, drawn 4:1: level 1 (green)", at(17, 1));
+		check(&fails, near(at(25, 1), 0, 0, 255, 0), "no clamp, drawn 4:1: level 2 (blue)", at(25, 1));
+		{
+			static const GLfloat green[4] = { 0, 1, 0, 1 };
+			static const GLenum wrap[3] = { GL_CLAMP_TO_BORDER, GL_CLAMP_TO_BORDER, GL_CLAMP };
+			static const GLenum filt[3] = { GL_NEAREST, GL_LINEAR, GL_LINEAR };
+			int bad[3] = { 0, 0, 0 };
+			GLuint t_r;
+
+			for (int i = 0; i < 8 * 8; i++)
+				memcpy(lvl + 4 * i, col[0], 4);
+			t_r = texture(8, 8, GL_RGBA, lvl, GL_NEAREST);
+			glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, green);
+			/* s, t = 2 (0 .. 1) - 0.5 over each 32 x 32 quad */
+			glMatrixMode(GL_TEXTURE);
+			glLoadIdentity();
+			glTranslatef(-0.5f, -0.5f, 0);
+			glScalef(2, 2, 1);
+			glMatrixMode(GL_MODELVIEW);
+			glClear(GL_COLOR_BUFFER_BIT);
+			for (int k = 0; k < 3; k++) {
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[k]);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[k]);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt[k]);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt[k]);
+				quad(32 * (k & 1), 32 * (k >> 1), 32 * (k & 1) + 32, 32 * (k >> 1) + 32, 0);
+			}
+			glMatrixMode(GL_TEXTURE);
+			glLoadIdentity();
+			glMatrixMode(GL_MODELVIEW);
+			read_back();
+			for (int k = 0; k < 3; k++)
+				for (int y = 0; y < 32; y++)
+					for (int x = 0; x < 32; x++) {
+						const uint8_t *p = at(32 * (k & 1) + x, 32 * (k >> 1) + y);
+						/* in texels of the 8 x 8 image: the pixel's centre against the image's edges */
+						float s = ((x + 0.5f) / 32 * 2 - 0.5f) * 8, t = ((y + 0.5f) / 32 * 2 - 0.5f) * 8;
+						float os = fmx(0.5f - s, s - 7.5f), ot = fmx(0.5f - t, t - 7.5f);
+						float in;
+
+						if (k == 0)
+							in = (os <= 0.5f && ot <= 0.5f) ? 1.0f : 0.0f;
+						else if (k == 1)
+							in = (1 - fmn(fmx(os, 0), 1)) * (1 - fmn(fmx(ot, 0), 1));
+						else
+							in = (1 - fmn(fmx(os, 0), 0.5f)) * (1 - fmn(fmx(ot, 0), 0.5f));
+						bad[k] += !near(p, (int)(255 * in + 0.5f), (int)(255 * (1 - in) + 0.5f), 0, 3);
+					}
+			check(&fails, !bad[0], "GL_CLAMP_TO_BORDER nearest: red inside, green out", at(2, 2));
+			check(&fails, !bad[1], "GL_CLAMP_TO_BORDER linear: the border blends in", at(32 + 7, 16));
+			check(&fails, !bad[2], "GL_CLAMP linear: half border past the edge", at(2, 32 + 2));
+			if (bad[0] || bad[1] || bad[2])
+				printf("  wrong pixels: %d / %d / %d\n", bad[0], bad[1], bad[2]);
+			glDeleteTextures(1, &t_r);
+		}
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+		glDisable(GL_TEXTURE_2D);
+		glMatrixMode(GL_PROJECTION);
+		glPopMatrix();
+		glMatrixMode(GL_MODELVIEW);
+		glDeleteProgram(prog);
+		glDeleteShader(sv);
+		glDeleteShader(sf);
+		glDeleteTextures(1, &t_b);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

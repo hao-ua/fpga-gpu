@@ -1361,10 +1361,80 @@ static void emit_intrinsic(fgc *c, nir_intrinsic_instr *in)
 
 /* ------------------------------------------------------------------ textures */
 
+/* the level the TMU works out for a 2D read: log2 of the longer of the coordinate's steps to the next pixel in x and
+ * in y, in texels of the unit's first level */
+static int tex_lambda(fgc *c, int coord, int u)
+{
+   int dx = vreg(c, false), dy = vreg(c, false), px = vreg(c, true), py = vreg(c, true), l = vreg(c, true);
+   int sz = kload(c, c->key->tex_size[u][0], c->key->tex_size[u][1], 0.0, 0.0);
+
+   emit(c, "DDX r%d r%d", dx, coord);
+   emit(c, "DDY r%d r%d", dy, coord);
+   emit(c, "MUL r%d r%d r%d", dx, dx, sz);
+   emit(c, "MUL r%d r%d r%d", dy, dy, sz);
+   emit(c, "MUL r%d r%d r%d", dx, dx, dx);
+   emit(c, "MUL r%d r%d r%d", dy, dy, dy);
+   emit(c, "ADD r%d r%d.x r%d.y", px, dx, dx);
+   emit(c, "ADD r%d r%d.x r%d.y", py, dy, dy);
+   emit(c, "MAX r%d r%d r%d", px, px, py);
+   emit(c, "MAX r%d r%d r%d", px, px, kf(c, 1.0e-12));
+   emit(c, "LOG2 r%d r%d", l, px);
+   emit(c, "MUL r%d r%d r%d", l, l, kf(c, 0.5));
+   return l;
+}
+
+/* the border colour mixed into what a 2D read gave (the TMU clamps to the edge): per axis with a border, how far the
+ * coordinate is past the middle of the outer texel, in texels (of the level lam, when it is not -1); nearest: the
+ * border past half a texel, linear: its share of the filter */
+static int tex_border(fgc *c, int r, int coord, int u, int lam)
+{
+   int n = kload(c, c->key->tex_size[u][0], c->key->tex_size[u][1], 0.0, 0.0);
+   int cn = vreg(c, false), a = vreg(c, false), b = vreg(c, false), in = vreg(c, true), d = vreg(c, false);
+   int bc = kload(c, c->key->border_color[u][0], c->key->border_color[u][1], c->key->border_color[u][2],
+                  c->key->border_color[u][3]);
+   unsigned m = c->key->border[u];
+   bool bs = m & FG_BORDER_S, bt = m & FG_BORDER_T;
+
+   if (lam >= 0) {
+      int e = vreg(c, true), nl = vreg(c, false);
+
+      emit(c, "MAX r%d r%d r%d", e, lam, kf(c, 0.0));
+      emit(c, "MUL r%d r%d r%d", e, e, kf(c, -1.0));
+      emit(c, "EXP2 r%d r%d", e, e);
+      emit(c, "MUL r%d r%d r%d", nl, n, e);
+      n = nl;
+   }
+   emit(c, "MUL r%d r%d r%d", cn, coord, n);
+   emit(c, "ADD r%d r%d -r%d", a, kf(c, 0.5), cn);
+   emit(c, "ADD r%d r%d -r%d", b, cn, n);
+   emit(c, "ADD r%d r%d r%d", b, b, kf(c, 0.5));
+   emit(c, "MAX r%d r%d r%d", a, a, b);
+   if (m & (FG_BORDER_S_HALF | FG_BORDER_T_HALF))
+      emit(c, "MIN r%d r%d r%d", a, a,
+           kload(c, m & FG_BORDER_S_HALF ? 0.5 : 4096.0, m & FG_BORDER_T_HALF ? 0.5 : 4096.0, 4096.0, 4096.0));
+   if (m & FG_BORDER_LINEAR) {
+      emit(c, "MAX r%d r%d r%d", a, a, kf(c, 0.0));
+      emit(c, "MIN r%d r%d r%d", a, a, kf(c, 1.0));
+      emit(c, "ADD r%d r%d -r%d", a, kf(c, 1.0), a);
+   } else {
+      emit(c, "SET SGE r%d r%d r%d", a, kf(c, 0.5), a);
+   }
+   if (bs && bt)
+      emit(c, "MUL r%d r%d.x r%d.y", in, a, a);
+   else
+      emit(c, "MOV r%d r%d.%c", in, a, bs ? 'x' : 'y');
+   emit(c, "ADD r%d r%d -r%d", d, r, bc);
+   emit(c, "MUL r%d r%d r%d", d, d, in);
+   emit(c, "ADD r%d r%d r%d", d, d, bc);
+   return d;
+}
+
 static void emit_tex(fgc *c, nir_tex_instr *tex)
 {
    int coord = -1, bias = -1, lod = -1, cmp = -1, i, r, t, u = (int)tex->texture_index;
+   int w = -1, lam = -1;
    bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE || tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
+   bool lclamp = false, brd = false;
 
    if (!c->fs)
       fail(c, "a texture read in a vertex program (the vertex core has no texture unit)", NULL);
@@ -1392,25 +1462,56 @@ static void emit_tex(fgc *c, nir_tex_instr *tex)
    if (coord < 0)
       fail(c, "a texture read without coordinates", NULL);
    c->samplers |= 1u << u;
-   r = vreg(c, false);
-   switch (tex->op) {
-   case nir_texop_tex:
-      emit(c, "TEX r%d r%d #%d %s", r, coord, u, cube ? ".xyz" : ".xy");
-      break;
-   case nir_texop_txb:
-   case nir_texop_txl: {
-      int w = tex->op == nir_texop_txb ? bias : lod;
-
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl)
+      fail(c, "a texture operation the cores do not have", NULL);
+   if (u < 8 && !cube) {
+      lclamp = c->key->lod_clamp >> u & 1;
+      brd = c->key->border[u] & (FG_BORDER_S | FG_BORDER_T);
+   }
+   if (tex->op != nir_texop_tex) {
+      w = tex->op == nir_texop_txb ? bias : lod;
       if (w < 0)
          fail(c, "a texture read without its bias or level", NULL);
+   }
+   if (u < 8 && c->key->lod_bias[u] != 0.0f) {
+      /* the sampler's LOD bias: on the program's bias or level (GL adds it to an explicit level too), else a read
+       * with that bias */
+      if (w >= 0) {
+         int s = vreg(c, true);
+
+         emit(c, "ADD r%d r%d r%d", s, w, kf(c, c->key->lod_bias[u]));
+         w = s;
+      } else {
+         w = kf(c, c->key->lod_bias[u]);
+      }
+   }
+   if (lclamp || (brd && (c->key->border[u] & FG_BORDER_MIP))) {
+      /* the level, worked out here: the clamp, and the size of a texel of that level for the border */
+      if (tex->op == nir_texop_txl) {
+         lam = w;
+      } else {
+         lam = tex_lambda(c, coord, u);
+         if (w >= 0)
+            emit(c, "ADD r%d r%d r%d", lam, lam, w);
+      }
+   }
+   r = vreg(c, false);
+   if (lclamp) {
+      int l = vreg(c, true);
+
+      emit(c, "MAX r%d r%d r%d", l, lam, kf(c, c->key->lod_min[u]));
+      emit(c, "MIN r%d r%d r%d", l, l, kf(c, c->key->lod_max[u]));
+      t = vreg(c, false);
+      emit(c, "MOV r%d r%d", t, coord);
+      emit(c, "MOV.w r%d r%d", t, l);
+      emit(c, "TEX r%d r%d #%d LOD .xyw", r, t, u);
+   } else if (w >= 0) {
       t = vreg(c, false);
       emit(c, "MOV r%d r%d", t, coord);
       emit(c, "MOV.w r%d r%d", t, w);
-      emit(c, "TEX r%d r%d #%d %s%s", r, t, u, tex->op == nir_texop_txb ? "BIAS" : "LOD", cube ? "" : " .xyw");
-      break;
-   }
-   default:
-      fail(c, "a texture operation the cores do not have", NULL);
+      emit(c, "TEX r%d r%d #%d %s%s", r, t, u, tex->op == nir_texop_txl ? "LOD" : "BIAS", cube ? "" : " .xyw");
+   } else {
+      emit(c, "TEX r%d r%d #%d %s", r, coord, u, cube ? ".xyz" : ".xy");
    }
    if (c->key->depth_samplers & (1u << u)) {
       /* a depth texture: the TMU reads the D24S8 word as RGBA bytes, R the stencil, then the depth high byte first */
@@ -1436,6 +1537,9 @@ static void emit_tex(fgc *c, nir_tex_instr *tex)
       emit(c, "MOV r%d r%d", d, o);
       emit(c, "MOV.w r%d r%d", d, kf(c, 1.0));
       r = d;
+      /* the border of a depth texture is a depth (its red), compared as one */
+      if (brd)
+         r = tex_border(c, r, coord, u, lam);
    }
    if (tex->is_shadow) {
       /* a depth compare (the TMU has none): the reference, clamped to [0, 1] as for a fixed-point depth, against
@@ -1478,6 +1582,9 @@ static void emit_tex(fgc *c, nir_tex_instr *tex)
       }
       r = d;
    }
+   /* a colour texture's border: the colour as the frontend gives it (for the texture's base format) */
+   if (brd && !(c->key->depth_samplers & (1u << u)))
+      r = tex_border(c, r, coord, u, lam);
    set_def(c, &tex->def, r);
 }
 

@@ -94,6 +94,10 @@ struct fg_sampler_state {
    uint32_t filter;           /* with the mip filter */
    uint32_t wrap;             /* [22:20] wrap s, t; [26:25] r */
    uint8_t compare;           /* a depth compare (shadow sampler): its PIPE_FUNC_* + 1; 0 none */
+   float lod_bias;            /* added to the level of every read (the TMU's BIAS; fg_compile_key.lod_bias) */
+   float min_lod, max_lod;    /* the level's clamp (the TMU clamps to the chain only: the program clamps) */
+   uint8_t border;            /* FG_BORDER_*: the axes that read the border colour past the edge (the program mixes it in) */
+   float border_color[4];
 };
 
 struct fg_velem {

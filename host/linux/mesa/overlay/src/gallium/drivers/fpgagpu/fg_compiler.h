@@ -15,6 +15,14 @@
 #define FG_FS_PARAMS 64  /* of the fragment core */
 #define FG_VARYINGS  8   /* varying vectors from the vertex to the fragment stage */
 
+/* a 2D unit's border (the TMU clamps to the edge; the program mixes the border colour in) */
+#define FG_BORDER_S      0x01 /* the s axis has a border: GL_CLAMP_TO_BORDER, or GL_CLAMP filtered */
+#define FG_BORDER_T      0x02
+#define FG_BORDER_S_HALF 0x04 /* GL_CLAMP: the coordinate stops at the edge, half a texel of border at most */
+#define FG_BORDER_T_HALF 0x08
+#define FG_BORDER_LINEAR 0x10 /* filtered: the border's share grows over a texel; else all past half a texel */
+#define FG_BORDER_MIP    0x20 /* read with mipmaps: a level's texels are larger */
+
 /* what a program depends on besides its NIR */
 struct fg_compile_key {
    uint32_t xops;           /* fragment stage: board B's extra operations, STATUS b_flags bits 28-29: bit 0 SQRT / RCPM / RSQM, bit 1 CLAMP */
@@ -26,6 +34,13 @@ struct fg_compile_key {
                              * 1 less, 2 equal, 3 less-or-equal, 4 greater, 5 not equal, 6 greater-or-equal, 7 always */
    uint32_t swizzled;       /* fragment stage: the units whose texel is rearranged, as swizzle[unit] says */
    uint32_t logic;          /* fragment stage, a logic op's colour: 0 the program's, 1 all ones, 2 its complement */
+   float lod_bias[8];       /* fragment stage: a unit's sampler LOD bias (GL_TEXTURE_LOD_BIAS), added to every read */
+   /* fragment stage, 2D units 0-7, what the TMU has not got: */
+   uint32_t lod_clamp;      /* the level worked out here and clamped to [lod_min, lod_max] (GL_TEXTURE_MIN_LOD / MAX_LOD) */
+   uint8_t border[8];       /* FG_BORDER_*: the axes that read border_color past the image's edge */
+   float lod_min[8], lod_max[8];
+   float tex_size[8][2];    /* the width and height of the unit's first level (lod_clamp, the border) */
+   float border_color[8][4];
    uint32_t point_flip;     /* fragment stage: gl_PointCoord.t is 1 - the board's (the rasterizer's sprite origin is
                              * the upper left of the surface's rows; the board's t runs from the lower left) */
    uint16_t swizzle[16];    /* 3 bits a component, R at bit 0 .. A at bit 9: 0-3 the texel's R, G, B, A; 4 zero; 5 one */

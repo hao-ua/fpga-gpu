@@ -74,11 +74,31 @@ Draw states: board B keeps 8191 of a context's draw states by id. When they run 
 again, before the next draw sends anything, with the images the draw reads on the next pass's list (`fg_egl_gl` test
 12).
 
-Blits (`glBlitFramebuffer`) are board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors, the
-scissor when nothing stretches (`fg_egl_gl` test 8); blended blits and blits between storage formats are not done. A
-blit into an image whose alpha the board keeps at 1.0 (an X format) from one whose alpha is not sets it to 1.0, and a
-blit's swizzle is COPY_IMAGE's where board B has the copy extensions (see Copies); on other boards a swizzling blit is
-not done.
+Blits (`glBlitFramebuffer`) are board B's COPY_IMAGE where it can: images of the same storage, a nearest stretch,
+mirrors, the scissor when nothing stretches (`fg_egl_gl` test 8). A blit into an image whose alpha the board keeps at
+1.0 (an X format) from one whose alpha is not sets it to 1.0, and a blit's swizzle is COPY_IMAGE's where board B has
+the copy extensions (see Copies). The rest is drawn by Mesa's blitter (`u_blitter`: the source sampled by the TMU, a
+quad into the destination's level and layer): a linear stretch, a conversion between storage formats (RGBA8 to
+RGB565 and back), blending, a colour mask, a swizzle the copy engine has not. Depth and stencil are copied only.
+Gallium's helpers write TGSI: the driver takes it through `tgsi_to_nir`.
+
+Levels and layers: board B renders into level 0 of a one-layer image. A target that is a mip level above 0, a cube
+face or a layer is rendered in a one-level image of that level's size (a shadow, one a level, the pitch board B
+needs), copied back into the level and layer after each pass; the shadow takes the level and layer first when it
+holds another or the image changed. The TMU starts at level 0 and reads the chain to its end: a view that starts at a
+higher level (GL_TEXTURE_BASE_LEVEL, a blit from a level) or a filtered chain cut short reads a copy of those levels
+of every layer, taken again when the image changed. `glGenerateMipmap` is Mesa's blit from each level to the next,
+linear 2:1: each texel the average of 2 x 2 (`fg_egl_gl` test 17). Depth or stencil of a level or layer above 0 is
+not rendered.
+
+Clears outside a pass (`clear_render_target`, `clear_depth_stencil`, `clear_texture`) are FILL_IMAGE: the colour as
+the format stores it (an X format's alpha 1.0, an L / A / LA / R / RG format's fixed channels), depth rounded to its
+bits, stencil, each through FILL's byte mask (in a D24S8 word the stencil is the top byte).
+
+Queries: board B counts no samples. GL_QUERY_COUNTER_BITS is 0, and an occlusion query's result is 1 when a draw ran
+inside it, else 0: never 0 where samples passed, so a program that culls by it draws too much, never too little (the
+Windows libraries' rule). `apply.sh` lets these queries reach the driver: Mesa makes the queries of a driver without a
+counter dummies that answer 0. The blitter's own draws do not count.
 
 Copies: a draw whose fragment program samples one 2D image at a varying and writes the texel as its colour, and does
 nothing else (`fract()` of the coordinate allowed: a repeating tile), is board B's COPY_IMAGE when the varying runs one
@@ -122,8 +142,8 @@ Flushes: a flush that submitted work waits for the one four flushes back (`FPGAG
 process that makes work faster than the boards do it does not queue it ever deeper (a dragged window trailed the
 pointer by ~130 ms; now ~15 ms). A flush at the end of a frame also waits for the frame before (one frame in flight).
 
-Not yet: copies between buffers and images, mipmap generation, queries, instancing, importing buffers,
-rendering into a level or layer above 0 or a target wider than 1280, more than one context drawing at a time.
+Not yet: copies between buffers and images, instancing, importing buffers, depth or stencil of a level or layer above
+0, a target wider than 1280, more than one context drawing at a time.
 
 ## Apply and build
 

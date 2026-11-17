@@ -143,5 +143,13 @@ edit("src/mesa/main/extensions_table.h",
      "EXT(EXT_texture_swizzle                     , EXT_texture_swizzle                    , GLL, GLC,  x ,  x , 2008)",
      ["EXT(EXT_texture_swizzle                     , EXT_texture_swizzle                    , GLL, GLC,  x , ES2, 2008)"],
      "replace")
+
+# occlusion queries: fpgagpu's board counts no samples (QUERY_COUNTER_BITS 0), yet its queries answer whether a draw
+# ran inside them (1, never 0 where samples passed); Mesa makes a counterless driver's queries dummies that answer 0
+edit("src/mesa/main/queryobj.c",
+     "      return !st->screen->caps.occlusion_query;",
+     ["      /* fpgagpu: no samples counter, but its queries say whether a draw ran (never 0 where samples passed) */",
+      "      return !st->screen->caps.occlusion_query && strcmp(st->screen->get_name(st->screen), \"fpgagpu\") != 0;"],
+     "replace")
 PY
 echo "done: configure with -Dgallium-drivers=fpgagpu,..."

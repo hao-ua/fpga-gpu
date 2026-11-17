@@ -150,6 +150,7 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    rsc->base = *templ;
    rsc->base.screen = pscreen;
    pipe_reference_init(&rsc->base.reference, 1);
+   fg_shadows_stale(rsc);
 
    if (templ->target == PIPE_BUFFER) {
       rsc->data = align_malloc(MAX2(templ->width0, 1), 64);
@@ -259,8 +260,10 @@ fg_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
 {
    struct fg_resource *rsc = fg_resource(prsc);
 
-   pipe_resource_reference(&rsc->shadow, NULL);
+   for (unsigned l = 0; l < FG_MAX_LEVELS; l++)
+      pipe_resource_reference(&rsc->shadow[l], NULL);
    pipe_resource_reference(&rsc->tight, NULL);
+   pipe_resource_reference(&rsc->lview, NULL);
    for (unsigned i = 0; i < ARRAY_SIZE(rsc->ralias); i++)
       if (rsc->ralias[i].gem)
          fg_gem_unref(fg_screen(pscreen), rsc->ralias[i].gem);
@@ -355,6 +358,7 @@ fg_resource_from_handle(struct pipe_screen *pscreen, const struct pipe_resource 
    rsc->base = *templ;
    rsc->base.screen = pscreen;
    pipe_reference_init(&rsc->base.reference, 1);
+   fg_shadows_stale(rsc);
    rsc->fmt = f;
    rsc->gem = gem;
    rsc->board_handle = (uint16_t)info.board_handle;
@@ -517,7 +521,7 @@ fg_write_image(struct fg_context *ctx, struct fg_resource *rsc, const struct fg_
    free(cmds);
    if (ok)
       rsc->initialized = true;
-   rsc->tight_stale = true;
+   fg_resource_written(rsc);
    return ok;
 }
 
@@ -628,7 +632,7 @@ fg_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptransfer)
       if (fg_context_pending_uses(ctx, ptransfer->resource))
          fg_context_flush_pending(ctx);
       fg_submit_stream(ctx);
-      rsc->shadow_stale = true;
+      fg_shadows_stale(rsc);
       if (rsc->fmt->expand) {
          const struct pipe_box *b = &ptransfer->box;
          size_t n = (size_t)b->width * b->height * b->depth;

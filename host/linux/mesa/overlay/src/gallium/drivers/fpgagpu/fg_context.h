@@ -103,6 +103,7 @@ struct fg_velems_state {
 struct fg_target {
    struct pipe_resource *color, *ds;
    struct pipe_resource *shadow_of; /* color is this image's render shadow: copied back after the FLUSH */
+   uint8_t level, layer;      /* the level and layer of shadow_of it renders */
    uint16_t color_handle, ds_handle;
    uint32_t width, height;
    bool depth16, has_stencil;
@@ -132,6 +133,7 @@ struct fg_region {
 struct fg_context {
    struct pipe_context base;
    struct primconvert_context *primconvert;
+   struct blitter_context *blitter;   /* blits drawn (what board B's copy engine does not do) */
 
    /* bound state */
    struct pipe_framebuffer_state fb;
@@ -165,6 +167,8 @@ struct fg_context {
    /* the pass */
    bool pass_open;
    unsigned pass_draws;
+   uint64_t draw_count;       /* draws made, in all (not the blitter's: queries_off) */
+   bool queries_off;
    struct fg_target tgt;
    bool have_tgt;
    struct pipe_resource **pass_res; /* what the open pass reads or writes, held until its FLUSH is submitted */
@@ -303,6 +307,8 @@ void fg_copy_end(struct fg_context *ctx, struct pipe_resource *dst);
 /* the handle the TMU reads the image by: its tight-row copy when its rows are padded, or when it is the pass's target
  * (snapshot) */
 uint16_t fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc, bool snapshot);
+/* the handle the TMU reads levels first .. last of the image by: a copy of those levels (fg_resource.lview) */
+uint16_t fg_level_handle(struct fg_context *ctx, struct pipe_resource *prsc, unsigned first, unsigned last);
 
 /* region passes: whether the open target may have one; a draw's or clear's pixels b (x0, y0, x1, y1 in the target)
  * admitted before anything of it is sent (it may end the pass first, or fix the origin); what it reached added after */

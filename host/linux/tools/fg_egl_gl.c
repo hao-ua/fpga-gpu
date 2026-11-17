@@ -39,7 +39,10 @@
  *  15. 32 render targets 21 x 29 (rendered in shadows of 96-byte rows; board B stores whole bands of 8 rows), each
  *      followed by an image with a pattern: the targets rendered again, every image must be unchanged;
  *  16. an 800 x 600 target with depth (no region passes) filled with rows of their own colour, then 100 passes of an
- *      8 x 8 quad: every row around the quads kept, the passes timed (with band skipping a pass costs its bands).
+ *      8 x 8 quad: every row around the quads kept, the passes timed (with band skipping a pass costs its bands);
+ *  17. levels, faces and blits: mip level 2 rendered (level 0 unchanged), six cube faces cleared and one drawn on,
+ *      glGenerateMipmap (each level the 2 x 2 average), GL_TEXTURE_BASE_LEVEL 1, a linear 2:1 blit, an RGBA8 ->
+ *      RGB565 blit (drawn), occlusion queries (1 with a draw, 0 without).
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -1483,6 +1486,233 @@ int main(int argc, char **argv)
 		glDeleteFramebuffersEXT(1, &fbo16);
 		glDeleteRenderbuffersEXT(2, rb16);
 		free(p);
+	}
+
+	printf("17. levels, faces and blits: rendering into mip level 2 and into cube faces, glGenerateMipmap (each level\n"
+	       "    the 2 x 2 average of the one above), GL_TEXTURE_BASE_LEVEL 1, a linear 2:1 blit, an RGBA8 -> RGB565 blit,\n"
+	       "    occlusion queries:\n");
+	{
+		typedef void (*blit_fn)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+		blit_fn blit = (blit_fn)eglGetProcAddress("glBlitFramebufferEXT");
+		uint8_t *img = malloc(64 * 64 * 4), *got = malloc(64 * 64 * 4), *lv[7];
+		GLuint t_m, t_c, t_g, t_h, rb565, fbo17[2], q;
+		GLuint qr = 99;
+		int bad, bad2;
+
+		glMatrixMode(GL_PROJECTION);
+		glPushMatrix();
+		glLoadIdentity();
+		glOrtho(0, 1, 0, 1, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glDisable(GL_TEXTURE_2D);
+		glDisable(GL_BLEND);
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_DEPTH_TEST);
+		glGenFramebuffersEXT(2, fbo17);
+		for (int y = 0; y < 64; y++) {
+			for (int x = 0; x < 64; x++) {
+				uint8_t *e = img + 4 * (y * 64 + x);
+
+				e[0] = x * 4;
+				e[1] = y * 4;
+				e[2] = (x * y) & 255;
+				e[3] = 255 - x;
+			}
+		}
+
+		/* level 2 (16 x 16) of a full chain as the target: cleared blue, its left half drawn red; level 0 unchanged */
+		t_m = texture(64, 64, GL_RGBA, img, GL_NEAREST_MIPMAP_NEAREST);
+		for (int l = 1; l < 7; l++)
+			glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA, 64 >> l, 64 >> l, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo17[0]);
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_m, 2);
+		glViewport(0, 0, 16, 16);
+		glClearColor(0, 0, 1, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glColor3f(1, 0, 0);
+		quad(0, 0, 0.5f, 1, 0);
+		memset(got, 0xA5, 16 * 16 * 4);
+		glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, got);
+		bad = 0;
+		for (int i = 0; i < 16 * 16; i++)
+			bad += (i % 16 < 8) ? !near(got + 4 * i, 255, 0, 0, 0) : !near(got + 4 * i, 0, 0, 255, 0);
+		check(&fails, !bad, "mip level 2 rendered: red | blue", got + 4 * (8 * 16 + 4));
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_m, 0);
+		glViewport(0, 0, 64, 64);
+		memset(got, 0xA5, 64 * 64 * 4);
+		glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, got);
+		check(&fails, !memcmp(got, img, 64 * 64 * 4), "level 0 unchanged", got + 4 * (10 * 64 + 10));
+
+		/* a cube map 32 x 32: each face cleared its own colour, face 3 also drawn on (a quad over its top half) */
+		glGenTextures(1, &t_c);
+		glBindTexture(GL_TEXTURE_CUBE_MAP, t_c);
+		glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		for (int f = 0; f < 6; f++)
+			glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, GL_RGBA, 32, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glViewport(0, 0, 32, 32);
+		for (int f = 0; f < 6; f++) {
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_CUBE_MAP_POSITIVE_X + f,
+			                          t_c, 0);
+			glClearColor(f * 40 / 255.0f, (255 - f * 40) / 255.0f, (f & 1) ? 1.0f : 0.0f, 1);
+			glClear(GL_COLOR_BUFFER_BIT);
+			if (f == 3) {
+				glColor3f(1, 1, 1);
+				quad(0, 0.5f, 1, 1, 0);
+			}
+		}
+		bad = 0;
+		for (int f = 0; f < 6; f++) {
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_CUBE_MAP_POSITIVE_X + f,
+			                          t_c, 0);
+			memset(got, 0xA5, 32 * 32 * 4);
+			glReadPixels(0, 0, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, got);
+			for (int i = 0; i < 32 * 32; i++)
+				bad += (f == 3 && i / 32 >= 16) ? !near(got + 4 * i, 255, 255, 255, 0) :
+				       !near(got + 4 * i, f * 40, 255 - f * 40, (f & 1) ? 255 : 0, 0);
+		}
+		if (bad)
+			printf("  %d cube face pixels wrong\n", bad);
+		check(&fails, !bad, "six cube faces: their colours, face 3's quad", got + 4 * (5 * 32 + 5));
+
+		/* glGenerateMipmap: each level the average of 2 x 2 texels of the one above (the box filter; +-1 a level) */
+		t_g = texture(64, 64, GL_RGBA, img, GL_NEAREST_MIPMAP_NEAREST);
+		glGenerateMipmapEXT(GL_TEXTURE_2D);
+		lv[0] = img;
+		bad = 0;
+		for (int l = 1; l < 7; l++) {
+			int s = 64 >> l;
+
+			lv[l] = malloc((size_t)s * s * 4);
+			for (int y = 0; y < s; y++)
+				for (int x = 0; x < s; x++)
+					for (int c = 0; c < 4; c++) {
+						const uint8_t *u = lv[l - 1];
+						int v = u[4 * (2 * y * 2 * s + 2 * x) + c] + u[4 * (2 * y * 2 * s + 2 * x + 1) + c] +
+						        u[4 * ((2 * y + 1) * 2 * s + 2 * x) + c] + u[4 * ((2 * y + 1) * 2 * s + 2 * x + 1) + c];
+
+						lv[l][4 * (y * s + x) + c] = (uint8_t)((v + 2) / 4);
+					}
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_g, l);
+			glViewport(0, 0, s, s);
+			memset(got, 0xA5, (size_t)s * s * 4);
+			glReadPixels(0, 0, s, s, GL_RGBA, GL_UNSIGNED_BYTE, got);
+			for (int i = 0; i < s * s * 4; i++)
+				if (abs(got[i] - lv[l][i]) > 1) {
+					if (!bad)
+						printf("  level %d texel %d channel %d: %d, the 2 x 2 average %d\n", l, i / 4, i % 4, got[i],
+						       lv[l][i]);
+					bad++;
+				}
+			/* the next level is the average of what this one holds */
+			memcpy(lv[l], got, (size_t)s * s * 4);
+		}
+		check(&fails, !bad, "glGenerateMipmap: 6 levels, each the 2 x 2 average", lv[1]);
+
+		/* GL_TEXTURE_BASE_LEVEL 1 (nearest, no mipmaps): the 64 x 64 target shows level 1 magnified 2x */
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glBindTexture(GL_TEXTURE_2D, t_g);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 1);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+		glColor3f(1, 1, 1);
+		quad(0, 0, 1, 1, 0);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+		glDisable(GL_TEXTURE_2D);
+		read_back();
+		bad = 0;
+		for (int y = 0; y < H; y++)
+			for (int x = 0; x < W; x++)
+				bad += !near(at(x, y), lv[1][4 * ((y / 2) * 32 + x / 2)], lv[1][4 * ((y / 2) * 32 + x / 2) + 1],
+				             lv[1][4 * ((y / 2) * 32 + x / 2) + 2], 0);
+		check(&fails, !bad, "GL_TEXTURE_BASE_LEVEL 1: level 1 shown", at(20, 20));
+
+		/* glBlitFramebuffer 64 x 64 -> 32 x 32, GL_LINEAR: each pixel the 2 x 2 average; RGBA8 -> RGB565 1:1 */
+		t_h = texture(32, 32, GL_RGBA, NULL, GL_NEAREST);
+		glGenRenderbuffersEXT(1, &rb565);
+		glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb565);
+		glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, 0x8D62 /* GL_RGB565 */, 64, 64);
+		{
+			GLint rbits = 0, gbits = 0;
+
+			glGetRenderbufferParameterivEXT(GL_RENDERBUFFER_EXT, GL_RENDERBUFFER_RED_SIZE_EXT, &rbits);
+			glGetRenderbufferParameterivEXT(GL_RENDERBUFFER_EXT, GL_RENDERBUFFER_GREEN_SIZE_EXT, &gbits);
+			printf("  GL_RGB565 renderbuffer: %d / %d bits red / green (GL error 0x%04x)\n", rbits, gbits, glGetError());
+		}
+		bad = bad2 = 0;
+		if (blit) {
+			glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, fbo17[0]);
+			glFramebufferTexture2DEXT(GL_READ_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_m, 0);
+			glBindFramebufferEXT(GL_DRAW_FRAMEBUFFER_EXT, fbo17[1]);
+			glFramebufferTexture2DEXT(GL_DRAW_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_h, 0);
+			blit(0, 0, 64, 64, 0, 0, 32, 32, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo17[1]);
+			glViewport(0, 0, 32, 32);
+			memset(got, 0xA5, 32 * 32 * 4);
+			glReadPixels(0, 0, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, got);
+			for (int y = 0; y < 32; y++)
+				for (int x = 0; x < 32; x++)
+					for (int c = 0; c < 4; c++) {
+						int v = img[4 * (2 * y * 64 + 2 * x) + c] + img[4 * (2 * y * 64 + 2 * x + 1) + c] +
+						        img[4 * ((2 * y + 1) * 64 + 2 * x) + c] + img[4 * ((2 * y + 1) * 64 + 2 * x + 1) + c];
+
+						bad += abs(got[4 * (y * 32 + x) + c] - (v + 2) / 4) > 1;
+					}
+			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rb565);
+			glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, fbo17[0]);
+			glBindFramebufferEXT(GL_DRAW_FRAMEBUFFER_EXT, fbo17[1]);
+			blit(0, 0, 64, 64, 0, 0, 64, 64, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo17[1]);
+			glViewport(0, 0, 64, 64);
+			memset(got, 0xA5, 64 * 64 * 4);
+			glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, got);
+			/* (each channel one of the two n-bit values around it: GL lets an undithered conversion take either; read
+			 * back through Mesa's conversion of n bits to 8, which truncates: +-1) */
+			for (int i = 0; i < 64 * 64; i++)
+				for (int c = 0; c < 3; c++) {
+					int m = c == 1 ? 63 : 31, lo = img[4 * i + c] * m / 255, hi = (img[4 * i + c] * m + 254) / 255;
+					int b = (got[4 * i + c] * m * 2 + 255) / 510;
+
+					if (((b != lo && b != hi) || abs(got[4 * i + c] - (b * 510 + m) / (2 * m)) > 1) && !bad2++)
+						printf("  RGB565 pixel (%d, %d) channel %d: %d (%d of %d), from %d\n", i % 64, i / 64, c,
+						       got[4 * i + c], b, m, img[4 * i + c]);
+				}
+		}
+		check(&fails, blit && !bad, "a linear 2:1 blit: each pixel the 2 x 2 average", got);
+		check(&fails, blit && !bad2, "an RGBA8 -> RGB565 blit: each channel converted to its bits", got + 4 * 100);
+
+		/* an occlusion query is 1 when a draw ran inside it, 0 when none did */
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glGenQueries(1, &q);
+		glBeginQuery(GL_SAMPLES_PASSED, q);
+		glColor3f(0, 1, 0);
+		quad(0.25f, 0.25f, 0.75f, 0.75f, 0);
+		glEndQuery(GL_SAMPLES_PASSED);
+		glGetQueryObjectuiv(q, GL_QUERY_RESULT, &qr);
+		bad = qr == 0;
+		glBeginQuery(GL_SAMPLES_PASSED, q);
+		glEndQuery(GL_SAMPLES_PASSED);
+		glGetQueryObjectuiv(q, GL_QUERY_RESULT, &qr);
+		bad += qr != 0;
+		glDeleteQueries(1, &q);
+		check(&fails, !bad, "occlusion queries: 1 with a draw, 0 without", (const uint8_t *)"\0\0\0\0");
+
+		glMatrixMode(GL_PROJECTION);
+		glPopMatrix();
+		glMatrixMode(GL_MODELVIEW);
+		glColor3f(1, 1, 1);
+		glDeleteFramebuffersEXT(2, fbo17);
+		glDeleteRenderbuffersEXT(1, &rb565);
+		glDeleteTextures(1, &t_m);
+		glDeleteTextures(1, &t_c);
+		glDeleteTextures(1, &t_g);
+		glDeleteTextures(1, &t_h);
+		for (int l = 1; l < 7; l++)
+			free(lv[l]);
+		free(img);
+		free(got);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

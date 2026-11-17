@@ -17,6 +17,7 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "indices/u_primconvert.h"
+#include "nir/tgsi_to_nir.h"
 #include "util/format/u_format.h"
 #include "util/u_atomic.h"
 #include "util/u_helpers.h"
@@ -405,11 +406,12 @@ fg_create_vs_state(struct pipe_context *pctx, const struct pipe_shader_state *cs
       return NULL;
    so->off = ~0u;
    so->id = ++ctx->next_vs_id;
-   if (cso->type != PIPE_SHADER_IR_NIR) {
-      fprintf(stderr, "fpgagpu: a vertex shader that is not NIR\n");
+   /* (Gallium's helpers, the blitter among them, write TGSI) */
+   so->nir = cso->type == PIPE_SHADER_IR_NIR ? cso->ir.nir : tgsi_to_nir(cso->tokens, pctx->screen, false);
+   if (!so->nir) {
+      fprintf(stderr, "fpgagpu: a vertex shader neither NIR nor TGSI\n");
       return so;
    }
-   so->nir = cso->ir.nir;
    fg_nir_lower(so->nir, &so->ev, NULL);
    so->vmask = fg_varying_mask(so->nir->info.outputs_written);
    key.noops = fg_noops(screen->a_flags);
@@ -451,11 +453,11 @@ fg_create_fs_state(struct pipe_context *pctx, const struct pipe_shader_state *cs
 
    if (!so)
       return NULL;
-   if (cso->type != PIPE_SHADER_IR_NIR) {
-      fprintf(stderr, "fpgagpu: a fragment shader that is not NIR\n");
+   so->nir = cso->type == PIPE_SHADER_IR_NIR ? cso->ir.nir : tgsi_to_nir(cso->tokens, pctx->screen, false);
+   if (!so->nir) {
+      fprintf(stderr, "fpgagpu: a fragment shader neither NIR nor TGSI\n");
       return so;
    }
-   so->nir = cso->ir.nir;
    fg_nir_lower(so->nir, NULL, &so->copy);
    return so;
 }
@@ -1071,9 +1073,14 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
          continue;
       }
       filter = view->u.tex.last_level > view->u.tex.first_level ? s->filter : s->filter_nomip;
-      h[15 + u] = fg_sample_handle(ctx, view->texture,
-                                   view->texture == t->color || (t->shadow_of && view->texture == t->shadow_of)) |
-                  filter << 16 | s->wrap;
+      /* a view that starts past level 0, or a filtered chain cut short, reads a copy of its levels; an image rendered
+       * in a shadow does not change before the pass ends: it is read as it is */
+      if (view->u.tex.first_level ||
+          (view->u.tex.last_level > view->u.tex.first_level && view->u.tex.last_level < view->texture->last_level))
+         h[15 + u] = fg_level_handle(ctx, view->texture, view->u.tex.first_level, view->u.tex.last_level);
+      else
+         h[15 + u] = fg_sample_handle(ctx, view->texture, view->texture == t->color);
+      h[15 + u] |= filter << 16 | s->wrap;
       fg_use_resource(ctx, view->texture);
    }
 
@@ -1846,6 +1853,8 @@ fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsign
       FG_NOTE_ONCE("instancing (each draw is drawn once)");
    if (!vs || !vs->ok || !ctx->fs || !ctx->velems)
       return;
+   if (!ctx->queries_off)
+      ctx->draw_count++; /* (an occlusion query's result: a draw ran) */
    if (fg_draw_as_copy(ctx, info, draws, num_draws) || !fg_set_target(ctx))
       return;
    fs = fg_fs_variant(ctx, ctx->fs, vs);

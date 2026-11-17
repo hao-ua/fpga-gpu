@@ -14,6 +14,7 @@
 
 #include "util/format/u_format.h"
 #include "util/u_atomic.h"
+#include "util/u_blitter.h"
 #include "util/u_debug.h"
 #include "util/u_framebuffer.h"
 #include "util/u_inlines.h"
@@ -441,8 +442,10 @@ fg_end_pass(struct fg_context *ctx)
         (fg_screen(ctx->base.screen)->band_skip ? FG_FL_SKIP_BANDS : 0);
    fg_emit_flush(ctx, fl, &r);
    if (ctx->tgt.shadow_of) {
-      /* rendered in the shadow: back into the image (what the FLUSH covered), after the FLUSH that rendered it */
-      fg_emit_copy(ctx, ctx->tgt.color, 0, 0, r.x, r.y, ctx->tgt.shadow_of, 0, 0, r.x, r.y, r.w, r.h);
+      /* rendered in the shadow: back into the image's level and layer (what the FLUSH covered), after the FLUSH that
+       * rendered it */
+      fg_emit_copy(ctx, ctx->tgt.color, 0, 0, r.x, r.y, ctx->tgt.shadow_of, ctx->tgt.level, ctx->tgt.layer, r.x, r.y,
+                   r.w, r.h);
       fg_resource(ctx->tgt.shadow_of)->initialized = true;
    }
    fg_submit_stream(ctx);
@@ -457,11 +460,11 @@ fg_end_pass(struct fg_context *ctx)
    }
    /* what the pass wrote: a tight-row copy of it is taken again before it is sampled */
    if (ctx->tgt.color)
-      fg_resource(ctx->tgt.color)->tight_stale = true;
+      fg_resource_written(fg_resource(ctx->tgt.color));
    if (ctx->tgt.shadow_of)
-      fg_resource(ctx->tgt.shadow_of)->tight_stale = true;
+      fg_resource_written(fg_resource(ctx->tgt.shadow_of));
    if (ctx->tgt.ds)
-      fg_resource(ctx->tgt.ds)->tight_stale = true;
+      fg_resource_written(fg_resource(ctx->tgt.ds));
    p_atomic_inc(&fg_screen(ctx->base.screen)->pass_seq);
    for (unsigned i = 0; i < ctx->npass_res; i++)
       pipe_resource_reference(&ctx->pass_res[i], NULL);
@@ -501,23 +504,26 @@ fg_target_hold(struct fg_context *ctx, const struct fg_target *t)
    }
 }
 
-/* the image board B renders into in place of c (pitch a multiple of 32, one level, one layer), made the first time */
+/* the image board B renders into in place of a level of c (that level's size, pitch a multiple of 32, one level, one
+ * layer), made the first time */
 static struct pipe_resource *
-fg_render_shadow(struct pipe_resource *c)
+fg_render_shadow(struct pipe_resource *c, unsigned level)
 {
    struct fg_resource *r = fg_resource(c);
 
-   if (!r->shadow) {
+   if (!r->shadow[level]) {
       struct pipe_resource templ = *c;
 
       templ.target = PIPE_TEXTURE_2D;
       templ.bind = PIPE_BIND_RENDER_TARGET;
+      templ.width0 = u_minify(c->width0, level);
+      templ.height0 = u_minify(c->height0, level);
       templ.last_level = 0;
       templ.array_size = 1;
-      r->shadow = c->screen->resource_create(c->screen, &templ);
-      r->shadow_stale = true;
+      r->shadow[level] = c->screen->resource_create(c->screen, &templ);
+      r->shadow_layer[level] = -1;
    }
-   return r->shadow;
+   return r->shadow[level];
 }
 
 /* the framebuffer's first colour buffer and depth-stencil buffer as the pass's target; a change ends the pass.
@@ -530,6 +536,7 @@ fg_set_target(struct fg_context *ctx)
    struct pipe_resource *z = fb->zsbuf.texture;
    struct fg_target t;
    const struct fg_format *f;
+   unsigned level, layer, w, h;
 
    if (!c) {
       FG_NOTE_ONCE("rendering without a colour buffer");
@@ -542,28 +549,34 @@ fg_set_target(struct fg_context *ctx)
       }
       return false;
    }
-   if (fb->cbufs[0].level || fb->cbufs[0].first_layer || c->width0 > FG_FLUSH_MAX_WIDTH ||
-       (z && (fb->zsbuf.level || fb->zsbuf.first_layer || z->width0 < c->width0 || z->height0 < c->height0))) {
-      FG_NOTE_ONCE("rendering into a mip level above 0, a cube face or layer above 0, or a target wider than 1280");
+   level = fb->cbufs[0].level;
+   layer = fb->cbufs[0].first_layer;
+   w = u_minify(c->width0, level);
+   h = u_minify(c->height0, level);
+   if (level >= FG_MAX_LEVELS || w > FG_FLUSH_MAX_WIDTH ||
+       (z && (fb->zsbuf.level || fb->zsbuf.first_layer || z->width0 < w || z->height0 < h))) {
+      FG_NOTE_ONCE("rendering into a target wider than 1280, or with depth or stencil of a level or layer above 0");
       return false;
    }
    f = fg_resource(c)->fmt;
    if (!fg_format_renderable(f))
       return false;
    rt = c;
-   if (fg_resource(c)->pitch % 32) {
-      rt = fg_render_shadow(c);
+   if (level || layer || fg_resource(c)->pitch % 32) {
+      rt = fg_render_shadow(c, level);
       if (!rt)
          return false;
    }
    memset(&t, 0, sizeof(t));
    t.color = rt;
    t.shadow_of = rt != c ? c : NULL;
+   t.level = (uint8_t)level;
+   t.layer = (uint8_t)layer;
    t.ds = z;
    t.color_handle = fg_resource(rt)->board_handle;
    t.ds_handle = z ? fg_resource(z)->board_handle : 0;
-   t.width = c->width0;
-   t.height = c->height0;
+   t.width = w;
+   t.height = h;
    t.depth16 = z && z->format == PIPE_FORMAT_Z16_UNORM;
    t.has_stencil = z && util_format_has_stencil(util_format_description(z->format));
    memcpy(t.bits, f->bits, sizeof(t.bits));
@@ -573,11 +586,12 @@ fg_set_target(struct fg_context *ctx)
       fg_end_pass(ctx);
       fg_target_hold(ctx, &t);
    }
-   if (t.shadow_of && fg_resource(c)->shadow_stale) {
-      /* the image changed (an upload, a copy, a first use): the shadow takes it before the pass renders. Board B
-       * copies at once and renders at the FLUSH, so this lands under the pass's draws whenever it is sent */
-      fg_emit_copy(ctx, c, 0, 0, 0, 0, rt, 0, 0, 0, 0, t.width, t.height);
-      fg_resource(c)->shadow_stale = false;
+   if (t.shadow_of && fg_resource(c)->shadow_layer[level] != (int)layer) {
+      /* the image changed (an upload, a copy, a first use), or the shadow holds another layer: it takes the level and
+       * layer before the pass renders. Board B copies at once and renders at the FLUSH, so this lands under the
+       * pass's draws whenever it is sent */
+      fg_emit_copy(ctx, c, level, layer, 0, 0, rt, 0, 0, 0, 0, t.width, t.height);
+      fg_resource(c)->shadow_layer[level] = (int)layer;
    }
    return true;
 }
@@ -796,31 +810,20 @@ fg_copy_end(struct fg_context *ctx, struct pipe_resource *dst)
    struct fg_resource *d = fg_resource(dst);
 
    d->initialized = true;
-   d->shadow_stale = true;
-   d->tight_stale = true;
+   fg_shadows_stale(d);
+   fg_resource_written(d);
    if (!ctx->pass_open)
       fg_submit_stream(ctx);
 }
 
-/* FILL_IMAGE: handle, level, layer, transfer format, channel mask, 0, x, y, w, h, value (bytes R, G, B, A) */
+static void fg_emit_fill(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, uint8_t tf,
+                         unsigned mask, unsigned x, unsigned y, unsigned w, unsigned h, uint32_t value);
+
 void
 fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, unsigned x,
                   unsigned y, unsigned w, unsigned h)
 {
-   uint8_t b[20] = { 0 };
-
-   fg_put16(b, fg_resource(dst)->board_handle);
-   b[2] = (uint8_t)level;
-   b[3] = (uint8_t)layer;
-   b[4] = FG_TF_RGBA8888;
-   b[5] = 0x8;
-   fg_put16(b + 8, x);
-   fg_put16(b + 10, y);
-   fg_put16(b + 12, w);
-   fg_put16(b + 14, h);
-   fg_put32(b + 16, 0xFF000000u);
-   fg_emit(ctx, FG_T_FILL_IMAGE, b, sizeof(b), NULL, 0);
-   fg_use_resource(ctx, dst);
+   fg_emit_fill(ctx, dst, level, layer, FG_TF_RGBA8888, 0x8, x, y, w, h, 0xFF000000u);
 }
 
 /* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key low (a
@@ -1016,6 +1019,53 @@ fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc, bool snapsh
    return t->board_handle;
 }
 
+uint16_t
+fg_level_handle(struct fg_context *ctx, struct pipe_resource *prsc, unsigned first, unsigned last)
+{
+   struct fg_resource *r = fg_resource(prsc), *v;
+   uint32_t seq = p_atomic_read(&fg_screen(ctx->base.screen)->pass_seq);
+   uint16_t src = r->sample_handle ? r->sample_handle : r->board_handle;
+   unsigned n;
+
+   last = MIN2(last, prsc->last_level);
+   first = MIN2(first, last);
+   n = last - first + 1;
+   if (r->lview && (r->lview_first != first || r->lview_n != n))
+      pipe_resource_reference(&r->lview, NULL);
+   if (!r->lview) {
+      struct pipe_resource templ = *prsc;
+
+      /* a D24S8 image's levels go through its RGBA8 alias into RGBA8, as the TMU reads them */
+      templ.format = r->sample_handle ? PIPE_FORMAT_R8G8B8A8_UNORM : prsc->format;
+      templ.width0 = u_minify(prsc->width0, first);
+      templ.height0 = u_minify(prsc->height0, first);
+      templ.last_level = n - 1;
+      templ.bind = PIPE_BIND_SAMPLER_VIEW;
+      r->lview = prsc->screen->resource_create(prsc->screen, &templ);
+      if (!r->lview)
+         return src;
+      r->lview_first = first;
+      r->lview_n = n;
+      r->lview_stale = true;
+   }
+   v = fg_resource(r->lview);
+   if (r->lview_stale || (r->shared && r->lview_seq != seq)) {
+      for (unsigned z = 0; z < prsc->array_size; z++) {
+         for (unsigned l = 0; l < n; l++) {
+            unsigned w = u_minify(prsc->width0, first + l), h = u_minify(prsc->height0, first + l);
+
+            fg_emit_copy_handles(ctx, src, first + l, z, 0, 0, w, h, v->board_handle, l, z, 0, 0, w, h, 0);
+         }
+      }
+      fg_use_resource(ctx, prsc);
+      r->lview_stale = false;
+      r->lview_seq = seq;
+      v->initialized = true;
+   }
+   fg_use_resource(ctx, r->lview);
+   return v->board_handle;
+}
+
 void
 fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
              unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
@@ -1024,9 +1074,50 @@ fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel,
    fg_emit_copy_scaled(ctx, src, slevel, slayer, sx, sy, w, h, dst, dlevel, dlayer, dx, dy, w, h, 0);
 }
 
-/* a blit as board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors (negative box sizes), the
- * scissor when the blit does not stretch, the alpha of an X destination kept at 1.0, a swizzle where board B has the
- * copy extensions. Blending, buffers and images of different storage are left out (noted) */
+/* Mesa's blitter saves the bound state, binds its own and gives the saved back after it */
+static void
+fg_blitter_save(struct fg_context *ctx)
+{
+   util_blitter_save_blend(ctx->blitter, (void *)ctx->blend);
+   util_blitter_save_depth_stencil_alpha(ctx->blitter, (void *)ctx->dsa);
+   util_blitter_save_stencil_ref(ctx->blitter, &ctx->stencil_ref);
+   util_blitter_save_rasterizer(ctx->blitter, (void *)ctx->rast);
+   util_blitter_save_fragment_shader(ctx->blitter, ctx->fs);
+   util_blitter_save_vertex_shader(ctx->blitter, ctx->vs);
+   util_blitter_save_viewport(ctx->blitter, &ctx->viewport);
+   util_blitter_save_scissor(ctx->blitter, &ctx->scissor);
+   util_blitter_save_vertex_elements(ctx->blitter, (void *)ctx->velems);
+   util_blitter_save_vertex_buffers(ctx->blitter, ctx->vb, ctx->nvb);
+   util_blitter_save_framebuffer(ctx->blitter, &ctx->fb);
+   util_blitter_save_fragment_sampler_states(ctx->blitter, FG_MAX_SAMPLERS, (void **)ctx->samplers);
+   util_blitter_save_fragment_sampler_views(ctx->blitter, FG_MAX_SAMPLERS, ctx->views);
+}
+
+/* a blit drawn: Mesa's blitter renders the source through the TMU (its level a copy of its own, fg_level_handle)
+ * into the destination's level and layer (a shadow, fg_set_target), with linear filtering, a conversion between
+ * storage formats, blending, a colour mask or a swizzle. false: it cannot (a destination wider than board B renders) */
+static bool
+fg_blit_draw(struct fg_context *ctx, const struct pipe_blit_info *info)
+{
+   uint8_t cb[2][sizeof(ctx->cb[0])];
+   uint32_t cb_size[2];
+
+   if (!ctx->blitter || u_minify(info->dst.resource->width0, info->dst.level) > FG_FLUSH_MAX_WIDTH ||
+       !util_blitter_is_blit_supported(ctx->blitter, info))
+      return false;
+   /* (the constant buffers are held as copies: the blitter gives back only what it saved) */
+   memcpy(cb, ctx->cb, sizeof(cb));
+   memcpy(cb_size, ctx->cb_size, sizeof(cb_size));
+   fg_blitter_save(ctx);
+   util_blitter_blit(ctx->blitter, info, NULL);
+   memcpy(ctx->cb, cb, sizeof(cb));
+   memcpy(ctx->cb_size, cb_size, sizeof(cb_size));
+   return true;
+}
+
+/* a blit as board B's COPY_IMAGE where it can: images of the same storage, a nearest stretch, mirrors (negative box
+ * sizes), the scissor when the blit does not stretch, the alpha of an X destination kept at 1.0, a swizzle where board
+ * B has the copy extensions; drawn otherwise (fg_blit_draw). Depth and stencil are copied only */
 static void
 fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
 {
@@ -1038,28 +1129,42 @@ fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    uint32_t flags = 0;
 
    if (src->target == PIPE_BUFFER || dst->target == PIPE_BUFFER || !s->fmt || !d->fmt ||
-       s->fmt->storage != d->fmt->storage || info->alpha_blend || info->src.box.depth != info->dst.box.depth ||
-       !sw || !sh || !dw || !dh) {
-      FG_NOTE_ONCE("a blit board B cannot do as a copy (a buffer, images of different storage, blending)");
+       info->src.box.depth != info->dst.box.depth || !sw || !sh || !dw || !dh) {
+      FG_NOTE_ONCE("a blit of a buffer, or of nothing");
       return;
    }
-   if (s->fmt->depth && (info->mask & PIPE_MASK_ZS) != (util_format_has_stencil(util_format_description(src->format)) ?
-                                                         PIPE_MASK_ZS : PIPE_MASK_Z)) {
-      FG_NOTE_ONCE("a blit of depth or stencil alone out of a combined image");
-      return;
-   }
-   if (!s->fmt->depth) {
+   if (s->fmt->depth || d->fmt->depth) {
+      if (s->fmt->storage != d->fmt->storage || info->alpha_blend) {
+         FG_NOTE_ONCE("a blit of depth or stencil between formats");
+         return;
+      }
+      if ((info->mask & PIPE_MASK_ZS) != (util_format_has_stencil(util_format_description(src->format)) ?
+                                          PIPE_MASK_ZS : PIPE_MASK_Z)) {
+         FG_NOTE_ONCE("a blit of depth or stencil alone out of a combined image");
+         return;
+      }
+   } else {
       const struct fg_format *vf = fg_format_info(info->src.format);
       unsigned char swz[4] = { PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W };
+      const bool stretch = abs(sw) != abs(dw) || abs(sh) != abs(dh);
+      bool channels, same;
 
       if (!vf || vf->storage != s->fmt->storage)
          vf = s->fmt;
       if (info->swizzle_enable)
          memcpy(swz, info->swizzle, sizeof(swz));
-      if (!fg_copy_channels(ctx, s->fmt, vf, d->fmt, swz, &flags)) {
-         FG_NOTE_ONCE("a blit with a swizzle board B does not copy");
+      channels = fg_copy_channels(ctx, s->fmt, vf, d->fmt, swz, &flags);
+      same = s->fmt->storage == d->fmt->storage && !info->alpha_blend;
+      if ((!same || !channels || (info->mask & PIPE_MASK_RGBA) != PIPE_MASK_RGBA ||
+           (stretch && (info->filter != PIPE_TEX_FILTER_NEAREST || info->scissor_enable))) &&
+          fg_blit_draw(ctx, info))
+         return;
+      if (!same || !channels) {
+         FG_NOTE_ONCE("a blit neither copied nor drawn (between storage formats, blended or swizzled)");
          return;
       }
+      if ((info->mask & PIPE_MASK_RGBA) != PIPE_MASK_RGBA)
+         FG_NOTE_ONCE("a blit's colour mask is not applied");
    }
    if (sw < 0) {
       sx += sw;
@@ -1110,11 +1215,128 @@ fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    fg_copy_end(ctx, dst);
 }
 
+/* FILL_IMAGE of a rectangle of a level and layer: value in the transfer format tf, channel mask (R 1, G 2, B 4, A 8;
+ * in a D24S8 word R is the stencil byte and G, B, A the depth) */
+static void
+fg_emit_fill(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, uint8_t tf,
+             unsigned mask, unsigned x, unsigned y, unsigned w, unsigned h, uint32_t value)
+{
+   uint8_t b[20] = { 0 };
+
+   fg_put16(b, fg_resource(dst)->board_handle);
+   b[2] = (uint8_t)level;
+   b[3] = (uint8_t)layer;
+   b[4] = tf;
+   b[5] = (uint8_t)mask;
+   fg_put16(b + 8, x);
+   fg_put16(b + 10, y);
+   fg_put16(b + 12, w);
+   fg_put16(b + 14, h);
+   fg_put32(b + 16, value);
+   fg_emit(ctx, FG_T_FILL_IMAGE, b, sizeof(b), NULL, 0);
+   fg_use_resource(ctx, dst);
+}
+
+/* a colour as FILL_IMAGE takes it for an image of format f: RGBA8 bytes (R, G, B, A) as the format reads them (an X
+ * format's alpha 1.0, the fixed channels of one kept as RGBA8), or RGB565 rounded to its bits */
+static uint32_t
+fg_fill_color(const struct fg_format *f, const float c[4], uint8_t *tf)
+{
+   uint8_t v[4];
+
+   if (f->storage == FG_FMT_RGB565) {
+      uint16_t p = 0;
+
+      util_format_pack_rgba(PIPE_FORMAT_B5G6R5_UNORM, &p, c, 1);
+      *tf = FG_TF_RGB565;
+      return p;
+   }
+   for (unsigned i = 0; i < 4; i++)
+      v[i] = float_to_ubyte(c[i]);
+   switch (f->expand) {
+   case FG_EXPAND_L: v[1] = v[2] = v[0]; v[3] = 255; break;
+   case FG_EXPAND_A: v[0] = v[1] = v[2] = 0; break;
+   case FG_EXPAND_LA: v[1] = v[2] = v[0]; break;
+   case FG_EXPAND_R: v[1] = v[2] = 0; v[3] = 255; break;
+   case FG_EXPAND_RG: v[2] = 0; v[3] = 255; break;
+   default:
+      if (f->force_alpha)
+         v[3] = 255;
+      break;
+   }
+   *tf = FG_TF_RGBA8888;
+   return (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
+}
+
+/* a rectangle of a colour image's level and layers as one colour: FILL_IMAGE */
+static void
+fg_fill_rect(struct fg_context *ctx, struct pipe_resource *prsc, unsigned level, unsigned first_layer,
+             unsigned last_layer, unsigned x, unsigned y, unsigned w, unsigned h, const float c[4])
+{
+   const struct fg_format *f = fg_resource(prsc)->fmt;
+   uint8_t tf;
+   uint32_t v;
+
+   if (!f || f->depth || !w || !h)
+      return;
+   v = fg_fill_color(f, c, &tf);
+   fg_copy_begin(ctx, prsc, prsc);
+   for (unsigned z = first_layer; z <= last_layer; z++)
+      fg_emit_fill(ctx, prsc, level, z, tf, 0xF, x, y, w, h, v);
+   fg_copy_end(ctx, prsc);
+}
+
+/* a rectangle of a depth-stencil image's level and layers: depth (clamped to [0, 1], rounded to its bits) and / or
+ * stencil, FILL_IMAGE of the raw word with the channels of each */
+static void
+fg_fill_ds(struct fg_context *ctx, struct pipe_resource *z, unsigned level, unsigned first_layer, unsigned last_layer,
+           unsigned flags, double depth, unsigned stencil, unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   const struct fg_format *f = fg_resource(z)->fmt;
+   double d = depth > 0.0 ? (depth < 1.0 ? depth : 1.0) : 0.0;
+   uint32_t v = 0;
+   unsigned mask = 0;
+
+   if (!f || !f->depth || !w || !h)
+      return;
+   if (f->storage == FG_FMT_D16) {
+      if (flags & PIPE_CLEAR_DEPTH) {
+         v = (uint32_t)rint(d * 65535.0);
+         mask = 0xF;
+      }
+   } else {
+      if (flags & PIPE_CLEAR_DEPTH) {
+         v |= (uint32_t)rint(d * 16777215.0);
+         mask |= 0xE;
+      }
+      if (flags & PIPE_CLEAR_STENCIL) {
+         v |= (stencil & 0xFFu) << 24;
+         mask |= 0x1;
+      }
+   }
+   if (!mask)
+      return;
+   fg_copy_begin(ctx, z, z);
+   for (unsigned l = first_layer; l <= last_layer; l++)
+      fg_emit_fill(ctx, z, level, l, FG_TF_RAW, mask, x, y, w, h, v);
+   fg_copy_end(ctx, z);
+   /* the stencil value the next whole-image depth clear keeps: known only after a fill of the whole image */
+   if ((mask & 1) && !x && !y && w >= u_minify(z->width0, level) && h >= u_minify(z->height0, level) && !level &&
+       !first_layer && z->array_size == 1) {
+      pipe_resource_reference(&ctx->stencil_ds, z);
+      ctx->stencil_known = true;
+      ctx->stencil_value = stencil & 0xFF;
+   } else if ((mask & 1) && z == ctx->stencil_ds) {
+      ctx->stencil_known = false;
+   }
+}
+
 static void
 fg_clear_render_target(struct pipe_context *pctx, struct pipe_surface *dst, const union pipe_color_union *color,
                        unsigned dstx, unsigned dsty, unsigned width, unsigned height, bool render_condition_enabled)
 {
-   FG_NOTE_ONCE("clear_render_target");
+   fg_fill_rect(fg_context(pctx), dst->texture, dst->level, dst->first_layer, dst->last_layer, dstx, dsty, width, height,
+                color->f);
 }
 
 static void
@@ -1122,14 +1344,42 @@ fg_clear_depth_stencil(struct pipe_context *pctx, struct pipe_surface *dst, unsi
                        unsigned stencil, unsigned dstx, unsigned dsty, unsigned width, unsigned height,
                        bool render_condition_enabled)
 {
-   FG_NOTE_ONCE("clear_depth_stencil");
+   fg_fill_ds(fg_context(pctx), dst->texture, dst->level, dst->first_layer, dst->last_layer, clear_flags, depth, stencil,
+              dstx, dsty, width, height);
 }
 
+/* data: one texel in the image's format */
 static void
 fg_clear_texture(struct pipe_context *pctx, struct pipe_resource *res, unsigned level, const struct pipe_box *box,
                  const void *data)
 {
-   FG_NOTE_ONCE("clear_texture");
+   struct fg_context *ctx = fg_context(pctx);
+   const struct fg_format *f = fg_resource(res)->fmt;
+   const struct util_format_description *desc = util_format_description(res->format);
+
+   if (!f || res->target == PIPE_BUFFER || box->depth < 1)
+      return;
+   if (f->depth) {
+      float z = 0.0f;
+      uint8_t s = 0;
+      unsigned flags = 0;
+
+      if (util_format_has_depth(desc)) {
+         util_format_unpack_z_float(res->format, &z, data, 1);
+         flags |= PIPE_CLEAR_DEPTH;
+      }
+      if (util_format_has_stencil(desc)) {
+         util_format_unpack_s_8uint(res->format, &s, data, 1);
+         flags |= PIPE_CLEAR_STENCIL;
+      }
+      fg_fill_ds(ctx, res, level, box->z, box->z + box->depth - 1, flags, z, s, box->x, box->y, box->width,
+                 box->height);
+   } else {
+      float c[4];
+
+      util_format_unpack_rgba(res->format, c, data, 1);
+      fg_fill_rect(ctx, res, level, box->z, box->z + box->depth - 1, box->x, box->y, box->width, box->height, c);
+   }
 }
 
 static bool
@@ -1150,10 +1400,16 @@ fg_resource_release(struct pipe_context *pctx, struct pipe_resource *prsc)
    pipe_resource_reference(&prsc, NULL);
 }
 
-/* ------------------------------------------------------------------ queries (none are exposed) */
+/* ------------------------------------------------------------------ queries
+ * Occlusion: board B counts quads and frames, not samples. A query's result is 1 when a draw ran inside it, else 0:
+ * never 0 where samples passed, so a program that culls by it draws too much, never too little (the Windows
+ * libraries' rule; GL lets a counter carry no information). GPU_FINISHED: the context's work done. Others: 0 */
 
 struct fg_query {
    unsigned type;
+   uint64_t draws0, draws;
+   uint64_t fence;
+   bool fenced;
 };
 
 static struct pipe_query *
@@ -1173,27 +1429,59 @@ fg_destroy_query(struct pipe_context *pctx, struct pipe_query *q)
 }
 
 static bool
-fg_begin_query(struct pipe_context *pctx, struct pipe_query *q)
+fg_begin_query(struct pipe_context *pctx, struct pipe_query *pq)
 {
+   struct fg_query *q = (struct fg_query *)pq;
+
+   q->draws0 = fg_context(pctx)->draw_count;
+   q->draws = 0;
    return true;
 }
 
 static bool
-fg_end_query(struct pipe_context *pctx, struct pipe_query *q)
+fg_end_query(struct pipe_context *pctx, struct pipe_query *pq)
 {
+   struct fg_context *ctx = fg_context(pctx);
+   struct fg_query *q = (struct fg_query *)pq;
+
+   q->draws = ctx->draw_count - q->draws0;
+   if (q->type == PIPE_QUERY_GPU_FINISHED) {
+      fg_context_flush_pending(ctx);
+      q->fenced = ctx->submitted;
+      q->fence = ctx->last_fence;
+   }
    return true;
 }
 
 static bool
-fg_get_query_result(struct pipe_context *pctx, struct pipe_query *q, bool wait, union pipe_query_result *result)
+fg_get_query_result(struct pipe_context *pctx, struct pipe_query *pq, bool wait, union pipe_query_result *result)
 {
-   result->u64 = 0;
-   return true;
+   struct fg_query *q = (struct fg_query *)pq;
+
+   switch (q->type) {
+   case PIPE_QUERY_OCCLUSION_COUNTER:
+      result->u64 = q->draws ? 1 : 0;
+      return true;
+   case PIPE_QUERY_OCCLUSION_PREDICATE:
+   case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
+      result->b = q->draws != 0;
+      return true;
+   case PIPE_QUERY_GPU_FINISHED:
+      if (q->fenced && fg_wait_fence(fg_screen(pctx->screen), q->fence, wait ? FG_WAIT_NS : 0))
+         return false;
+      result->b = true;
+      return true;
+   default:
+      memset(result, 0, sizeof(*result));
+      return true;
+   }
 }
 
+/* the blitter's own draws (enable false) are not the application's */
 static void
 fg_set_active_query_state(struct pipe_context *pctx, bool enable)
 {
+   fg_context(pctx)->queries_off = !enable;
 }
 
 static void
@@ -1317,6 +1605,8 @@ fg_context_destroy(struct pipe_context *pctx)
    fg_context_flush_pending(ctx);
    if (screen->last_ctx == ctx)
       screen->last_ctx = NULL;
+   if (ctx->blitter)
+      util_blitter_destroy(ctx->blitter);
    fg_draw_fini(ctx);
    util_unreference_framebuffer_state(&ctx->fb);
    fg_target_hold(ctx, NULL);
@@ -1416,6 +1706,10 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 
    fg_resource_context_init(pctx);
    fg_draw_init(pctx);
+   /* (after every entry point is set: the blitter makes its state objects here) */
+   ctx->blitter = util_blitter_create(pctx);
+   if (!ctx->blitter)
+      fprintf(stderr, "fpgagpu: no blitter: blits that are no copy are left out\n");
 
    p_atomic_inc(&pscreen->num_contexts);
    return pctx;

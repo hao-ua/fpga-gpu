@@ -63,16 +63,27 @@ struct fg_resource {
    uint64_t bo_size;
    bool initialized;		/* a clear or a write has reached it */
 
-   /* board B renders into a pitch that is a multiple of 32, the TMU reads tight rows: an image whose tight rows are
-    * not that is rendered in a copy (shadow), copied back after each pass */
-   struct pipe_resource *shadow;
-   bool shadow_stale;		/* the image changed since the shadow was copied from it */
+   /* board B renders into level 0 of a one-layer image whose pitch is a multiple of 32, the TMU reads tight rows: a
+    * target it cannot render in place (rows that are not such a pitch, a level above 0, a layer or cube face) is
+    * rendered in a one-level image of that level's size (shadow[level]), copied back after each pass.
+    * shadow_layer[level]: the layer the shadow holds a copy of; -1 none (or the image changed since) */
+#define FG_MAX_LEVELS 12
+   struct pipe_resource *shadow[FG_MAX_LEVELS];
+   int shadow_layer[FG_MAX_LEVELS];
 
    /* the other way round: an image with padded rows (one board B renders into or shows) that is sampled is read from
     * a copy with tight rows, taken before a pass that samples it when the image changed. Another process may write a
     * shared image (imported or handed out): its copy is taken again in every pass that samples it */
    struct pipe_resource *tight;
    bool tight_stale;		/* the image changed since tight was copied from it */
+
+   /* the TMU starts at an image's level 0 and reads its chain to the end: a view of levels lview_first .. + lview_n - 1
+    * (GL's base and max level, a blit from a level) reads a copy of those levels of every layer, taken again when the
+    * image changed */
+   struct pipe_resource *lview;
+   unsigned lview_first, lview_n;
+   bool lview_stale;
+   uint32_t lview_seq;
    bool shared;
    uint32_t tight_seq;		/* the screen's pass count when tight was copied */
 
@@ -93,6 +104,22 @@ static inline struct fg_resource *
 fg_resource(struct pipe_resource *prsc)
 {
    return (struct fg_resource *)prsc;
+}
+
+/* the image changed: the copies it is sampled through (tight rows, levels) are to be taken again */
+static inline void
+fg_resource_written(struct fg_resource *rsc)
+{
+   rsc->tight_stale = true;
+   rsc->lview_stale = true;
+}
+
+/* the image changed other than through a shadow: every shadow is to take it again */
+static inline void
+fg_shadows_stale(struct fg_resource *rsc)
+{
+   for (unsigned l = 0; l < FG_MAX_LEVELS; l++)
+      rsc->shadow_layer[l] = -1;
 }
 
 struct fg_transfer {

@@ -117,6 +117,10 @@ W = [
     ('a function-like macro over lines', '#define F(a, b) (a + b)\nvoid main() { gl_FragColor = vec4(F(1.0,\n 2.0)); }\n', (3, 3, 3, 3)),
     ('the same #define again', '#define V (1.0 + 2.0)\n#define V (1.0 /* */ + 2.0)\n#define G(a,b) (a  +b)\n#define G(a,b)(a /* */ +b)\nvoid main() { gl_FragColor = vec4(V, G(1.0, 1.0), 0.0, 0.0); }\n', (3, 2, 0, 0)),
     ('a declaration under an if is a scope of its own', 'float a = 1.0;\nvoid main() { if (v0.x > 0.0) float a = 5.0; else float a = 7.0; gl_FragColor = vec4(a); }\n', (1, 1, 1, 1)),
+    ('an ivec component += counts a loop', 'void main() { vec4 r = vec4(1.0, 2.0, 3.0, 4.0); for (ivec4 i = ivec4(0, 1, 3, 0); i.x < i.z; i.x += i.y) { r = r.yzwx; } ivec2 k = ivec2(5, 2); k.y -= k.x; gl_FragColor = vec4(r.x, r.y, float(k.y), 0.0); }\n', (4, 1, -3, 0)),
+    ('an int local as an out and an inout argument', 'void f(out int a) { a = -1; }\nvoid g(inout int a) { a = -a; }\nvoid main() { int x = 1; f(x); int y = 3; g(y); gl_FragColor = vec4(float(x * int(n)), float(y), 0.0, 0.0); }\n', (-4, -3, 0, 0)),
+    ('a global as an out argument is a copy', 'float x = 1.0;\nbool d(out float y) { y = 2.0; return x == 1.0 && y == 2.0; }\nvoid main() { bool r = d(x); gl_FragColor = vec4(r ? 1.0 : 0.0, x, 0.0, 0.0); }\n', (1, 2, 0, 0)),
+    ('one array as two inout arguments', 'void neg(inout float a[2]) { a[0] = -a[0]; a[1] = -a[1]; }\nfloat f(inout float a[2], inout float b[2]) { neg(a); return a[0] == b[0] ? 1.0 : -1.0; }\nvoid main() { float r[2]; r[0] = 3.0; r[1] = 4.0; float m = f(r, r); gl_FragColor = vec4(m, 0.0, 0.0, 0.0); }\n', (-1, 0, 0, 0)),
     ('invariant on varyings and gl_Position', 'invariant varying vec4 q;\nvoid main() { gl_FragColor = vec4(2.0); }\n', (2, 2, 2, 2)),
 ]
 # (name, stage, source): each must not compile

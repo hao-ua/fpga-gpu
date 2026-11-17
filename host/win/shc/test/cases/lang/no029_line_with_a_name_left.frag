@@ -1,0 +1,2 @@
+#line X
+void main() { }

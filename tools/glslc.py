@@ -423,7 +423,7 @@ class Parser:
     def ident(self):
         """the name a declaration gives: an identifier (§3.7); a program from an application that names a keyword or a number fails"""
         k,v=self.next()
-        if self.strict and k!='id': raise CompileError("expected a name, got " + ('<number>' if k=='num' else repr(v)))
+        if k=='num' or (self.strict and k!='id'): raise CompileError("expected a name, got " + ('<number>' if k=='num' else repr(v)))
         return v
 
     # ---- top level ----
@@ -2036,8 +2036,21 @@ class Compiler(Codegen):
         if len(params)!=len(argexprs): raise CompileError(f"{name}(): expected {len(params)} args, got {len(argexprs)}")
         binds=Scope(); copyout=[]; outs=[]                           # bind args in the CALLER's scope first
         wrt=self._written([body], {})                                # a parameter the body never writes keeps a known value (const, cvec)
+        bases=[self._base(ae) for (pq,_,_),ae in zip(params,argexprs) if pq in ('out','inout')]
         for (pq,pty,pname),ae in zip(params, argexprs):              # (arg eval may nest same-name calls: not recursion)
-            if pq in ('out','inout') and self._no_alias(ae):         # no register to alias: a copy, written back at the end
+            agg=None; shared=False
+            if pq in ('out','inout'):
+                if ae[0]=='var' and self._const_home(ae[1]) is not None: self._promote(ae[1])      # a register to write
+                b=self._base(ae)                                     # §6.1.1 copies in and out: an alias would show when another
+                shared=b is not None and (bases.count(b)>1 or self._sees(body, b, {name}, b in {p[2] for p in params}))   # argument or the function sees it
+                if shared and not self._no_alias(ae):
+                    lv=self.get_lvalue_reg(ae)
+                    if isinstance(lv,(MatVal,ArrayVal,StructVal)): agg=lv
+            if agg is not None:                                      # an array, struct or matrix of its own, written back at the end
+                pr=self._clone(agg) if pq=='inout' else self._like(agg)
+                binds[pname]=(pr,pty); copyout.append((ae,pr))
+                if pq=='out': outs.append(pr)
+            elif pq in ('out','inout') and (self._no_alias(ae) or self._repr_differs(ae, pty) or shared):   # no register to alias: a copy, written back at the end
                 pr=self.alloc(pty); pr.tmp=False
                 if pq=='inout':
                     av=self.eval(ae); av=self._asi(av) if pty=='int' else self._asf(av)
@@ -2069,6 +2082,26 @@ class Compiler(Codegen):
         self.cur_ret=saved
         for ae,pr in copyout: self.store(ae, pr)
         return holder[0] if holder[0] is not None else retreg
+    def _base(self, e):
+        """the variable an lvalue writes: v of v.xy, a[i], s.m"""
+        while e[0] in ('swizzle','index'): e=e[1]
+        return e[1] if e[0]=='var' else None
+    def _sees(self, e, name, seen, own=False):
+        """does a function body read or write `name`, also through the functions it calls (a local of the name counts too);
+        own: the function has a parameter of the name, so only the functions it calls can see the caller's"""
+        if isinstance(e,list): return any(self._sees(x, name, seen, own) for x in e)
+        if not isinstance(e,tuple) or not e: return False
+        if e[0]=='var': return e[1]==name and not own
+        if e[0]=='call':
+            fn=self.callmap[id(e)].name if id(e) in self.callmap else e[1]
+            if fn in self.funcs and fn not in seen:
+                seen.add(fn)
+                if self._sees(self.funcs[fn][2], name, seen): return True
+        return any(self._sees(x, name, seen, own) for x in e[1:])
+    def _repr_differs(self, e, pty):
+        """a local whose register holds its value in the other representation than the parameter's: a promoted int is a float"""
+        lt=self._local_type(e[1]) if e[0]=='var' else None
+        return lt is not None and (lt=='int')!=(pty=='int')
     def _no_alias(self, e):
         """an out / inout argument without a register of its own: part of a vector"""
         if e[0]=='index': return isinstance(self.eval_lvalue(e[1]), Reg)
@@ -2631,7 +2664,7 @@ class Compiler(Codegen):
                     self._copy_val(cur, rv)
                 else: target.members[mask]=rv                # aggregate member (mat/array/nested) re-bind
                 return
-            self.masked_write(target, mask, rv); return
+            self.masked_write(target, mask, self._asf(rv)); return     # a vector holds its ints as floats: i.x += 1 is an IADD
         if lhs[0]=='index':                                  # a[i] = rv   (local array / matrix column / vector component)
             ci=self.fold_const(lhs[2])
             if lhs[1][0]=='swizzle' and not isinstance(self.eval_lvalue(lhs[1][1]),StructVal):       # v.zy[1] = rv

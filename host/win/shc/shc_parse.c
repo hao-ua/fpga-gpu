@@ -208,10 +208,8 @@ static int accept_(P *p, const char *v)
 static const char *ident(P *p)
 {
     Tk *k = next(p);
-    if (p->h->strict && k->k != TK_ID) {
-        if (k->k == TK_NUM) sh_compile_error(p->h, "expected a name, got <number>");
-        sh_compile_error(p->h, "expected a name, got '%s'", k->v);
-    }
+    if (k->k == TK_NUM) sh_compile_error(p->h, "expected a name, got <number>");
+    if (p->h->strict && k->k != TK_ID) sh_compile_error(p->h, "expected a name, got '%s'", k->v);
     return k->v;
 }
 

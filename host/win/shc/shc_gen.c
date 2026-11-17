@@ -1923,6 +1923,46 @@ static int no_alias(Cg *c, Node *e)
     return e->kind == N_SWIZZLE && !is_struct(eval_lvalue(c, e->a));
 }
 
+static const char *local_type(Cg *c, const char *name);
+
+/* the variable an lvalue writes: v of v.xy, a[i], s.m */
+static const char *lv_base(Node *e)
+{
+    while (e->kind == N_SWIZZLE || e->kind == N_INDEX) e = e->a;
+    return e->kind == N_VAR ? e->s : NULL;
+}
+
+/* does a function body read or write `name`, also through the functions it calls (a local of the name counts too);
+ * own: the function has a parameter of the name, so only the functions it calls can see the caller's */
+static int sees(Cg *c, Node *e, const char *name, Dict *seen, int own)
+{
+    int r = 0, i;
+    if (!e || e->kind == N_REG) return 0;
+    SH_ENTER(c->h, 2);
+    if (e->kind == N_VAR) r = !own && !strcmp(e->s, name);
+    else {
+        if (e->kind == N_CALL) {
+            const char *fn = e->fn ? e->fn->name : e->s;
+            DictEnt *fe = dict_find(&c->funcs, fn);
+            if (fe && !dict_find(seen, fn)) {
+                dict_put(c->h, seen, fn);
+                r = sees(c, ((Func *)fe->p)->body, name, seen, 0);
+            }
+        }
+        if (!r) r = sees(c, e->a, name, seen, own) || sees(c, e->b, name, seen, own) || sees(c, e->c, name, seen, own) || sees(c, e->d, name, seen, own);
+        for (i = 0; i < e->nlist && !r; i++) r = sees(c, e->list[i], name, seen, own);
+    }
+    SH_LEAVE(c->h, 2);
+    return r;
+}
+
+/* a local whose register holds its value in the other representation than the parameter's: a promoted int is a float */
+static int repr_differs(Cg *c, Node *e, const char *pty)
+{
+    const char *lt = e->kind == N_VAR ? local_type(c, e->s) : NULL;
+    return lt && !strcmp(lt, "int") != !strcmp(pty, "int");
+}
+
 /* a return under an if or in a loop (under: any return at all) */
 static int early_return(Cg *c, Node *s, int under)
 {
@@ -2005,7 +2045,36 @@ static Val *inline_call(Cg *c, const char *name, Node **argexprs, int nargs)
         Param *p = &f->params[i];
         Node *ae = argexprs[i];
         if (!strcmp(p->q, "out") || !strcmp(p->q, "inout")) {
-            if (no_alias(c, ae)) {              /* no register to alias: a copy, written back at the end */
+            const char *b;
+            int shared = 0, k;
+            Val *agg = NULL;
+            if (ae->kind == N_VAR && const_home(c, ae->s)) promote(c, ae->s);         /* a register to write */
+            b = lv_base(ae);                    /* §6.1.1 copies in and out: an alias would show when another argument or the function sees it */
+            if (b) {
+                int same = 0, own = 0;
+                for (k = 0; k < nargs; k++) {
+                    const char *q = f->params[k].q, *o;
+                    if ((!strcmp(q, "out") || !strcmp(q, "inout")) && (o = lv_base(argexprs[k])) != NULL && !strcmp(o, b)) same++;
+                }
+                for (k = 0; k < f->nparams; k++) if (!strcmp(f->params[k].name, b)) own = 1;
+                if (same > 1) shared = 1;
+                else {
+                    Dict *seen = new_dict(c);
+                    dict_put(c->h, seen, name);
+                    shared = sees(c, f->body, b, seen, own);
+                }
+            }
+            if (shared && !no_alias(c, ae)) {
+                Val *lv = get_lvalue_reg(c, ae);
+                if (lv && (lv->kind == V_MAT || lv->kind == V_ARRAY || lv->kind == V_STRUCT)) agg = lv;
+            }
+            if (agg) {                          /* an array, struct or matrix of its own, written back at the end */
+                Val *pr = !strcmp(p->q, "inout") ? clone_val(c, agg) : like(c, agg);
+                local_set(c, binds, p->name, pr, p->ty);
+                copy[i] = pr;
+                if (!strcmp(p->q, "out")) outs[i] = pr;
+            }
+            else if (no_alias(c, ae) || repr_differs(c, ae, p->ty) || shared) {    /* no register to alias: a copy, written back at the end */
                 Val *pr = alloc(c, p->ty);
                 if (!strcmp(p->q, "inout")) {
                     Val *av = eval(c, ae);
@@ -2695,7 +2764,7 @@ static void store(Cg *c, Node *lhs, Val *rv)
             }
             return;
         }
-        masked_write(c, target, mask, rv);
+        masked_write(c, target, mask, asf(c, rv));      /* a vector holds its ints as floats: i.x += 1 is an IADD */
         return;
     }
     if (lhs->kind == N_INDEX) {

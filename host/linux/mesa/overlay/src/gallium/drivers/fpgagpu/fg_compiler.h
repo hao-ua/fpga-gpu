@@ -25,6 +25,9 @@ struct fg_compile_key {
    uint32_t shadow_func;    /* fragment stage: 3 bits a unit (units 0-7), a shadow read's compare function: 0 never,
                              * 1 less, 2 equal, 3 less-or-equal, 4 greater, 5 not equal, 6 greater-or-equal, 7 always */
    uint32_t swizzled;       /* fragment stage: the units whose texel is rearranged, as swizzle[unit] says */
+   uint32_t logic;          /* fragment stage, a logic op's colour: 0 the program's, 1 all ones, 2 its complement */
+   uint32_t point_flip;     /* fragment stage: gl_PointCoord.t is 1 - the board's (the rasterizer's sprite origin is
+                             * the upper left of the surface's rows; the board's t runs from the lower left) */
    uint16_t swizzle[16];    /* 3 bits a component, R at bit 0 .. A at bit 9: 0-3 the texel's R, G, B, A; 4 zero; 5 one */
 };
 

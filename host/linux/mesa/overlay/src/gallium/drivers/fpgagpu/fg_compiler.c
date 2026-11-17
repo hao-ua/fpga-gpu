@@ -977,7 +977,12 @@ static void emit_alu(fgc *c, nir_alu_instr *alu)
       alu_src(c, a, sizeof(a), alu, 0, n, "");
       alu_src(c, b, sizeof(b), alu, 1, n, "");
       alu_src(c, d3, sizeof(d3), alu, 2, n, "");
-      emit(c, "SEL r%d %s %s %s", r, a, b, d3);
+      /* only the def's components: the register allocator may give a source that ends here the destination's
+       * register, and a padded swizzle (.xy reads .xyyy) would read a component the select wrote before it */
+      if (n < 4)
+         emit(c, "SEL.%.*s r%d %s %s %s", (int)n, "xyzw", r, a, b, d3);
+      else
+         emit(c, "SEL r%d %s %s %s", r, a, b, d3);
       return;
    case nir_op_fdot2:
       t = vreg(c, false);
@@ -1088,6 +1093,17 @@ static void emit_zero_def(fgc *c, const nir_def *d)
    set_def(c, d, d->num_components == 1 ? kf(c, 0.0) : kload(c, 0, 0, 0, 0));
 }
 
+/* gl_PointCoord loaded into d (its components from first on): t the other way up where the key says so */
+static void point_coord_flip(fgc *c, const nir_def *d, unsigned first)
+{
+   int r;
+
+   if (!c->key->point_flip || first > 1 || first + d->num_components < 2)
+      return;
+   r = def_reg(c, d);
+   emit(c, "ADD.%c r%d r%d -r%d", "xyzw"[1 - first], r, kload(c, 1, 1, 1, 1), r);
+}
+
 static void emit_fs_input(fgc *c, nir_intrinsic_instr *in, unsigned loc)
 {
    unsigned first = nir_intrinsic_component(in);
@@ -1096,7 +1112,10 @@ static void emit_fs_input(fgc *c, nir_intrinsic_instr *in, unsigned loc)
    switch (loc) {
    case VARYING_SLOT_POS: emit_ldv(c, &in->def, 8, first); return;
    case VARYING_SLOT_FACE: emit_ldv(c, &in->def, 9, 0); return;
-   case VARYING_SLOT_PNTC: emit_ldv(c, &in->def, 10, first); return;
+   case VARYING_SLOT_PNTC:
+      emit_ldv(c, &in->def, 10, first);
+      point_coord_flip(c, &in->def, first);
+      return;
    default: break;
    }
    slot = varying_slot(c, loc);
@@ -1295,6 +1314,7 @@ static void emit_intrinsic(fgc *c, nir_intrinsic_instr *in)
       return;
    case nir_intrinsic_load_point_coord:
       emit_ldv(c, &in->def, 10, 0);
+      point_coord_flip(c, &in->def, 0);
       return;
    case nir_intrinsic_load_uniform:
       emit_load_uniform(c, in);
@@ -1574,7 +1594,19 @@ static void emit_outputs(fgc *c)
    int i;
 
    if (c->fs) {
-      emit(c, "STO 0 r%d", c->color ? c->color : kload(c, 0, 0, 0, 0));
+      int col = c->color ? c->color : kload(c, 0, 0, 0, 0);
+
+      /* a logic op the colour does (GL_SET, GL_INVERT with blending: all ones; GL_COPY_INVERTED: 1 - the colour, which
+       * the board's conversion of the clamped value makes the complement of its bits) */
+      if (c->key->logic == 1) {
+         col = kload(c, 1, 1, 1, 1);
+      } else if (c->key->logic == 2) {
+         int t = vreg(c, false);
+
+         emit(c, "ADD r%d r%d -r%d", t, kload(c, 1, 1, 1, 1), col);
+         col = t;
+      }
+      emit(c, "STO 0 r%d", col);
       if (c->depth)
          emit(c, "STOZ r%d", c->depth);
       return;

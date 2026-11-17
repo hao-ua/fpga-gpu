@@ -73,6 +73,13 @@ struct fg_blend_state {
    uint32_t h0;               /* blend [6], dither [7], colour mask [19:16] */
    uint32_t h4;               /* factors and equations */
    bool dither;
+   /* a logic op (glLogicOp; board B has none): CLEAR, NOOP, COPY and INVERT by blending and the colour mask, SET and
+    * COPY_INVERTED by the colour the program writes (logic_fs: fg_compile_key.logic); the others drawn twice over a
+    * cleared target and worked out on the PC (logic_slow, the op in logic_op; fg_draw_logic) */
+   uint8_t logic_fs;
+   bool logic_slow;
+   uint8_t logic_op;
+   uint8_t colormask;         /* Gallium's R 1, G 2, B 4, A 8 */
 };
 
 struct fg_dsa_state {
@@ -263,6 +270,10 @@ uint32_t fg_stream(struct fg_context *ctx, const void *data, uint32_t bytes, uin
 void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
                   unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
                   unsigned w, unsigned h);
+/* FILL_IMAGE of a rectangle of a level and layer: value in the transfer format tf, channel mask (R 1, G 2, B 4, A 8;
+ * in a D24S8 word R is the stencil byte and G, B, A the depth) */
+void fg_emit_fill(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, uint8_t tf,
+                  unsigned mask, unsigned x, unsigned y, unsigned w, unsigned h, uint32_t value);
 /* the stored alpha of a rectangle of an RGBA8 image set to 1.0 (FILL_IMAGE with the alpha channel alone) */
 void fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, unsigned x,
                        unsigned y, unsigned w, unsigned h);

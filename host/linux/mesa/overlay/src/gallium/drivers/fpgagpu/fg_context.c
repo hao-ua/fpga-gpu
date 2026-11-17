@@ -885,9 +885,6 @@ fg_copy_end(struct fg_context *ctx, struct pipe_resource *dst)
       fg_submit_stream(ctx);
 }
 
-static void fg_emit_fill(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, uint8_t tf,
-                         unsigned mask, unsigned x, unsigned y, unsigned w, unsigned h, uint32_t value);
-
 void
 fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, unsigned x,
                   unsigned y, unsigned w, unsigned h)
@@ -1285,9 +1282,7 @@ fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    fg_copy_end(ctx, dst);
 }
 
-/* FILL_IMAGE of a rectangle of a level and layer: value in the transfer format tf, channel mask (R 1, G 2, B 4, A 8;
- * in a D24S8 word R is the stencil byte and G, B, A the depth) */
-static void
+void
 fg_emit_fill(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, uint8_t tf,
              unsigned mask, unsigned x, unsigned y, unsigned w, unsigned h, uint32_t value)
 {

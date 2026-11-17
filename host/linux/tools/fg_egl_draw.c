@@ -6,7 +6,8 @@
  *   2. a triangle with red, green and blue corners: the colour near each corner;
  *   3. a 2 x 2 texture (red, green, blue, white; nearest) on a quad over the target: each quarter;
  *   4. a white quad of alpha 0.5 blended (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) over black: 128 +-2;
- *   5. a 2 x 2 R8 texture with GL_TEXTURE_SWIZZLE_A = GL_RED (X's glamor reads glyphs so): alpha = red.
+ *   5. a 2 x 2 R8 texture with GL_TEXTURE_SWIZZLE_A = GL_RED (X's glamor reads glyphs so): alpha = red;
+ *   6. a 16-pixel point coloured by gl_PointCoord in the framebuffer object: s grows right, t down.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_draw.c -o fg_egl_draw -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGLESv2 -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_draw [render node, default /dev/dri/renderD129]
@@ -283,6 +284,38 @@ int main(int argc, char **argv)
 			check(&fails, near(p, r8[i], 0, 0, r8[i], 1), what, p);
 		}
 		glDeleteTextures(1, &t8);
+	}
+
+	printf("6. a 16-pixel point coloured by gl_PointCoord in a framebuffer object (ES: s grows right, t down):\n");
+	{
+		static const char *pvs = "attribute vec4 pos;\nvoid main() { gl_PointSize = 16.0; gl_Position = pos; }\n";
+		static const char *pfs = "precision mediump float;\nvoid main() { gl_FragColor = vec4(gl_PointCoord, 0.0, 1.0); }\n";
+		static const float centre[2] = { 0, 0 };
+		GLuint pp = glCreateProgram(), sh[2];
+		const uint8_t *ul, *lr;
+
+		for (int k = 0; k < 2; k++) {
+			sh[k] = glCreateShader(k ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+			glShaderSource(sh[k], 1, k ? &pfs : &pvs, NULL);
+			glCompileShader(sh[k]);
+			glAttachShader(pp, sh[k]);
+		}
+		glBindAttribLocation(pp, 0, "pos");
+		glLinkProgram(pp);
+		glUseProgram(pp);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, centre);
+		glEnableVertexAttribArray(0);
+		glDisableVertexAttribArray(1);
+		glDrawArrays(GL_POINTS, 0, 1);
+		read_back();
+		ul = at(W / 2 - 7, H / 2 + 6); /* GL's y up: the point's upper left */
+		lr = at(W / 2 + 6, H / 2 - 7);
+		check(&fails, ul[0] < 64 && ul[1] < 64, "upper left: s and t near 0", ul);
+		check(&fails, lr[0] > 191 && lr[1] > 191, "lower right: s and t near 1", lr);
+		glDeleteProgram(pp);
+		glDeleteShader(sh[0]);
+		glDeleteShader(sh[1]);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

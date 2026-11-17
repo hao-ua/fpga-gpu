@@ -136,6 +136,11 @@ uint16_t fg_rect_alias(struct pipe_screen *pscreen, struct fg_resource *rsc, uns
                        unsigned height, uint32_t *gem);
 bool fg_vertex_format_supported(enum pipe_format format);
 
+/* level 0, layer 0 of a colour image, w x h from its corner, as it is stored: RGBA8 as bytes R, G, B, A, RGB565 as its
+ * 16-bit words; read (after what was sent before is done) or written */
+struct fg_context;
+bool fg_image_io(struct fg_context *ctx, struct pipe_resource *prsc, bool write, unsigned w, unsigned h, void *data);
+
 void fg_resource_screen_init(struct pipe_screen *pscreen);
 void fg_resource_context_init(struct pipe_context *pctx);
 

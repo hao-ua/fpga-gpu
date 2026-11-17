@@ -1840,6 +1840,89 @@ int main(int argc, char **argv)
 		free(got);
 	}
 
+	printf("18. logic ops: each of the 16 over a pattern (a colour of its own a texel), a solid colour on the left half,\n"
+	       "    every pixel against the op worked out here:\n");
+	{
+		static const GLenum ops[16] = { GL_CLEAR, GL_AND, GL_AND_REVERSE, GL_COPY, GL_AND_INVERTED, GL_NOOP, GL_XOR,
+		                                GL_OR, GL_NOR, GL_EQUIV, GL_INVERT, GL_OR_REVERSE, GL_COPY_INVERTED,
+		                                GL_OR_INVERTED, GL_NAND, GL_SET };
+		static const uint8_t src[4] = { 0x5A, 0xC3, 0x0F, 0x96 };
+		uint8_t *pat = malloc(W * H * 4);
+		GLuint t_p;
+		int bad_ops = 0;
+
+		for (int i = 0; i < W * H; i++) {
+			pat[4 * i] = (uint8_t)((i % W) * 4);
+			pat[4 * i + 1] = (uint8_t)((i / W) * 4);
+			pat[4 * i + 2] = (uint8_t)(((i % W) ^ (i / W)) * 4 + 3);
+			pat[4 * i + 3] = (uint8_t)(i * 7);
+		}
+		t_p = texture(W, H, GL_RGBA, pat, GL_NEAREST);
+		glMatrixMode(GL_PROJECTION);
+		glPushMatrix();
+		glLoadIdentity();
+		glOrtho(0, 1, 0, 1, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_BLEND);
+		for (int o = 0; o < 16; o++) {
+			int bad = 0;
+
+			glEnable(GL_TEXTURE_2D);
+			glBindTexture(GL_TEXTURE_2D, t_p);
+			glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+			quad(0, 0, 1, 1, 0);
+			glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+			glDisable(GL_TEXTURE_2D);
+			glEnable(GL_COLOR_LOGIC_OP);
+			glLogicOp(ops[o]);
+			glColor4ub(src[0], src[1], src[2], src[3]);
+			quad(0, 0, 0.5f, 1, 0);
+			glDisable(GL_COLOR_LOGIC_OP);
+			read_back();
+			for (int y = 0; y < H; y++)
+				for (int x = 0; x < W; x++)
+					for (int c = 0; c < 4; c++) {
+						unsigned s = src[c], d = pat[4 * (y * W + x) + c], r;
+
+						switch (ops[o]) {
+						case GL_CLEAR: r = 0; break;
+						case GL_AND: r = s & d; break;
+						case GL_AND_REVERSE: r = s & ~d; break;
+						case GL_COPY: r = s; break;
+						case GL_AND_INVERTED: r = ~s & d; break;
+						case GL_NOOP: r = d; break;
+						case GL_XOR: r = s ^ d; break;
+						case GL_OR: r = s | d; break;
+						case GL_NOR: r = ~(s | d); break;
+						case GL_EQUIV: r = ~(s ^ d); break;
+						case GL_INVERT: r = ~d; break;
+						case GL_OR_REVERSE: r = s | ~d; break;
+						case GL_COPY_INVERTED: r = ~s; break;
+						case GL_OR_INVERTED: r = ~s | d; break;
+						case GL_NAND: r = ~(s & d); break;
+						default: r = 0xFF; break;
+						}
+						if (x >= W / 2)
+							r = d;
+						bad += at(x, y)[c] != (r & 0xFF);
+					}
+			if (bad) {
+				printf("  logic op 0x%04x: %d channels wrong\n", ops[o], bad);
+				bad_ops++;
+			}
+		}
+		check(&fails, !bad_ops, "16 logic ops: every channel exact", at(10, 10));
+		glMatrixMode(GL_PROJECTION);
+		glPopMatrix();
+		glMatrixMode(GL_MODELVIEW);
+		glColor3f(1, 1, 1);
+		glDeleteTextures(1, &t_p);
+		free(pat);
+	}
+
 	printf("GL error 0x%04x\n", glGetError());
 	{
 		GLuint t[4] = { t_rgb, t_mod, t_alpha, t_mip };

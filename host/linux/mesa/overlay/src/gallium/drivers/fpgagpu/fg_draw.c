@@ -141,8 +141,6 @@ fg_create_blend_state(struct pipe_context *pctx, const struct pipe_blend_state *
 
    if (!so)
       return NULL;
-   if (cso->logicop_enable)
-      FG_NOTE_ONCE("a logic op");
    so->h0 = (rt->blend_enable ? 64u : 0) | (cso->dither ? 128u : 0) | fg_board_cmask(rt->colormask) << 16;
    if (rt->blend_enable)
       so->h4 = fg_blend_factor(rt->rgb_src_factor) | fg_blend_factor(rt->rgb_dst_factor) << 4 |
@@ -151,6 +149,38 @@ fg_create_blend_state(struct pipe_context *pctx, const struct pipe_blend_state *
    else
       so->h4 = 1u | 1u << 8; /* ONE, ZERO: what the factors of a state without blending read as */
    so->dither = cso->dither;
+   so->colormask = rt->colormask;
+   if (cso->logicop_enable) {
+      /* a logic op replaces blending */
+      so->h0 &= ~64u;
+      so->h4 = 1u | 1u << 8;
+      switch (cso->logicop_func) {
+      case PIPE_LOGICOP_COPY:
+         break;
+      case PIPE_LOGICOP_NOOP:
+         so->h0 &= ~(0xFu << 16);
+         break;
+      case PIPE_LOGICOP_CLEAR:
+         so->h0 |= 64u;         /* src ZERO + dst ZERO */
+         so->h4 = 0;
+         break;
+      case PIPE_LOGICOP_SET:
+         so->logic_fs = 1;
+         break;
+      case PIPE_LOGICOP_COPY_INVERTED:
+         so->logic_fs = 2;
+         break;
+      case PIPE_LOGICOP_INVERT:
+         so->logic_fs = 1;      /* all ones x (1 - dst) + dst x 0: the complement of every bit */
+         so->h0 |= 64u;
+         so->h4 = 5u | 9u << 8; /* ONE_MINUS_DST_COLOR, ZERO; ONE_MINUS_DST_ALPHA, ZERO */
+         break;
+      default:
+         so->logic_slow = true;
+         so->logic_op = (uint8_t)cso->logicop_func;
+         break;
+      }
+   }
    return so;
 }
 
@@ -502,6 +532,11 @@ fg_fs_variant(struct fg_context *ctx, struct fg_fs_state *fs, const struct fg_vs
    key.xops = screen->b_flags >> 28 & 3u;
    key.noops = fg_noops(screen->b_flags);
    key.vs_outputs = vs->vmask;
+   key.logic = ctx->blend ? ctx->blend->logic_fs : 0;
+   /* (only for a program that reads gl_PointCoord: the others keep one variant) */
+   key.point_flip = ctx->rast && ctx->rast->sprite_coord_mode == PIPE_SPRITE_COORD_UPPER_LEFT &&
+                    (BITSET_TEST(fs->nir->info.system_values_read, SYSTEM_VALUE_POINT_COORD) ||
+                     (fs->nir->info.inputs_read & VARYING_BIT_PNTC));
    for (unsigned u = 0; u < FG_MAX_SAMPLERS; u++) {
       struct pipe_sampler_view *view = ctx->views[u];
 
@@ -1575,6 +1610,8 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
    /* what is written is the texel as it is */
    if (ctx->blend->h0 & 64u)
       return fg_copy_no(ctx, "blending");
+   if (ctx->blend->logic_fs || ctx->blend->logic_slow)
+      return fg_copy_no(ctx, "a logic op");
    cmask = ctx->blend->h0 >> 16 & 0xF;
    want = fg_board_cmask(fg_format_wmask(df));
    for (unsigned c = 0; c < 4; c++)
@@ -1845,6 +1882,9 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
    return true;
 }
 
+static void fg_draw_logic(struct fg_context *ctx, const struct pipe_draw_info *info, unsigned drawid_offset,
+                          const struct pipe_draw_start_count_bias *draws, unsigned num_draws);
+
 static void
 fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsigned drawid_offset,
             const struct pipe_draw_indirect_info *indirect, const struct pipe_draw_start_count_bias *draws,
@@ -1875,6 +1915,10 @@ fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsign
       return;
    if (!ctx->queries_off)
       ctx->draw_count++; /* (an occlusion query's result: a draw ran) */
+   if (ctx->blend && ctx->blend->logic_slow) {
+      fg_draw_logic(ctx, info, drawid_offset, draws, num_draws);
+      return;
+   }
    if (fg_draw_as_copy(ctx, info, draws, num_draws) || !fg_set_target(ctx))
       return;
    fs = fg_fs_variant(ctx, ctx->fs, vs);
@@ -1958,6 +2002,114 @@ fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsign
          fg_hw_draw(ctx, &d, fg_hw_mode[info->mode], count, true, ioff);
       }
    }
+}
+
+/* bitwise op o (Gallium's PIPE_LOGICOP_*: bit 3 the result for s 1 d 1, bit 2 s 1 d 0, bit 1 s 0 d 1, bit 0 s 0 d 0) */
+static uint32_t
+fg_logic(unsigned o, uint32_t s, uint32_t d)
+{
+   return ((o & 8) ? s & d : 0) | ((o & 4) ? s & ~d : 0) | ((o & 2) ? ~s & d : 0) | ((o & 1) ? ~s & ~d : 0);
+}
+
+/* a logic op board B has not (AND, OR, XOR, NOR, NAND, EQUIV and their reversed and inverted forms), the Windows
+ * libraries' way: the target is read; the draw is made over the target filled with zeros and over it filled with ones
+ * (blending off, every channel, depth and stencil tested but not written), both read: a pixel the draw wrote is the
+ * same in both, the draw's colour; the op is worked out on the PC for those pixels through the colour mask and the
+ * result written back; then the draw once more with the colour masked off, for its depth and stencil writes */
+static void
+fg_draw_logic(struct fg_context *ctx, const struct pipe_draw_info *info, unsigned drawid_offset,
+              const struct pipe_draw_start_count_bias *draws, unsigned num_draws)
+{
+   const struct fg_blend_state *bl = ctx->blend;
+   const struct fg_dsa_state *ds = ctx->dsa;
+   struct fg_blend_state plain = *bl;
+   struct fg_dsa_state test;
+   struct pipe_resource *rt;
+   const struct fg_format *f;
+   unsigned w, h, n, bpp, cm;
+   uint8_t *d = NULL, *s0 = NULL, *s1 = NULL;
+   bool queries_off = ctx->queries_off, no_copy = ctx->no_copy, ok = true;
+
+   if (!fg_set_target(ctx))
+      return;
+   rt = ctx->tgt.color;
+   f = fg_resource(rt)->fmt;
+   w = ctx->tgt.width;
+   h = ctx->tgt.height;
+   n = w * h;
+   bpp = f->storage == FG_FMT_RGB565 ? 2 : 4;
+   d = malloc((size_t)n * bpp);
+   s0 = malloc((size_t)n * bpp);
+   s1 = malloc((size_t)n * bpp);
+   if (!d || !s0 || !s1)
+      goto out;
+   plain.h0 = (bl->h0 & ~(64u | 0xFu << 16)) | fg_board_cmask(0xF) << 16;
+   plain.h4 = 1u | 1u << 8;
+   plain.logic_fs = 0;
+   plain.logic_slow = false;
+   if (ds) {
+      test = *ds;
+      test.h0 &= ~2u;
+      test.h1 &= ~(0xFFu << 16);
+      test.h2 &= ~(0xFFu << 16);
+   }
+   /* (its draws are not counted by queries, and are not done as copies: they write the image read here) */
+   ctx->queries_off = true;
+   ctx->no_copy = true;
+   fg_end_pass(ctx);
+   ok = fg_image_io(ctx, rt, false, w, h, d);
+   for (unsigned k = 0; k < 2 && ok; k++) {
+      fg_copy_begin(ctx, rt, rt);
+      fg_emit_fill(ctx, rt, 0, 0, FG_TF_RAW, 0xF, 0, 0, w, h, k ? 0xFFFFFFFFu : 0);
+      fg_copy_end(ctx, rt);
+      ctx->blend = &plain;
+      if (ds)
+         ctx->dsa = &test;
+      fg_draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, num_draws);
+      ctx->blend = bl;
+      ctx->dsa = ds;
+      fg_end_pass(ctx);
+      ok = fg_image_io(ctx, rt, false, w, h, k ? s1 : s0);
+   }
+   if (!ok) {
+      fprintf(stderr, "fpgagpu: a logic op's target could not be read\n");
+      goto out;
+   }
+   /* the channels the op writes: the colour mask's, of those the format stores (an X format's alpha stays 1.0) */
+   cm = bl->colormask & fg_format_wmask(f) & (f->force_alpha || bpp == 2 ? 0x7u : 0xFu);
+   if (bpp == 2) {
+      uint16_t *dw = (uint16_t *)d, *a = (uint16_t *)s0, *b = (uint16_t *)s1;
+      uint32_t keep = ((cm & 1) ? 0xF800u : 0) | ((cm & 2) ? 0x07E0u : 0) | ((cm & 4) ? 0x001Fu : 0);
+
+      for (unsigned i = 0; i < n; i++)
+         if (a[i] == b[i])
+            dw[i] = (uint16_t)((dw[i] & ~keep) | (fg_logic(bl->logic_op, a[i], dw[i]) & keep));
+   } else {
+      for (unsigned i = 0; i < n; i++) {
+         if (memcmp(s0 + 4 * i, s1 + 4 * i, 4))
+            continue;
+         for (unsigned c = 0; c < 4; c++)
+            if (cm >> c & 1)
+               d[4 * i + c] = (uint8_t)fg_logic(bl->logic_op, s0[4 * i + c], d[4 * i + c]);
+      }
+   }
+   fg_image_io(ctx, rt, true, w, h, d);
+   if (ctx->tgt.shadow_of) {
+      fg_emit_copy(ctx, rt, 0, 0, 0, 0, ctx->tgt.shadow_of, ctx->tgt.level, ctx->tgt.layer, 0, 0, w, h);
+      fg_resource_written(fg_resource(ctx->tgt.shadow_of));
+   }
+   if (ds && ((ds->h0 & 2u) || (ds->h1 & 0xFFu << 16) || (ds->h2 & 0xFFu << 16))) {
+      plain.h0 &= ~(0xFu << 16);
+      ctx->blend = &plain;
+      fg_draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, num_draws);
+      ctx->blend = bl;
+   }
+out:
+   ctx->queries_off = queries_off;
+   ctx->no_copy = no_copy;
+   free(d);
+   free(s0);
+   free(s1);
 }
 
 static void

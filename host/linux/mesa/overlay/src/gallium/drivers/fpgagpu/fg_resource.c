@@ -633,6 +633,36 @@ fg_texture_map(struct pipe_context *pctx, struct pipe_resource *prsc, unsigned l
    return t->staging;
 }
 
+bool
+fg_image_io(struct fg_context *ctx, struct pipe_resource *prsc, bool write, unsigned w, unsigned h, void *data)
+{
+   struct fg_screen *screen = fg_screen(ctx->base.screen);
+   struct fg_resource *rsc = fg_resource(prsc);
+   const struct fg_format *f = rsc->fmt->storage == FG_FMT_RGB565 ? fg_format_info(PIPE_FORMAT_B5G6R5_UNORM)
+                                                                   : &fg_rgba8_wire;
+
+   if (write) {
+      struct pipe_box box = { .width = (int)w, .height = (int)h, .depth = 1 };
+
+      return fg_write_image(ctx, rsc, f, 0, &box, data, (uintptr_t)w * h * f->bpp);
+   }
+   fg_submit_stream(ctx);
+   if (fg_wait_bo(screen, rsc->gem, FG_WAIT_NS))
+      return false;
+   {
+      struct drm_fpgagpu_read rd = {
+         .handle = rsc->gem,
+         .data = (uintptr_t)data,
+         .size = (uint64_t)w * h * f->bpp,
+         .w = (uint16_t)w,
+         .h = (uint16_t)h,
+         .tformat = f->tformat,
+      };
+
+      return !drmIoctl(screen->fd, DRM_IOCTL_FPGAGPU_READ, &rd);
+   }
+}
+
 static void
 fg_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptransfer)
 {

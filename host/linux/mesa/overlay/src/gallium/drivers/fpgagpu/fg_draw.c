@@ -850,8 +850,9 @@ fg_hw_draw(struct fg_context *ctx, const struct fg_hw_draw *d, unsigned mode, ui
     * board-A state then goes in the pass its DRAW is in, which another process cannot come between) */
    if (ctx->next_id >= FG_MAX_IDS)
       fg_ids_restart(ctx);
-   fg_claim_boards(ctx);
+   /* (the boards are claimed inside the pass: another context's pass ends before this one opens) */
    fg_pass_open(ctx);
+   fg_claim_boards(ctx);
    if (!fg_place(ctx, &ctx->prog_a, &vs->prog, &vs_off, &vs_gen) ||
        !fg_place(ctx, &ctx->prog_b, &fs->prog, &fs_off, &fs_gen))
       return;

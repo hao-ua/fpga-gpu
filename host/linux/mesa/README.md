@@ -142,8 +142,14 @@ Flushes: a flush that submitted work waits for the one four flushes back (`FPGAG
 process that makes work faster than the boards do it does not queue it ever deeper (a dragged window trailed the
 pointer by ~130 ms; now ~15 ms). A flush at the end of a frame also waits for the frame before (one frame in flight).
 
+Contexts: the boards hold one context's state at a time (its programs, attributes, uniforms, draw states by id), and
+a context that takes them from another sends its own again. The kernel keeps processes' passes apart (PASS), not the
+contexts of one file: a context of the screen opening a pass waits until another's pass ends (at most 5 s, as the
+kernel waits), and claims the boards inside its pass. Two threads drawing at once in two contexts with different
+programs drew wrong frames before (2 of 6 runs; `fg_egl_threads`), none since.
+
 Not yet: copies between buffers and images, instancing, importing buffers, depth or stencil of a level or layer above
-0, a target wider than 1280, more than one context drawing at a time.
+0, a target wider than 1280.
 
 ## Apply and build
 
@@ -181,6 +187,9 @@ glyphs). `host/linux/tools/fg_egl_gl.c` (linked with `-lGL` instead of
 `-lGLESv2`): desktop OpenGL with fixed function the way Quake 3 engines draw: `glBegin(GL_QUADS)`, client arrays
 with `glDrawElements(GL_UNSIGNED_INT)` and two texture units, alpha test, depth test with `glDepthRange`, a mip chain
 uploaded level by level.
+
+`host/linux/tools/fg_egl_threads.c` (`-lEGL -lGLESv2 -lgbm`): two threads drawing at once, each in a context of its
+own with its own programs, 300 frames each, every 10th read back whole.
 
 `host/linux/tools/fg_kms_flip.c`: a GBM surface on the card (DRM master needed, no X on it), an EGL window surface,
 frames cleared and flipped onto board B's HDMI with KMS the way SDL's kmsdrm driver runs a game; the buffers are

@@ -391,6 +391,35 @@ fg_pass_take(struct fg_context *ctx, bool take)
       fg_hw_invalidate(ctx);
 }
 
+#define FG_PASS_WAIT_NS (5ll * 1000 * 1000 * 1000)
+
+/* the screen's boards for this context's pass: another context of the screen with a pass open (another thread) ends it
+ * first; after FG_PASS_WAIT_NS they are taken anyway, as the kernel does between processes */
+static void
+fg_screen_pass_hold(struct fg_context *ctx, bool hold)
+{
+   struct fg_screen *screen = fg_screen(ctx->base.screen);
+
+   mtx_lock(&screen->pass_mtx);
+   if (hold) {
+      struct timespec until;
+
+      timespec_get(&until, TIME_UTC);
+      until.tv_sec += FG_PASS_WAIT_NS / 1000000000ll;
+      while (screen->pass_ctx && screen->pass_ctx != ctx) {
+         if (cnd_timedwait(&screen->pass_cnd, &screen->pass_mtx, &until) == thrd_timedout) {
+            fprintf(stderr, "fpgagpu: another context's pass did not end in 5 s: its boards are taken\n");
+            break;
+         }
+      }
+      screen->pass_ctx = ctx;
+   } else if (screen->pass_ctx == ctx) {
+      screen->pass_ctx = NULL;
+      cnd_broadcast(&screen->pass_cnd);
+   }
+   mtx_unlock(&screen->pass_mtx);
+}
+
 void
 fg_pass_open(struct fg_context *ctx)
 {
@@ -398,6 +427,7 @@ fg_pass_open(struct fg_context *ctx)
 
    if (ctx->pass_open)
       return;
+   fg_screen_pass_hold(ctx, true);
    fg_pass_take(ctx, true);
    fg_emit(ctx, FG_T_FRAME_BEGIN, z, sizeof(z), NULL, 0);
    ctx->pass_open = true;
@@ -472,6 +502,7 @@ fg_end_pass(struct fg_context *ctx)
    ctx->nbos = 0;
    ctx->pass_open = false;
    fg_pass_take(ctx, false);
+   fg_screen_pass_hold(ctx, false);
    ctx->pass_draws = 0;
    ctx->cl_flags = 0;
    ctx->cl_depth = 0xFFFFFF;

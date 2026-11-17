@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "c11/threads.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/simple_mtx.h"
@@ -77,6 +78,11 @@ struct fg_screen {
 
    /* the boards hold one context's state at a time: its programs, attributes, uniforms and draw states */
    void *last_ctx;
+   /* a pass is one frame on the boards: the kernel keeps processes' passes apart (PASS), not the contexts of one file,
+    * so a context opening a pass waits for another's to end (pass_ctx, under pass_mtx), at most FG_PASS_WAIT_NS */
+   mtx_t pass_mtx;
+   cnd_t pass_cnd;
+   void *pass_ctx;
 
    /* the GEM handles of this fd and how many resources name each: importing a BO the fd already has (one of its own
     * exports, a buffer shared twice) gives the same handle, closed once the last resource goes */

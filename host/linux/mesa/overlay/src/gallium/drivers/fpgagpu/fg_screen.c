@@ -184,6 +184,8 @@ fg_screen_destroy(struct pipe_screen *pscreen)
    close(screen->fd);
    free(screen->gems);
    simple_mtx_destroy(&screen->gem_lock);
+   cnd_destroy(&screen->pass_cnd);
+   mtx_destroy(&screen->pass_mtx);
    FREE(screen);
 }
 
@@ -413,6 +415,8 @@ fg_screen_create(int fd, const struct pipe_screen_config *config, struct rendero
    }
    screen->fd = fd;
    simple_mtx_init(&screen->gem_lock, mtx_plain);
+   mtx_init(&screen->pass_mtx, mtx_plain);
+   cnd_init(&screen->pass_cnd);
 
    version = drmGetVersion(fd);
    ours = version && version->name && strcmp(version->name, "fpgagpu") == 0;

@@ -2762,6 +2762,29 @@ class Compiler(Codegen):
         val=h.pop(name)
         r=self.alloc('float'); r.tmp=False; home[name]=(r,'float')
         self.emit('MOV', f'r{r.n}', f'r{self.kf(float(val)).n}'); return r
+    def _lv_struct(self, e):
+        """the value of a local the lvalue e names, an aggregate member of a local struct made on the way (None: no such local)"""
+        if e[0]=='var':
+            for sc in reversed(self.locals):
+                if e[1] in sc: return sc[e[1]][0]
+            return None
+        if e[0]=='swizzle':
+            st=self._lv_struct(e[1])
+            if not isinstance(st,StructVal) or e[2] not in st.members: return None
+            if st.members[e[2]] is None: st.members[e[2]]=self._member_new(st.sname, e[2])
+            return st.members[e[2]]
+        if e[0]=='index':
+            a=self._lv_struct(e[1]); ci=self.fold_const(e[2])
+            if isinstance(a,ArrayVal) and a.kind=='local' and ci is not None and 0<=int(ci)<len(a.elems): return a.elems[int(ci)]
+        return None
+    def _member_new(self, sname, mname):
+        """registers for an aggregate member of a local struct, at its first write: 0, as the struct's other members"""
+        for mt,mn,ma in self.structs[sname]:
+            if mn==mname:
+                n=self._arrsize(ma)
+                v=ArrayVal(mt, n, 'local', elems=[self._fresh(mt) for _ in range(n)]) if ma is not None else self._fresh(mt)
+                self._zero(v); return v
+        return None
     def eval_lvalue(self, e):
         e=self._fd(e)
         if e[0]=='var':
@@ -2771,6 +2794,7 @@ class Compiler(Codegen):
         if e[0]=='index':                                    # a[const] -> the element's Reg (local arr / mat col)
             ci=self.fold_const(e[2])
             if ci is None: raise CompileError("array index must be a constant expression")
+            self._lv_struct(e[1])                            # s.b[0] = x: s.b gets its registers at its first write
             arr=self.eval(e[1]); i=int(ci)
             if isinstance(arr,ArrayVal) and arr.kind!='local' and e[1][0]=='swizzle':
                 # a struct copied from a uniform shares its read-only array until the first write, which would otherwise
@@ -2825,7 +2849,7 @@ class Compiler(Codegen):
             self.scan_cond_assigns(stmt[2], True); self.scan_cond_assigns(stmt[3], True)
         elif k=='for':
             self._scan.append({})
-            runtime=self._refs_runtime(stmt[2])                       # runtime bound -> real (non-unrolled) loop
+            runtime=self._refs_runtime(stmt[2]) or self._refs_runtime(stmt[3])     # runtime bound or step -> real (non-unrolled) loop
             if not runtime and (self.stage=='fs' or self.isa64) and self._long_for(stmt):
                 self.hw_for[id(stmt)]=self._for_trips(stmt[1], stmt[2], stmt[3]); runtime=True     # a long constant loop: the hardware loop too (_long_for)
             self.scan_cond_assigns(stmt[1], incond)
@@ -4400,9 +4424,21 @@ def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True
     # the optimizer removed, or an unrolled loop's index nobody reads, would otherwise stay in the pool (a 60-pass loop would
     # keep 60 vectors for one load — of the fragment core's 64, the uniforms included)
     used=sorted({int(n) for ln in code for n in re.findall(r'@(\d+)', ln)})
-    slot={o:i for i,o in enumerate(used)}
-    out=[re.sub(r'@(\d+)', lambda m: str(base+slot[int(m.group(1))]), ln) for ln in code]
-    pool=[list(c.const_order[o]) for o in used]
+    # A constant whose four lanes are one value, loaded by LDP only, takes one lane of a row it shares with three others: LDP's
+    # swizzle picks it (a scalar reads .x of its slot, a vector its splat). The rows left over go to the uniforms
+    other={int(n) for ln in code if not ln.startswith('LDP ') for n in re.findall(r'@(\d+)', ln)}
+    lane=[o for o in used if o not in other and c.const_order[o][0]==c.const_order[o][1]==c.const_order[o][2]==c.const_order[o][3]]
+    whole=[o for o in used if o not in set(lane)]
+    pool=[list(c.const_order[o]) for o in whole]
+    slot={o:(i,None) for i,o in enumerate(whole)}
+    for i,o in enumerate(lane):
+        if i%4==0: pool.append([0.0]*4)
+        pool[-1][i%4]=c.const_order[o][0]; slot[o]=(len(pool)-1, i%4)
+    def at(m):
+        r,k=slot[int(m.group(1))]
+        if k is None: return f'{base+r}{m.group(2) or ""}'
+        return f'{base+r}.' + 'xyzw'[k]*(len(m.group(2))-1 if m.group(2) else 4)
+    out=[re.sub(r'@(\d+)(\.[xyzw]+)?', at, ln) for ln in code]
     return {'sasm':'\n'.join(out), 'attribs':c.attribs, 'uniforms':c.uniforms, 'samplers':c.samplers, 'sampler_sizes':c.sampler_sizes,
             'varyings':c.varyings, 'const_base':base, 'const_pool':pool, 'isa64':isa64, 'vs_tex':c.vs_tex}
 

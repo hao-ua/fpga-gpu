@@ -15,6 +15,14 @@ VS = 'attribute vec4 a0; uniform float n;\n'
 A = 'mat2 a = mat2(1.0, 2.0, 3.0, 4.0); mat2 b = mat2(5.0, 6.0, 7.0, 8.0); '
 P = 'mat2 p = mat2(1.0, 2.0, 4.0, 8.0); '
 K = 'int k = int(v0.x * 4.0); '                                        # 3 and 1
+
+
+def a71(x):
+    for k in range(70): x = x * 0.5 + k
+    return x
+
+
+A71 = (a71(0.75), a71(0.25))                                            # 70 steps of a = a * 0.5 + k: more constants than rows
 # name, program (a main that ends by writing gl_FragColor), the result where x > 0.5, the result elsewhere (None: the same)
 C = [
     ('mat + mat', A + 'mat2 c = a + b; gl_FragColor = vec4(c[0], c[1]);', (6, 8, 10, 12)),
@@ -121,6 +129,9 @@ W = [
     ('an int local as an out and an inout argument', 'void f(out int a) { a = -1; }\nvoid g(inout int a) { a = -a; }\nvoid main() { int x = 1; f(x); int y = 3; g(y); gl_FragColor = vec4(float(x * int(n)), float(y), 0.0, 0.0); }\n', (-4, -3, 0, 0)),
     ('a global as an out argument is a copy', 'float x = 1.0;\nbool d(out float y) { y = 2.0; return x == 1.0 && y == 2.0; }\nvoid main() { bool r = d(x); gl_FragColor = vec4(r ? 1.0 : 0.0, x, 0.0, 0.0); }\n', (1, 2, 0, 0)),
     ('one array as two inout arguments', 'void neg(inout float a[2]) { a[0] = -a[0]; a[1] = -a[1]; }\nfloat f(inout float a[2], inout float b[2]) { neg(a); return a[0] == b[0] ? 1.0 : -1.0; }\nvoid main() { float r[2]; r[0] = 3.0; r[1] = 4.0; float m = f(r, r); gl_FragColor = vec4(m, 0.0, 0.0, 0.0); }\n', (-1, 0, 0, 0)),
+    ('arrays in a local struct written element by element', 'struct T { float a; vec2 b[2]; };\nstruct S { float a; float b[3]; T t[2]; };\nvoid main() { S s; s.a = 1.0; s.b[1] = 4.0; s.t[1].b[0] = vec2(5.0, 6.0); gl_FragColor = vec4(s.a, s.b[1], s.b[0], s.t[1].b[0].y); }\n', (1, 4, 0, 6)),
+    ('a loop whose step reads a uniform', 'float f() { for (int i = 1; i < 10; i += int(n) - 4) return 2.0; return 3.0; }\nvoid main() { gl_FragColor = vec4(f()); }\n', (2, 2, 2, 2)),
+    ('71 scalar constants', 'void main() { float a = v0.x; ' + ''.join('a = a * 0.5 + %d.0; ' % k for k in range(70)) + 'gl_FragColor = vec4(a); }\n', (A71[0],) * 4, (A71[1],) * 4),
     ('invariant on varyings and gl_Position', 'invariant varying vec4 q;\nvoid main() { gl_FragColor = vec4(2.0); }\n', (2, 2, 2, 2)),
 ]
 # (name, stage, source): each must not compile

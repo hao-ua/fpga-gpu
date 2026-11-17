@@ -2809,6 +2809,57 @@ static void store(Cg *c, Node *lhs, Val *rv)
     sh_compile_error(c->h, "unsupported assignment target");
 }
 
+/* registers for an aggregate member of a local struct, at its first write: 0, as the struct's other members */
+static Val *member_new(Cg *c, const char *sname, const char *mname)
+{
+    StructDef *s = (StructDef *)dict_find(&c->structs, sname)->p;
+    int i;
+    for (i = 0; i < s->n; i++) {
+        Member *m = &s->m[i];
+        Val *v;
+        if (strcmp(m->name, mname)) continue;
+        if (m->arr) {
+            long long n = arrsize(c, m->arr), j;
+            Val **elems = new_vals(c, n);
+            for (j = 0; j < n; j++) elems[j] = fresh(c, m->ty);
+            v = mk_array(c, m->ty, n, 1, 0, elems);
+        }
+        else v = fresh(c, m->ty);
+        zero_val(c, v);
+        return v;
+    }
+    return NULL;
+}
+
+/* the value of a local the lvalue e names, an aggregate member of a local struct made on the way (NULL: no such local) */
+static Val *lv_struct(Cg *c, Node *e)
+{
+    Val *r = NULL;
+    SH_ENTER(c->h, 1);
+    if (e->kind == N_VAR) {
+        Local *l = local_find(c, e->s);
+        r = l ? l->v : NULL;
+    }
+    else if (e->kind == N_SWIZZLE) {
+        Val *st = lv_struct(c, e->a);
+        DictEnt *m = is_struct(st) ? dict_find(st->u.st.members, e->s) : NULL;
+        if (m) {
+            if (!m->p) m->p = member_new(c, st->u.st.sname, e->s);
+            r = (Val *)m->p;
+        }
+    }
+    else if (e->kind == N_INDEX) {
+        Val *a = lv_struct(c, e->a);
+        double ci;
+        if (is_array(a) && a->u.a.local == 1 && fold_const(c, e->b, &ci)) {
+            long long i = py_int(c, ci);
+            if (i >= 0 && i < a->u.a.size) r = a->u.a.elems[i];
+        }
+    }
+    SH_LEAVE(c->h, 1);
+    return r;
+}
+
 static Val *eval_lvalue_(Cg *c, Node *e)
 {
     e = fd(c, e);
@@ -2821,6 +2872,7 @@ static Val *eval_lvalue_(Cg *c, Node *e)
         Val *arr;
         long long i;
         if (!fold_const(c, e->b, &ci)) sh_compile_error(c->h, "array index must be a constant expression");
+        lv_struct(c, e->a);                     /* s.b[0] = x: s.b gets its registers at its first write */
         arr = eval(c, e->a);
         i = py_int(c, ci);
         if (is_array(arr) && arr->u.a.local != 1 && e->a->kind == N_SWIZZLE) {
@@ -3065,7 +3117,7 @@ static void scan_cond_assigns(Cg *c, Node *s, int incond)
         scan_cond_assigns(c, s->c, 1);
         break;
     case S_FOR: {
-        int rt = refs_runtime(c, s->b);
+        int rt = refs_runtime(c, s->b) || refs_runtime(c, s->c);      /* runtime bound or step -> real (non-unrolled) loop */
         memset(&in, 0, sizeof in);
         in.up = c->scan; c->scan = &in;
         if (!rt && (s->hwloop = long_for(c, s)) != 0) rt = 1;      /* a long constant loop: the hardware loop too (hwloop = its pass count) */

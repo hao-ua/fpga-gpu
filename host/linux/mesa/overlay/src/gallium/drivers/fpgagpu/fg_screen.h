@@ -69,6 +69,8 @@ struct fg_screen {
    uint32_t link_flags;		/* bit 0 board B alive, bit 2 the board link trained */
    uint32_t status_layout;	/* board A's STATUS layout */
    bool band_skip;		/* FLUSH may leave out the bands nothing reaches (FPGAGPU_NOSKIP=1: never) */
+   bool copy_ext;		/* board B's COPY_IMAGE takes alpha = 255, a swizzle, a tile and a list of rectangles
+				 * (B flags bit 14; FPGAGPU_NOCOPYEXT=1: never) */
 
    bool debug;			/* FPGAGPU_DEBUG: flags at creation, the time each read map spends on stderr */
    unsigned debug_shaders;	/* FPGAGPU_SHADERS=1: each program's assembler text on stderr */

@@ -256,8 +256,45 @@ void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned sl
                   unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
                   unsigned w, unsigned h);
 /* the stored alpha of a rectangle of an RGBA8 image set to 1.0 (FILL_IMAGE with the alpha channel alone) */
-void fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned x, unsigned y, unsigned w,
-                       unsigned h);
+void fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, unsigned x,
+                       unsigned y, unsigned w, unsigned h);
+
+/* COPY_IMAGE's flags. ALPHA_ONE: an RGBA8 destination's alpha = 255 (a FILL_IMAGE after the copy where board B lacks
+ * the copy extensions); SWIZZLE: destination channel c (R, G, B, A) <- source channel FG_COPY_SEL(flags, c), on the
+ * RGBA8 values (before ALPHA_ONE); TILE: the source rectangle repeats over the destination rectangle from a phase in it
+ * (no mirrors); LIST: more 1:1 rectangles after the first, each at the first one's offset. SWIZZLE, TILE and LIST
+ * only where the screen has copy_ext */
+#define FG_COPY_MIRROR_X  0x01u
+#define FG_COPY_MIRROR_Y  0x02u
+#define FG_COPY_ALPHA_ONE 0x08u
+#define FG_COPY_SWIZZLE   0x10u
+#define FG_COPY_TILE      0x20u
+#define FG_COPY_LIST      0x40u
+#define FG_COPY_SEL(flags, c) ((flags) >> (8 + 2 * (c)) & 3u)
+#define FG_COPY_LIST_MAX  160   /* rectangles in one COPY_IMAGE: 36 + 8 * 159 bytes fit one datagram */
+
+/* one 1:1 rectangle of a copy; a tile (tile set): the destination rectangle (dx, dy, w, h) from the source rectangle
+ * (sx, sy, tw, th) repeated, starting at (px, py) in it */
+struct fg_copy_piece {
+   int sx, sy, dx, dy, w, h;
+   bool tile;
+   int tw, th, px, py;
+};
+
+/* 1:1 copies in the given order, each with flags (ALPHA_ONE, SWIZZLE); a run of them at one offset is one COPY_IMAGE
+ * with a list where the screen has copy_ext. Tiles go one a command */
+void fg_emit_copies(struct fg_context *ctx, struct pipe_resource *src, struct pipe_resource *dst,
+                    const struct fg_copy_piece *p, unsigned n, uint32_t flags);
+/* what a copy from an image stored as sf, read as the view format vf through the swizzle sw (PIPE_SWIZZLE_* per
+ * channel), into one of format df (the same storage) writes: COPY_IMAGE's SWIZZLE and ALPHA_ONE added to *flags.
+ * false: board B cannot copy it so (a constant 0, a 1 other than in alpha, or a swizzle without copy_ext) */
+struct fg_format;
+bool fg_copy_channels(struct fg_context *ctx, const struct fg_format *sf, const struct fg_format *vf,
+                      const struct fg_format *df, const unsigned char sw[4], uint32_t *flags);
+/* a stretch or a mirror (FG_COPY_MIRROR_*), with ALPHA_ONE and SWIZZLE */
+void fg_emit_copy_scaled(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer,
+                         unsigned sx, unsigned sy, unsigned sw, unsigned sh, struct pipe_resource *dst, unsigned dlevel,
+                         unsigned dlayer, unsigned dx, unsigned dy, unsigned dw, unsigned dh, uint32_t flags);
 /* before COPY_IMAGEs from src into dst: a pass that reads or writes either ends (board B copies at once and renders
  * at a FLUSH); after them: what dst's copies (shadow, tight rows) hold is old, and the stream goes out when no pass
  * is open */

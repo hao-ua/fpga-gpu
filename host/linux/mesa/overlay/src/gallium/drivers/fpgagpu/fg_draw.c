@@ -1336,12 +1336,12 @@ fg_draw_bounds(struct fg_context *ctx, const struct pipe_draw_info *info, const 
 /* ------------------------------------------------------------------ draws that copy an image */
 
 #define FG_COPY_MAX_VERTS  4096 /* the vertices a draw may have to be looked at as a copy */
-#define FG_COPY_MAX_PIECES 64   /* the COPY_IMAGEs it may become */
+#define FG_COPY_MAX_PIECES 64   /* the COPY_IMAGEs it may become, 8 cuts an axis at most... */
+#define FG_COPY_MAX_PIECES_EXT 256 /* ...or this many where board B has the copy extensions (tiles past it) */
 #define FG_COPY_EPS        (1.0 / 64.0)
-
-struct fg_copy_piece {
-   int sx, sy, dx, dy, w, h;
-};
+/* a COPY_IMAGE costs board B about 5.5 us, about what 1 024 pixels take longer as a tile (one a clock) than as 1:1
+ * pieces (the burst path, ~2.6 a clock): a tile replaces pieces that would cover fewer pixels than that per extra one */
+#define FG_COPY_CMD_PX     1024
 
 static bool
 fg_copy_no(struct fg_context *ctx, const char *why)
@@ -1364,16 +1364,26 @@ fg_copy_edge(double x, int *px)
    return true;
 }
 
-/* one axis of a copy: the destination run [d, d + n) reads the source from s on. A wrapping axis (a repeating tile)
- * is cut where the source wraps; -1: a run past the image on an axis that does not wrap, or too many cuts */
+/* the pieces one axis of a copy is cut into, the destination run of n reading the source from s on: a wrapping axis
+ * (a repeating tile) is cut where the source wraps; -1: a run past the image on an axis that does not wrap */
 static int
-fg_copy_runs(int d, int n, int s, int size, bool wraps, int run[][3], int max)
+fg_copy_cuts(int n, int s, int size, bool wraps)
+{
+   if (!wraps)
+      return s < 0 || s + n > size ? -1 : 1;
+   s %= size;
+   if (s < 0)
+      s += size;
+   return (s + n + size - 1) / size;
+}
+
+/* those pieces: the destination run [d, d + n) cut into run[k] = {destination, source, length} */
+static int
+fg_copy_runs(int d, int n, int s, int size, bool wraps, int run[][3])
 {
    int k = 0;
 
    if (!wraps) {
-      if (s < 0 || s + n > size)
-         return -1;
       run[0][0] = d;
       run[0][1] = s;
       run[0][2] = n;
@@ -1385,8 +1395,6 @@ fg_copy_runs(int d, int n, int s, int size, bool wraps, int run[][3], int max)
    while (n > 0) {
       int len = MIN2(n, size - s);
 
-      if (k == max)
-         return -1;
       run[k][0] = d;
       run[k][1] = s;
       run[k][2] = len;
@@ -1396,6 +1404,27 @@ fg_copy_runs(int d, int n, int s, int size, bool wraps, int run[][3], int max)
       s = 0;
    }
    return k;
+}
+
+/* one axis of a tile for the destination run of n reading the source from s on: the source run [*s0, *s0 + *len) it
+ * repeats and the phase in it the run starts at (the whole axis where the run wraps) */
+static void
+fg_copy_tile_axis(int n, int s, int size, bool wraps, int *s0, int *len, int *phase)
+{
+   if (wraps) {
+      s %= size;
+      if (s < 0)
+         s += size;
+   }
+   if (s + n <= size) {
+      *s0 = s;
+      *len = n;
+      *phase = 0;
+   } else {
+      *s0 = 0;
+      *len = size;
+      *phase = s;
+   }
 }
 
 /* the corner (bit 0: right, bit 1: bottom) of a rectangle with edges x0 < x1, y0 < y1 a point is at; -1 none */
@@ -1473,7 +1502,10 @@ fg_copy_tri(enum mesa_prim mode, unsigned i, unsigned t[3])
  * as board B's COPY_IMAGE (its copy engine moves about a pixel a clock and only the rectangle, where a pass loads and
  * stores every row it reaches). The copies give what GL defines for such a draw: each pixel takes the texel under its
  * centre. Where the alpha written is 1.0 (the board keeps the target's at 1.0, or the texel reads it so) and the
- * source's stored alpha is not kept at 1.0, the copy's alpha is set to 1.0 after it. false: it is to be drawn */
+ * source's stored alpha is not kept at 1.0, the copy sets it (fg_copy_channels; a view's swizzle the same way). A
+ * repeating texture is cut into 1:1 pieces where it wraps; where board B has the copy extensions it is copied as a
+ * tile instead when the pieces would cost more (not inside one image: a tile has no overlap order). false: it is to
+ * be drawn */
 static bool
 fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const struct pipe_draw_start_count_bias *draws,
                 unsigned num_draws)
@@ -1482,17 +1514,20 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
    const struct fg_vs_state *vs = ctx->vs;
    const struct pipe_rasterizer_state *rs = ctx->rast;
    const struct pipe_viewport_state *vp = &ctx->viewport;
-   struct fg_copy_piece pieces[FG_COPY_MAX_PIECES];
+   const bool ext = fg_screen(ctx->base.screen)->copy_ext;
+   const unsigned cap = ext ? FG_COPY_MAX_PIECES_EXT : FG_COPY_MAX_PIECES;
+   const int axis_max = ext ? FG_COPY_MAX_PIECES_EXT : 8;
+   struct fg_copy_piece *pieces;
    struct pipe_sampler_view *view;
    const struct fg_sampler_state *smp;
    struct pipe_resource *src, *dst;
    const struct fg_format *sf, *df, *vf;
    struct fg_eval *ev[3];
-   uint32_t need, cmask, want;
+   uint32_t need, cmask, want, cflags = 0;
    const uint8_t *ib = NULL;
-   unsigned total = 0, npieces = 0, swa;
+   unsigned total = 0, npieces = 0;
    int clip[4], tw, th, sw, sh;
-   bool wraps[2], fill;
+   bool wraps[2], tiles;
    double (*win)[2] = NULL, (*tex)[2] = NULL;
 
    if (ctx->no_copy || !cp->ok)
@@ -1551,16 +1586,15 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
        vf->storage != sf->storage ||
        ((sf->expand || df->expand || vf->expand) && !(sf == df && vf == sf)))
       return fg_copy_no(ctx, "formats board B does not copy as they are sampled");
-   swa = view->swizzle_a;
-   if (view->swizzle_r != PIPE_SWIZZLE_X || view->swizzle_g != PIPE_SWIZZLE_Y || view->swizzle_b != PIPE_SWIZZLE_Z ||
-       (swa != PIPE_SWIZZLE_W && swa != PIPE_SWIZZLE_1))
-      return fg_copy_no(ctx, "a swizzle");
-   /* the alpha written is 1.0: the board keeps the target's at 1.0, or the texel reads it so; a source whose
-    * stored alpha is 1.0 (an X format) copies it */
-   fill = (df->force_alpha || swa == PIPE_SWIZZLE_1 || vf->force_alpha) && !sf->force_alpha &&
-          df->storage == FG_FMT_RGBA8;
+   {
+      const unsigned char swz[4] = { view->swizzle_r, view->swizzle_g, view->swizzle_b, view->swizzle_a };
+
+      if (!fg_copy_channels(ctx, sf, vf, df, swz, &cflags))
+         return fg_copy_no(ctx, "a swizzle board B does not copy");
+   }
    wraps[0] = cp->fract[0] || (smp->wrap >> 20 & 3u) == 0;
    wraps[1] = cp->fract[1] || (smp->wrap >> 22 & 3u) == 0;
+   tiles = ext && src != dst;
    sw = (int)src->width0;
    sh = (int)src->height0;
 
@@ -1594,9 +1628,11 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
 
    win = malloc(total * sizeof(*win));
    tex = malloc(total * sizeof(*tex));
-   if (!win || !tex) {
+   pieces = malloc(cap * sizeof(*pieces));
+   if (!win || !tex || !pieces) {
       free(win);
       free(tex);
+      free(pieces);
       return false;
    }
    {
@@ -1660,7 +1696,8 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
          for (unsigned i = 0; i < ntri && !why; i += 2) {
             unsigned t[6];
             double r[4];
-            int px[4], run_x[8][3], run_y[8][3], nx, ny;
+            int px[4], run_x[FG_COPY_MAX_PIECES_EXT][3], run_y[FG_COPY_MAX_PIECES_EXT][3], cx, cy, nx, ny;
+            int64_t n_pc, area;
 
             fg_copy_tri(info->mode, i, t);
             fg_copy_tri(info->mode, i + 1, t + 3);
@@ -1681,20 +1718,45 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
             px[3] = MIN2(px[3], clip[3]);
             if (px[2] <= px[0] || px[3] <= px[1])
                continue;
-            nx = fg_copy_runs(px[0], px[2] - px[0], px[0] + (int)off[0], sw, wraps[0], run_x, 8);
-            ny = fg_copy_runs(px[1], px[3] - px[1], px[1] + (int)off[1], sh, wraps[1], run_y, 8);
-            if (nx < 0 || ny < 0) {
+            cx = fg_copy_cuts(px[2] - px[0], px[0] + (int)off[0], sw, wraps[0]);
+            cy = fg_copy_cuts(px[3] - px[1], px[1] + (int)off[1], sh, wraps[1]);
+            if (cx < 0 || cy < 0) {
                why = "texels past the image's edge";
                break;
             }
-            for (int a = 0; a < ny && !why; a++) {
+            n_pc = (int64_t)cx * cy;
+            area = (int64_t)(px[2] - px[0]) * (px[3] - px[1]);
+            /* a tile where the pieces would cost more, or are too many */
+            if (tiles && n_pc > 1 &&
+                (area < (n_pc - 1) * FG_COPY_CMD_PX || cx > axis_max || cy > axis_max || npieces + n_pc > cap)) {
+               struct fg_copy_piece *p = &pieces[npieces];
+
+               if (npieces == cap) {
+                  why = "too many rectangles";
+                  break;
+               }
+               memset(p, 0, sizeof(*p));
+               p->tile = true;
+               p->dx = px[0];
+               p->dy = px[1];
+               p->w = px[2] - px[0];
+               p->h = px[3] - px[1];
+               fg_copy_tile_axis(p->w, px[0] + (int)off[0], sw, wraps[0], &p->sx, &p->tw, &p->px);
+               fg_copy_tile_axis(p->h, px[1] + (int)off[1], sh, wraps[1], &p->sy, &p->th, &p->py);
+               npieces++;
+               continue;
+            }
+            if (cx > axis_max || cy > axis_max || npieces + n_pc > cap) {
+               why = "too many rectangles";
+               break;
+            }
+            nx = fg_copy_runs(px[0], px[2] - px[0], px[0] + (int)off[0], sw, wraps[0], run_x);
+            ny = fg_copy_runs(px[1], px[3] - px[1], px[1] + (int)off[1], sh, wraps[1], run_y);
+            for (int a = 0; a < ny; a++) {
                for (int b = 0; b < nx; b++) {
                   struct fg_copy_piece *p = &pieces[npieces];
 
-                  if (npieces == FG_COPY_MAX_PIECES) {
-                     why = "too many rectangles";
-                     break;
-                  }
+                  memset(p, 0, sizeof(*p));
                   p->dx = run_x[b][0];
                   p->sx = run_x[b][1];
                   p->w = run_x[b][2];
@@ -1709,8 +1771,10 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
       }
       free(win);
       free(tex);
-      if (why)
+      if (why) {
+         free(pieces);
          return fg_copy_no(ctx, why);
+      }
    }
 
    /* inside one image (a window moved within the screen) a rectangle must not overwrite another's source before that
@@ -1735,18 +1799,22 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
       }
    }
    fg_copy_begin(ctx, src, dst);
-   for (unsigned i = 0; i < npieces; i++) {
+   for (unsigned i = 0; i < npieces && ctx->debug_copy; i++) {
       const struct fg_copy_piece *p = &pieces[i];
 
-      if (ctx->debug_copy)
-         fprintf(stderr, "fpgagpu: copy %dx%d from %d,%d of %s %ux%u to %d,%d of %s %ux%u%s\n", p->w, p->h, p->sx,
-                 p->sy, util_format_short_name(src->format), src->width0, src->height0, p->dx, p->dy,
-                 util_format_short_name(dst->format), dst->width0, dst->height0, fill ? ", alpha 1" : "");
-      fg_emit_copy(ctx, src, 0, 0, p->sx, p->sy, dst, 0, 0, p->dx, p->dy, p->w, p->h);
-      if (fill)
-         fg_emit_alpha_one(ctx, dst, p->dx, p->dy, p->w, p->h);
+      if (p->tile)
+         fprintf(stderr, "fpgagpu: copy %dx%d of the tile %dx%d at %d,%d from %d,%d in it, of %s %ux%u, to %d,%d of %s "
+                 "%ux%u, flags 0x%x\n", p->w, p->h, p->tw, p->th, p->sx, p->sy, p->px, p->py,
+                 util_format_short_name(src->format), src->width0, src->height0, p->dx, p->dy,
+                 util_format_short_name(dst->format), dst->width0, dst->height0, cflags);
+      else
+         fprintf(stderr, "fpgagpu: copy %dx%d from %d,%d of %s %ux%u to %d,%d of %s %ux%u, flags 0x%x\n", p->w, p->h,
+                 p->sx, p->sy, util_format_short_name(src->format), src->width0, src->height0, p->dx, p->dy,
+                 util_format_short_name(dst->format), dst->width0, dst->height0, cflags);
    }
+   fg_emit_copies(ctx, src, dst, pieces, npieces, cflags);
    fg_copy_end(ctx, dst);
+   free(pieces);
    return true;
 }
 

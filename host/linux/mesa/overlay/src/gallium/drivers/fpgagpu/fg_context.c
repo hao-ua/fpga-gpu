@@ -804,11 +804,14 @@ fg_copy_end(struct fg_context *ctx, struct pipe_resource *dst)
 
 /* FILL_IMAGE: handle, level, layer, transfer format, channel mask, 0, x, y, w, h, value (bytes R, G, B, A) */
 void
-fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned x, unsigned y, unsigned w, unsigned h)
+fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned level, unsigned layer, unsigned x,
+                  unsigned y, unsigned w, unsigned h)
 {
    uint8_t b[20] = { 0 };
 
    fg_put16(b, fg_resource(dst)->board_handle);
+   b[2] = (uint8_t)level;
+   b[3] = (uint8_t)layer;
    b[4] = FG_TF_RGBA8888;
    b[5] = 0x8;
    fg_put16(b + 8, x);
@@ -820,15 +823,26 @@ fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned x,
    fg_use_resource(ctx, dst);
 }
 
-/* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key. Both
- * images are held until the stream is submitted: the frontend often lets go of a source right after a copy */
+/* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key low (a
+ * tile's phase, py << 16 | px) and high, then a list's rectangles {x, y, w, h} after the first. Both images are held
+ * until the stream is submitted: the frontend often lets go of a source right after a copy */
 static void
-fg_emit_copy_handles(struct fg_context *ctx, uint16_t src, unsigned slevel, unsigned slayer, unsigned sx, unsigned sy,
-                     unsigned sw, unsigned sh, uint16_t dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
-                     unsigned dw, unsigned dh, uint32_t flags)
+fg_emit_copy_cmd(struct fg_context *ctx, uint16_t src, unsigned slevel, unsigned slayer, unsigned sx, unsigned sy,
+                 unsigned sw, unsigned sh, uint16_t dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
+                 unsigned dw, unsigned dh, uint32_t flags, uint32_t key_lo, const struct fg_copy_piece *list,
+                 unsigned nlist)
 {
-   uint8_t b[36];
+   uint8_t b[36 + 8 * (FG_COPY_LIST_MAX - 1)];
 
+   assert(nlist < FG_COPY_LIST_MAX);
+   if (nlist)
+      flags |= FG_COPY_LIST;
+   for (unsigned i = 0; i < nlist; i++) {
+      fg_put16(b + 36 + 8 * i, list[i].dx);
+      fg_put16(b + 38 + 8 * i, list[i].dy);
+      fg_put16(b + 40 + 8 * i, list[i].w);
+      fg_put16(b + 42 + 8 * i, list[i].h);
+   }
    fg_put16(b + 0, src);
    b[2] = (uint8_t)slevel;
    b[3] = (uint8_t)slayer;
@@ -844,20 +858,120 @@ fg_emit_copy_handles(struct fg_context *ctx, uint16_t src, unsigned slevel, unsi
    fg_put16(b + 20, dw);
    fg_put16(b + 22, dh);
    fg_put32(b + 24, flags);
-   fg_put32(b + 28, 0);
+   fg_put32(b + 28, key_lo);
    fg_put32(b + 32, 0);
-   fg_emit(ctx, FG_T_COPY_IMAGE, b, sizeof(b), NULL, 0);
+   fg_emit(ctx, FG_T_COPY_IMAGE, b, 36 + 8 * nlist, NULL, 0);
 }
 
 static void
+fg_emit_copy_handles(struct fg_context *ctx, uint16_t src, unsigned slevel, unsigned slayer, unsigned sx, unsigned sy,
+                     unsigned sw, unsigned sh, uint16_t dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
+                     unsigned dw, unsigned dh, uint32_t flags)
+{
+   fg_emit_copy_cmd(ctx, src, slevel, slayer, sx, sy, sw, sh, dst, dlevel, dlayer, dx, dy, dw, dh, flags, 0, NULL, 0);
+}
+
+/* flags as the board takes them: ALPHA_ONE stays in the command only where board B has the copy extensions (the
+ * caller fills the alpha after it otherwise) */
+static uint32_t
+fg_copy_board_flags(struct fg_context *ctx, uint32_t flags)
+{
+   if (!fg_screen(ctx->base.screen)->copy_ext) {
+      assert(!(flags & (FG_COPY_SWIZZLE | FG_COPY_TILE | FG_COPY_LIST)));
+      flags &= ~FG_COPY_ALPHA_ONE;
+   }
+   return flags;
+}
+
+static bool
+fg_copy_fill_after(struct fg_context *ctx, uint32_t flags)
+{
+   return (flags & FG_COPY_ALPHA_ONE) && !fg_screen(ctx->base.screen)->copy_ext;
+}
+
+void
 fg_emit_copy_scaled(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
                     unsigned sy, unsigned sw, unsigned sh, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer,
                     unsigned dx, unsigned dy, unsigned dw, unsigned dh, uint32_t flags)
 {
    fg_emit_copy_handles(ctx, fg_resource(src)->board_handle, slevel, slayer, sx, sy, sw, sh,
-                        fg_resource(dst)->board_handle, dlevel, dlayer, dx, dy, dw, dh, flags);
+                        fg_resource(dst)->board_handle, dlevel, dlayer, dx, dy, dw, dh, fg_copy_board_flags(ctx, flags));
    fg_use_resource(ctx, src);
    fg_use_resource(ctx, dst);
+   if (fg_copy_fill_after(ctx, flags))
+      fg_emit_alpha_one(ctx, dst, dlevel, dlayer, dx, dy, dw, dh);
+}
+
+void
+fg_emit_copies(struct fg_context *ctx, struct pipe_resource *src, struct pipe_resource *dst,
+               const struct fg_copy_piece *p, unsigned n, uint32_t flags)
+{
+   const bool ext = fg_screen(ctx->base.screen)->copy_ext;
+   const uint16_t sh = fg_resource(src)->board_handle, dh = fg_resource(dst)->board_handle;
+   const uint32_t bf = fg_copy_board_flags(ctx, flags);
+
+   for (unsigned i = 0; i < n;) {
+      unsigned k = 1;
+
+      if (p[i].tile) {
+         assert(ext);
+         fg_emit_copy_cmd(ctx, sh, 0, 0, p[i].sx, p[i].sy, p[i].tw, p[i].th, dh, 0, 0, p[i].dx, p[i].dy, p[i].w,
+                          p[i].h, bf | FG_COPY_TILE, (uint32_t)p[i].py << 16 | (uint32_t)p[i].px, NULL, 0);
+      } else {
+         /* the run of rectangles after it at its offset goes in its list */
+         while (ext && i + k < n && k < FG_COPY_LIST_MAX && !p[i + k].tile &&
+                p[i + k].sx - p[i + k].dx == p[i].sx - p[i].dx && p[i + k].sy - p[i + k].dy == p[i].sy - p[i].dy)
+            k++;
+         if (ctx->debug_copy && k > 1)
+            fprintf(stderr, "fpgagpu: one COPY_IMAGE with a list: %u rectangles\n", k);
+         fg_emit_copy_cmd(ctx, sh, 0, 0, p[i].sx, p[i].sy, p[i].w, p[i].h, dh, 0, 0, p[i].dx, p[i].dy, p[i].w, p[i].h,
+                          bf, 0, p + i + 1, k - 1);
+      }
+      if (fg_copy_fill_after(ctx, flags))
+         fg_emit_alpha_one(ctx, dst, 0, 0, p[i].dx, p[i].dy, p[i].w, p[i].h);
+      i += k;
+   }
+   fg_use_resource(ctx, src);
+   fg_use_resource(ctx, dst);
+}
+
+bool
+fg_copy_channels(struct fg_context *ctx, const struct fg_format *sf, const struct fg_format *vf,
+                 const struct fg_format *df, const unsigned char sw[4], uint32_t *flags)
+{
+   const bool rgba8 = df->storage == FG_FMT_RGBA8;
+   uint32_t sel = 0;
+   bool ident = true;
+
+   for (unsigned c = 0; c < 4; c++) {
+      unsigned s = sw[c];
+
+      /* the view reads W as 1.0 (an X format) where the stored alpha may be anything */
+      if (s == PIPE_SWIZZLE_W && vf->force_alpha && !sf->force_alpha)
+         s = PIPE_SWIZZLE_1;
+      if (c == 3) {
+         if (!rgba8)
+            s = PIPE_SWIZZLE_W;          /* RGB565 stores no alpha */
+         else if (df->force_alpha)
+            s = PIPE_SWIZZLE_1;          /* an X image's stored alpha is kept at 1.0 */
+         if (s == PIPE_SWIZZLE_1) {
+            if (!sf->force_alpha)        /* (an X source's stored alpha is 1.0 already) */
+               *flags |= FG_COPY_ALPHA_ONE;
+            s = PIPE_SWIZZLE_W;
+         }
+      }
+      if (s > PIPE_SWIZZLE_W)
+         return false;
+      sel |= s << (8 + 2 * c);
+      ident = ident && s == c;
+   }
+   if (!ident) {
+      /* an expanded format's stored channels other than its own hold fixed values a swizzle would overwrite */
+      if (!fg_screen(ctx->base.screen)->copy_ext || sf->expand || df->expand)
+         return false;
+      *flags |= FG_COPY_SWIZZLE | sel;
+   }
+   return true;
 }
 
 /* the handle the TMU reads an image by. The TMU reads tight rows: an image whose rows are padded is read from its
@@ -910,11 +1024,9 @@ fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel,
    fg_emit_copy_scaled(ctx, src, slevel, slayer, sx, sy, w, h, dst, dlevel, dlayer, dx, dy, w, h, 0);
 }
 
-#define FG_COPY_MIRROR_X 1u
-#define FG_COPY_MIRROR_Y 2u
-
 /* a blit as board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors (negative box sizes), the
- * scissor when the blit does not stretch. Blending, buffers and images of different storage are left out (noted) */
+ * scissor when the blit does not stretch, the alpha of an X destination kept at 1.0, a swizzle where board B has the
+ * copy extensions. Blending, buffers and images of different storage are left out (noted) */
 static void
 fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
 {
@@ -935,6 +1047,19 @@ fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
                                                          PIPE_MASK_ZS : PIPE_MASK_Z)) {
       FG_NOTE_ONCE("a blit of depth or stencil alone out of a combined image");
       return;
+   }
+   if (!s->fmt->depth) {
+      const struct fg_format *vf = fg_format_info(info->src.format);
+      unsigned char swz[4] = { PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W };
+
+      if (!vf || vf->storage != s->fmt->storage)
+         vf = s->fmt;
+      if (info->swizzle_enable)
+         memcpy(swz, info->swizzle, sizeof(swz));
+      if (!fg_copy_channels(ctx, s->fmt, vf, d->fmt, swz, &flags)) {
+         FG_NOTE_ONCE("a blit with a swizzle board B does not copy");
+         return;
+      }
    }
    if (sw < 0) {
       sx += sw;

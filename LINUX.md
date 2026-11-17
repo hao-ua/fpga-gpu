@@ -267,6 +267,12 @@ counters and the last STATUS.
     walked, loaded or stored. On a 800 x 600 target with depth (whole-target passes) a pass of an 8 x 8 quad costs 0.36
     ms instead of 6.86 (`fg_egl_gl` test 16; `FPGAGPU_NOSKIP=1` for the old way). The flashed pair (A 154 / B 142)
     ignores the flag.
+  - Copy extensions (2026-11-17, B 162 = B 161 + COPY_IMAGE's alpha 255, swizzle, tile, list and a burst path for 1:1
+    copies; loaded with A 160, then flashed): Mesa uses them where B's flags have bit 14 (`host/linux/mesa/README.md`,
+    Copy extensions): the alpha of an X image set in the copy, a draw's rectangles at one offset in one command, a
+    repeating texture as tiles where pieces would cost more, swizzles. 30 moves of the 604 x 394 xterm: the boards
+    done 250 ms after they start, 18 ms after xdotool's 30 synced moves (232 ms): moves no longer wait for the boards.
+    The 64 x 64 tile over 800 x 600: 3.56 ms (drawn before: 5.10). `FPGAGPU_NOCOPYEXT=1` for the old way.
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.

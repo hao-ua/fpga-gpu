@@ -75,7 +75,10 @@ again, before the next draw sends anything, with the images the draw reads on th
 12).
 
 Blits (`glBlitFramebuffer`) are board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors, the
-scissor when nothing stretches (`fg_egl_gl` test 8); blended blits and blits between storage formats are not done.
+scissor when nothing stretches (`fg_egl_gl` test 8); blended blits and blits between storage formats are not done. A
+blit into an image whose alpha the board keeps at 1.0 (an X format) from one whose alpha is not sets it to 1.0, and a
+blit's swizzle is COPY_IMAGE's where board B has the copy extensions (see Copies); on other boards a swizzling blit is
+not done.
 
 Copies: a draw whose fragment program samples one 2D image at a varying and writes the texel as its colour, and does
 nothing else (`fract()` of the coordinate allowed: a repeating tile), is board B's COPY_IMAGE when the varying runs one
@@ -92,6 +95,20 @@ open pass of the whole target that has draws (ending it for the copy would cost 
 This is how the X server copies (glamor's copy and tile programs): 30 moves of a 604 x 394 xterm took 279 ms until
 the boards were done instead of 546, of a 364 x 264 one 151 ms instead of 264 (`fg_egl_gl` test 14).
 `FPGAGPU_NOCOPY=1` turns it off; `FPGAGPU_DEBUG_COPY=1` prints each copy, and why a copying draw was drawn.
+
+Copy extensions: where board B's flags have bit 14 (B 162 on), its COPY_IMAGE also sets an RGBA8 destination's alpha
+to 255, swizzles channels, repeats a source rectangle over the destination from a phase (a tile), and takes a list of
+1:1 rectangles at one offset; its 1:1 copies of a format to the same go a burst at a time (~2.6 pixels a clock).
+Mesa then sets the alpha in the copy instead of a FILL_IMAGE after it; copies a view's swizzle (any of R, G, B, A for
+each channel, or alpha 1; not on the L / A / LA / R / RG formats, which keep fixed values in the other channels);
+sends the rectangles of a draw that share an offset as one command with a list (up to 160); and lets a draw become up
+to 256 copies, 1:1 pieces or tiles. A rectangle a repeating texture wraps over is one tile where its pieces would be
+more than that or would cover fewer than 1 024 pixels per extra piece (a command costs about what 1 024 pixels take
+longer as a tile, which goes a pixel a clock); a tile inside one image is not used (it has no overlap order).
+`fg_egl_gl` test 14: an 8 x 8 tile over 200 x 150 and a 2-row run wrapping 5 times are one tile each, 20 rectangles of
+a draw one command; the 64 x 64 tile over 800 x 600 is 130 pieces, 3.56 ms (one tile 4.70, drawn 5.10, as it was
+before). 30 moves of the 604 x 394 xterm: the boards done 250 ms after they start, 18 ms after the moves (xdotool's
+30 synced moves, 232 ms, pace them; 279 ms on B 161). `FPGAGPU_NOCOPYEXT=1` uses none of it.
 
 Reading the target: GL_NV_texture_barrier and GL_MESA_tile_raster_order are offered, so the X server copies a window
 inside the screen image directly instead of through a temporary image. A barrier ends the pass. A copy inside one

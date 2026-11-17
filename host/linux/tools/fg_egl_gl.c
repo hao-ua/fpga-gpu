@@ -30,7 +30,9 @@
  *  14. draws that copy (the X server's way: a program that samples one image at a varying running one to one with
  *      the window position, quads of 16-bit positions), done as COPY_IMAGE: a rectangle, two in one draw, one cut by
  *      the scissor, a repeating tile (fract) that wraps on both axes, an image with alpha into an RGB one and back
- *      (alpha 1.0 survives), the same program magnified (drawn, not copied); with GL_NV_texture_barrier, two
+ *      (alpha 1.0 survives), an 8 x 8 tile over 200 x 150, a 2-row run wrapping in x, 20 rectangles in one draw
+ *      (tiles and a list where board B has the copy extensions), the same program magnified (drawn, not copied);
+ *      the 64 x 64 tile over 800 x 600 timed and checked; with GL_NV_texture_barrier, two
  *      rectangles moved over themselves inside one image (copies in the move's order) and a draw magnifying rows
  *      of its own target into rows it reads (drawn from a copy taken before its pass); a copy into a whole-target
  *      pass with a draw (drawn in it); 40 moves of a 374 x 298 window (into a temporary image and back) timed;
@@ -949,11 +951,11 @@ int main(int argc, char **argv)
 		glClear(GL_COLOR_BUFFER_BIT);
 		glEnableVertexAttribArray(0);
 
-/* quads of (x0, y0, x1, y1) boxes, the source at box + (ox, oy) (modulo the image for the tile), into a target
- * tw x th */
+/* quads of (x0, y0, x1, y1) boxes (up to 32), the source at box + (ox, oy) (modulo the image for the tile), into a
+ * target tw x th */
 #define COPY_DRAW(k, boxes, nbox, ox, oy, sw, sh, tw, th)                                                       \
 		do {                                                                                                \
-			GLshort v_[8 * 8];                                                                              \
+			GLshort v_[8 * 32];                                                                             \
 			for (int b_ = 0; b_ < (nbox); b_++) {                                                           \
 				const int *q_ = (boxes) + 4 * b_;                                                           \
 				GLshort *o_ = v_ + 8 * b_;                                                                  \
@@ -1045,6 +1047,76 @@ int main(int argc, char **argv)
 		if (bad)
 			printf("  %d pixels wrong\n", bad);
 		check(&fails, !bad, "RGBA (alpha 0) -> RGB -> RGBA: colours, alpha 1.0", p + 4 * (30 * 256 + 170));
+
+		/* the copy extensions' cases (on a board B without them: pieces, or drawn): an 8 x 8 tile over 200 x 150 (26 x
+		 * 19 pieces: a tile), a 2-row run across the repeating 64 x 64 image (5 pieces of 512 pixels: a tile that
+		 * repeats in x alone), twenty rectangles in one draw at one offset (one command with a list) */
+		{
+			static const int wide[4] = { 20, 20, 220, 170 };   /* the 8 x 8 tile from (3, 5) on */
+			static const int thin[4] = { 0, 200, 256, 202 };   /* the 64 x 64 image from (60, 9) on, wrapping in x */
+			uint8_t *t8 = malloc(8 * 8 * 4);
+			int many[4 * 20], bad_in = 0, bad_out = 0, fx = -1, fy = -1;
+			GLuint t_small;
+
+			for (int y = 0; y < 8; y++) {
+				for (int x = 0; x < 8; x++) {
+					uint8_t *q = t8 + 4 * (y * 8 + x);
+
+					q[0] = x * 30 + 7;
+					q[1] = y * 30 + 11;
+					q[2] = 200 - x * y;
+					q[3] = 77;
+				}
+			}
+			for (int i = 0; i < 20; i++) {          /* 10 x 4 boxes in 4 columns, 5 rows: rows 176..199 */
+				many[4 * i] = 2 + 15 * (i % 4);
+				many[4 * i + 1] = 176 + 5 * (i / 4);
+				many[4 * i + 2] = many[4 * i] + 10;
+				many[4 * i + 3] = many[4 * i + 1] + 4;
+			}
+			t_small = texture(8, 8, GL_RGBA, t8, GL_NEAREST);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo9);
+			glViewport(0, 0, 256, 256);
+			glClear(GL_COLOR_BUFFER_BIT);
+			COPY_DRAW(1, wide, 1, 3 - 20, 5 - 20, 8, 8, 256, 256);
+			glBindTexture(GL_TEXTURE_2D, t_src);
+			COPY_DRAW(0, thin, 1, 60, 9 - 200, 64, 64, 256, 256);
+			COPY_DRAW(0, many, 20, 0, 3 - 176, 64, 64, 256, 256);
+			memset(p, 0xA5, 256 * 256 * 4);
+			glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, p);
+			for (int y = 0; y < 256; y++) {
+				for (int x = 0; x < 256; x++) {
+					const uint8_t *q = p + 4 * (y * 256 + x), *e = NULL;
+					int in_many = 0;
+
+					for (int i = 0; i < 20; i++)
+						in_many |= x >= many[4 * i] && x < many[4 * i + 2] && y >= many[4 * i + 1] && y < many[4 * i + 3];
+					if (x >= 20 && x < 220 && y >= 20 && y < 170)
+						e = t8 + 4 * (((y - 15) & 7) * 8 + ((x - 17) & 7));
+					else if (y >= 200 && y < 202)
+						e = pat + 4 * ((y - 191) * 64 + (x + 60) % 64);
+					else if (in_many)
+						e = pat + 4 * ((y - 173) * 64 + x);
+					if (e ? memcmp(q, e, 4) != 0 : !(q[0] == 0 && q[1] == 0 && q[2] == 255 && q[3] == 255)) {
+						if (fx < 0) {
+							fx = x;
+							fy = y;
+						}
+						if (e)
+							bad_in++;
+						else
+							bad_out++;
+					}
+				}
+			}
+			if (bad_in || bad_out)
+				printf("  %d copied pixels wrong, %d outside changed; the first at (%d, %d)\n", bad_in, bad_out, fx, fy);
+			check(&fails, !bad_in, "a small tile over a wide rectangle, a run wrapping in x, 20 rectangles in a draw: exact",
+			      p + 4 * (100 * 256 + 100));
+			check(&fails, !bad_out, "the pixels around them: blue", p + 4 * (250 * 256 + 250));
+			glDeleteTextures(1, &t_small);
+			free(t8);
+		}
 
 		/* the same program magnified 2x: not a copy, drawn */
 		glBindTexture(GL_TEXTURE_2D, t_src);
@@ -1156,7 +1228,23 @@ int main(int argc, char **argv)
 		{
 			static const int fill[4] = { 0, 0, 800, 600 };
 
+			glFinish();
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
 			COPY_DRAW(1, fill, 1, 0, 0, 64, 64, 800, 600);    /* the tile over all of it */
+			glFinish();
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
+			printf("  the 64 x 64 tile over 800 x 600: %.2f ms\n", (t1 - t0) * 1e3);
+			memset(p, 0xA5, 800 * 600 * 4);
+			glReadPixels(0, 0, 800, 600, GL_RGBA, GL_UNSIGNED_BYTE, p);
+			bad = 0;
+			for (int y = 0; y < 600; y++)
+				for (int x = 0; x < 800; x++)
+					bad += memcmp(p + 4 * (y * 800 + x), pat + 4 * ((y % 64) * 64 + x % 64), 4) != 0;
+			if (bad)
+				printf("  %d pixels of the tile wrong\n", bad);
+			check(&fails, !bad, "the 64 x 64 tile over 800 x 600: exact", p + 4 * (300 * 800 + 400));
 		}
 		{
 			GLuint t_tmp = texture(374, 298, GL_RGBA, NULL, GL_NEAREST);

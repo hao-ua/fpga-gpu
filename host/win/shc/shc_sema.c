@@ -178,6 +178,8 @@ typedef struct S {
     Dict funcs, structs;
     ShFn *cur;
     int loops, depthrange;
+    Dict gnames;                                 /* a global name -> "function", "variable" or "struct": §4.2.7, they share one name space */
+    int fragout;                                 /* 1 gl_FragColor, 2 gl_FragData: the ones the program writes */
 } S;
 
 static const ShT ERR = { "?", -1 };
@@ -331,6 +333,32 @@ static int has_opaque(S *s, const char *b)
     return 0;
 }
 
+/* a struct type with an array among its members, at any depth */
+static int has_array(S *s, const char *b)
+{
+    StructInfo *i;
+    int k;
+    if ((i = struct_get(s, b)) != NULL) for (k = 0; k < i->n; k++) if (i->m[k].arr || has_array(s, i->m[k].ty)) return 1;
+    return 0;
+}
+
+static void gname(S *s, const char *name, const char *kind)
+{
+    DictEnt *e = dict_find(&s->gnames, name);
+    if (!e) { dict_put(s->h, &s->gnames, name)->p = (void *)kind; return; }
+    if (strcmp((const char *)e->p, kind)) serr(s, "'%s' is already declared as a %s", name, (const char *)e->p);
+}
+
+/* a write to e: §7.2, a shader writes gl_FragColor or gl_FragData, not both */
+static void wrote(S *s, Node *e)
+{
+    SH_ENTER(s->h, 1);
+    while (e->kind == N_SWIZZLE || e->kind == N_INDEX) e = e->a;
+    if (e->kind == N_VAR && !strcmp(e->s, "gl_FragData")) s->fragout |= 2;
+    else if (e->kind == N_VAR && !strcmp(e->s, "gl_FragColor")) s->fragout |= e->fragdata ? 2 : 1;
+    SH_LEAVE(s->h, 1);
+}
+
 static void do_struct(S *s, const char *name, Member *m, int n)
 {
     StructInfo *i = (StructInfo *)sh_alloc(s->h, sizeof(StructInfo));
@@ -402,6 +430,18 @@ static void gdecl(S *s, Decl *d)
 }
 
 static void stmt(S *s, Node *n);
+static ShT ty_builtin(S *s, const char *n, ShT *ts, int na);
+
+/* a built-in function of this name takes exactly these parameters */
+static int builtin_takes(S *s, const char *name, ShT *sig, int n)
+{
+    int strict = s->strict;
+    ShT t;
+    s->strict = 0;
+    t = ty_builtin(s, name, sig, n);
+    s->strict = strict;
+    return !is_err(t);
+}
 
 static ShFn *func(S *s, Decl *d)
 {
@@ -421,6 +461,8 @@ static ShFn *func(S *s, Decl *d)
         sig[i].b = p->ty; sig[i].arr = size_of(s, p->arr);
     }
     if (!strncmp(name, "gl_", 3)) serr(s, "'%s': the gl_ prefix is reserved", name);
+    if (strcmp(ret, "void") && has_array(s, ret)) serr(s, "%s: a function cannot return a struct with an array", name);
+    if (s->strict && builtin_takes(s, name, sig, d->nparams)) serr(s, "%s: a built-in function cannot be declared again", name);
     e = dict_put(s->h, &s->funcs, name);
     for (f = (ShFn *)e->p; f; f = f->next) {
         int same = f->nparams == d->nparams;
@@ -434,7 +476,13 @@ static ShFn *func(S *s, Decl *d)
         if (last) last->next = fn;
         else e->p = fn;
     }
-    else if (strcmp(fn->ret, ret)) serr(s, "%s: two return types", name);
+    else {
+        if (strcmp(fn->ret, ret)) serr(s, "%s: two return types", name);
+        if (!isdef) serr(s, "%s is already declared", name);
+        for (i = 0; i < d->nparams && i < fn->nparams; i++)
+            if (strcmp(d->params[i].q, fn->params[i].q) || d->params[i].isconst != fn->params[i].isconst)
+                serr(s, "%s: a parameter's qualifiers differ from its declaration", name);
+    }
     if (isdef) {
         if (fn->defined) serr(s, "%s is already defined", name);
         fn->defined = 1; fn->node = d; fn->params = d->params;
@@ -514,7 +562,12 @@ static void stmt_(S *s, Node *n)
         scope_push(s);
         stmt(s, n->a); cond(s, n->b);
         if (n->c) ty(s, n->c);
-        s->loops++; stmt(s, n->d); s->loops--;
+        s->loops++;
+        if (s->strict && n->d && n->d->kind == S_BLOCK) {           /* §6.3: the body shares the scope of the for statement */
+            for (i = 0; i < n->d->nlist; i++) stmt(s, n->d->list[i]);
+        }
+        else stmt(s, n->d);
+        s->loops--;
         s->nscope--;
         break;
     case S_WHILE:
@@ -843,7 +896,10 @@ static ShT ty_call(S *s, Node *e)
                 }
                 for (i = 0; i < na; i++) {
                     const char *q = f->params[i].q;
-                    if ((!strcmp(q, "out") || !strcmp(q, "inout")) && !is_lvalue(s, e->list[i])) serr(s, "%s: an %s argument must be a variable", n, q);
+                    if (!strcmp(q, "out") || !strcmp(q, "inout")) {
+                        wrote(s, e->list[i]);
+                        if (!is_lvalue(s, e->list[i])) serr(s, "%s: an %s argument must be a variable", n, q);
+                    }
                 }
                 return tn(f->ret);
             }
@@ -872,6 +928,7 @@ static ShT ty1(S *s, Node *e)
         ShT t = ty(s, e->a);
         int n;
         const char *f;
+        wrote(s, e->a);
         if (is_err(t)) return t;
         if (!is_lvalue(s, e->a)) serr(s, "%s needs a variable it can write", e->s);
         f = fam(t.b, &n);
@@ -902,6 +959,7 @@ static ShT ty1(S *s, Node *e)
     }
     case N_ASSIGN: {
         ShT t = ty(s, e->a), r = ty(s, e->b);
+        wrote(s, e->a);
         if (!is_err(t) && !is_lvalue(s, e->a)) serr(s, "assignment to something that cannot be written");
         if (!strcmp(e->s, "=")) {
             if (!tsame(t, r)) serr(s, "cannot assign a %s to a %s", r.b, t.b);
@@ -971,11 +1029,12 @@ void sh_sema(Shc *h, Decl *ast, int nd, int fs, int exts, int *depthrange)
         Decl *d = &ast[i];
         switch (d->kind) {
         case D_PREC: prec_stmt(s, d->qual, d->ty); break;
-        case D_STRUCT: do_struct(s, d->name, d->members, d->nmembers); break;
-        case D_GDECL: gdecl(s, d); break;
-        default: func(s, d); break;
+        case D_STRUCT: do_struct(s, d->name, d->members, d->nmembers); gname(s, d->name, "struct"); break;
+        case D_GDECL: gdecl(s, d); gname(s, d->name, "variable"); break;
+        default: func(s, d); gname(s, d->name, "function"); break;
         }
     }
+    if (s->fragout == 3) serr(s, "a shader writes gl_FragColor or gl_FragData, not both");
     me = dict_find(&s->funcs, "main");
     {
         ShFn *f;

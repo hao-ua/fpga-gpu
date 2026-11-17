@@ -109,10 +109,9 @@ double sh_str2d(Shc *h, const char *s, size_t n);          /* float(str) of digi
 double sh_fmod(double x, double y);                        /* exact, the C99 fmod */
 double sh_pymod(double x, double y);                       /* Python float %, y != 0 */
 
-/* ---------------- preprocessor, the Python expression evaluator of #if ---------------- */
+/* ---------------- preprocessor ---------------- */
 enum { SH_EXT_DERIV = 1, SH_EXT_LOD = 2, SH_EXT_FRAGDEPTH = 4, SH_EXT_3D = 8 };   /* glslc.EXTENSIONS; *exts = the ones #extension enabled */
 char *sh_preprocess(Shc *h, const char *src, int fs, int *exts);
-int   sh_pyeval_truth(Shc *h, const char *expr);           /* `1 if eval(expr) else 0`, every exception = 0 */
 
 /* ---------------- lexer, AST ---------------- */
 enum { TK_KW, TK_ID, TK_NUM, TK_OP, TK_EOF };
@@ -138,6 +137,7 @@ typedef struct Node {
     int isc;                     /* S_LDECL const */
     int cond;                    /* S_LDECL: written under runtime control flow, so a real masked register */
     int hwloop;                  /* S_FOR: the pass count of a long constant-bounded loop that is a hardware loop, else 0 (glslc.hw_for; shc_gen.c long_for) */
+    int fragdata;                /* N_VAR gl_FragColor that was gl_FragData[0] (Parser.fragdata) */
     struct Node *a, *b, *c, *d;  /* children: see sh_parse (the field order of the Python tuples) */
     struct Node **list; int nlist;
     struct Val *reg;             /* N_REG: a pre-materialized value in a synthetic AST */

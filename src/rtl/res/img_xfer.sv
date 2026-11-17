@@ -8,11 +8,20 @@
 //              previous one reuses its half (vertical upscale), a plain FILL has no read job.
 //   reader     R1 bursts of the segment -> pixel unpacker (1 / 2 / 4 bytes) -> source colour key flag -> row buffer
 //              (two halves of 2**RB_LOG2 pixels x {key, raw}); it runs one row ahead of the writer.
-//   writer     per destination pixel: buffer index (COPY: horizontal DDA, mirror), buffer read, storage -> RGBA8
-//              (RGB565 exact: round(c * 255 / 31), round(c * 255 / 63), alpha 255), -> destination storage format
-//              (8 -> 5 / 6 bits rounded to nearest) with byte masks (transparent pixels, FILL channel masks), FILL
-//              read-modify-write of RGB565 channels, or -> READ transfer format; then 32-byte bursts -> W2, or the
-//              transfer bytes packed little-endian into words -> o_*.
+//   writer     per destination pixel: buffer index (COPY: horizontal DDA, mirror; a wrapped tile: the column
+//              modulo the tile), buffer read, storage -> RGBA8 (RGB565 exact: round(c * 255 / 31), round(c * 255 / 63),
+//              alpha 255), COPY's channel swizzle and alpha = 255, -> destination storage format (8 -> 5 / 6 bits
+//              rounded to nearest) with byte masks (transparent pixels, FILL channel masks), FILL read-modify-write of
+//              RGB565 channels, or -> READ transfer format; then 32-byte bursts -> W2, or the transfer bytes packed
+//              little-endian into words -> o_*.
+//   bursts     a COPY of one format to the same (RGBA8 or the 16-bit formats), 1:1, without a key, a horizontal mirror,
+//              a swizzle or a tile moves whole bursts: the reader stores the source row's bursts as they are (8 lanes
+//              of 32 bits a cycle), the writer reads two consecutive bursts, shifts them by the source / destination
+//              alignment (in 2-byte steps) and writes a destination burst a cycle, the row's first and last masked.
+//              The row is in the buffer before any of it is written, as in the pixel path, so overlapping copies stay
+//              exact. RGBA8's alpha = 255 applies to every 4th byte of the destination burst.
+// The row buffer is 8 lanes of 32-bit words (+ the key flag): pixel k of a half in lane k mod 8; in burst mode a
+// burst's 8 words in one lane row. W2 takes a burst's data beat up to one ahead of its command (one burst a cycle).
 // Geometry inputs: *_row0 = byte address of row 0 of the level (base + level / layer offset), pitches, rectangles.
 // COPY DDA (u(i) = floor((2i + 1) * sw / (2 * dw))): hq = sw / dw, hr2 = 2 * (sw % dw), hu0 = sw / (2 * dw),
 // ha0 = sw % (2 * dw); likewise v. Storage format codes: 0 RGBA8 (word 0xRRGGBBAA), 1 RGB565 ({R5, G6, B5}), 2 P8
@@ -38,6 +47,11 @@ module img_xfer #(
     input  wire [13:0]  cmd_hr2, cmd_ha0, cmd_vr2, cmd_va0,
     input  wire         cmd_mir_x, cmd_mir_y, cmd_bottom_up, cmd_key,
     input  wire [31:0]  cmd_key_lo, cmd_key_hi,
+    input  wire         cmd_alpha1,               // COPY: an RGBA8 destination's alpha = 255
+    input  wire         cmd_swz,                  // COPY: destination channel c (0 R, 1 G, 2 B, 3 A) <- source channel
+    input  wire [7:0]   cmd_swz_sel,              //   cmd_swz_sel[2c +: 2], on the RGBA8 values
+    input  wire         cmd_wrap,                 // COPY: the source rectangle is a tile repeated over the destination;
+    input  wire [12:0]  cmd_px, cmd_py,           //   destination (i, j) <- tile ((px + i) mod sw, (py + j) mod sh), px < sw, py < sh
     input  wire [31:0]  cmd_value,                // FILL: one pixel in transfer format cmd_tfmt (RAW: storage value)
     input  wire [3:0]   cmd_mask,                 // FILL: b0 R, b1 G, b2 B, b3 A
     input  wire         cmd_rmw,                  // FILL: RGB565 with a partial R/G/B mask
@@ -129,6 +143,10 @@ module img_xfer #(
     reg  [12:0] hq, hu0, vq, vu0;
     reg  [13:0] hr2, ha0, vr2, va0;
     reg         mx, my, bup, key_en, rmw;
+    reg         alpha1, swz, wrap;                // COPY: alpha = 255, swizzle, a wrapped tile
+    reg  [7:0]  swz_sel;
+    reg  [12:0] px, py;
+    reg         bm;                               // the command moves whole bursts
     reg  [31:0] klo, khi, fill_raw;
     reg  [3:0]  fill_be;
     reg  [15:0] m565;
@@ -220,9 +238,9 @@ module img_xfer #(
                 wj_wd <= {q_last, (op == OP_FILL && !rmw), q_keep, q_read ? !hsel : hsel, q_waddr, q_start, q_cnt};
                 have_prev <= 1'b1; vprev <= v_eff;
                 if (op == OP_READ) remain <= remain - {11'h0, q_cnt};
-                // next row: advance the vertical DDA (vcur = v(k + 1), vnxt = v(k + 2))
+                // next row: advance the vertical DDA (vcur = v(k + 1), vnxt = v(k + 2)); a tile's rows modulo its height
                 vcur <= vnxt;
-                vnxt <= vnxt + vq + {12'h0, vcar};
+                vnxt <= wrap ? ((vnxt == sh - 13'd1) ? 13'd0 : vnxt + 13'd1) : vnxt + vq + {12'h0, vcar};
                 vacc <= vcar ? 14'(vsum - {1'b0, dh, 1'b0}) : vsum[13:0];
                 k <= k + 13'd1;
                 qs <= q_last ? Q_DONE : Q_ROW;
@@ -234,29 +252,49 @@ module img_xfer #(
             k <= 13'd0; have_prev <= 1'b0; hsel <= 1'b1;               // the first read job takes half 0
             remain <= cmd_npix;
             nrows <= (cmd_op == OP_READ) ? 13'd0 : cmd_d_h;
-            // v(0) = vu0 with accumulator va0; vnxt = v(1)
+            // v(0) = vu0 with accumulator va0; vnxt = v(1); a tile: py, then py + 1 modulo its height
             vcur <= cmd_vu0;
             begin : v1
                 reg [14:0] s1; s1 = {1'b0, cmd_va0} + {1'b0, cmd_vr2};
                 if (s1 >= {1'b0, cmd_d_h, 1'b0}) begin vnxt <= cmd_vu0 + cmd_vq + 13'd1; vacc <= 14'(s1 - {1'b0, cmd_d_h, 1'b0}); end
                 else begin vnxt <= cmd_vu0 + cmd_vq; vacc <= s1[13:0]; end
             end
+            if (cmd_wrap && cmd_op == OP_COPY) begin
+                vcur <= cmd_py; vnxt <= (cmd_py == cmd_s_h - 13'd1) ? 13'd0 : cmd_py + 13'd1;
+            end
             qs <= Q_ROW;
         end
         if (fin) qs <= Q_IDLE;
     end
 
-    // ---------------- row buffer ----------------
-    (* ram_style = "block" *) reg [32:0] rb [0:(1 << RBA) - 1];
-    reg         rb_we; reg [RBA-1:0] rb_wa; reg [32:0] rb_wd;
-    reg  [32:0] rb_q;
+    // ---------------- row buffer: 8 lanes of {key, word}, a lane row per 8 pixels / per burst ----------------
+    localparam int RBR = RBA - 3;                 // lane row address bits: {half, row in the half}
+    reg         rb_we; reg [RBA-1:0] rb_wa; reg [32:0] rb_wd;     // a pixel (pixel path): lane rb_wa[2:0]
+    reg         bb_we; reg [RBR-1:0] bb_wa; reg [255:0] bb_wd;    // a burst (burst path): every lane
     reg  [1:0]  half_full;
-    wire        rb_re;
+    wire        rb_re;                            // a pixel read
     wire [RBA-1:0] rb_ra;
-    always @(posedge clk) begin
-        if (rb_we) rb[rb_wa] <= rb_wd;
-        if (rb_re) rb_q <= rb[rb_ra];
-    end
+    wire        bb_re;                            // a burst read
+    wire [RBR-1:0] bb_ra;
+    wire [RBR-1:0] ln_ra = bb_re ? bb_ra : rb_ra[RBA-1:3];
+    wire        ln_re = rb_re || bb_re;
+    wire [32:0] ln_q [0:7];                       // every lane's word of the row read the cycle before
+    reg  [2:0]  rb_sel;                           // the pixel read's lane
+    genvar gl;
+    generate for (gl = 0; gl < 8; gl = gl + 1) begin : g_lane
+        (* ram_style = "block" *) reg [32:0] lm [0:(1 << RBR) - 1];
+        reg  [32:0] q;
+        wire        we = bb_we || (rb_we && rb_wa[2:0] == 3'(gl));
+        wire [RBR-1:0] wa = bb_we ? bb_wa : rb_wa[RBA-1:3];
+        wire [32:0] wd = bb_we ? {1'b0, bb_wd[gl*32 +: 32]} : rb_wd;
+        always @(posedge clk) begin
+            if (we) lm[wa] <= wd;
+            if (ln_re) q <= lm[ln_ra];
+        end
+        assign ln_q[gl] = q;
+    end endgenerate
+    always @(posedge clk) if (rb_re) rb_sel <= rb_ra[2:0];
+    wire [32:0] rb_q = ln_q[rb_sel];
 
     // ---------------- reader ----------------
     reg         rd_act;                           // a job: issuing and / or unpacking
@@ -275,8 +313,14 @@ module img_xfer #(
     sfifo #(.W(256), .AW(4), .RAM_STYLE("block")) u_df (.clk(clk), .rst(rst), .wen(r_valid), .wdata(rd_data),      // block RAM (172 LUT as LUTRAM; same cycles)
         .full(), .count(), .ren(df_pop), .rdata(df_d), .rvalid(df_v));
     wire [4:0]  ppb_m1 = (rbl == 2'd2) ? 5'd7 : (rbl == 2'd1) ? 5'd15 : 5'd31;
-    wire        up_emit = rd_act && up_left != 0 && df_v;
-    assign df_pop = up_emit && (up_p == ppb_m1 || up_left == 13'd1);
+    wire        up_emit = rd_act && !bm && up_left != 0 && df_v;
+    // burst path: every landed burst goes into the half's next lane row as it is
+    reg  [9:0]  bu_left;                          // bursts still to store
+    reg  [RBR-2:0] bu_idx;                        // the next burst's row in the half
+    reg         bb_last_q;                        // the burst being written is the job's last
+    reg  [4:0]  so_half [0:1];                    // a half's row: its first source byte's offset in its first burst
+    wire        bu_emit = rd_act && bm && bu_left != 0 && df_v;
+    assign df_pop = (up_emit && (up_p == ppb_m1 || up_left == 13'd1)) || bu_emit;
     // job start: the half must be free
     wire        rj_take = run && !rd_act && rj_v && !half_full[rj_d[43]];
     assign rj_pop = rj_take;
@@ -299,7 +343,7 @@ module img_xfer #(
                                    in_rng(k0_raw[7:0], klo[7:0], khi[7:0]));
     reg         rel_v; reg rel_half;              // the writer releases a half (from below)
     always @(posedge clk) begin
-        rb_we <= 1'b0; k0_v <= 1'b0;
+        rb_we <= 1'b0; k0_v <= 1'b0; bb_we <= 1'b0; bb_last_q <= 1'b0;
         if (rst || !run) begin
             rd_act <= 1'b0; n_iss <= 0; n_pop <= 0; half_full <= 2'b00;
         end else begin
@@ -310,7 +354,14 @@ module img_xfer #(
                 rd_left <= 10'(rj_e1[29:5] - rj_s[29:5]) + 10'd1;
                 up_left <= rj_n; up_idx <= 13'd0;
                 up_p <= (rbl == 2'd2) ? {2'b00, rj_s[4:2]} : (rbl == 2'd1) ? {1'b0, rj_s[4:1]} : rj_s[4:0];
+                bu_left <= 10'(rj_e1[29:5] - rj_s[29:5]) + 10'd1; bu_idx <= '0; so_half[rj_d[43]] <= rj_s[4:0];
             end
+            if (bu_emit) begin
+                bb_we <= 1'b1; bb_wa <= {rd_half, bu_idx}; bb_wd <= df_d; bb_last_q <= (bu_left == 10'd1);
+                bu_idx <= bu_idx + 1'b1; bu_left <= bu_left - 10'd1;
+                if (bu_left == 10'd1) rd_act <= 1'b0;
+            end
+            if (bb_we && bb_last_q) half_full[bb_wa[RBR-1]] <= 1'b1;
             if (up_emit) begin
                 k0_v <= 1'b1; k0_half <= rd_half; k0_idx <= up_idx[RB_LOG2-1:0]; k0_last <= (up_left == 13'd1);
                 case (rbl)
@@ -342,8 +393,44 @@ module img_xfer #(
     wire        hcar = hsum >= {1'b0, dw, 1'b0};
     // write job fields: [59] last, [58] no half (plain FILL), [57] keep the half, [56] half, [55:26] row address,
     // [25:13] first buffer index, [12:0] pixels
-    wire        wj_take = run && !wr_act && wj_v && (wj_d[58] || half_full[wj_d[56]]) && !wj_hold;
+    reg         bw_act;                           // burst path: a row's lane reads being issued
+    wire        wj_take = run && !wr_act && !bw_act && wj_v && (wj_d[58] || half_full[wj_d[56]]) && !wj_hold;
     assign wj_pop = wj_take;
+    // COPY: the swizzle (destination channel c <- source channel swz_sel[2c +: 2], channel c at bits [31 - 8c -: 8]) and
+    // alpha = 255, on the RGBA8 value
+    function automatic [31:0] cmix(input [31:0] c);
+        reg [31:0] s;
+        for (int k = 0; k < 4; k++) s[31 - 8*k -: 8] = swz ? c[31 - 8*swz_sel[2*k +: 2] -: 8] : c[31 - 8*k -: 8];
+        cmix = alpha1 ? {s[31:8], 8'hFF} : s;
+    endfunction
+    // ---------------- burst writer (burst path): per row, nout destination bursts from nout + 1 lane reads ----------------
+    // Output burst j holds destination bytes 32 j + b - d0 of the row; source byte offset so (in its first burst, so_half)
+    // against d0: delta = so - d0, sh = delta mod 32, output j = ({src[base + 1], src[base]} >> 8 sh), base = j - (delta < 0).
+    // Read r (r = 0 .. nout) is source burst r - (delta < 0) (none for r = 0 when delta < 0: zeros); output j follows read
+    // j + 1 with the read before it as `prev`.
+    reg         bw_half, bw_keep, bw_lrow;        // the row's half, keep the half, the command's last row
+    reg  [24:0] bw_bi;                            // the destination burst of output 0
+    reg  [9:0]  bw_n, bw_r;                       // output bursts, the next read
+    reg         bw_neg;                           // delta < 0
+    reg  [4:0]  bw_sh, bw_d0, bw_d1;              // the shift (bytes), output 0's first byte, the last output's last byte
+    reg  [12:0] bw_npix;
+    wire        bw_null  = bw_neg && (bw_r == 10'd0);
+    wire        bw_issue = bw_act && go;
+    wire        bw_rend  = bw_issue && (bw_r == bw_n);                     // the row's last read
+    wire [9:0]  bw_ri    = bw_r - {9'h0, bw_neg};
+    assign bb_re = bw_issue && !bw_null;
+    assign bb_ra = {bw_half, bw_ri[RBR-2:0]};
+    // P1: the read in the lanes; P2: shifted by 64-bit steps (304 bits kept); the last step (16-bit steps) and the push: stage F
+    reg         p1_v, p1_null, p1_out, p1_lrow; reg [4:0] p1_sh; reg [31:0] p1_be; reg [24:0] p1_bi;
+    reg         p2_v, p2_lrow; reg [4:0] p2_sh; reg [31:0] p2_be; reg [24:0] p2_bi; reg [303:0] p2_s;
+    reg  [255:0] bw_prev;                         // the row's previous read
+    wire [255:0] bw_cur;
+    generate for (gl = 0; gl < 8; gl = gl + 1) begin : g_cur
+        assign bw_cur[gl*32 +: 32] = p1_null ? 32'h0 : ln_q[gl][31:0];
+    end endgenerate
+    wire [511:0] bw_cat = {bw_cur, bw_prev};
+    wire [31:0]  bw_be0 = (bw_r == 10'd1) ? (32'hFFFF_FFFF << bw_d0) : 32'hFFFF_FFFF;   // output bw_r - 1's byte enables
+    wire [31:0]  bw_be  = (bw_r == bw_n) ? (bw_be0 & (32'hFFFF_FFFF >> (5'd31 - bw_d1))) : bw_be0;
     wire        a_v   = wr_act;
     wire [12:0] a_idx = (op == OP_COPY) ? (mx ? (sw - 13'd1 - wr_u) : wr_u) : (wr_start + wr_i);
     wire        a_end = (wr_i == wr_cnt - 13'd1);
@@ -359,18 +446,40 @@ module img_xfer #(
         rel_v <= 1'b0; wj_hold <= 1'b0;
         if (rst || !run) begin
             wr_act <= 1'b0; b_v <= 1'b0; c_v <= 1'b0; d_v <= 1'b0; e_v <= 1'b0;
+            bw_act <= 1'b0; p1_v <= 1'b0; p2_v <= 1'b0;
         end else begin
-            if (wj_take) begin
+            if (wj_take && !bm) begin
                 wr_act <= 1'b1; wr_last <= wj_d[59]; wr_noh <= wj_d[58]; wr_keep <= wj_d[57]; wr_half <= wj_d[56];
                 wr_addr <= wj_d[55:26]; wr_start <= wj_d[25:13]; wr_cnt <= wj_d[12:0];
-                wr_i <= 13'd0; wr_u <= hu0; wr_acc <= ha0;
+                wr_i <= 13'd0; wr_u <= wrap ? px : hu0; wr_acc <= ha0;
             end
+            // ---- burst path: a row's geometry, then nout + 1 lane reads ----
+            if (wj_take && bm) begin : BWT
+                reg [15:0] e; reg [4:0] so;
+                so = so_half[wj_d[56]];
+                e = {11'h0, wj_d[30:26]} + ({3'h0, wj_d[12:0]} << dbl) - 16'd1;      // the row's last byte from burst 0
+                bw_act <= 1'b1; bw_lrow <= wj_d[59]; bw_keep <= wj_d[57]; bw_half <= wj_d[56];
+                bw_bi <= wj_d[55:31]; bw_d0 <= wj_d[30:26]; bw_d1 <= e[4:0]; bw_n <= 10'(e >> 5) + 10'd1;
+                bw_neg <= so < wj_d[30:26]; bw_sh <= so - wj_d[30:26]; bw_r <= 10'd0; bw_npix <= wj_d[12:0];
+            end
+            if (bw_issue) begin
+                bw_r <= bw_r + 10'd1;
+                if (bw_rend) begin
+                    bw_act <= 1'b0; wj_hold <= 1'b1;
+                    if (!bw_keep) begin rel_v <= 1'b1; rel_half <= bw_half; end
+                end
+            end
+            p1_v <= bw_issue; p1_null <= bw_null; p1_out <= bw_r != 10'd0; p1_lrow <= bw_lrow && bw_rend;
+            p1_sh <= bw_sh; p1_be <= bw_be; p1_bi <= bw_bi + 25'(bw_r) - 25'd1;
+            if (p1_v) bw_prev <= bw_cur;
+            p2_v <= p1_v && p1_out; p2_lrow <= p1_lrow; p2_sh <= p1_sh; p2_be <= p1_be; p2_bi <= p1_bi;
+            p2_s <= 304'(bw_cat >> {p1_sh[4:3], 6'd0});
             if (go) begin
                 // A -> B
                 b_v <= a_v; b_addr <= wr_addr + ({17'h0, wr_i} << dbl); b_last <= a_v && a_end && wr_last;
                 if (a_v) begin
                     wr_i <= wr_i + 13'd1;
-                    wr_u <= wr_u + hq + {12'h0, hcar};
+                    wr_u <= wrap ? ((wr_u == sw - 13'd1) ? 13'd0 : wr_u + 13'd1) : wr_u + hq + {12'h0, hcar};
                     wr_acc <= hcar ? 14'(hsum - {1'b0, dw, 1'b0}) : hsum[13:0];
                     if (a_end) begin
                         wr_act <= 1'b0; wj_hold <= 1'b1;
@@ -381,7 +490,7 @@ module img_xfer #(
                 c_v <= b_v; c_addr <= b_addr; c_last <= b_last; c_q <= rb_q;
                 // C -> D: decode the stored value
                 d_v <= c_v; d_addr <= c_addr; d_last <= c_last; d_raw <= c_q[31:0]; d_key <= c_q[32];
-                d_c <= st_rgba((op == OP_FILL) ? df : sf, c_q[31:0]);
+                d_c <= cmix(st_rgba((op == OP_FILL) ? df : sf, c_q[31:0]));
                 // D -> E: encode
                 e_v <= d_v; e_addr <= d_addr; e_last <= d_last;
                 case (op)
@@ -418,18 +527,21 @@ module img_xfer #(
     wire         e_new = bur_have && e_bi != bur_i;
     wire [255:0] m_d   = (bur_d & ~e_bm) | e_dv;
     wire [31:0]  m_be  = bur_be | e_be32;
-    // issue: data beat first, then its command (as img_write)
+    // issue: a burst's data beat, then its command; a data beat may go up to two ahead of the commands (the command of
+    // one burst and the data of the next in one cycle: a burst a cycle)
     reg  [31:0]  wr_dat, wr_cmd, n_push;
-    reg  [24:0]  cmd_bi;
-    wire         data_turn = (wr_dat == wr_cmd);
-    assign w_wren = bf_v && data_turn;
+    reg  [24:0]  cmd_q [0:1];                     // the bursts of data beats sent ahead of their commands
+    wire [31:0]  w_ahead = wr_dat - wr_cmd;
+    assign w_wren = bf_v && (w_ahead < 32'd2);
     assign w_wend = w_wren;
     assign w_data = bf_d[255:0];
     assign w_mask = bf_d[287:256];
     assign bf_pop = w_wren && w_wdf_rdy;
-    assign w_en   = !data_turn;
-    assign w_addr = {1'b0, cmd_bi, 3'b000};
-    assign w_req  = bf_v || !data_turn;
+    assign w_en   = (w_ahead != 32'd0);
+    assign w_addr = {1'b0, cmd_q[wr_cmd[0]], 3'b000};
+    assign w_req  = bf_v || (w_ahead != 32'd0);
+    // burst path: the last shift step (16-bit steps) of P2, RGBA8's alpha = 255 on every 4th byte
+    wire [255:0] bw_out = 256'(p2_s >> {p2_sh[2:1], 4'd0}) | ((alpha1 && df == 2'd0) ? {8{32'h0000_00FF}} : 256'h0);
 
     // ---------------- stage F': byte packer (READ) -> output FIFO ----------------
     reg          of_wen; reg [31:0] of_wd;
@@ -448,8 +560,10 @@ module img_xfer #(
             bur_have <= 1'b0; bur_be <= 0; fin_pend <= 1'b0; pk_n <= 0; pk_b <= 0;
             if (rst) begin wr_dat <= 0; wr_cmd <= 0; n_push <= 0; c_pixels <= 0; end
         end else begin
-            if (bf_pop) begin wr_dat <= wr_dat + 1; cmd_bi <= bf_d[312:288]; end
+            if (bf_pop) begin wr_dat <= wr_dat + 1; cmd_q[wr_dat[0]] <= bf_d[312:288]; end
             if (w_en && w_rdy) wr_cmd <= wr_cmd + 1;
+            if (p2_v) begin bf_wen <= 1'b1; bf_wd <= {p2_bi, ~p2_be, bw_out}; n_push <= n_push + 1; end   // a burst-path burst
+            if (bw_rend) c_pixels <= c_pixels + {19'h0, bw_npix};
             if (fin_pend) begin                       // a final burst / word left over from the last pixel
                 if (op == OP_READ) begin
                     of_wen <= 1'b1; of_wd <= pk_b[31:0]; pk_n <= 0;
@@ -491,24 +605,34 @@ module img_xfer #(
     assign start = cmd_valid && !run;
     // FIFO counts include words still in the memory behind the output register (a fresh write is not yet rvalid)
     wire drained = (qs == Q_DONE) && rj_cnt == 0 && !rd_act && wj_cnt == 0 && !wr_act && !b_v && !c_v && !d_v && !e_v &&
+                   !bw_act && !p1_v && !p2_v &&
                    !fin_pend && !bur_have && bf_cnt == 0 && !bf_wen && wr_dat == n_push && wr_cmd == n_push &&
                    !of_wen && of_cnt == 0 && last_seen;
     assign fin = run && drained;
     assign busy = run;
+    // the burst path: COPY of a format to the same (not P8), 1:1, no key, horizontal mirror, swizzle or tile, and a row of at
+    // most 511 bursts after any alignment (a half holds 512)
+    wire bm_go = cmd_op == OP_COPY && cmd_s_fmt == cmd_d_fmt && cmd_s_fmt != 2'd2 && cmd_s_w == cmd_d_w && cmd_s_h == cmd_d_h &&
+                 !cmd_mir_x && !cmd_key && !cmd_swz && !cmd_wrap && (cmd_s_fmt != 2'd0 || cmd_s_w <= 13'd4088);
     always @(posedge clk) begin
         if (rst) begin run <= 1'b0; c_ops <= 0; last_seen <= 1'b0; end
         else begin
             if (go && e_v && e_last) last_seen <= 1'b1;
+            if (p2_v && p2_lrow) last_seen <= 1'b1;
             if (fin) begin run <= 1'b0; c_ops <= c_ops + 1; end
             if (start) begin
                 run <= 1'b1; last_seen <= 1'b0;
+                bm <= bm_go;
+                alpha1 <= cmd_alpha1 && cmd_op == OP_COPY; swz <= cmd_swz && cmd_op == OP_COPY; swz_sel <= cmd_swz_sel;
+                wrap <= cmd_wrap && cmd_op == OP_COPY; px <= cmd_px; py <= cmd_py;
                 op <= cmd_op; sf <= cmd_s_fmt; df <= cmd_d_fmt;
                 s_row0 <= cmd_s_row0; s_pitch <= cmd_s_pitch; d_row0 <= cmd_d_row0; d_pitch <= cmd_d_pitch;
                 sx <= cmd_s_x; sy <= cmd_s_y; sw <= cmd_s_w; sh <= cmd_s_h;
                 dx <= cmd_d_x; dy <= cmd_d_y; dw <= cmd_d_w; dh <= cmd_d_h;
                 hq <= cmd_hq; hu0 <= cmd_hu0; vq <= cmd_vq; vu0 <= cmd_vu0;
                 hr2 <= cmd_hr2; ha0 <= cmd_ha0; vr2 <= cmd_vr2; va0 <= cmd_va0;
-                mx <= cmd_mir_x; my <= cmd_mir_y; bup <= cmd_bottom_up; key_en <= cmd_key && cmd_op == OP_COPY;
+                mx <= cmd_mir_x && !cmd_wrap; my <= cmd_mir_y && !cmd_wrap; bup <= cmd_bottom_up && !cmd_wrap;   // (a tile: none)
+                key_en <= cmd_key && cmd_op == OP_COPY;
                 klo <= cmd_key_lo; khi <= cmd_key_hi; rmw <= cmd_rmw && cmd_op == OP_FILL;
                 tfmt <= cmd_tfmt; j0 <= cmd_j0; i0 <= cmd_i0; npix <= cmd_npix;
                 case (cmd_tfmt)

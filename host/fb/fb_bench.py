@@ -11,7 +11,8 @@ Board A's coarse depth (the draws' flags from their DRAW_STATE, fbproto.zc_flags
 libraries: --no-zc sends no flags (A culls nothing), --no-lazy sends every TRI item; A's counters print per test (STATUS
 layout 12). The partial_* tests draw into a few bands of a target they do not clear (as a desktop's redraw does) and
 flush_empty flushes no draw and no clear: their FLUSHes leave the other bands out (FLUSH flags bit 10, as the libraries do on
-boards that report it), --no-skip walks every band.
+boards that report it), --no-skip walks every band. --only copies: COPY_IMAGE rates (whole screen 1:1 and stretched, 100
+rectangles as commands and as a list).
 
 Fill and texture tests draw L full-screen layers per frame, triangle tests a grid of triangles of a given area over the
 whole screen with an MVP transform (tri_culled: the same grid with both faces culled, so geometry and no pixels). Shaders
@@ -219,6 +220,31 @@ def run_test(bd, t, W, H, secs, textures_up):
     return fps
 
 
+def copies(bd, W, H, secs):
+    """COPY_IMAGE rates on board B: a whole-screen 1:1 copy (whole bursts on a board B with STATUS flags bit 14), the same
+    stretched by one pixel (one pixel a cycle), and 100 rectangles of 32 x 16 as separate commands and as one list"""
+    ext = fp.decode_b_flags(bd.status()['b_flags']).get('copy_ext', 0)
+    for h_, base in zip(H_IMG, B_IMG):
+        bd.create_image(h_, base, W, H, fp.FMT_RGBA8, origin=1, usage=fp.USE_RT | fp.USE_SCANOUT | fp.USE_TRANSFER)
+    bd.fence(timeout=10.0)
+    rects = [((k % 20) * (W // 20), (k // 20) * (H // 5), 32, 16) for k in range(100)]
+    def rate(name, send, px):
+        n = 0; t0 = time.monotonic()
+        while time.monotonic() - t0 < secs:
+            with bd.batch(): send()
+            n += 1
+            if n % 8 == 0: bd.fence(timeout=30.0)
+        bd.fence(timeout=30.0); el = time.monotonic() - t0
+        for e in bd.take_errors(): print("  EV_ERROR seq %d: %s" % (e[0], err_text(e[:4])))
+        print(f"RESULT {name} ms={1e3 * el / n:.3f} Mpix={px * n / el / 1e6:.1f} copy_ext={ext}")
+    rate('copy_1to1', lambda: bd.copy_image(H_IMG[0], H_IMG[1], 0, 0, W, H, 0, 0), W * H)
+    rate('copy_stretch', lambda: bd.copy_image(H_IMG[0], H_IMG[1], 0, 0, W - 1, H, 0, 0, W, H), W * H)
+    rate('copy_rects_cmds', lambda: [bd.copy_image(H_IMG[0], H_IMG[1], x, y, w, h, x, y) for x, y, w, h in rects], 100 * 32 * 16)
+    if ext:
+        x0, y0, w0, h0 = rects[0]
+        rate('copy_rects_list', lambda: bd.copy_image(H_IMG[0], H_IMG[1], x0, y0, w0, h0, x0, y0, rects=rects[1:]), 100 * 32 * 16)
+
+
 def transfers(bd):
     """texture upload and readback, MB/s"""
     data = bytes(2048 * 2048 * 4)
@@ -260,6 +286,7 @@ def main():
     for t in TESTS:
         if names is None or t.name in names:
             run_test(bd, t, W, H, secs, up)
+    if names is None or 'copies' in names: copies(bd, W, H, secs)
     if names is None: transfers(bd)
     return 0
 

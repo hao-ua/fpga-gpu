@@ -1,6 +1,10 @@
 // fb_cmd_b — board B command processor, clk_sys. Executes the host
 // commands board A forwards over the link strictly in order; a command starts after the previous one has
-// finished (its DDR writes accepted by the arbiter, its READ_DATA handed to the link).
+// finished (its DDR writes accepted by the arbiter, its READ_DATA handed to the link) — except that COPY_IMAGE and
+// FILL_IMAGE end once their job is handed to the copy engine (img_xfer: one job running, one waiting in the xf_*
+// registers). While the engine has a job, DRAW_STATE, CURSOR, CURSOR_POS, SET_PALETTE, CREATE_IMAGE, CREATE_BUFFER,
+// DESTROY and further COPY / FILL_IMAGEs go on; every other command waits until it has finished (a job carries the
+// addresses it resolved, so a later table change does not reach it).
 // Input: word stream from link_b_port (w0 = {0, type, body bytes} with c_first, w1 = seq, body words, c_last).
 // Bodies (little-endian words):
 //   SET_MODE     mode                                 -> disp_b; EV_MODE {mode} / ERR_RANGE / ERR_MODE
@@ -14,7 +18,12 @@
 //   READ_IMAGE   {layer, level, handle}, {0, flags, format}, {y, x}, {h, w}, first pixel, count (0 = rest), tag
 //   FILL_IMAGE   {layer, level, handle}, {0, mask, format}, {y, x}, {h, w}, value
 //   COPY_IMAGE   {slayer, slevel, src}, {dlayer, dlevel, dst}, {sy, sx}, {sh, sw}, {dy, dx}, {dh, dw}, flags
-//                (b0 mirror x, b1 mirror y, b2 source colour key), key low, key high
+//                (b0 mirror x, b1 mirror y, b2 source colour key, b3 alpha = 255 (RGBA8 destinations), b4 swizzle:
+//                destination channel c (R G B A) <- source channel b[9 + 2c : 8 + 2c] on the RGBA8 values, b5 tile:
+//                the source rectangle repeats over the destination rectangle from phase {py, px} = key low (px < sw,
+//                py < sh; not with a mirror, a key or a list), b6 list: 1:1, then pairs {dy, dx}, {dh, dw} after the key
+//                words, each copied from (dx, dy) + (sx - dx0, sy - dy0) of the first rectangle (not with a mirror or
+//                a tile)), key low, key high [, list pairs]; b3 / b4 not with RGBA4444 / RGBA5551 / P8
 //   SET_PALETTE  {count, first}, count x 0x00RRGGBB
 //   CURSOR       {.., op}: op 1 SHAPE {0, first}, pixels...; op 2 SHOW {0, flags, mode, 2}, {0, hot_y, hot_x},
 //                {y, x} (flags b0 take the new shape, b1 set the position); op 3 HIDE; op 4 MOVE {y, x}
@@ -137,6 +146,9 @@ module fb_cmd_b
     output reg  [7:0]   xf_tfmt,
     output reg  [12:0]  xf_j0, xf_i0,
     output reg  [23:0]  xf_npix,
+    output reg          xf_alpha1, xf_swz, xf_wrap,
+    output reg  [7:0]   xf_swz_sel,
+    output reg  [12:0]  xf_px, xf_py,
     input  wire         xf_busy,
     input  wire         xo_valid,
     input  wire [31:0]  xo_data,
@@ -216,7 +228,6 @@ module fb_cmd_b
         S_RI3, S_RI4, S_RI5,
         S_FI3, S_FI4,
         S_CP2, S_CP3, S_CP4, S_CP5, S_CP6, S_CP7, S_CP8, S_CP9,
-        S_XF, S_XFW,
         S_PALD, S_PALP, S_PALW,
         S_CSD,
         S_BUF1, S_BUF2, S_BUF3,                                    // B buffer lookup (WRITE / READ_BUFFER)
@@ -234,7 +245,10 @@ module fb_cmd_b
     reg         it_w;                               // the image-table read's second wait cycle (img_table port 2 has the block
                                                     // RAM's output register: ridx, two cycles, the descriptor)
     reg  [31:0] hold_t;
-    assign busy = (st != S_W0);
+    assign busy = (st != S_W0) || xf_cmd_valid || xf_busy;
+    // the copy engine has a job (registered), and the command in hand may go on beside it (set in S_EXEC0)
+    reg         xq_busy, xq_pass;
+    always @(posedge clk) xq_busy <= xf_cmd_valid || xf_busy;
 
     function automatic [3:0] nfields(input [7:0] t);
         case (t)
@@ -284,7 +298,7 @@ module fb_cmd_b
     wire        h_take  = dw_hold && d_src;                 // a held word arrives (got_last: it reads as 0, ERR_LEN)
     wire        h_word  = dw_hold && (d_src || got_last);
     wire        d_sink_rdy = ((st == S_MWD || dw_pass) && x_wd_ready) || (st == S_WID && iw_d_ready) || (st == S_PALD) ||
-                             (st == S_CSD && cs_ready);
+                             (st == S_CSD && cs_ready) || (st == S_CP6) || (st == S_CP7);   // (COPY's list pairs)
     assign x_wd_valid = dw_emit || (((st == S_MWD) || dw_pass) && dleft != 0 && (d_src || got_last));
     assign x_wd_data  = dw_emit ? dw_data : got_last ? 32'h0 : c_data;
     assign iw_d_valid = (st == S_WID) && dleft != 0 && (d_src || got_last);
@@ -459,6 +473,31 @@ module fb_cmd_b
                     {1'b0, cp_sx} + {1'b0, cp_sw} > {4'h0, s_wl} || {1'b0, cp_sy} + {1'b0, cp_sh} > {4'h0, s_hl};
         cp_bad_d <= {1'b0, cp_dx} + {1'b0, cp_dw} > {4'h0, g_wl} || {1'b0, cp_dy} + {1'b0, cp_dh} > {4'h0, g_hl};
     end
+    // COPY's flags (f[6]): b0 mirror x, b1 mirror y, b2 key, b3 alpha = 255, b4 swizzle (selects b15:8), b5 tile (phase in
+    // f[7]), b6 list; checked like the rectangles, registered (valid in S_CP3: the source descriptor since S_CP2, the
+    // destination's d since its S_DS2)
+    wire        cp_mx = f[6][0], cp_my = f[6][1], cp_key = f[6][2], cp_a1 = f[6][3], cp_swz = f[6][4], cp_wrap = f[6][5], cp_list = f[6][6];
+    wire        cp_11 = (cp_sw == cp_dw) && (cp_sh == cp_dh);
+    reg         cp_bad_f, cp_bad_len, cp_fast;
+    always @(posedge clk) begin
+        cp_bad_f <= f[6][31:16] != 16'h0 || f[6][7] || (!cp_swz && f[6][15:8] != 8'h0) ||
+                    (cp_wrap && (cp_mx || cp_my || cp_key || cp_list || f[7][31:29] != 3'h0 || f[7][15:13] != 3'h0 ||
+                                 {3'h0, f[7][12:0]} >= cp_sw || {3'h0, f[7][28:16]} >= cp_sh)) ||
+                    (cp_list && (cp_mx || cp_my || !cp_11)) ||
+                    ((cp_a1 || cp_swz) && (raw_only(sd.format) || raw_only(d.format)));
+        cp_bad_len <= cp_list ? (blen[2:0] != 3'd4) : 1'b0;      // 36 bytes + 8 per pair
+        cp_fast <= cp_11 || cp_wrap;                             // no division: hq = 1, hu0 = 0, ha0 = sw (likewise v)
+    end
+    // the list's pairs: the source offset of the first rectangle, the pair in hand, its checks (registered)
+    reg  [31:0] cl_xy, cl_wh;                       // {dy, dx}, {dh, dw}
+    wire signed [17:0] cl_ox = $signed({2'b00, cp_sx}) - $signed({2'b00, cp_dx}), cl_oy = $signed({2'b00, cp_sy}) - $signed({2'b00, cp_dy});
+    wire signed [17:0] cl_sx = $signed({2'b00, cl_xy[15:0]}) + cl_ox, cl_sy = $signed({2'b00, cl_xy[31:16]}) + cl_oy;
+    reg         cl_bad;
+    always @(posedge clk)
+        cl_bad <= cl_wh[15:0] == 16'h0 || cl_wh[31:16] == 16'h0 || cl_wh[15:13] != 3'h0 || cl_wh[31:29] != 3'h0 ||
+                  {1'b0, cl_xy[15:0]} + {1'b0, cl_wh[15:0]} > {4'h0, g_wl} || {1'b0, cl_xy[31:16]} + {1'b0, cl_wh[31:16]} > {4'h0, g_hl} ||
+                  cl_sx < 0 || cl_sy < 0 || cl_sx + $signed({2'b00, cl_wh[15:0]}) > $signed({5'h0, s_wl}) ||
+                  cl_sy + $signed({2'b00, cl_wh[31:16]}) > $signed({5'h0, s_hl});
     wire [5:0]  dfmt = d.format;
     reg  [2:0]  tbpp;
     reg  [15:0] pbytes;                             // payload bytes
@@ -466,6 +505,9 @@ module fb_cmd_b
     reg  [25:0] wh;
     reg  [12:0] j0, i0;
     reg  [3:0]  dvi;                                // COPY: which DDA division
+    reg  [12:0] c_hq, c_hu0, c_vq, c_vu0;           // COPY: the walk's steps, kept here until the job goes into xf_*
+    reg  [13:0] c_hr2, c_ha0, c_vr2, c_va0;
+    wire        cl_same = (s_row0 == d.base + g_off[29:0]) && (s_pitchl == g_pitchl);   // COPY: one surface
 
     task automatic error(input [7:0] code, input [31:0] detail);
         ev_pend <= 1'b1; ev_code <= EV_ERROR; ev_a0 <= {24'h0, code}; ev_a1 <= {24'h0, mtype}; ev_a2 <= detail;
@@ -504,14 +546,15 @@ module fb_cmd_b
 
     always @(posedge clk) begin
         set_mode <= 1'b0; pres_valid <= 1'b0; it_we <= 1'b0; x_cmd_valid <= 1'b0; iw_cmd_valid <= 1'b0;
-        xf_cmd_valid <= 1'b0; g_start <= 1'b0; dv_start <= 1'b0; pm_we <= 1'b0; pal_pub <= 1'b0; cur_cmd <= 1'b0;
+        if (xf_cmd_valid && xf_cmd_ready) xf_cmd_valid <= 1'b0;        // the engine took the job (it waits there until then)
+        g_start <= 1'b0; dv_start <= 1'b0; pm_we <= 1'b0; pal_pub <= 1'b0; cur_cmd <= 1'b0;
         bt_we <= 1'b0; rd_go <= 1'b0;
         if (e_valid && e_ready) e_valid <= 1'b0;
         if (rst) begin
             st <= S_W0; got_last <= 1'b0; e_valid <= 1'b0; op_v <= 1'b0; pd_v <= 1'b0; ev_pend <= 1'b0; it_w <= 1'b0;
             for (int i = 0; i < 9; i++) f[i] <= 0;
             x_own <= 1'b0; r_req <= 1'b0; r_src <= 1'b0; c_cmds <= 0; c_errs <= 0; c_images <= 0; c_draws <= 0;
-            dw_mode <= 1'b0; cm_old <= 1'b0;
+            dw_mode <= 1'b0; cm_old <= 1'b0; xf_cmd_valid <= 1'b0; xq_pass <= 1'b0;
         end else begin
             if (sync_wipe && st != S_W0) cm_old <= 1'b1;        // a wipe in the middle of a command: it is older (S_W0 sets it below)
             // present completion (the image became current) or replacement
@@ -550,8 +593,14 @@ module fb_cmd_b
                         if (fi + 4'd1 == nf_now || c_last) st <= S_EXEC0;
                     end
                 end
-                S_EXEC0: st <= S_EXEC;                                 // the xc_* checks settle
-                S_EXEC: if (!h_active) begin
+                S_EXEC0: begin                                         // the xc_* checks settle
+                    xq_pass <= mtype == T_COPY_IMAGE || mtype == T_FILL_IMAGE || mtype == T_DRAW_STATE || mtype == T_CURSOR ||
+                               mtype == T_CURSOR_POS || mtype == T_SET_PALETTE || mtype == T_CREATE_IMAGE ||
+                               mtype == T_CREATE_BUFFER || mtype == T_DESTROY;
+                    st <= S_EXEC;
+                end
+                // a command that may not go on beside the copy engine's job waits until the engine has finished
+                S_EXEC: if (!h_active && !(xq_busy && !xq_pass)) begin
                     c_cmds <= c_cmds + 16'd1;
                     if (xc_len_bad) error(ERR_LEN, {16'h0, blen});
                     else case (mtype)
@@ -830,8 +879,9 @@ module fb_cmd_b
                         st <= S_RI5;
                     end
                 end
-                S_RI5: if (xf_cmd_ready) begin
+                S_RI5: if (xf_cmd_ready && !xf_cmd_valid) begin
                     xf_cmd_valid <= 1'b1; xf_op <= XF_READ; xf_s_fmt <= sf_of(dfmt); xf_d_fmt <= sf_of(dfmt);
+                    xf_alpha1 <= 1'b0; xf_swz <= 1'b0; xf_wrap <= 1'b0;
                     xf_s_row0 <= d.base + g_off[29:0]; xf_s_pitch <= g_pitchl;
                     xf_s_x <= t_x[12:0]; xf_s_y <= t_y[12:0]; xf_s_w <= t_w[12:0]; xf_s_h <= t_h[12:0];
                     xf_tfmt <= t_tf; xf_j0 <= j0; xf_i0 <= i0; xf_npix <= npix;
@@ -849,14 +899,15 @@ module fb_cmd_b
                         error(ERR_RANGE, f[2]);
                     else st <= S_FI4;
                 end
-                S_FI4: if (xf_cmd_ready) begin
+                S_FI4: if (!xf_cmd_valid) begin                // the job waits in the xf_* registers until the engine takes it
                     xf_cmd_valid <= 1'b1; xf_op <= XF_FILL; xf_s_fmt <= sf_of(dfmt); xf_d_fmt <= sf_of(dfmt);
                     xf_d_row0 <= d.base + g_off[29:0]; xf_d_pitch <= g_pitchl;
                     xf_d_x <= t_x[12:0]; xf_d_y <= t_y[12:0]; xf_d_w <= t_w[12:0]; xf_d_h <= t_h[12:0];
                     xf_tfmt <= t_tf; xf_value <= f[4]; xf_mask <= f[1][11:8];
                     xf_rmw <= (dfmt == FMT_RGB565) && f[1][10:8] != 3'b000 && f[1][10:8] != 3'b111;
                     xf_key <= 1'b0; xf_mir_x <= 1'b0; xf_mir_y <= 1'b0; xf_bottom_up <= 1'b0;
-                    st <= S_XFW;
+                    xf_alpha1 <= 1'b0; xf_swz <= 1'b0; xf_wrap <= 1'b0;
+                    finish();
                 end
                 // ---------------- COPY_IMAGE ----------------
                 S_CP2: begin                                 // source checked: keep its level, check the destination
@@ -864,42 +915,67 @@ module fb_cmd_b
                     desc_check(f[1], S_CP3);
                 end
                 S_CP3: begin
-                    if (((raw_only(sd.format) || raw_only(dfmt)) && sd.format != dfmt) || f[6][31:3] != 29'h0) error(ERR_RANGE, f[6]);
+                    if (((raw_only(sd.format) || raw_only(dfmt)) && sd.format != dfmt) || cp_bad_f) error(ERR_RANGE, f[6]);
+                    else if (cp_bad_len) error(ERR_LEN, {16'h0, blen});
                     else if (cp_bad_s) error(ERR_RANGE, f[3]);           // (registered a cycle ahead, above)
                     else if (cp_bad_d) error(ERR_RANGE, f[5]);
-                    else begin
+                    else if (cp_fast) begin                               // 1:1 or a tile: the walk's steps without dividing
+                        c_hq <= 13'd1; c_hr2 <= 14'd0; c_hu0 <= 13'd0; c_ha0 <= {1'b0, cp_sw[12:0]};
+                        c_vq <= 13'd1; c_vr2 <= 14'd0; c_vu0 <= 13'd0; c_va0 <= {1'b0, cp_sh[12:0]};
+                        dleft <= cp_list ? 16'((blen - 16'd36) >> 2) : 16'd0;
+                        st <= S_CP5;
+                    end else begin
                         // DDA divisions: sw / dw, sw / (2 dw), sh / dh, sh / (2 dh)
+                        dleft <= 16'd0;
                         dvi <= 4'd0; dv_a <= {16'h0, cp_sw}; dv_b <= cp_dw; dv_start <= 1'b1; st <= S_CP4;
                     end
                 end
                 S_CP4: if (dv_done) begin
                     case (dvi)
-                        4'd0: begin xf_hq <= dv_q[12:0]; xf_hr2 <= {dv_r[12:0], 1'b0};
+                        4'd0: begin c_hq <= dv_q[12:0]; c_hr2 <= {dv_r[12:0], 1'b0};
                                     dv_a <= {16'h0, cp_sw}; dv_b <= {cp_dw[14:0], 1'b0}; end
-                        4'd1: begin xf_hu0 <= dv_q[12:0]; xf_ha0 <= dv_r[13:0];
+                        4'd1: begin c_hu0 <= dv_q[12:0]; c_ha0 <= dv_r[13:0];
                                     dv_a <= {16'h0, cp_sh}; dv_b <= cp_dh; end
-                        4'd2: begin xf_vq <= dv_q[12:0]; xf_vr2 <= {dv_r[12:0], 1'b0};
+                        4'd2: begin c_vq <= dv_q[12:0]; c_vr2 <= {dv_r[12:0], 1'b0};
                                     dv_a <= {16'h0, cp_sh}; dv_b <= {cp_dh[14:0], 1'b0}; end
-                        default: begin xf_vu0 <= dv_q[12:0]; xf_va0 <= dv_r[13:0]; end
+                        default: begin c_vu0 <= dv_q[12:0]; c_va0 <= dv_r[13:0]; end
                     endcase
                     dvi <= dvi + 4'd1;
                     if (dvi == 4'd3) st <= S_CP5; else dv_start <= 1'b1;
                 end
-                S_CP5: if (xf_cmd_ready) begin
+                // the job into the xf_* registers once they are free (the engine took the one before); the command ends
+                // there, or goes on with its list
+                S_CP5: if (!xf_cmd_valid) begin
                     xf_cmd_valid <= 1'b1; xf_op <= XF_COPY; xf_s_fmt <= sf_of(sd.format); xf_d_fmt <= sf_of(dfmt);
                     xf_s_row0 <= s_row0; xf_s_pitch <= s_pitchl;
                     xf_s_x <= cp_sx[12:0]; xf_s_y <= cp_sy[12:0]; xf_s_w <= cp_sw[12:0]; xf_s_h <= cp_sh[12:0];
                     xf_d_row0 <= d.base + g_off[29:0]; xf_d_pitch <= g_pitchl;
                     xf_d_x <= cp_dx[12:0]; xf_d_y <= cp_dy[12:0]; xf_d_w <= cp_dw[12:0]; xf_d_h <= cp_dh[12:0];
-                    xf_mir_x <= f[6][0]; xf_mir_y <= f[6][1]; xf_key <= f[6][2]; xf_key_lo <= f[7]; xf_key_hi <= f[8];
-                    // an overlapping 1:1 copy inside one surface is exact when rows go bottom-up for dy > sy
-                    xf_bottom_up <= (s_row0 == d.base + g_off[29:0]) && (s_pitchl == g_pitchl) && cp_sw == cp_dw &&
-                                    cp_sh == cp_dh && !f[6][1] && cp_dy > cp_sy;
+                    xf_hq <= c_hq; xf_hr2 <= c_hr2; xf_hu0 <= c_hu0; xf_ha0 <= c_ha0;
+                    xf_vq <= c_vq; xf_vr2 <= c_vr2; xf_vu0 <= c_vu0; xf_va0 <= c_va0;
+                    xf_mir_x <= cp_mx; xf_mir_y <= cp_my; xf_key <= cp_key; xf_key_lo <= f[7]; xf_key_hi <= f[8];
+                    xf_alpha1 <= cp_a1; xf_swz <= cp_swz; xf_swz_sel <= f[6][15:8];
+                    xf_wrap <= cp_wrap; xf_px <= f[7][12:0]; xf_py <= f[7][28:16];
+                    // an overlapping 1:1 copy inside one surface is exact when rows go bottom-up for dy > sy (a list's
+                    // pairs share the offset, so the same rule holds for each of them)
+                    xf_bottom_up <= cl_same && cp_11 && !cp_my && !cp_wrap && cp_dy > cp_sy;
                     xf_rmw <= 1'b0;
-                    st <= S_XFW;
+                    if (dleft == 16'd0) finish(); else st <= S_CP6;
                 end
-                S_XFW: st <= S_XF;                           // the engine has taken the command
-                S_XF: if (!xf_busy && !xf_cmd_valid) finish();
+                // ---------------- COPY_IMAGE's list: a pair, its checks, its job ----------------
+                S_CP6: if (d_take) begin cl_xy <= c_data; st <= S_CP7; end
+                       else if (got_last) error(ERR_LEN, {16'h0, blen});
+                S_CP7: if (d_take) begin cl_wh <= c_data; st <= S_CP8; end
+                       else if (got_last) error(ERR_LEN, {16'h0, blen});
+                S_CP8: st <= S_CP9;                                         // cl_bad settles
+                S_CP9: if (cl_bad) error(ERR_RANGE, cl_xy);
+                       else if (!xf_cmd_valid) begin
+                    xf_cmd_valid <= 1'b1;
+                    xf_s_x <= cl_sx[12:0]; xf_s_y <= cl_sy[12:0]; xf_s_w <= cl_wh[12:0]; xf_s_h <= cl_wh[28:16];
+                    xf_d_x <= cl_xy[12:0]; xf_d_y <= cl_xy[28:16]; xf_d_w <= cl_wh[12:0]; xf_d_h <= cl_wh[28:16];
+                    xf_ha0 <= {1'b0, cl_wh[12:0]}; xf_va0 <= {1'b0, cl_wh[28:16]};
+                    if (dleft == 16'd0) finish(); else st <= S_CP6;
+                end
                 // ---------------- SET_PALETTE ----------------
                 S_PALD: if (dleft == 0 && !d_take) st <= S_PALP;
                 S_PALP: if (!pal_busy) begin pal_pub <= 1'b1; st <= S_PALW; end

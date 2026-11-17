@@ -28,6 +28,7 @@
 
 #define RX_BYTES	2048
 #define RTT_FLOOR_NS	(200 * NSEC_PER_USEC)
+#define FG_EXP_BEHIND	100000		/* datagrams: more than a STATUS snapshot can be behind by its age */
 
 /* ------------------------------------------------------------------ timers, scaled to the round trip */
 
@@ -135,6 +136,8 @@ static bool fg_room(struct fg_net *n, u32 need)
 {
 	unsigned int w = READ_ONCE(n->win_n);
 
+	if (READ_ONCE(n->lost))				/* the sender gives up */
+		return true;
 	return w < FG_WINDOW && (!w || READ_ONCE(n->inflight) + need <= READ_ONCE(n->credit));
 }
 
@@ -148,7 +151,7 @@ int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *s
 	if (len > FG_DGRAM_MAX - FG_HDR_BYTES)
 		return -EINVAL;
 	mutex_lock(&n->lock);
-	while (n->win_n >= FG_WINDOW || (n->win_n && n->inflight + need > n->credit)) {
+	while (!n->lost && (n->win_n >= FG_WINDOW || (n->win_n && n->inflight + need > n->credit))) {
 		mutex_unlock(&n->lock);
 		left = wait_event_interruptible_timeout(n->wq, fg_room(n, need), left);
 		if (left < 0)
@@ -156,6 +159,10 @@ int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *s
 		if (left == 0)
 			return -ETIMEDOUT;
 		mutex_lock(&n->lock);
+	}
+	if (n->lost) {					/* a board restarted: nothing goes until fg_net_recover() */
+		mutex_unlock(&n->lock);
+		return -EIO;
 	}
 	p = &n->win[(n->win_head + n->win_n) % FG_WINDOW];
 	p->seq = n->next_seq;
@@ -173,7 +180,7 @@ int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *s
 	r = fg_sendto(n, p->data, p->len);
 	n->n_sent++;
 	if (seqp)
-		*seqp = p->seq;
+		*seqp = p->seq + n->seq_base;
 	mutex_unlock(&n->lock);
 	return r;
 }
@@ -265,6 +272,78 @@ static void fg_rx_read_data(struct fg_net *n, u32 tag, u32 off, const u8 *d, u32
 	rd->last_data = ktime_get();
 }
 
+/* A STATUS reply against the last one: has a board restarted? Called with the lock held.
+ *   Board A: its uptime is short of the last one plus the time since (2 s and 0.1 % of slack; the host's clock may
+ *   stand still while a virtual machine is paused, which makes the board look older, never younger), or the sequence
+ *   number it expects is far behind the oldest datagram it has not acknowledged (it starts at 1 again).
+ *   Board B: its frame count, which only its reset clears, went back; board A must have had a STATUS packet from it
+ *   since its own reset.
+ * A reply older than the last one (reordered on the way) is left out */
+static void fg_status_watch(struct fg_net *n, ktime_t now)
+{
+	unsigned int lost = 0, count = 0;
+	u32 up, bf;
+
+	if (n->status_n <= FG_ST_B_STATUS_PKTS)
+		return;
+	up = n->status[FG_ST_UPTIME];
+	if (n->up_valid) {
+		u64 el = max_t(s64, ktime_ms_delta(now, n->up_at), 0);
+		bool wrap = n->up_ms >= 0xF0000000u && up < 0x10000000u;
+
+		if (!wrap && (u64)up + 2000 + el / 1000 < (u64)n->up_ms + el) {
+			lost |= FG_LOST_A;
+			count++;
+		} else if (!wrap && (s32)(up - n->up_ms) < 0) {
+			return;
+		}
+	}
+	n->up_ms = up;
+	n->up_at = now;
+	n->up_valid = true;
+	if (!(n->lost & FG_LOST_A) && !(lost & FG_LOST_A) &&
+	    (s32)(n->next_seq - n->win_n - n->status[FG_ST_EXP_SEQ]) > FG_EXP_BEHIND) {
+		lost |= FG_LOST_A;
+		count++;
+	}
+	if (n->status[FG_ST_B_STATUS_PKTS] && FG_LINK_B_ALIVE(n->status[FG_ST_LINK_FLAGS])) {
+		bf = n->status[FG_ST_B_FRAMES];
+		if (n->b_frames_valid && bf + 30 < n->b_frames && !(n->b_frames >= 0xF0000000u && bf < 0x10000000u)) {
+			lost |= FG_LOST_B;
+			count++;
+		}
+		if (!n->b_frames_valid || lost || (s32)(bf - n->b_frames) > 0)
+			n->b_frames = bf;
+		n->b_frames_valid = true;
+	}
+	if (lost) {
+		n->lost |= lost;
+		n->restarts += count;
+	}
+}
+
+/* as if a STATUS reply had shown these boards restarted (a test of the recovery) */
+void fg_net_set_lost(struct fg_net *n, unsigned int lost)
+{
+	mutex_lock(&n->lock);
+	n->lost |= lost & (FG_LOST_A | FG_LOST_B);
+	n->restarts++;
+	mutex_unlock(&n->lock);
+	wake_up_all(&n->wq);
+}
+
+unsigned int fg_net_lost(struct fg_net *n, unsigned int *restarts)
+{
+	unsigned int l;
+
+	mutex_lock(&n->lock);
+	l = n->lost;
+	if (restarts)
+		*restarts = n->restarts;
+	mutex_unlock(&n->lock);
+	return l;
+}
+
 static void fg_rx(struct fg_net *n, const u8 *d, int len)
 {
 	const u8 *b = d + FG_HDR_BYTES;
@@ -296,12 +375,14 @@ static void fg_rx(struct fg_net *n, const u8 *d, int len)
 		n->status_n = nw;
 		n->status_count++;
 		n->status_at = ktime_get();
+		fg_status_watch(n, n->status_at);
 		break;
 	case FG_R_EVENT:
 		if (bl < 16)
 			break;
 		cw = get_unaligned_le32(b);
 		ev = &n->events[n->ev_next % FG_EVENTS];
+		seq += n->seq_base;
 		ev->seq = seq;
 		ev->code = cw & 0xff;
 		ev->idx = (cw >> 8) & 0xff;
@@ -473,12 +554,17 @@ static int fg_net_wait_event_x(struct fg_net *n, u32 seq, u8 idx, struct fg_even
 				return ev->code == FG_EV_ERROR ? -EIO : 0;
 			}
 		}
+		if (n->lost) {				/* a board restarted: the event will not come */
+			mutex_unlock(&n->lock);
+			return -EIO;
+		}
 		seen = n->ev_next;
 		mutex_unlock(&n->lock);
 		if (intr)
-			left = wait_event_interruptible_timeout(n->wq, READ_ONCE(n->ev_next) != seen, left);
+			left = wait_event_interruptible_timeout(n->wq, READ_ONCE(n->ev_next) != seen || READ_ONCE(n->lost),
+								left);
 		else
-			left = wait_event_timeout(n->wq, READ_ONCE(n->ev_next) != seen, left);
+			left = wait_event_timeout(n->wq, READ_ONCE(n->ev_next) != seen || READ_ONCE(n->lost), left);
 		if (left < 0)
 			return (int)left;
 		if (left == 0)
@@ -496,10 +582,41 @@ int fg_net_wait_event_uninterruptible(struct fg_net *n, u32 seq, u8 idx, struct 
 	return fg_net_wait_event_x(n, seq, idx, ev, timeout_ms, false);
 }
 
-/* lockless: a wait condition must not sleep on the mutex */
+/* lockless: a wait condition must not sleep on the mutex. After a board's restart no answer comes for what was sent
+ * before: those fences count as passed */
 bool fg_net_fence_passed(struct fg_net *n, u32 seq)
 {
-	return READ_ONCE(n->fence_valid) && (s32)(READ_ONCE(n->fence_done) - seq) >= 0;
+	return READ_ONCE(n->lost) || (READ_ONCE(n->fence_valid) && (s32)(READ_ONCE(n->fence_done) - seq) >= 0);
+}
+
+/* After the restart of the boards in `lost` (as fg_net_lost gave it, with `restarts`): every fence so far counts as
+ * passed; for board A a new session, in which the wire's sequence numbers start at 1 again while the ones the driver
+ * sees go on. Sending works again when it returns 0. -EAGAIN: another restart came in the meantime; -ETIMEDOUT: board
+ * A did not answer the HELLO. No sequenced sender may run beside it (the caller holds the stream's lock) */
+int fg_net_recover(struct fg_net *n, unsigned int lost, unsigned int restarts, unsigned int timeout_ms)
+{
+	u32 last;
+	int r = 0;
+
+	mutex_lock(&n->lock);
+	last = n->seq_base + n->next_seq - 1;
+	WRITE_ONCE(n->fence_done, last);
+	WRITE_ONCE(n->fence_valid, true);
+	if (lost & FG_LOST_A)
+		n->seq_base = last;
+	mutex_unlock(&n->lock);
+	if (lost & FG_LOST_A)
+		r = fg_net_hello(n, timeout_ms);
+	if (r)
+		return r;
+	mutex_lock(&n->lock);
+	if (n->restarts == restarts)
+		n->lost = 0;
+	else
+		r = -EAGAIN;
+	mutex_unlock(&n->lock);
+	wake_up_all(&n->wq);
+	return r;
 }
 
 int fg_net_wait_fence(struct fg_net *n, u32 seq, long timeout_jiffies)

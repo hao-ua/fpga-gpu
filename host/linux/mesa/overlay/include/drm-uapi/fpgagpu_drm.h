@@ -158,8 +158,10 @@ struct drm_fpgagpu_bo_info {
  * PASS: the boards hold one render state: board A's program, attributes, uniforms and frame, board B's draw states. A
  * process takes them for a render pass (FRAME_BEGIN .. FLUSH, which may take several SUBMITs) and gives them back
  * after it; while one process holds them, another's BEGIN waits, at most timeout_ns, after which it takes them anyway.
- * Closing the file gives them back too. state_lost: another process held them since this one last did, so nothing it
- * sent before (programs, attributes, uniforms, draw states) is on the boards any more.
+ * Closing the file gives them back too. state_lost 1: another process held them since this one last did, so nothing it
+ * sent before (programs, attributes, uniforms, draw states) is on the boards any more. state_lost 2: a board restarted
+ * since this file's last BEGIN. The driver made a new session and described every buffer object again, but what they
+ * held (program words, vertex data, images) is gone too and must be written again.
  */
 enum drm_fpgagpu_pass_op {
 	FPGAGPU_PASS_BEGIN	= 0,
@@ -168,7 +170,7 @@ enum drm_fpgagpu_pass_op {
 
 struct drm_fpgagpu_pass {
 	__u32 op;		/* in: enum drm_fpgagpu_pass_op */
-	__u32 state_lost;	/* out, BEGIN */
+	__u32 state_lost;	/* out, BEGIN: 0, 1 or 2 */
 	__s64 timeout_ns;	/* in, BEGIN */
 };
 

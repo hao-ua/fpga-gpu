@@ -55,6 +55,11 @@ void fg_bo_free_work(struct work_struct *work)
 		spin_unlock(&fdev->free_lock);
 		if (!bo)
 			break;
+		if (bo->created) {
+			mutex_lock(&fdev->bo_lock);
+			list_del(&bo->bo_link);
+			mutex_unlock(&fdev->bo_lock);
+		}
 		if (bo->created && drm_dev_enter(&fdev->drm, &idx)) {	/* no messages once the device is unplugged */
 			u8 d[4];
 
@@ -71,6 +76,26 @@ void fg_bo_free_work(struct work_struct *work)
 		drm_gem_object_release(&bo->base);
 		kfree(bo);
 	}
+}
+
+/* the boards in `lost` restarted and their tables are empty: the descriptor of every BO on them again, in the order
+ * they were made (an alias after its image). What the memory held is gone. Called with submit_lock held */
+void fg_bo_recreate(struct fpgagpu_device *fdev, unsigned int lost, unsigned int *done, unsigned int *failed)
+{
+	struct fg_bo *bo;
+
+	*done = 0;
+	*failed = 0;
+	mutex_lock(&fdev->bo_lock);
+	list_for_each_entry(bo, &fdev->bo_list, bo_link) {
+		if (!(lost & (bo->kind == FPGAGPU_BO_A_BUFFER ? FG_LOST_A : FG_LOST_B)))
+			continue;
+		if (fg_net_send_seq(&fdev->net, bo->create_type, bo->create_body, bo->create_len, NULL, SEND_TIMEOUT_MS))
+			(*failed)++;
+		else
+			(*done)++;
+	}
+	mutex_unlock(&fdev->bo_lock);
 }
 
 int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file *file)
@@ -175,17 +200,25 @@ int fpgagpu_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file 
 		put_unaligned_le32((u32)size, body + 8);
 		blen = 12;
 	}
+	bo->create_type = type;
+	bo->create_len = (u8)blen;
+	memcpy(bo->create_body, body, blen);
 	if (!drm_dev_enter(drm, &idx)) {
 		r = -ENODEV;
 		goto put;
 	}
 	mutex_lock(&fdev->submit_lock);
 	r = fg_net_send_seq(&fdev->net, type, body, blen, NULL, SEND_TIMEOUT_MS);
+	if (!r) {
+		bo->created = true;
+		mutex_lock(&fdev->bo_lock);
+		list_add_tail(&bo->bo_link, &fdev->bo_list);
+		mutex_unlock(&fdev->bo_lock);
+	}
 	mutex_unlock(&fdev->submit_lock);
 	drm_dev_exit(idx);
 	if (r)
 		goto put;
-	bo->created = true;
 	r = drm_gem_handle_create(file, &bo->base, &a->handle);
 	if (!r) {
 		a->board_handle = bo->board_handle;

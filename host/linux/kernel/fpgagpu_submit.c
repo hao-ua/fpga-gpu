@@ -405,6 +405,7 @@ int fpgagpu_ioctl_pass(struct drm_device *drm, void *data, struct drm_file *file
 {
 	struct fpgagpu_device *fdev = to_fpgagpu(drm);
 	struct drm_fpgagpu_pass *a = data;
+	struct fg_file *ff = file->driver_priv;
 	ktime_t end;
 
 	if (a->op == FPGAGPU_PASS_END) {
@@ -432,9 +433,27 @@ int fpgagpu_ioctl_pass(struct drm_device *drm, void *data, struct drm_file *file
 			return (int)r;
 	}
 	a->state_lost = fdev->last_owner != file;
+	if (ff && ff->reset_gen != fdev->reset_gen) {	/* a board restarted since: what it had in board memory is gone */
+		ff->reset_gen = fdev->reset_gen;
+		a->state_lost = 2;
+	}
 	fdev->pass_owner = file;
 	fdev->last_owner = file;
 	mutex_unlock(&fdev->pass_lock);
+	return 0;
+}
+
+int fpgagpu_open(struct drm_device *drm, struct drm_file *file)
+{
+	struct fpgagpu_device *fdev = to_fpgagpu(drm);
+	struct fg_file *ff = kzalloc(sizeof(*ff), GFP_KERNEL);
+
+	if (!ff)
+		return -ENOMEM;
+	mutex_lock(&fdev->pass_lock);
+	ff->reset_gen = fdev->reset_gen;
+	mutex_unlock(&fdev->pass_lock);
+	file->driver_priv = ff;
 	return 0;
 }
 
@@ -459,6 +478,8 @@ void fpgagpu_postclose(struct drm_device *drm, struct drm_file *file)
 		fdev->last_owner = NULL;	/* a file opened later at the same address is another process */
 	mutex_unlock(&fdev->pass_lock);
 	wake_up_all(&fdev->pass_wq);
+	kfree(file->driver_priv);
+	file->driver_priv = NULL;
 }
 
 /* ------------------------------------------------------------------ READ */

@@ -569,6 +569,7 @@ static void fg_crtc_atomic_enable(struct drm_crtc *crtc, fg_atomic_t *state)
 	if (r)
 		drm_warn(crtc->dev, "SET_MODE %d (%dx%d) failed: %d\n", id, cs->mode.hdisplay, cs->mode.vdisplay, r);
 	fdev->kms.mode_id = id;
+	fdev->kms.mode_set = true;
 	fdev->kms.need_present = true;			/* the plane update after this shows the image again */
 	drm_dev_exit(idx);
 }
@@ -725,6 +726,21 @@ int fg_kms_init(struct fpgagpu_device *fdev)
 
 	drm_mode_config_reset(drm);
 	return 0;
+}
+
+/* board B restarted: it has no mode, scanout image, shown image or cursor of ours any more. The mode goes again
+ * here; the next plane updates make the scanout image and send the cursor's shape, and show what they are given.
+ * Called with submit_lock held */
+void fg_kms_board_lost(struct fpgagpu_device *fdev)
+{
+	struct fg_kms *k = &fdev->kms;
+
+	k->img_valid = false;
+	k->shown = 0;
+	k->need_present = true;
+	WRITE_ONCE(k->cur_shown, false);
+	if (k->mode_set && fg_set_mode(fdev, k->mode_id))
+		drm_warn(&fdev->drm, "SET_MODE %d after board B's restart failed\n", k->mode_id);
 }
 
 /* before the transport goes: nothing may send the cursor's position after it */

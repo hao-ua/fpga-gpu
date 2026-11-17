@@ -3,3 +3,7 @@
 # Not while it is starting: its own wait (lightdm-wait-fpgagpu.conf) takes the card then, and a restart in the middle
 # of that wait leaves it failed
 ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="fpgagpu", RUN+="/bin/sh -c 'systemctl is-active -q display-manager.service && systemctl --no-block restart display-manager.service'"
+
+# Board B restarted while the module was loaded (the driver's change event with FPGAGPU_RESET=1, sent once it has
+# recovered): every image X had on it is gone, so a running display manager starts again
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ENV{FPGAGPU_RESET}=="1", RUN+="/bin/sh -c 'systemctl is-active -q display-manager.service && systemctl --no-block restart display-manager.service'"

@@ -255,6 +255,17 @@ counters and the last STATUS.
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.
+    The module now recovers by itself. It asks for STATUS once a second: board A restarted when its uptime is short
+    of the last one plus the time since, or the sequence number it expects is far behind ours; board B when its
+    frame count went back. Until it has recovered, commands fail at once (EIO) and fences count as passed. Recovery:
+    a new session with board A (the wire's sequence numbers start at 1, the driver's fences go on), the CREATE of
+    every buffer object on the restarted boards again (contents lost), after board B's restart the display's mode,
+    a hotplug event (the console redraws) and a change uevent `FPGAGPU_RESET=1`, on which
+    `x11/99-fpgagpu-display.rules` restarts a running display manager. After a restart of board A alone X keeps
+    running: PASS's `state_lost` 2 tells Mesa to place its programs again. Checked with the test parameter
+    (`echo 1` / `3` `> /sys/module/fpgagpu/parameters/restarted`: as if board A / both had restarted): A alone, X the
+    same process and drawing, 2 buffer objects described again; both, 171 described again, X restarted by udev;
+    `fpgagpu_selftest` and `fg_egl_gl` pass after each without a reload. Not yet seen with a board really restarted.
   - fpgagpu loads at boot (`kernel/fpgagpu-load.conf` as `/etc/modules-load.d/fpgagpu.conf`). While board A does not
     answer (the boards off; at boot, the network not up yet) the module stays loaded and greets it again every 5 s;
     the DRM device appears once it answers. LightDM waits up to 10 s for the card at its start

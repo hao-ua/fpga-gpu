@@ -10,6 +10,7 @@
  *   modprobe fpgagpu ip=192.168.1.10          board A on this host's network
  *   modprobe fpgagpu ip=127.0.0.1             through host/linux/tools/g2_relay.py from a remote host
  */
+#include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -23,6 +24,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_print.h>
+#include <drm/drm_probe_helper.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_fbdev_shmem.h>
@@ -136,6 +138,7 @@ static const struct drm_driver fpgagpu_drm_driver = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
 #endif
+	.open			= fpgagpu_open,
 	.postclose		= fpgagpu_postclose,	/* a pass the file held is given back */
 	.ioctls			= fpgagpu_ioctls,
 	.num_ioctls		= ARRAY_SIZE(fpgagpu_ioctls),
@@ -165,6 +168,67 @@ static void fpgagpu_fbdev_setup(struct drm_device *drm)
 
 #define ATTACH_RETRY_S		5		/* while board A does not answer: HELLO again this often */
 #define ATTACH_HELLO_MS		1500		/* each try: three HELLOs */
+#define WATCH_MS		1000		/* a STATUS request this often: a board's restart shows in the reply */
+
+/*
+ * A board restarted while the module was loaded (a power cut, a new bitstream): its tables and memory are empty, and
+ * board A expects a new session. The transport stops sending when a STATUS reply shows it (fpgagpu_net.c); here, with
+ * the command stream held: a new session with board A if it was the one; the descriptor of every buffer object on the
+ * restarted boards again (their contents are gone); the display's mode again if board B restarted. Every file then
+ * learns at its next pass that what it kept in board memory is lost (PASS's state_lost 2). After board B's restart
+ * the console redraws on the hotplug event, and a change uevent with FPGAGPU_RESET=1 lets udev restart a display
+ * server, whose images are gone. false: not done, to be tried again
+ */
+static bool fpgagpu_recover(struct fpgagpu_device *fdev, unsigned int lost, unsigned int restarts)
+{
+	struct device *dev = fdev->drm.dev;
+	unsigned int done = 0, failed = 0;
+	int r;
+
+	dev_warn(dev, "board%s restarted: recovering\n",
+		 lost == (FG_LOST_A | FG_LOST_B) ? "s A and B" : (lost & FG_LOST_A) ? " A" : " B");
+	mutex_lock(&fdev->submit_lock);
+	r = fg_net_recover(&fdev->net, lost, restarts, ATTACH_HELLO_MS);
+	if (r) {
+		mutex_unlock(&fdev->submit_lock);
+		dev_warn(dev, "no new session yet (%d)\n", r);
+		return false;
+	}
+	fg_bo_recreate(fdev, lost, &done, &failed);
+	fdev->frame_owner = NULL;			/* the frame a file had open went with the boards */
+	if (lost & FG_LOST_B)
+		fg_kms_board_lost(fdev);
+	mutex_unlock(&fdev->submit_lock);
+	mutex_lock(&fdev->pass_lock);
+	fdev->reset_gen++;
+	mutex_unlock(&fdev->pass_lock);
+	dev_warn(dev, "recovered: %s%u buffer objects described again%s, their contents lost\n",
+		 (lost & FG_LOST_A) ? "a new session, " : "", done, failed ? " (some failed)" : "");
+	if (lost & FG_LOST_B) {
+		char *envp[] = { "FPGAGPU_RESET=1", NULL };
+
+		drm_kms_helper_hotplug_event(&fdev->drm);
+		kobject_uevent_env(&fdev->drm.primary->kdev->kobj, KOBJ_CHANGE, envp);
+	}
+	return true;
+}
+
+static void fpgagpu_watch_work(struct work_struct *work)
+{
+	struct fpgagpu_device *fdev = container_of(to_delayed_work(work), struct fpgagpu_device, watch_work);
+	unsigned int lost, restarts;
+	int idx;
+
+	if (!drm_dev_enter(&fdev->drm, &idx))
+		return;					/* unplugged: the module is going */
+	lost = fg_net_lost(&fdev->net, &restarts);
+	if (lost)
+		fpgagpu_recover(fdev, lost, restarts);
+	else
+		fg_net_send_unseq(&fdev->net, FG_T_STATUS_REQ, NULL, 0);
+	drm_dev_exit(idx);
+	queue_delayed_work(fg_wq, &fdev->watch_work, msecs_to_jiffies(WATCH_MS));
+}
 
 /* greets board A; once it answers: the display and the DRM device (render node, card, console). -EAGAIN: no answer
  * (the boards are off, or the network is not up yet) */
@@ -197,6 +261,7 @@ static int fpgagpu_attach(struct fpgagpu_device *fdev)
 		goto fail;
 	fpgagpu_fbdev_setup(&fdev->drm);
 	fdev->attached = true;
+	queue_delayed_work(fg_wq, &fdev->watch_work, msecs_to_jiffies(WATCH_MS));
 	return 0;
 fail:
 	fg_kms_fini(fdev);
@@ -236,6 +301,9 @@ static int fpgagpu_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&fdev->bo_free);
 	INIT_WORK(&fdev->free_work, fg_bo_free_work);
 	INIT_DELAYED_WORK(&fdev->attach_work, fpgagpu_attach_work);
+	INIT_DELAYED_WORK(&fdev->watch_work, fpgagpu_watch_work);
+	mutex_init(&fdev->bo_lock);
+	INIT_LIST_HEAD(&fdev->bo_list);
 	r = fg_mem_init(fdev);
 	if (r)
 		return r;
@@ -265,6 +333,7 @@ static void fpgagpu_remove_device(struct platform_device *pdev)
 	cancel_delayed_work_sync(&fdev->attach_work);
 	if (fdev->attached) {
 		drm_dev_unplug(&fdev->drm);
+		cancel_delayed_work_sync(&fdev->watch_work);	/* it does not queue itself again once unplugged */
 		drm_atomic_helper_shutdown(&fdev->drm);
 		fg_kms_fini(fdev);
 	}
@@ -294,6 +363,31 @@ static struct platform_driver fpgagpu_platform_driver = {
 
 static struct platform_device *fpgagpu_pdev;
 
+/* a test of the recovery without restarting a board:
+ *   echo 1 > /sys/module/fpgagpu/parameters/restarted      as if board A had restarted (2: board B, 3: both)
+ * The boards still hold everything, so they refuse the descriptors sent again (error events in the log) */
+static int fpgagpu_set_restarted(const char *val, const struct kernel_param *kp)
+{
+	struct fpgagpu_device *fdev = fpgagpu_pdev ? platform_get_drvdata(fpgagpu_pdev) : NULL;
+	unsigned int v;
+	int r = kstrtouint(val, 0, &v);
+
+	if (r)
+		return r;
+	if (!v || v > (FG_LOST_A | FG_LOST_B))
+		return -EINVAL;
+	if (!fdev || !fdev->attached)
+		return -ENODEV;
+	fg_net_set_lost(&fdev->net, v);
+	return 0;
+}
+
+static const struct kernel_param_ops fpgagpu_restarted_ops = {
+	.set = fpgagpu_set_restarted,
+};
+module_param_cb(restarted, &fpgagpu_restarted_ops, NULL, 0200);
+MODULE_PARM_DESC(restarted, "test: recover as if board A (1), board B (2) or both (3) had restarted");
+
 static int __init fpgagpu_init(void)
 {
 	int r;
@@ -319,7 +413,10 @@ fail_wq:
 
 static void __exit fpgagpu_exit(void)
 {
-	platform_device_unregister(fpgagpu_pdev);
+	struct platform_device *pdev = fpgagpu_pdev;
+
+	fpgagpu_pdev = NULL;				/* the test parameter finds no device from here on */
+	platform_device_unregister(pdev);
 	platform_driver_unregister(&fpgagpu_platform_driver);
 	destroy_workqueue(fg_wq);			/* runs the frees still queued */
 }

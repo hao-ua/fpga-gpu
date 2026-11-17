@@ -40,9 +40,13 @@ enum { FG_ACKF_NAK = 1, FG_ACKF_FULL = 2 };
 /* STATUS words the driver reads itself */
 #define FG_ST_LAYOUT		0
 #define FG_ST_BUILD		1
+#define FG_ST_UPTIME		2		/* board A, ms */
 #define FG_ST_FLAGS		3
+#define FG_ST_EXP_SEQ		19		/* the sequence number board A expects next */
 #define FG_ST_B_FLAGS		37
+#define FG_ST_B_FRAMES		38		/* board B's vsyncs since its reset */
 #define FG_ST_LINK_FLAGS	42
+#define FG_ST_B_STATUS_PKTS	45		/* board B's STATUS packets board A has had since its own reset */
 #define FG_LINK_B_ALIVE(f)	((f) & 1u)
 #define FG_LINK_TRAINED(f)	(((f) >> 2) & 1u)
 
@@ -116,13 +120,31 @@ struct fg_net {
 	/* round trip (RFC 6298 style), from datagrams acknowledged without a resend */
 	s64 srtt_ns, rttvar_ns;
 
+	/* a board that restarted, as its STATUS shows it: board A's uptime short of what it was plus the time since, or
+	 * the sequence number it expects far behind ours; board B's frame count gone back. While `lost` is set senders
+	 * and waiters give up (-EIO) and every fence counts as passed, until fg_net_recover() */
+	u32 up_ms;				/* board A's uptime at the last STATUS, and when that was */
+	ktime_t up_at;
+	bool up_valid;
+	u32 b_frames;				/* board B's frame count at the last STATUS that had one */
+	bool b_frames_valid;
+	unsigned int lost;			/* FG_LOST_* */
+	unsigned int restarts;			/* restarts seen */
+	u32 seq_base;				/* added to the wire's sequence numbers, which start at 1 again with every
+						 * session: the fences and events the driver sees go on from the last */
+
 	/* counters */
 	u64 n_sent, n_resent, n_resends, n_rx, n_rx_bad, n_nak, n_full;
 };
 
+enum { FG_LOST_A = 1, FG_LOST_B = 2 };
+
 int fg_net_init(struct fg_net *n, struct device *dev, const char *ip, u16 port);
 void fg_net_fini(struct fg_net *n);
 int fg_net_hello(struct fg_net *n, unsigned int timeout_ms);
+unsigned int fg_net_lost(struct fg_net *n, unsigned int *restarts);
+void fg_net_set_lost(struct fg_net *n, unsigned int lost);
+int fg_net_recover(struct fg_net *n, unsigned int lost, unsigned int restarts, unsigned int timeout_ms);
 int fg_net_status(struct fg_net *n, u32 *words, u32 room, u32 *got, u64 *serial, unsigned int timeout_ms);
 int fg_net_send_seq(struct fg_net *n, u8 type, const void *body, u32 len, u32 *seq, unsigned int timeout_ms);
 int fg_net_send_unseq(struct fg_net *n, u8 type, const void *body, u32 len);
@@ -155,6 +177,7 @@ struct fg_kms {
 	u32 img_fourcc, img_w, img_h;
 	u32 frame_id;
 	int mode_id;
+	bool mode_set;				/* mode_id was sent to board B (SET_MODE) */
 	bool cur_shown;				/* board B shows the hardware cursor */
 	s16 cur_x, cur_y;			/* its top-left corner on the screen */
 	struct delayed_work cur_work;		/* the last position once more, a while after the last move */
@@ -186,6 +209,14 @@ struct fg_bo {
 	u32 last_fence;				/* the newest SUBMIT fence that named it */
 	bool fenced;
 	struct list_head free_link;		/* on fpgagpu_device.bo_free while DESTROY is pending */
+	struct list_head bo_link;		/* on fpgagpu_device.bo_list while its descriptor is on the board */
+	u8 create_type, create_len;		/* its CREATE_*, sent again when its board restarted */
+	u8 create_body[20];
+};
+
+/* what the driver keeps per open file */
+struct fg_file {
+	u32 reset_gen;				/* fpgagpu_device.reset_gen when it last took the boards for a pass */
 };
 
 struct fpgagpu_device {
@@ -196,9 +227,11 @@ struct fpgagpu_device {
 	struct mutex submit_lock;		/* one command stream at a time: SUBMIT, READ, the display's uploads */
 	struct drm_file *frame_owner;		/* under submit_lock: the file whose SUBMITs left a frame open on the
 						 * boards (a FRAME_BEGIN not yet followed by its FLUSH) */
-	struct mutex pass_lock;			/* the two below */
+	struct mutex pass_lock;			/* the three below */
 	struct drm_file *pass_owner;		/* the file holding the boards' render state for a pass (PASS), or NULL */
 	struct drm_file *last_owner;		/* the file that held it last */
+	u32 reset_gen;				/* counts the boards' restarts recovered from: a file behind it lost what
+						 * it had in board memory */
 	wait_queue_head_t pass_wq;
 	u32 fence_id;				/* the id in the next FENCE body */
 	u32 read_tag;				/* the tag of the last READ request */
@@ -208,10 +241,16 @@ struct fpgagpu_device {
 	struct delayed_work attach_work;	/* while board A does not answer: HELLO again every few seconds */
 	unsigned int attach_tries;
 	bool attached;				/* board A answered: the display and the DRM device are set up */
+	struct mutex bo_lock;			/* bo_list; taken inside submit_lock */
+	struct list_head bo_list;		/* every BO whose descriptor is on a board, oldest first */
+	struct delayed_work watch_work;		/* asks for STATUS every second and recovers from a board's restart */
 };
 
 int fg_kms_init(struct fpgagpu_device *fdev);
 void fg_kms_fini(struct fpgagpu_device *fdev);
+void fg_kms_board_lost(struct fpgagpu_device *fdev);
+void fg_bo_recreate(struct fpgagpu_device *fdev, unsigned int lost, unsigned int *done, unsigned int *failed);
+int fpgagpu_open(struct drm_device *drm, struct drm_file *file);
 
 int fg_mem_init(struct fpgagpu_device *fdev);
 void fg_mem_fini(struct fpgagpu_device *fdev);

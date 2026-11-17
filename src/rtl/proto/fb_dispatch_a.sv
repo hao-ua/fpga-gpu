@@ -122,6 +122,11 @@ module fb_dispatch_a #(
     output reg           g_st_lazy,              // VS_STATE word 4 bit 29: TRI items only in bands where a quad follows
     output reg           g_cz_d16,               // with g_render, from the FLUSH: the depth attachment has 16 bits
     output reg  [23:0]   g_cz_init,              //   the depth every pixel starts the frame with, the largest when unknown (loaded)
+    output reg           g_skip,                 //   FLUSH flags bit 10: bands with nothing binned that the clear does not reach are not walked
+    output reg           g_cl_any,               //   the clear writes something B keeps in its DDR: colour with a non-zero mask, or depth /
+                                                 //   stencil (a non-zero mask) into a depth-stencil image
+    output reg           g_cl_sc,                //   the clear is scissored: rows g_cl_y0 <= y < g_cl_y1 (the FLUSH's box, as B reads it)
+    output reg  [12:0]   g_cl_y0, g_cl_y1,
     output reg  [2:0]    g_ad_size, g_dr_mode,
     output reg  [31:0]   g_dr_first, g_dr_count,
     output reg  [1:0]    g_st_cull,
@@ -526,6 +531,11 @@ module fb_dispatch_a #(
                               // (the largest)
                               g_cz_d16 <= f[0][25];
                               g_cz_init <= (f[6][15:0] == 16'h0 || (f[0][23] && !f[0][17])) ? f[3][23:0] : (f[0][25] ? 24'h00FFFF : 24'hFFFFFF);
+                              // the bands the walk may leave out: nothing binned and nothing of the clear that B writes back
+                              g_skip <= f[0][26];
+                              g_cl_any <= (f[0][16] && f[0][21:18] != 4'h0) ||
+                                          (f[6][15:0] != 16'h0 && (f[0][23] || (f[0][24] && f[6][23:16] != 8'h0)));
+                              g_cl_sc <= f[0][17]; g_cl_y0 <= f[4][28:16]; g_cl_y1 <= f[5][28:16];
                           end
                 D_GUNI: begin                                   // 4 body words per uniform -> one param write
                     if (take_uni) begin

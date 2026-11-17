@@ -56,8 +56,10 @@ MODE_NAMES = {0: "640x480@60", 1: "800x600@60", 2: "1280x720@60", 3: "1280x800@6
               4: "1024x768@60"}
 PRES_AT_ONCE, PRES_HOLD = 1, 2          # PRESENT flags
 # FLUSH flags: clear colour, clear scissor, colour mask {R,G,B,A} << 2, dither the clear, clear depth,
-# clear stencil, the depth attachment has 16 bits
+# clear stencil, the depth attachment has 16 bits, skip (board A leaves out the bands with nothing to draw that the clear
+# does not reach: board B neither loads nor writes them; STATUS layout 13 counts them)
 FL_CLEAR_COLOR, FL_CLEAR_SCISSOR, FL_DITHER, FL_CLEAR_DEPTH, FL_CLEAR_STENCIL, FL_DEPTH16 = 1, 2, 64, 128, 256, 512
+FL_SKIP_BANDS = 1024
 def FL_CMASK(m): return (m & 0xF) << 2
 # depth / stencil functions of DRAW_STATE (GL order), depth func in h0 [4:2]
 FN_NEVER, FN_LESS, FN_EQUAL, FN_LEQUAL, FN_GREATER, FN_NOTEQUAL, FN_GEQUAL, FN_ALWAYS = range(8)
@@ -134,7 +136,9 @@ STATUS_NAMES = [
     "a_disp_idle", "a_disp_gwait",
     # layout 12: the render side's coarse depth and TRI items, cumulative: quads culled, quads sent, TRI items sent, TRI items
     # held back (no quad followed: dropped), TRI items sent for a visit that sent no quad, blocks an occluder pair lowered
-    "a_cz_culled", "a_cz_quads_sent", "a_tri_sent", "a_tri_held", "a_tri_noquad", "a_cz_blocks"]
+    "a_cz_culled", "a_cz_quads_sent", "a_tri_sent", "a_tri_held", "a_tri_noquad", "a_cz_blocks",
+    # layout 13: bands A's walk left out (FLUSH flags bit 10: nothing binned, not reached by the clear), cumulative
+    "a_bands_skipped"]
 B_CYC_NAMES = ["frame", "flush", "band change", "draw change", "FS busy", "band set-up", "stream empty", "ROP stall"]
 # the boards' clk_sys in kHz, for cycle counters -> ms (GPU2_CLK_MHZ, default 120)
 CLK_KHZ = float(os.environ.get("GPU2_CLK_MHZ", "120")) * 1e3
@@ -164,7 +168,8 @@ def a_cz_split(st, st0, frames=1):
     walked = d("a_cz_culled") + d("a_cz_quads_sent")
     return ("A per frame: %.0f quads walked, %.0f culled (%.1f%%), %.0f sent | TRI items %.0f sent, %.0f held back, %.0f sent with "
             "no quad | %.0f blocks lowered" % (walked, d("a_cz_culled"), 100.0 * d("a_cz_culled") / walked if walked else 0.0,
-                                               d("a_cz_quads_sent"), d("a_tri_sent"), d("a_tri_held"), d("a_tri_noquad"), d("a_cz_blocks")))
+                                               d("a_cz_quads_sent"), d("a_tri_sent"), d("a_tri_held"), d("a_tri_noquad"), d("a_cz_blocks"))
+            + (" | %.1f bands left out" % d("a_bands_skipped") if st.get("layout", 0) >= 13 else ""))
 
 
 # board A's coarse-depth flags of a draw (VS_STATE word 4 [28:25]) and the lazy TRI bit (29): vs_state(zc=...)
@@ -321,7 +326,7 @@ def format_ip(st):
 def decode_b_flags(f):
     return {"calib": f & 1, "mmcm_locked": (f >> 1) & 1, "video": (f >> 2) & 1, "mode_busy": (f >> 3) & 1,
             "mode": (f >> 4) & 7, "image_shown": (f >> 7) & 1, "fill_done": (f >> 8) & 1, "lock_fail": (f >> 11) & 1,
-            "cp_busy": (f >> 12) & 1, "cur_img": (f >> 16) & 1023, "render_busy": (f >> 26) & 1,
+            "cp_busy": (f >> 12) & 1, "band_next": (f >> 13) & 1, "cur_img": (f >> 16) & 1023, "render_busy": (f >> 26) & 1,
             "fs_stack_err": (f >> 27) & 1, "xsfu": (f >> 28) & 1, "xclamp": (f >> 29) & 1,
             # the fragment core lacks the integer divider / SIN / COS (glslc noops for the fragment stage: (f >> 30) & 3)
             "no_idiv": (f >> 30) & 1, "no_sincos": (f >> 31) & 1}

@@ -19,9 +19,11 @@
 //             sends the TRI item again in every band where the triangle is not current; B keeps no record store.
 //   TRISEL    1 beat: w0 {3, ..}, w1 triangle id: a no-op when it names the current triangle; any other is counted in
 //             c_errs and skipped (board A resends the TRI item instead)
-//   BAND      1 beat: w0 {4, .., y0[10:0]}: flushes the band in progress, starts band y0 (nl rows: NLMAX = 8 when the
-//             target is at most BAND8_MAXW = 1024 wide — the band buffer's CELLS = 4 096 cells then hold 8 lines of it —
-//             else NLINES = 4; board A bins and walks with the same rule)
+//   BAND      1 beat: w0 {4, np[27], nv[26], ny0[25:15], 0, y0[10:0]}: flushes the band in progress, starts band y0 (nl
+//             rows: NLMAX = 8 when the target is at most BAND8_MAXW = 1024 wide — the band buffer's CELLS = 4 096 cells
+//             then hold 8 lines of it — else NLINES = 4; board A bins and walks with the same rule). np: the item names
+//             the band that follows it, ny0 (nv: there is one; board A may leave bands out), which the ROP preloads while
+//             this band renders; without np it preloads the band below (y0 + nl)
 //   FRAME_END 1 beat: w0 {5, .., aborted[0]}: flushes the last band, waits for its writes, done (aborted: board A gave
 //             the frame up after RENDER_TIMEOUT and ended it in-band, so the pairing of FLUSHes and frames holds)
 //   NOP / other kinds: 1 beat, skipped (other kinds counted in c_errs)
@@ -397,6 +399,7 @@ module b_render #(
     // one is announced (or the frame ends), none of its quads is alive and none of its fragments is behind the core;
     // fragments of a later band wait at the ROP input; peeks of the next band are served from the preload bank
     reg  [10:0] bq_y0 [0:3]; reg [1:0] nq_slot, rs_slot; reg [2:0] bands_q; reg fend;
+    reg  [10:0] bq_ny0 [0:3]; reg [3:0] bq_np, bq_nv;    // per slot: the band its BAND item names as the next one (np: named, nv: one follows)
     // the ROP's cell addresses are formed HERE (timing: band_y0 -> the line subtract -> the row-base mux -> the cell adder
     // stays off the paths into the ROP's bank addresses and the hazard
     // compares): a fragment's band line comes from ITS band's y0 (bq_y0 of its slot — a fragment of the next band waits
@@ -436,15 +439,16 @@ module b_render #(
     wire        rop_sw   = br_valid && (br_bank != rop_bank);
     wire        rop_hold = rop_sw || (br_valid && (br_slot != rs_slot || !band_on));
     assign      br_ready = rop_ready && !rop_hold;
-    // the band preload in advance: board A walks every band in order, so the band
-    // below the one rendering is the next one — the ROP preloads it from the band's start, not from its BAND item (which
-    // comes after the band's last quad: a preload then hides only behind the pipeline's drain, and an 8-line band's preload
-    // is twice as long). Registered (the ROP multiplies the preload's y0 in its start cycle); the announced band takes
-    // over once its BAND item is parsed (the same y0); none below the target's last band.
+    // the band preload in advance: the band that follows the one rendering, as its BAND item names it (board A walks the
+    // bands in order and may leave out bands it has nothing for), else the band below it — the ROP preloads it from the
+    // band's start, not from the next BAND item (which comes after the band's last quad: a preload then hides only behind
+    // the pipeline's drain, and an 8-line band's preload is twice as long). Registered (the ROP multiplies the preload's y0
+    // in its start cycle); the announced band takes over once its BAND item is parsed (the same y0); none after the last
+    // band A sends, none below the target's last band.
     reg  [11:0] spn_y0; reg spn_ok;
     always @(posedge clk) begin
-        spn_y0 <= 12'(band_y0) + 12'(nl);
-        spn_ok <= band_on && (12'(band_y0) + 12'(nl) < rt_height);
+        spn_y0 <= bq_np[rs_slot] ? 12'(bq_ny0[rs_slot]) : 12'(band_y0) + 12'(nl);
+        spn_ok <= band_on && (bq_np[rs_slot] ? bq_nv[rs_slot] : (12'(band_y0) + 12'(nl) < rt_height));
     end
     wire        pl_nok = nx_ok || spn_ok;
     wire [10:0] pl_ny0 = nx_ok ? bq_y0[nx_slot] : spn_y0[10:0];
@@ -538,7 +542,12 @@ module b_render #(
     // the current band may be flushed: none of its quads alive, none of its fragments behind the core (b_rop itself waits
     // for its RMW pipe)
     wire tail_cur = (c1_v && c1_slot == rs_slot) || (c2_v && c2_slot == rs_slot) || (br_valid && br_slot == rs_slot);
-    wire bm_go_flush = (bm == BM_RUN) && (nx_ok || fend) && qz_s[rs_slot] && !tail_cur;
+    // and the ROP has run the band for a cycle: it starts the next band's preload in the first cycle the band runs with no
+    // flush asked for, so a band with no quad (its flush could be asked for while it is still being loaded) does not leave
+    // the next band to load one burst group at a time
+    reg  bm_run_ok;
+    always @(posedge clk) bm_run_ok <= (bm == BM_RUN) && band_run;
+    wire bm_go_flush = (bm == BM_RUN) && bm_run_ok && (nx_ok || fend) && qz_s[rs_slot] && !tail_cur;
 
     // ================================================================ item sequencer
     typedef enum logic [4:0] {M_IDLE, M_ITEM, M_TRI, M_TSWAIT, M_TRIVAR, M_TRIEND, M_DSWAIT,
@@ -582,6 +591,7 @@ module b_render #(
     wire [2:0]  t_lsb = t_rem[0]?3'd0:t_rem[1]?3'd1:t_rem[2]?3'd2:t_rem[3]?3'd3:t_rem[4]?3'd4:t_rem[5]?3'd5:t_rem[6]?3'd6:3'd7;
     wire        quad_blk = ((6'(eq_cnt) + 6'(qp_cnt)) >= 6'(EQD)) && (w0[31:28] == 4'd1);   // a QUAD waits for room in the early queue (the pipe counted)
     reg  [10:0] nb_y0;                                                // the next band's y0 (band_y0 changes at its start)
+    reg  [10:0] nb_ny0; reg nb_np, nb_nv;                             // the band its BAND item names as the one after it
     // pixel issuer handshake (declared here, driven below). The issuer takes the early queue's head once its verdict is in:
     // a rejected quad is dropped (e_drop), any other goes to quad_setup when the quad path has room; the
     // next quad is taken in the cycle the issuer sends the last pixel of the previous one (4 cycles per quad).
@@ -669,7 +679,7 @@ module b_render #(
                                     tb <= 6'd1; t_ts <= cur_ts + 1'b1;
                                     ms <= M_TRI; end
                         4'd3: if (!(cur_ok && w1[19:0] == cur_tri)) c_errs <= c_errs + 1;   // no record store: only the current one
-                        4'd4: begin nb_y0 <= w0[10:0]; ms <= M_BAND; end
+                        4'd4: begin nb_y0 <= w0[10:0]; nb_np <= w0[27]; nb_nv <= w0[26]; nb_ny0 <= w0[25:15]; ms <= M_BAND; end
                         4'd5: ms <= M_FEND;
                         4'd0: ;
                         default: c_errs <= c_errs + 1;
@@ -805,7 +815,11 @@ module b_render #(
                 // ---------------------------------------------------------------- BAND / FRAME_END
                 // a BAND item only announces the band (slot nq_slot + 1); the band manager renders the slots in order,
                 // the sequencer waits only while all 4 slots are announced
-                M_BAND: if (bq_push) begin bq_y0[nq_slot + 2'd1] <= nb_y0; nq_slot <= nq_slot + 2'd1; ms <= M_ITEM; end
+                M_BAND: if (bq_push) begin
+                            bq_y0[nq_slot + 2'd1] <= nb_y0; bq_ny0[nq_slot + 2'd1] <= nb_ny0;
+                            bq_np[nq_slot + 2'd1] <= nb_np; bq_nv[nq_slot + 2'd1] <= nb_nv;
+                            nq_slot <= nq_slot + 2'd1; ms <= M_ITEM;
+                        end
                 M_FEND: begin fend <= 1'b1; if (bands_q == 3'd0 && bm == BM_IDLE) ms <= M_FDONE; end   // every band flushed
                 M_FDONE: if (!flush_busy) begin done <= 1'b1; c_frames <= c_frames + 1; ms <= M_IDLE; end
                 default: ms <= M_IDLE;

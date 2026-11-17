@@ -798,6 +798,19 @@ int g2_status(g2_board *b, uint32_t out[G2_ST_WORDS], int *nwords)
     return -1;
 }
 
+int g2_last_status(g2_board *b, uint32_t out[G2_ST_WORDS])
+{
+    int ok;
+    AcquireSRWLockExclusive(&b->lock);
+    ok = b->status_count != 0;
+    if (ok) {
+        memset(out, 0, G2_ST_WORDS * 4);
+        memcpy(out, b->status_words, (size_t)b->status_n * 4);
+    }
+    ReleaseSRWLockExclusive(&b->lock);
+    return ok ? 0 : -1;
+}
+
 int g2_check_boards(g2_board *b, int min_a_build)
 {
     uint32_t st[G2_ST_WORDS];

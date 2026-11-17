@@ -58,6 +58,10 @@ module a_geom #(
                                                  //   VS_STATE before a FLUSH decides for its frame)
     input  wire        g_cz_d16 = 1'b0,          // with g_render, from the FLUSH: the depth attachment has 16 bits
     input  wire [23:0] g_cz_init = 24'hFFFFFF,   //   the depth every pixel starts the frame with (the largest when unknown)
+    input  wire        g_skip = 1'b0,            //   bands with nothing binned that the clear does not reach are not walked
+    input  wire        g_cl_any = 1'b0,          //   the clear writes something B keeps in its DDR
+    input  wire        g_cl_sc = 1'b0,           //   in the rows g_cl_y0 <= y < g_cl_y1 only
+    input  wire [12:0] g_cl_y0 = 13'd0, g_cl_y1 = 13'd0,
     input  wire [6:0]  g_st_lw,                  // the line width (pixels)
     input  wire [7:0]  g_st_fsmask,
     input  wire [11:0] g_st_w, g_st_h,
@@ -77,6 +81,7 @@ module a_geom #(
     output wire [IDX_W-1:0] tri_count,
     output wire [31:0] c_quads,                  // the render side's statistics
     output wire [31:0] c_vis,                    //   primitive-band visits, cumulative (STATUS word 100)
+    output wire [31:0] c_bskip,                  //   bands not walked, cumulative (STATUS word 122)
     output wire [6*32-1:0] c_cz,                 //   the coarse depth and the TRI items, cumulative (STATUS words 116-121, a_render):
                                                  //   {blocks lowered, TRIs sent with no quad, TRIs held back, TRIs sent, quads sent, quads culled}
     output wire [NPROF*32-1:0] prof,             // the geometry side's profile, cumulative cycle counters (STATUS words 101-113, see below)
@@ -206,6 +211,7 @@ module a_geom #(
                .REC_BANK_W(REC_BANK_W), .POOL_W(POOL_W))
       u_rn (.clk, .rst, .go(g_render), .go_bank(gbank), .abort(g_abort), .abort_soft(g_abort_soft), .done(g_render_done), .busy(rn_busy), .scr_w, .scr_h,
         .cz_d16(g_cz_d16), .cz_init(g_cz_init), .lazy,
+        .skip(g_skip), .cl_any(g_cl_any), .cl_sc(g_cl_sc), .cl_y0(g_cl_y0), .cl_y1(g_cl_y1), .c_bskip,
         .c_vis, .c_cull(c_cz[0 +: 32]), .c_qsent(c_cz[32 +: 32]), .c_trisent(c_cz[64 +: 32]), .c_trihold(c_cz[96 +: 32]),
         .c_trinq(c_cz[128 +: 32]), .c_occ(c_cz[160 +: 32]),
         .q_bank, .q_band, .q_head, .q_count,

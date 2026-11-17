@@ -394,8 +394,9 @@ module board_b_core
     // engine busy, [27] a fragment-program stack violation since reset (3D); [28] the fragment core has SQRT / RCPM / RSQM,
     // [29] it has CLAMP (constants of the build; 0 on a board B built without them — a program with those opcodes
     // there issues them as no-ops); [30] / [31] the fragment core lacks the integer divider / SIN / COS (the libraries'
-    // compilers then replace those ops): this core has both, so 0
-    wire [31:0] flags = {2'h0, B3D_XCLAMP, B3D_XSFU, rd_err_stack, rd_busy, cur_tag[9:0], 3'h0, cp_busy, lock_fail, key_down, x_busy, fill_done, cur_valid, cur_mode,
+    // compilers then replace those ops): this core has both, so 0; [13] the band preload follows the next band a BAND item
+    // names (board A may then leave bands out: the libraries set FLUSH flags bit 10 only with it)
+    wire [31:0] flags = {2'h0, B3D_XCLAMP, B3D_XSFU, rd_err_stack, rd_busy, cur_tag[9:0], 2'h0, 1'b1, cp_busy, lock_fail, key_down, x_busy, fill_done, cur_valid, cur_mode,
                          mode_busy, video_on, mmcm_locked, calib_done};
     wire [31:0] lflags = {l_eye, l_phase, 8'h0, 1'b0, l_guard_fail, l_tx_enabled, l_training, l_far_up, l_trained,
                           l_lock, 1'b0};

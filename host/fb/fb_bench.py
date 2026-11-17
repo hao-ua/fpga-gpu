@@ -5,10 +5,13 @@ renders frames as fast as it can for a few seconds; the rate is what got through
 included, and B's cycle counters show its own part of the frame.
 
   python3 host/fb/fb_bench.py [--ip 192.168.1.10] [--mode 1] [--secs 3] [--only NAME[,NAME]] [--list] [--no-zc] [--no-lazy]
+                              [--no-skip]
 
 Board A's coarse depth (the draws' flags from their DRAW_STATE, fbproto.zc_flags) and lazy TRI items are on, as in the
 libraries: --no-zc sends no flags (A culls nothing), --no-lazy sends every TRI item; A's counters print per test (STATUS
-layout 12).
+layout 12). The partial_* tests draw into a few bands of a target they do not clear (as a desktop's redraw does) and
+flush_empty flushes no draw and no clear: their FLUSHes leave the other bands out (FLUSH flags bit 10, as the libraries do on
+boards that report it), --no-skip walks every band.
 
 Fill and texture tests draw L full-screen layers per frame, triangle tests a grid of triangles of a given area over the
 whole screen with an MVP transform (tri_culled: the same grid with both faces culled, so geometry and no pixels). Shaders
@@ -77,7 +80,16 @@ TESTS = [
     T('tri_32px',       'geom', FS_FLAT, tri=32),
     T('tri_128px',      'geom', FS_FLAT, tri=128),
     T('tri_512px',      'geom', FS_FLAT, tri=512),
+    T('partial_2bands', 'part', FS_FLAT, tri=16),               # (tri: the rows drawn, about the target's middle)
+    T('partial_8bands', 'part', FS_FLAT, tri=64),
+    T('flush_empty',    'part', FS_FLAT, tri=0),
 ]
+
+
+def rows_mesh(H, rows):
+    """a full-width quad over `rows` rows about the target's middle"""
+    y = rows / H
+    return [(-1.0, -y, 0.0), (1.0, -y, 0.0), (1.0, y, 0.0), (-1.0, y, 0.0)], [0, 1, 2, 0, 2, 3]
 
 
 def compile_pair(vs, fs):
@@ -124,7 +136,7 @@ def grid_mesh(W, H, area):
 def run_test(bd, t, W, H, secs, textures_up):
     vs = VS_GEOM if t.kind == 'geom' else VS_FILL
     rv, rf, wv, wf = compile_pair(vs, t.fs)
-    v, idx = grid_mesh(W, H, t.tri) if t.kind == 'geom' else layer_mesh(t.layers, t.z)
+    v, idx = grid_mesh(W, H, t.tri) if t.kind == 'geom' else rows_mesh(H, max(t.tri, 1)) if t.kind == 'part' else layer_mesh(t.layers, t.z)
     bd.create_buffer(H_VBO, A_VBO, 4 << 20); bd.write_buffer(H_VBO, 0, b''.join(struct.pack("<I", f24(c)) for p in v for c in p))
     bd.create_buffer(H_IBO, A_IBO, 1 << 20); bd.write_buffer(H_IBO, 0, struct.pack("<%dH" % len(idx), *idx))
     bd.create_buffer(H_VSPROG, A_VSPROG, 4096); bd.write_buffer(H_VSPROG, 0, words64_bytes(wv))
@@ -168,6 +180,7 @@ def run_test(bd, t, W, H, secs, textures_up):
                         'uM': [(1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0)]})
     cc = tuple(fp.c16(c) for c in CLEAR)
     flags = fp.FL_CLEAR_COLOR | fp.FL_CMASK(0xF) | (fp.FL_CLEAR_DEPTH | fp.FL_CLEAR_STENCIL if t.z else 0)
+    if t.kind == 'part': flags = 0 if NO_SKIP else fp.FL_SKIP_BANDS   # the target kept (no clear): every band walked is loaded and written
     pending = collections.deque(); i = -1; t0 = time.monotonic(); st0 = bd.status()
     while time.monotonic() - t0 < secs:
         i += 1
@@ -175,7 +188,7 @@ def run_test(bd, t, W, H, secs, textures_up):
         with bd.batch():
             bd.frame_begin()
             bd.vs_uniforms(0, uvs)
-            bd.draw(0, len(idx), 0, index_handle=H_IBO)
+            if t.kind != 'part' or t.tri: bd.draw(0, len(idx), 0, index_handle=H_IBO)
             bd.flush(H_IMG[i & 1], flags, cc, clear_depth=0xFFFFFF, scissor=(0, 0, W, H))
         pending.append(bd.present(H_IMG[i & 1], frame_id=i, hold=False, wait=False))
     while pending: bd.wait_event(pending.popleft(), timeout=20.0)
@@ -191,6 +204,9 @@ def run_test(bd, t, W, H, secs, textures_up):
     if t.kind == 'geom':
         tris = len(idx) // 3
         rate = f"tris_M={tris * fps / 1e6:.3f} verts_M={len(v) * fps / 1e6:.3f} tris={tris}"
+    elif t.kind == 'part':
+        rate = f"rows={t.tri} skip={0 if NO_SKIP else 1}"
+        if st.get('layout', 0) >= 13: rate += f" bands_left_out={((st['a_bands_skipped'] - st0['a_bands_skipped']) & 0xFFFFFFFF) / n:.1f}/frame"
     else:
         rate = f"Mpix={t.layers * px * fps / 1e6:.1f}"
         if t.nsamp: rate += f" Msamples={t.layers * px * fps * t.nsamp / 1e6:.1f}"
@@ -217,15 +233,15 @@ def transfers(bd):
     print(f"RESULT transfer upload_MBps={up:.1f} readback_MBps={down:.1f}")
 
 
-NO_ZC = NO_LAZY = False
+NO_ZC = NO_LAZY = NO_SKIP = False
 NOOPS = {'vs': 0, 'fs': 0}                                     # fbproto.stage_noops of the board (main sets it)
 
 
 def main():
-    global NO_ZC, NO_LAZY, NOOPS
+    global NO_ZC, NO_LAZY, NO_SKIP, NOOPS
     a = sys.argv[1:]
     def opt(name, default, conv=str): return conv(a[a.index(name) + 1]) if name in a else default
-    NO_ZC, NO_LAZY = '--no-zc' in a, '--no-lazy' in a
+    NO_ZC, NO_LAZY, NO_SKIP = '--no-zc' in a, '--no-lazy' in a, '--no-skip' in a
     if '--list' in a:
         for t in TESTS: print(t.name)
         return 0

@@ -1,8 +1,8 @@
 # a_status_jtag.tcl — read board A's status vector over JTAG (BSCANE2 USER1, link_status_jtag).
 #   vivado -mode batch -nojournal -source tools/a_status_jtag.tcl -tclargs <serial> [reads=1] [interval_s=1]
 # Frame (LSB first on TDO): {MAGIC=A5, seq, status_vec (word 0 first), seq}; status_vec = STATUS_WORDS
-# (122, layout 12; 116 on builds of layout 11, read when the longer frame does not check) x 32 bits, the same words as the
-# STATUS datagram (src/rtl/top/board_a_core.sv, host/fb/fbproto.py).
+# (123, layout 13; 122 on builds of layout 12, 116 on layout 11: read when the longer frame does not check) x 32 bits, the
+# same words as the STATUS datagram (src/rtl/top/board_a_core.sv, host/fb/fbproto.py).
 if {[llength $argv] < 1} { puts "usage: -tclargs <target-serial> [reads=1] [interval_s=1]"; exit 1 }
 set serial [lindex $argv 0]
 set reads  [expr {[llength $argv] > 1 ? [lindex $argv 1] : 1}]
@@ -39,11 +39,11 @@ set names {layout build uptime_ms flags phy rx_ok rx_fcs rx_len rx_ovf rx_er arp
            a_cyc_geom a_cyc_render a_cyc_rs_credit a_cyc_rs_full a_visits
            a_prof_load a_prof_copy a_prof_feed a_prof_fetch_wait a_prof_core a_prof_asm a_prof_vo_stall a_prof_setup
            a_prof_push_stall a_prof_bin a_prof_clear a_prof_loads_draws a_prof_prims a_disp_idle a_disp_gwait
-           a_cz_culled a_cz_quads_sent a_tri_sent a_tri_held a_tri_noquad a_cz_blocks}
+           a_cz_culled a_cz_quads_sent a_tri_sent a_tri_held a_tri_noquad a_cz_blocks a_bands_skipped}
 
 for {set r 0} {$r < $reads} {incr r} {
     set ok 0
-    foreach NW {122 116} {
+    foreach NW {123 122 116} {
         set N [expr {8 + 8 + $NW * 32 + 8}]
         for {set try 0} {$try < 5 && !$ok} {incr try} {
             scan_ir_hw_jtag 6 -tdi 02
@@ -52,7 +52,7 @@ for {set r 0} {$r < $reads} {incr r} {
             set magic [field $bits 7 0]
             set seq0  [field $bits 15 8]
             set seq1  [field $bits [expr {$N-1}] [expr {$N-8}]]
-            if {$magic == 0xA5 && $seq0 == $seq1 && ($NW == 116 || [field $bits 47 16] >= 12)} { set ok 1 }
+            if {$magic == 0xA5 && $seq0 == $seq1 && ($NW == 116 || [field $bits 47 16] >= ($NW == 123 ? 13 : 12))} { set ok 1 }
         }
         if {$ok} break
     }
@@ -98,6 +98,8 @@ for {set r 0} {$r < $reads} {incr r} {
         puts [format "  CZ visits=%u quads_culled=%u quads_sent=%u tri_sent=%u tri_held=%u tri_noquad=%u blocks_lowered=%u" \
             [lindex $w 100] [lindex $w 116] [lindex $w 117] [lindex $w 118] [lindex $w 119] [lindex $w 120] [lindex $w 121]]
     }
+    # layout 13: the bands the walk left out (FLUSH flags bit 10), cumulative
+    if {$NW >= 123} { puts [format "  SKIP bands_left_out=%u" [lindex $w 122]] }
     if {$r < $reads - 1} { after [expr {int($ival * 1000)}] }
 }
 close_hw_target

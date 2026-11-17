@@ -291,6 +291,14 @@ module tb_b_render;
                  wf_q, real'(wf_cov) / (wf_q == 0 ? 1 : wf_q), wf_p3, wf_pi);
     end
 
+    // the band starts, and those that load the band themselves (no preload of it: a load of one burst group at a time) —
+    // only the frame's first band may: every later band is preloaded while the one before it renders (the band below, or
+    // the one its BAND item names)
+    int n_bstart = 0, n_bload = 0;
+    always @(posedge clk) if (!rst && dut.band_start && dut.u_rop.st == dut.u_rop.S_IDLE) begin
+        n_bstart++;
+        if (!dut.u_rop.fast && !(dut.u_rop.pf_ok[dut.u_rop.rbk] && dut.u_rop.pf_y0[dut.u_rop.rbk] == dut.band_y0)) n_bload++;
+    end
     int err = 0; int W, H, bpp;
     initial begin
         int fd, r; reg [31:0] a; reg [255:0] d; reg [63:0] b; reg [31:0] pv [0:23]; reg [31:0] e; longint t0;
@@ -341,6 +349,8 @@ module tb_b_render;
         $display("tb_b_render: band-buffer cross-port collisions (a peek of the cell written in the same cycle): bank 0 %0d, 1 %0d, 2 %0d",
                  dut.u_rop.BANK[0].INF.n_col, dut.u_rop.BANK[1].INF.n_col, dut.u_rop.BANK[2].INF.n_col);
         $display("tb_b_render: output latch covered: %0d launches into the slot being read, %0d cycles a STO waited for it", n_reuse, n_stostall);
+        $display("tb_b_render: %0d bands started, %0d of them loaded without a preload", n_bstart, n_bload);
+        if (n_bload > 1) begin err++; $display("  %0d bands loaded without a preload (only the frame's first may be)", n_bload); end
         repeat (50) @(posedge clk);
         fd = $fopen("tools/gen/br_expect.hex", "r");
         for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) begin

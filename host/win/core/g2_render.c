@@ -180,7 +180,10 @@ static int image_alloc(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uin
     pitch = tight || levels > 1 || layers > 1 ? w * bpp : (w * bpp + 31) & ~31u;
     bytes = levels > 1 || layers > 1 ? g2_image_bytes(w, h, bpp, levels, layers) : pitch * h;
     if (handle_take(r, &hd) < 0) return -1;
-    a = g2_heap_alloc(r->heap_b, bytes, 32);
+    /* board B renders in bands of up to 8 rows and loads and stores every row of the last band (b_rop), also past an image
+     * whose height is no multiple of 8: those rows get memory of the image's own, or they would rewrite the next image's
+     * bytes, and zero those that fall in the row padding of a pitch wider than the image */
+    a = g2_heap_alloc(r->heap_b, bytes + (((h + 7) & ~7u) - h) * pitch, 32);
     if (!a) { g2_handle_free(&r->h_img, hd); return -1; }
     g2_create_image(r->bd, hd, a, w, h, fmt, pitch, origin, levels, layers, 0, usage);
     if (bump) r->id_gen++;

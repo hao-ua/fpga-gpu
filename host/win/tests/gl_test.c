@@ -4377,6 +4377,69 @@ static void test_fbo_targets(void)
     plain();
 }
 
+/* targets whose height is no multiple of 8 (board B loads and stores whole bands of 8 rows) leave the next image intact: 32 textures 21 x
+ * 29 (rows of 96 bytes) rendered into once, each followed by a 64 x 8 texture with a pattern; every target rendered again, then every
+ * pattern read back. Without the bands' rows in the targets' memory, a pattern after a target had bytes zeroed where its 96-byte rows are
+ * padding */
+static void test_band_tail(void)
+{
+    enum { N = 32, TW = 21, TH = 29, VW = 64, VH = 8 };
+    static uint8_t pat[VW * VH * 4], got[VW * VH * 4];
+    GLuint t[N], v[N], fbo;
+    int i, k, imgs = 0, bytes = 0;
+    for (k = 0; k < VW * VH; k++) {
+        pat[4 * k] = (uint8_t)(k * 7 + 1);
+        pat[4 * k + 1] = (uint8_t)(k * 13 + 2);
+        pat[4 * k + 2] = (uint8_t)(k * 29 + 3);
+        pat[4 * k + 3] = 255;
+    }
+    glGenFramebuffersEXT(1, &fbo);
+    for (i = 0; i < N; i++) {
+        t[i] = fb_tex(GL_TEXTURE_2D, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, TW, TH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t[i], 0);
+        fb_view(TW, TH);
+        glColor3f(1, 0, 0);
+        quad(0, 0, TW, TH, 0);
+        glFinish();
+        fb_back();
+        v[i] = fb_tex(GL_TEXTURE_2D, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, VW, VH, 0, GL_RGBA, GL_UNSIGNED_BYTE, pat);
+    }
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+    for (i = 0; i < N; i++) {
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t[i], 0);
+        fb_view(TW, TH);
+        glColor3f(0, 1, 0);
+        quad(0, 0, TW, TH, 0);
+        glFlush();
+    }
+    for (i = 0; i < N; i++) {
+        int n = 0;
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, v[i], 0);
+        memset(got, 0xA5, sizeof got);
+        glReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        for (k = 0; k < VW * VH * 4; k++) n += got[k] != pat[k];
+        imgs += n != 0;
+        bytes += n;
+    }
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t[N - 1], 0);
+    fb_view(TW, TH);
+    px(10, 14, "the last 21 x 29 target: green", 0, 255, 0, 255);
+    px(20, 28, "its top-right pixel: green", 0, 255, 0, 255);
+    fb_back();
+    g_checks++;
+    if (imgs) {
+        g_bad++;
+        printf("FAIL %d of %d textures after 21 x 29 targets changed (%d bytes)\n", imgs, N, bytes);
+    }
+    glDeleteFramebuffersEXT(1, &fbo);
+    glDeleteTextures(N, t);
+    glDeleteTextures(N, v);
+    plain();
+}
+
 static void test_blit(void)
 {
     GLuint src, dst, fbo[2], ds, dd;
@@ -4883,6 +4946,7 @@ static void test_gaps(void)
     if (!p_Blit || !p_AttQ || !p_RbQ || !p_GenRb || !p_BindRb || !p_RbStore || !p_FbRb || !p_FbTex3) { g_bad++; printf("FAIL a framebuffer entry point is missing\n"); return; }
     SCENE(test_units());
     SCENE(test_fbo_targets());
+    SCENE(test_band_tail());
     SCENE(test_blit());
     SCENE(test_pbo());
     SCENE(test_lod_fs());

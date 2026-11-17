@@ -30,8 +30,10 @@
  *  14. draws that copy (the X server's way: a program that samples one image at a varying running one to one with
  *      the window position, quads of 16-bit positions), done as COPY_IMAGE: a rectangle, two in one draw, one cut by
  *      the scissor, a repeating tile (fract) that wraps on both axes, an image with alpha into an RGB one and back
- *      (alpha 1.0 survives), the same program magnified (drawn, not copied); 40 moves of a 374 x 298 window (into a
- *      temporary image and back, as the X server moves one) timed.
+ *      (alpha 1.0 survives), the same program magnified (drawn, not copied); with GL_NV_texture_barrier, two
+ *      rectangles moved over themselves inside one image (copies in the move's order) and a draw magnifying rows
+ *      of its own target into rows it reads (drawn from a copy taken before its pass); a copy into a whole-target
+ *      pass with a draw (drawn in it); 40 moves of a 374 x 298 window (into a temporary image and back) timed.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -1057,6 +1059,88 @@ int main(int argc, char **argv)
 		if (bad)
 			printf("  %d pixels wrong\n", bad);
 		check(&fails, !bad, "magnified 2x (drawn): each texel on 2 x 2 pixels", p + 4 * (170 * 256 + 10));
+
+		/* reading the image a draw renders into, as the X server moves a window with GL_NV_texture_barrier and
+		 * GL_MESA_tile_raster_order: two rectangles moved 3 right and 5 down over themselves (a copy, in the order
+		 * of the move), then a draw magnifying rows above it into rows it reads (drawn: from a copy of the image
+		 * taken before its pass) */
+		{
+			void (*barrier)(void) = (void (*)(void))eglGetProcAddress("glTextureBarrierNV");
+			const char *exts = (const char *)glGetString(GL_EXTENSIONS);
+			uint8_t *img = malloc(256 * 256 * 4), *want = malloc(256 * 256 * 4);
+			static const int moved[8] = { 40, 40, 140, 50, 30, 50, 150, 120 };
+			static const int mag2[4] = { 150, 150, 200, 200 };
+			GLuint t_self, fbo12;
+
+			check(&fails, exts && strstr(exts, "GL_NV_texture_barrier") && strstr(exts, "GL_MESA_tile_raster_order") &&
+			      barrier, "GL_NV_texture_barrier and GL_MESA_tile_raster_order offered", (const uint8_t *)"\0\0\0\0");
+			for (int y = 0; y < 256; y++) {
+				for (int x = 0; x < 256; x++) {
+					uint8_t *q = img + 4 * (y * 256 + x);
+
+					q[0] = x;
+					q[1] = y;
+					q[2] = (x ^ y) | 1;
+					q[3] = 255;
+				}
+			}
+			t_self = texture(256, 256, GL_RGBA, img, GL_NEAREST);
+			glGenFramebuffersEXT(1, &fbo12);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo12);
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_self, 0);
+			glViewport(0, 0, 256, 256);
+			if (barrier)
+				barrier();
+			COPY_DRAW(0, moved, 2, -3, -5, 256, 256, 256, 256);
+			if (barrier)
+				barrier();
+			COPY_DRAW(0, mag2, 1, 130, 130, 512, 512, 256, 256);   /* texel = (pixel + 130) / 2: rows 140..164 */
+			/* what GL gives: the move reads the image as it was, the magnification the image after the move */
+			memcpy(want, img, 256 * 256 * 4);
+			for (int b = 0; b < 2; b++)
+				for (int y = moved[4 * b + 1]; y < moved[4 * b + 3]; y++)
+					for (int x = moved[4 * b]; x < moved[4 * b + 2]; x++)
+						memcpy(want + 4 * (y * 256 + x), img + 4 * ((y - 5) * 256 + x - 3), 4);
+			memcpy(img, want, 256 * 256 * 4);
+			for (int y = 150; y < 200; y++)
+				for (int x = 150; x < 200; x++)
+					memcpy(want + 4 * (y * 256 + x), img + 4 * (((y + 130) / 2) * 256 + (x + 130) / 2), 4);
+			memset(p, 0xA5, 256 * 256 * 4);
+			glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, p);
+			{
+				int bad_mv = 0, bad_mag = 0, bad_rest = 0, fx = -1, fy = -1;
+
+				for (int y = 0; y < 256; y++) {
+					for (int x = 0; x < 256; x++) {
+						const uint8_t *q = p + 4 * (y * 256 + x), *e = want + 4 * (y * 256 + x);
+						int in_mv = (x >= 40 && x < 140 && y >= 40 && y < 50) || (x >= 30 && x < 150 && y >= 50 && y < 120);
+						int in_mag = x >= 150 && x < 200 && y >= 150 && y < 200;
+						int ok = in_mag ? near(q, e[0], e[1], e[2], 1) : !memcmp(q, e, 4);
+
+						if (!ok && fx < 0) {
+							fx = x;
+							fy = y;
+						}
+						if (!ok && in_mv)
+							bad_mv++;
+						else if (!ok && in_mag)
+							bad_mag++;
+						else if (!ok)
+							bad_rest++;
+					}
+				}
+				if (bad_mv || bad_mag || bad_rest)
+					printf("  wrong: %d moved, %d magnified, %d elsewhere; the first at (%d, %d)\n", bad_mv, bad_mag,
+					       bad_rest, fx, fy);
+				check(&fails, !bad_mv, "two rectangles moved over themselves: exact", p + 4 * (60 * 256 + 60));
+				check(&fails, !bad_mag, "a draw reading rows of its own target: the image before", p + 4 * (180 * 256 + 180));
+				check(&fails, !bad_rest, "the rest of the image unchanged", p + 4 * (220 * 256 + 20));
+			}
+			glDeleteFramebuffersEXT(1, &fbo12);
+			glDeleteTextures(1, &t_self);
+			free(img);
+			free(want);
+		}
 
 		/* moves of an xterm-sized window inside an 800 x 600 image */
 		glBindTexture(GL_TEXTURE_2D, t_dst);

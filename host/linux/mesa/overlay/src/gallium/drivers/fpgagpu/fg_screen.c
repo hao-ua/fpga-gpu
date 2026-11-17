@@ -375,6 +375,13 @@ fg_init_screen_caps(struct fg_screen *screen)
    /* texture transfers map the image (READ_IMAGE / WRITE_IMAGE), they are not blits */
    caps->texture_transfer_modes = 0;
 
+   /* reading what a draw renders into (the X server copies a window inside the screen image with these instead of
+    * through a temporary image): a barrier ends the pass (fg_texture_barrier), a draw reads its own target from a copy
+    * taken before its pass renders (fg_sample_handle), and a one-to-one copy is board B's COPY_IMAGE, exact where the
+    * two rectangles overlap; so every raster order gives what GL_MESA_tile_raster_order asks */
+   caps->texture_barrier = true;
+   caps->tile_raster_order = true;
+
    /* board B's memory is not host memory. Its BOs travel between users of this device as dma-bufs (DRM PRIME): without
     * the export bit GBM gives every surface a host-memory dumb buffer instead of an image; imports are how X and its
     * clients share buffers (DRI3) */

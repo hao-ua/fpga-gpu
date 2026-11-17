@@ -1071,7 +1071,9 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
          continue;
       }
       filter = view->u.tex.last_level > view->u.tex.first_level ? s->filter : s->filter_nomip;
-      h[15 + u] = fg_sample_handle(ctx, view->texture) | filter << 16 | s->wrap;
+      h[15 + u] = fg_sample_handle(ctx, view->texture,
+                                   view->texture == t->color || (t->shadow_of && view->texture == t->shadow_of)) |
+                  filter << 16 | s->wrap;
       fg_use_resource(ctx, view->texture);
    }
 
@@ -1711,6 +1713,27 @@ fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const
          return fg_copy_no(ctx, why);
    }
 
+   /* inside one image (a window moved within the screen) a rectangle must not overwrite another's source before that
+    * one is copied: they go in the direction of the move, the far rows first, then the far columns. Each copy is exact
+    * where its own two rectangles overlap (board B goes bottom-up for a copy down and reads a whole row first) */
+   if (src == dst && npieces > 1) {
+      for (unsigned i = 1; i < npieces; i++) {
+         struct fg_copy_piece p = pieces[i];
+         unsigned j = i;
+
+         while (j > 0) {
+            const struct fg_copy_piece *q = &pieces[j - 1];
+            int ky = p.dy - q->dy, kx = p.dx - q->dx;
+            bool before = ky ? (p.sy < p.dy ? ky > 0 : ky < 0) : (p.sx < p.dx ? kx > 0 : kx < 0);
+
+            if (!before)
+               break;
+            pieces[j] = *q;
+            j--;
+         }
+         pieces[j] = p;
+      }
+   }
    fg_copy_begin(ctx, src, dst);
    for (unsigned i = 0; i < npieces; i++) {
       const struct fg_copy_piece *p = &pieces[i];

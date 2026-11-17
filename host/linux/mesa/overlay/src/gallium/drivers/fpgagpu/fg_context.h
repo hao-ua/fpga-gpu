@@ -209,6 +209,13 @@ struct fg_context {
     * draw with a copying fragment program was drawn, and each copy, on stderr) */
    bool no_copy;
    bool debug_copy;
+
+   /* the fences of the last flushes that submitted work, a ring: the next such flush waits for the one flush_depth
+    * flushes back (FPGAGPU_FLUSH_DEPTH, default 4: the X server flushes a few times a window move; 0: no wait) */
+#define FG_FLUSH_RING 8
+   uint64_t flush_fence[FG_FLUSH_RING];
+   unsigned flush_n;          /* flushes recorded */
+   unsigned flush_depth;
 };
 
 static inline struct fg_context *
@@ -256,8 +263,9 @@ void fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsign
  * is open */
 void fg_copy_begin(struct fg_context *ctx, struct pipe_resource *src, struct pipe_resource *dst);
 void fg_copy_end(struct fg_context *ctx, struct pipe_resource *dst);
-/* the handle the TMU reads the image by: its tight-row copy when its rows are padded */
-uint16_t fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc);
+/* the handle the TMU reads the image by: its tight-row copy when its rows are padded, or when it is the pass's target
+ * (snapshot) */
+uint16_t fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc, bool snapshot);
 
 /* region passes: whether the open target may have one; a draw's or clear's pixels b (x0, y0, x1, y1 in the target)
  * admitted before anything of it is sent (it may end the pass first, or fix the origin); what it reached added after */

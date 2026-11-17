@@ -241,9 +241,17 @@ counters and the last STATUS.
   - Moves still lagged with bigger windows. Since 2026-11-17 Mesa does a draw that copies an image one to one as
     board B's COPY_IMAGE (~9 ns a copied pixel; `host/linux/mesa/README.md`, Copies): X's window copies and tiles all
     became copies (190 in 10 moves, none drawn). 30 moves, until the boards were done: a 604 x 394 xterm 546 -> 279
-    ms, a 364 x 264 one 264 -> 151 ms (the moves themselves take 140 ms). What remains a move: X copies the window
+    ms, a 364 x 264 one 264 -> 151 ms (the moves themselves take 140 ms). What remained a move: X copied the window
     into a temporary image and back (no GL_NV_texture_barrier: two copies), and the strip a move uncovers is
     composited into a temporary of its bounds (glamor's composite program, a pass of ~613 x 428) before it is copied.
+  - Big windows still trailed the pointer while dragged: X does not wait for the boards, so moves queued behind
+    each other (a 604 x 394 xterm dragged 60 steps at ~110 a second: the boards finished 122-135 ms after the
+    pointer stopped). Since 2026-11-17 a flush that submitted work waits for the one four flushes back
+    (`FPGAGPU_FLUSH_DEPTH`, 0 = no wait), and Mesa offers GL_NV_texture_barrier and GL_MESA_tile_raster_order, so
+    glamor copies a window inside the screen image directly (one COPY_IMAGE instead of two; README, Copies). The same
+    drag: the boards done 14-16 ms after the pointer stopped; 30 moves of that xterm one after another 303 ms (279
+    before, with the backlog; without the wait 208). Depth 1 / 2 / 4 measured: 513 / 383 / 302 ms (the X server
+    flushes a few times a move). Left a move: the uncovered strip's pass of ~613 x 428.
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.

@@ -87,6 +87,18 @@ This is how the X server copies (glamor's copy and tile programs): 30 moves of a
 the boards were done instead of 546, of a 364 x 264 one 151 ms instead of 264 (`fg_egl_gl` test 14).
 `FPGAGPU_NOCOPY=1` turns it off; `FPGAGPU_DEBUG_COPY=1` prints each copy, and why a copying draw was drawn.
 
+Reading the target: GL_NV_texture_barrier and GL_MESA_tile_raster_order are offered, so the X server copies a window
+inside the screen image directly instead of through a temporary image. A barrier ends the pass. A copy inside one
+image is exact where its rectangles overlap (board B goes bottom-up for a copy down and reads a row before writing
+it), and the rectangles of one draw go in the move's direction, the far rows first. A draw that is no copy and samples
+its own target reads a copy of it taken once a pass, before the pass renders (the tight-row copy's mechanism), since
+board B rewrites the target band by band while the pass's fragments read it; so any raster order gives what the
+extension asks (`fg_egl_gl` test 14).
+
+Flushes: a flush that submitted work waits for the one four flushes back (`FPGAGPU_FLUSH_DEPTH`, 0 = no wait), so a
+process that makes work faster than the boards do it does not queue it ever deeper (a dragged window trailed the
+pointer by ~130 ms; now ~15 ms). A flush at the end of a frame also waits for the frame before (one frame in flight).
+
 Not yet: copies between buffers and images, mipmap generation, queries, instancing, importing buffers,
 rendering into a level or layer above 0 or a target wider than 1280, more than one context drawing at a time.
 

@@ -372,7 +372,8 @@ fg_emit_flush(struct fg_context *ctx, uint32_t flags, const struct fg_flush_rect
 }
 
 /* the boards' render state for this process until the pass ends (another process's pass would land in the middle of
- * one that takes several SUBMITs); what another process sent since this one last held it replaced its state */
+ * one that takes several SUBMITs); what another process sent since this one last held it replaced its state. After a
+ * board's restart (state_lost 2) the board memory is empty too: the programs are placed again as well */
 static void
 fg_pass_take(struct fg_context *ctx, bool take)
 {
@@ -383,7 +384,9 @@ fg_pass_take(struct fg_context *ctx, bool take)
 
    if (drmIoctl(fg_screen(ctx->base.screen)->fd, DRM_IOCTL_FPGAGPU_PASS, &p))
       return;
-   if (take && p.state_lost)
+   if (take && p.state_lost == 2)
+      fg_hw_lost(ctx);
+   else if (take && p.state_lost)
       fg_hw_invalidate(ctx);
 }
 
@@ -705,6 +708,17 @@ fg_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence, unsigned f
    struct fg_screen *screen = fg_screen(pctx->screen);
 
    fg_context_flush_pending(ctx);
+   /* a process that makes work faster than the boards do it (the X server moves a window at every pointer motion, a
+    * big one costing board B several ms) would queue it ever deeper, and what shows would trail behind: a flush that
+    * submitted work waits for the one flush_depth flushes back, so the boards do those while the process makes the
+    * next */
+   if (ctx->flush_depth && ctx->submitted &&
+       (!ctx->flush_n || ctx->flush_fence[(ctx->flush_n - 1) % FG_FLUSH_RING] != ctx->last_fence)) {
+      if (ctx->flush_n >= ctx->flush_depth)
+         fg_wait_fence(screen, ctx->flush_fence[(ctx->flush_n - ctx->flush_depth) % FG_FLUSH_RING], FG_WAIT_NS);
+      ctx->flush_fence[ctx->flush_n % FG_FLUSH_RING] = ctx->last_fence;
+      ctx->flush_n++;
+   }
    if (flags & PIPE_FLUSH_END_OF_FRAME) {
       /* one frame in flight: board A bins the next while board B renders this one */
       if (ctx->frame_fence_valid)
@@ -846,15 +860,18 @@ fg_emit_copy_scaled(struct fg_context *ctx, struct pipe_resource *src, unsigned 
 /* the handle the TMU reads an image by. The TMU reads tight rows: an image whose rows are padded is read from its
  * tight-row copy, taken here when the image changed (every pass for a shared image). Board B copies at once and
  * renders at the FLUSH, so the copy lands under the pass's draws. A sampled D24S8 image is copied through its RGBA8
- * alias into an RGBA8 copy, which the fragment program reads the same way */
+ * alias into an RGBA8 copy, which the fragment program reads the same way. snapshot: the image is the pass's target,
+ * which board B rewrites band by band while the pass's fragments read it: they read that copy (taken once a pass, so
+ * what the image held before the pass), whatever its rows, and a draw that reads its own target overlapping where it
+ * writes gives what GL_MESA_tile_raster_order promises in any raster order */
 uint16_t
-fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc)
+fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc, bool snapshot)
 {
    struct fg_resource *r = fg_resource(prsc), *t;
    uint16_t src = r->sample_handle ? r->sample_handle : r->board_handle;
    uint32_t seq = p_atomic_read(&fg_screen(ctx->base.screen)->pass_seq);
 
-   if (r->pitch == prsc->width0 * fg_storage_bpp(r->fmt))
+   if (!snapshot && r->pitch == prsc->width0 * fg_storage_bpp(r->fmt))
       return src;
    if (!r->tight) {
       struct pipe_resource templ = *prsc;
@@ -1126,9 +1143,12 @@ fg_set_stream_output_targets(struct pipe_context *pctx, unsigned num_targets,
 {
 }
 
+/* what the draws before it wrote is to be read after it (GL_NV_texture_barrier): board B renders a pass at its FLUSH,
+ * so the pass ends here */
 static void
 fg_texture_barrier(struct pipe_context *pctx, unsigned flags)
 {
+   fg_end_pass(fg_context(pctx));
 }
 
 static void
@@ -1201,6 +1221,7 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    ctx->no_region = debug_get_bool_option("FPGAGPU_NOREGION", false);
    ctx->no_copy = debug_get_bool_option("FPGAGPU_NOCOPY", false);
    ctx->debug_copy = debug_get_bool_option("FPGAGPU_DEBUG_COPY", false);
+   ctx->flush_depth = MIN2(debug_get_num_option("FPGAGPU_FLUSH_DEPTH", 4), FG_FLUSH_RING - 1);
    ctx->cl_depth = 0xFFFFFF;
    ctx->cl_smask = 0xFF;
    ctx->next_id = 1;

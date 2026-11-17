@@ -675,7 +675,9 @@ typedef struct {
    int svcap;
    double *pool; /* 4 doubles a vector */
    int npool, poolcap;
-   int *pool_vec, *pool_sca; /* the register a pool vector was loaded into, as a vector / as a scalar (0 = none) */
+   int *pool_vec;            /* the register a pool vector was loaded into as a vector (0 = none) */
+   int *pool_sca;            /* 4 a vector: the register a lane was loaded into as a scalar (0 = none) */
+   int *pool_lanes;          /* the lanes scalar constants packed into a vector have taken (0: a vector constant) */
    int *defs;                /* nir_def index -> register */
    int ndefs;
    int labels;
@@ -730,58 +732,114 @@ static int vreg(fgc *c, bool scalar)
    return n;
 }
 
-static int kload(fgc *c, double x, double y, double z, double w, bool scalar)
+/* a new pool vector (x, y, z, w); lanes: the lanes packed scalars take of it (0: a vector constant) */
+static int pool_add(fgc *c, double x, double y, double z, double w, int lanes)
+{
+   if (c->npool == c->poolcap) {
+      int cap = c->poolcap ? c->poolcap * 2 : 64;
+      double *np = (double *)sh_alloc(c->h, (size_t)cap * 4 * sizeof(double));
+      int *nv = (int *)sh_zalloc(c->h, (size_t)cap * sizeof(int));
+      int *ns = (int *)sh_zalloc(c->h, (size_t)cap * 4 * sizeof(int));
+      int *nl = (int *)sh_zalloc(c->h, (size_t)cap * sizeof(int));
+
+      if (c->npool) {
+         memcpy(np, c->pool, (size_t)c->npool * 4 * sizeof(double));
+         memcpy(nv, c->pool_vec, (size_t)c->npool * sizeof(int));
+         memcpy(ns, c->pool_sca, (size_t)c->npool * 4 * sizeof(int));
+         memcpy(nl, c->pool_lanes, (size_t)c->npool * sizeof(int));
+      }
+      c->pool = np;
+      c->pool_vec = nv;
+      c->pool_sca = ns;
+      c->pool_lanes = nl;
+      c->poolcap = cap;
+   }
+   c->pool[4 * c->npool] = x;
+   c->pool[4 * c->npool + 1] = y;
+   c->pool[4 * c->npool + 2] = z;
+   c->pool[4 * c->npool + 3] = w;
+   c->pool_lanes[c->npool] = lanes;
+   return c->npool++;
+}
+
+/* a vector constant: a parameter vector of its own (one holding the same four values shared; not one scalars are
+ * packed into, whose free lanes may still change) */
+static int kload(fgc *c, double x, double y, double z, double w)
 {
    int i, slot = -1, r;
 
    for (i = 0; i < c->npool; i++) {
       const double *p = &c->pool[4 * i];
 
-      if (p[0] == x && p[1] == y && p[2] == z && p[3] == w) {
+      if (!c->pool_lanes[i] && p[0] == x && p[1] == y && p[2] == z && p[3] == w) {
          slot = i;
          break;
       }
    }
-   if (slot < 0) {
-      if (c->npool == c->poolcap) {
-         int cap = c->poolcap ? c->poolcap * 2 : 64;
-         double *np = (double *)sh_alloc(c->h, (size_t)cap * 4 * sizeof(double));
-         int *nv = (int *)sh_zalloc(c->h, (size_t)cap * sizeof(int));
-         int *ns = (int *)sh_zalloc(c->h, (size_t)cap * sizeof(int));
-
-         if (c->npool) {
-            memcpy(np, c->pool, (size_t)c->npool * 4 * sizeof(double));
-            memcpy(nv, c->pool_vec, (size_t)c->npool * sizeof(int));
-            memcpy(ns, c->pool_sca, (size_t)c->npool * sizeof(int));
-         }
-         c->pool = np;
-         c->pool_vec = nv;
-         c->pool_sca = ns;
-         c->poolcap = cap;
-      }
-      c->pool[4 * c->npool] = x;
-      c->pool[4 * c->npool + 1] = y;
-      c->pool[4 * c->npool + 2] = z;
-      c->pool[4 * c->npool + 3] = w;
-      slot = c->npool++;
-   }
-   if (!c->remat) {
-      r = scalar ? c->pool_sca[slot] : c->pool_vec[slot];
-      if (r)
-         return r;
-   }
-   r = vreg(c, scalar);
+   if (slot < 0)
+      slot = pool_add(c, x, y, z, w, 0);
+   if (!c->remat && c->pool_vec[slot])
+      return c->pool_vec[slot];
+   r = vreg(c, false);
    emit(c, "LDP r%d @%d", r, slot);
-   if (!c->remat) {
-      if (scalar)
-         c->pool_sca[slot] = r;
-      else
-         c->pool_vec[slot] = r;
-   }
+   if (!c->remat)
+      c->pool_vec[slot] = r;
    return r;
 }
 
-static int kf(fgc *c, double f) { return kload(c, f, f, f, f, true); }
+/* a scalar constant: any lane of the pool that holds it, else the next free lane of a vector scalars are packed into
+ * (four to a parameter vector: the fragment core has 64, uniforms included), read with that lane broadcast. 0 and 1
+ * are vectors of their own, all four lanes, which the optimizer's compare folding recognises */
+static int kf(fgc *c, double f)
+{
+   static const char *bcast[4] = { "xxxx", "yyyy", "zzzz", "wwww" };
+   int i, k, slot = -1, lane = 0, r;
+
+   if (f == 0.0 || f == 1.0) {
+      for (i = 0; i < c->npool && slot < 0; i++) {
+         const double *p = &c->pool[4 * i];
+
+         if (!c->pool_lanes[i] && p[0] == f && p[1] == f && p[2] == f && p[3] == f)
+            slot = i;
+      }
+      if (slot < 0)
+         slot = pool_add(c, f, f, f, f, 0);
+      if (!c->remat && c->pool_sca[4 * slot])
+         return c->pool_sca[4 * slot];
+      r = vreg(c, true);
+      emit(c, "LDP r%d @%d", r, slot);
+      if (!c->remat)
+         c->pool_sca[4 * slot] = r;
+      return r;
+   }
+   for (i = 0; i < c->npool && slot < 0; i++) {
+      int n = c->pool_lanes[i] ? c->pool_lanes[i] : 4;
+
+      for (k = 0; k < n; k++) {
+         if (c->pool[4 * i + k] == f) {
+            slot = i;
+            lane = k;
+            break;
+         }
+      }
+   }
+   for (i = 0; i < c->npool && slot < 0; i++) {
+      if (c->pool_lanes[i] && c->pool_lanes[i] < 4) {
+         slot = i;
+         lane = c->pool_lanes[i]++;
+         c->pool[4 * i + lane] = f;
+      }
+   }
+   if (slot < 0)
+      slot = pool_add(c, f, 0.0, 0.0, 0.0, 1);
+   if (!c->remat && c->pool_sca[4 * slot + lane])
+      return c->pool_sca[4 * slot + lane];
+   r = vreg(c, true);
+   emit(c, "LDP r%d @%d.%s", r, slot, bcast[lane]);
+   if (!c->remat)
+      c->pool_sca[4 * slot + lane] = r;
+   return r;
+}
 
 static int def_reg(fgc *c, const nir_def *d)
 {
@@ -1027,7 +1085,7 @@ static void emit_ldv(fgc *c, const nir_def *d, unsigned idx, unsigned first)
 
 static void emit_zero_def(fgc *c, const nir_def *d)
 {
-   set_def(c, d, d->num_components == 1 ? kf(c, 0.0) : kload(c, 0, 0, 0, 0, false));
+   set_def(c, d, d->num_components == 1 ? kf(c, 0.0) : kload(c, 0, 0, 0, 0));
 }
 
 static void emit_fs_input(fgc *c, nir_intrinsic_instr *in, unsigned loc)
@@ -1441,7 +1499,7 @@ static void emit_block(fgc *c, nir_block *block)
             fail(c, "a constant that is not 32-bit", NULL);
          for (i = 0; i < n && i < 4; i++)
             v[i] = lc->value[i].f32;
-         set_def(c, &lc->def, n == 1 ? kf(c, v[0]) : kload(c, v[0], v[1], v[2], v[3], false));
+         set_def(c, &lc->def, n == 1 ? kf(c, v[0]) : kload(c, v[0], v[1], v[2], v[3]));
          break;
       }
       case nir_instr_type_undef:
@@ -1516,12 +1574,12 @@ static void emit_outputs(fgc *c)
    int i;
 
    if (c->fs) {
-      emit(c, "STO 0 r%d", c->color ? c->color : kload(c, 0, 0, 0, 0, false));
+      emit(c, "STO 0 r%d", c->color ? c->color : kload(c, 0, 0, 0, 0));
       if (c->depth)
          emit(c, "STOZ r%d", c->depth);
       return;
    }
-   emit(c, "STO 0 r%d", c->pos ? c->pos : kload(c, 0, 0, 0, 1, false));
+   emit(c, "STO 0 r%d", c->pos ? c->pos : kload(c, 0, 0, 0, 1));
    if (c->psize)
       emit(c, "STO 1 r%d", c->psize);
    for (i = 0; i < FG_VARYINGS; i++)

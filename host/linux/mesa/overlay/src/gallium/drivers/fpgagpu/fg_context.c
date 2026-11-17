@@ -1700,6 +1700,7 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 {
    struct fg_context *ctx = CALLOC_STRUCT(fg_context);
    struct pipe_context *pctx;
+   int64_t prog_kb;
 
    if (!ctx)
       return NULL;
@@ -1715,8 +1716,10 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    ctx->cl_smask = 0xFF;
    ctx->next_id = 1;
 
-   if (!fg_ctx_bo_create(ctx, &ctx->prog_a, FPGAGPU_BO_A_BUFFER, FG_PROG_A_BYTES) ||
-       !fg_ctx_bo_create(ctx, &ctx->prog_b, FPGAGPU_BO_B_BUFFER, FG_PROG_B_BYTES) ||
+   /* (FPGAGPU_PROG_KB: program buffers of that many KB, to see them fill and start again) */
+   prog_kb = debug_get_num_option("FPGAGPU_PROG_KB", 0);
+   if (!fg_ctx_bo_create(ctx, &ctx->prog_a, FPGAGPU_BO_A_BUFFER, prog_kb > 0 ? prog_kb * 1024 : FG_PROG_A_BYTES) ||
+       !fg_ctx_bo_create(ctx, &ctx->prog_b, FPGAGPU_BO_B_BUFFER, prog_kb > 0 ? prog_kb * 1024 : FG_PROG_B_BYTES) ||
        !fg_ctx_bo_create(ctx, &ctx->ring, FPGAGPU_BO_A_BUFFER, FG_RING_BYTES)) {
       fg_ctx_bo_destroy(ctx, &ctx->prog_a);
       fg_ctx_bo_destroy(ctx, &ctx->prog_b);

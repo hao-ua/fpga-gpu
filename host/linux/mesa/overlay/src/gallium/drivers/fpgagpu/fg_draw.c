@@ -547,10 +547,8 @@ fg_place(struct fg_context *ctx, struct fg_ctx_bo *bo, const struct fg_program *
 
    if (*off != ~0u && *gen == ctx->prog_gen)
       return true;
-   if (a + bytes > bo->size) {
-      FG_NOTE_ONCE("reusing program memory (the context's program buffer is full)");
+   if (a + bytes > bo->size)
       return false;
-   }
    fg_write_buffer(ctx, bo, a, p->words, bytes);
    bo->used = a + bytes;
    *off = a;
@@ -857,8 +855,23 @@ fg_hw_draw(struct fg_context *ctx, const struct fg_hw_draw *d, unsigned mode, ui
    fg_pass_open(ctx);
    fg_claim_boards(ctx);
    if (!fg_place(ctx, &ctx->prog_a, &vs->prog, &vs_off, &vs_gen) ||
-       !fg_place(ctx, &ctx->prog_b, &fs->prog, &fs_off, &fs_gen))
-      return;
+       !fg_place(ctx, &ctx->prog_b, &fs->prog, &fs_off, &fs_gen)) {
+      /* a program buffer is full: once the boards are done with what was sent, every program is placed again from the
+       * start (the pass ends first, the draw ids start again, board A's program is sent again) */
+      if (vs->prog.nwords * 8 > ctx->prog_a.size || fs->prog.nwords * 8 > ctx->prog_b.size)
+         return;
+      fg_ids_restart(ctx);
+      if (ctx->submitted)
+         fg_wait_fence(fg_screen(ctx->base.screen), ctx->last_fence, FG_WAIT_NS);
+      ctx->prog_a.used = ctx->prog_b.used = 0;
+      ctx->prog_gen++;
+      ctx->hw_prog = NULL;
+      fg_pass_open(ctx);
+      fg_claim_boards(ctx);
+      if (!fg_place(ctx, &ctx->prog_a, &vs->prog, &vs_off, &vs_gen) ||
+          !fg_place(ctx, &ctx->prog_b, &fs->prog, &fs_off, &fs_gen))
+         return;
+   }
    ((struct fg_vs_state *)vs)->off = vs_off;
    ((struct fg_vs_state *)vs)->off_gen = vs_gen;
    ((struct fg_fs_variant *)fs)->off = fs_off;
@@ -1090,9 +1103,10 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
       fg_use_resource(ctx, view->texture);
    }
 
-   /* board A clips x and y only at its guard band: the scissor keeps a draw to its viewport (a point goes by near
-    * and far only) */
-   if (mode != MESA_PRIM_POINTS) {
+   /* board A clips x and y only at its guard band: the scissor keeps a draw to its viewport. Points too: one whose
+    * centre lies a little outside has the fragments of it inside the viewport, none outside (what dEQP's reference
+    * draws; board A clips points by near and far only) */
+   {
       double sx = fabs(vp->scale[0]), sy = fabs(vp->scale[1]);
       int x0 = (int)ceil(vp->translate[0] - sx - 0.5) - ox, y0 = (int)ceil(vp->translate[1] - sy - 0.5) - oy;
       int x1 = (int)ceil(vp->translate[0] + sx - 0.5) - ox, y1 = (int)ceil(vp->translate[1] + sy - 0.5) - oy;

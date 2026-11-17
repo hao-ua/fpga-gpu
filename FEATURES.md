@@ -18,6 +18,8 @@ only what the hardware can do exactly, or what the PC can do exactly beside it; 
 - **Coarse depth:** quads that board B's depth test would drop are not sent. A keeps a
   conservative depth bound per 4×2 block of each band from the draws' flags (a promise about each draw's depth state, sent
   by the libraries); the image is unchanged. A triangle's setup goes to B only in a band where it sends a quad.
+- **Band skipping:** bands with nothing to draw that the pass's clear does not reach are neither loaded nor written, so a
+  pass that redraws a small part of a kept target costs only the bands it touches.
 
 ### Fragments, depth and stencil (board B)
 - **Depth and stencil:**

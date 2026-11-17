@@ -26,7 +26,7 @@ The Python tools run from `host/fb` (Python 3, standard library).
 
 | test | command | what it measures |
 |---|---|---|
-| **fb_bench** | `python3 fb_bench.py --mode M --secs 3 [--only a,b]` | 18 rates, each printed as a RESULT line and a PROFILE line (see below). About 1 min per mode. |
+| **fb_bench** | `python3 fb_bench.py --mode M --secs 3 [--only a,b]` | 21 rates, each printed as a RESULT line and a PROFILE line (see below). About 1 min per mode. |
 | **fb_cube** | `python3 fb_cube.py --check`; `--cubes N --nohold --secs 6` | exactness against the model (32 cubes, held to vsync); throughput |
 | **fb_texperf** | `python3 fb_texperf.py --all --mode M [--check]` | 21 texture cases, cycles per quad; 6 s per case |
 | **fb_shader** | `python3 fb_shader.py --shader raymarch\|spiral\|heart --mode M` | fragment-shader-bound full-screen scenes |
@@ -47,6 +47,8 @@ The Python tools run from `host/fb` (Python 3, standard library).
 - **textures:** tex1 nearest / bilinear / trilinear, tex2, tex4, tex8;
 - **ALU:** alu_16, alu_64;
 - **triangles:** tri_culled, tri_8px, tri_32px, tri_128px, tri_512px;
+- **partial redraws:** partial_2bands, partial_8bands (a full-width strip of 16 / 64 rows into a target that is not
+  cleared), flush_empty (no draw, no clear): ms per pass with band skipping, `--no-skip` for every band walked;
 - **host transfer:** upload and read-back.
 
 Each test prints a **RESULT** line with fps, the rate, B's frame ms, A's geometry ms and the walk's band visits. Its
@@ -106,7 +108,8 @@ wait ms.
 - **blocks lowered:** the coarse-depth bounds that opaque draws lowered.
 
 The two board-A features have switches in the libraries, both on by default: `GPU2_COARSE_Z=0` (no culling) and
-`GPU2_LAZY_TRI=0` (every TRI item sent); the line names the one that is off.
+`GPU2_LAZY_TRI=0` (every TRI item sent); the line names the one that is off. The line ends with the **bands left out**
+per frame (STATUS layout 13; `GPU2_SKIP_BANDS=0` walks every band).
 
 ## Latest results
 

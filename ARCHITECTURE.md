@@ -72,6 +72,10 @@ texture unit.
     edge values B forms; each draw's flags (VS_STATE, set by the libraries from its depth state) say what may be culled.
   - **Lazy TRI items:** a primitive's setup goes to B only in front of its first quad that is sent in a band.
   - Both are switched by the libraries (`GPU2_COARSE_Z`, `GPU2_LAZY_TRI`, on by default) and counted in STATUS.
+  - **Band skipping** (FLUSH flags bit 10): a band with an empty bin list that the pass's clear does not reach is left
+    out, so B neither loads nor writes it. A pass that draws into a few bands of a target it keeps costs those bands.
+    Each BAND item names the next band walked, so B preloads the right one. The libraries set the bit when both boards
+    report it (`GPU2_SKIP_BANDS=0` turns it off); STATUS counts the bands left out.
 - **`mem_arb`:** 5 read and 4 write ports onto the DDR3 controller.
 
 ## 3. Board B — fragments, images and display
@@ -203,12 +207,13 @@ texture unit.
 - **Bands:** 8 pixel rows for targets up to 1024 wide, 4 rows above that, up to 1280 wide.
 - **B's band buffer:**
   - Three banks of 4096 cells. A cell is 2 pixels of colour, depth, stencil and an epoch.
-  - The next band is loaded while the current one renders.
+  - The next band is loaded while the current one renders: the one its BAND item names, else the band below.
   - A D24S8 target is loaded and flushed per band, so depth and stencil persist between passes.
 - **Render stream:** 64-bit beats.
   - QUAD items take 1 beat.
   - TRI items take 13 + 5 per varying beats.
-  - BAND, FRAME_END and NOP mark the structure.
+  - BAND, FRAME_END and NOP mark the structure. A BAND item carries its first row and the first row of the next band
+    walked.
 
 ## 9. Clocks and resources
 

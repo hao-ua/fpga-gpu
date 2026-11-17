@@ -1699,6 +1699,131 @@ int main(int argc, char **argv)
 		glDeleteQueries(1, &q);
 		check(&fails, !bad, "occlusion queries: 1 with a draw, 0 without", (const uint8_t *)"\0\0\0\0");
 
+		/* board B renders targets at most 1280 wide: a wider attachment makes the framebuffer unsupported */
+		{
+			GLuint t_w[2];
+			GLenum st[2];
+
+			glGenTextures(2, t_w);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo17[0]);
+			for (int k = 0; k < 2; k++) {
+				glBindTexture(GL_TEXTURE_2D, t_w[k]);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, k ? 2048 : 1280, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+				glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_w[k], 0);
+				st[k] = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+			}
+			printf("  1280 x 16: 0x%04x, 2048 x 16: 0x%04x\n", st[0], st[1]);
+			check(&fails, st[0] == GL_FRAMEBUFFER_COMPLETE_EXT && st[1] == GL_FRAMEBUFFER_UNSUPPORTED_EXT,
+			      "1280 wide complete, 2048 wide unsupported", (const uint8_t *)"\0\0\0\0");
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, 0, 0);
+			glDeleteTextures(2, t_w);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		}
+
+		/* scissored stencil clears in a framebuffer whose stencil is a stencil-only renderbuffer and in one with a packed
+		 * depth-stencil one: the whole of it 0, (8..40, 16..112) 1, (16..112, 32..96) 2; then red where 1, green where
+		 * 2, blue where 0 */
+		for (int k = 0; k < 2; k++) {
+			GLuint rbs[2];
+			int bad_s = 0;
+
+			glGenRenderbuffersEXT(2, rbs);
+			glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rbs[0]);
+			glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, 128, 128);
+			glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rbs[1]);
+			glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, k ? GL_DEPTH24_STENCIL8_EXT : GL_STENCIL_INDEX8_EXT, 128, 128);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo17[1]);
+			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rbs[0]);
+			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_STENCIL_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rbs[1]);
+			if (k)
+				glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rbs[1]);
+			glViewport(0, 0, 128, 128);
+			glClearColor(0, 0, 0, 1);
+			glClearStencil(0);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(8, 16, 32, 96);
+			glClearStencil(1);
+			glClear(GL_STENCIL_BUFFER_BIT);
+			glScissor(16, 32, 96, 64);
+			glClearStencil(2);
+			glClear(GL_STENCIL_BUFFER_BIT);
+			glDisable(GL_SCISSOR_TEST);
+			glEnable(GL_STENCIL_TEST);
+			glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+			for (int v = 0; v < 3; v++) {
+				glStencilFunc(GL_EQUAL, v, 0xFF);
+				glColor3f(v == 1, v == 2, v == 0);
+				quad(0, 0, 1, 1, 0);
+			}
+			glDisable(GL_STENCIL_TEST);
+			{
+				uint8_t *g = malloc(128 * 128 * 4);
+
+				memset(g, 0xA5, 128 * 128 * 4);
+				glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, g);
+				for (int y = 0; y < 128; y++)
+					for (int x = 0; x < 128; x++) {
+						int v = (x >= 16 && x < 112 && y >= 32 && y < 96) ? 2 :
+						        (x >= 8 && x < 40 && y >= 16 && y < 112) ? 1 : 0;
+
+						if (!near(g + 4 * (y * 128 + x), v == 1 ? 255 : 0, v == 2 ? 255 : 0, v == 0 ? 255 : 0, 0) &&
+						    !bad_s++)
+							printf("  %s: (%d, %d) = (%u, %u, %u), stencil %d\n", k ? "D24S8" : "S8", x, y,
+							       g[4 * (y * 128 + x)], g[4 * (y * 128 + x) + 1], g[4 * (y * 128 + x) + 2], v);
+					}
+				memcpy(got, g, 16);
+				free(g);
+			}
+			check(&fails, !bad_s, k ? "scissored stencil clears, packed depth-stencil" :
+			                          "scissored stencil clears, a stencil-only renderbuffer", got);
+			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_STENCIL_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, 0);
+			glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, 0);
+			glDeleteRenderbuffersEXT(2, rbs);
+		}
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+
+		/* depth into level 1 of a depth texture (32 x 32): a near red quad over the left half, then a far green one
+		 * over all of it with GL_LESS: left red, right green */
+		{
+			GLuint t_d, t_cd;
+
+			glGenTextures(1, &t_d);
+			glBindTexture(GL_TEXTURE_2D, t_d);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+			for (int l = 0; l < 7; l++)
+				glTexImage2D(GL_TEXTURE_2D, l, GL_DEPTH_COMPONENT, 64 >> l, 64 >> l, 0, GL_DEPTH_COMPONENT,
+				             GL_UNSIGNED_INT, NULL);
+			t_cd = texture(32, 32, GL_RGBA, NULL, GL_NEAREST);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo17[0]);
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_cd, 0);
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D, t_d, 1);
+			bad = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) != GL_FRAMEBUFFER_COMPLETE_EXT;
+			glViewport(0, 0, 32, 32);
+			glClearColor(0, 0, 0, 1);
+			glClearDepth(1.0);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+			glEnable(GL_DEPTH_TEST);
+			glDepthFunc(GL_LESS);
+			glColor3f(1, 0, 0);
+			quad(0, 0, 0.5f, 1, 0.5f);
+			glColor3f(0, 1, 0);
+			quad(0, 0, 1, 1, -0.5f);
+			glDisable(GL_DEPTH_TEST);
+			memset(got, 0xA5, 32 * 32 * 4);
+			glReadPixels(0, 0, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, got);
+			for (int i = 0; i < 32 * 32; i++)
+				bad += (i % 32 < 16) ? !near(got + 4 * i, 255, 0, 0, 0) : !near(got + 4 * i, 0, 255, 0, 0);
+			check(&fails, !bad, "depth into level 1 of a depth texture: red | green", got + 4 * (16 * 32 + 8));
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D, 0, 0);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+			glViewport(0, 0, W, H);
+			glDeleteTextures(1, &t_d);
+			glDeleteTextures(1, &t_cd);
+		}
+
 		glMatrixMode(GL_PROJECTION);
 		glPopMatrix();
 		glMatrixMode(GL_MODELVIEW);

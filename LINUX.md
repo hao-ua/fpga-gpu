@@ -273,6 +273,15 @@ counters and the last STATUS.
     repeating texture as tiles where pieces would cost more, swizzles. 30 moves of the 604 x 394 xterm: the boards
     done 250 ms after they start, 18 ms after xdotool's 30 synced moves (232 ms): moves no longer wait for the boards.
     The 64 x 64 tile over 800 x 600: 3.56 ms (drawn before: 5.10). `FPGAGPU_NOCOPYEXT=1` for the old way.
+  - The rest of OpenGL ES 2.0 / OpenGL 2.0 (2026-11-17, `host/linux/mesa/README.md`): rendering into mip levels, cube
+    faces and layers (colour, depth, stencil) through shadows copied back after each pass; sampling from a base level
+    above 0 through a copy of those levels; Mesa's blitter for the blits the copy engine cannot do (linear, between
+    storage formats, blended, masked), and with it glGenerateMipmap; clears outside a pass as FILL_IMAGE; occlusion
+    queries by the Windows libraries' rule (0 counter bits, 1 when a draw ran); contexts of one process drawing at
+    once take turns; framebuffers with an attachment wider than 1280 unsupported. Checked by `fg_egl_gl` test 17,
+    `fg_egl_threads` and dEQP-GLES2 (built in the VM from VK-GL-CTS, the x11_egl target: pbuffers through X's
+    fpgagpu device; the surfaceless target finds no device, libdrm lists no platform device without device-tree
+    data).
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.

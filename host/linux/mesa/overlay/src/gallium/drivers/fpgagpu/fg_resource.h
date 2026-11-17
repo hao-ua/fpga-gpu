@@ -24,8 +24,9 @@ struct fg_format {
 };
 
 /* L8, A8, LA88, R8 and RG8 are stored as RGBA8 (L, L, L, 1), (0, 0, 0, A), (L, L, L, A), (R, 0, 0, 1), (R, G, 0, 1):
- * what the TMU reads is the format's */
-enum { FG_EXPAND_NONE, FG_EXPAND_L, FG_EXPAND_A, FG_EXPAND_LA, FG_EXPAND_R, FG_EXPAND_RG };
+ * what the TMU reads is the format's. Z16 is stored as D24S8 (board B loads and stores depth as D24S8 words only; a
+ * FLUSH with DEPTH16 keeps the depth there as 0 .. 65535) */
+enum { FG_EXPAND_NONE, FG_EXPAND_L, FG_EXPAND_A, FG_EXPAND_LA, FG_EXPAND_R, FG_EXPAND_RG, FG_EXPAND_Z16 };
 
 /* the channels of an expanded format that rendering writes (Gallium's mask order: R 1, G 2, B 4, A 8); the others
  * keep the values the format reads as */

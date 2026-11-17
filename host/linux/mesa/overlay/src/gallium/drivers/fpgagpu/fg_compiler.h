@@ -21,6 +21,7 @@ struct fg_compile_key {
    uint32_t noops;          /* the units this stage's core lacks, STATUS flags bits 30-31: bit 0 the integer divider, bit 1 SIN / COS */
    uint64_t vs_outputs;     /* fragment stage: fg_varying_mask() of the vertex stage it runs with */
    uint32_t depth_samplers; /* fragment stage: the units a depth texture is bound to (the TMU reads its D24S8 word) */
+   uint32_t depth16_samplers; /* of those, the ones whose word keeps a 16-bit depth (Z16: 0 .. 65535) */
    uint32_t shadow_func;    /* fragment stage: 3 bits a unit (units 0-7), a shadow read's compare function: 0 never,
                              * 1 less, 2 equal, 3 less-or-equal, 4 greater, 5 not equal, 6 greater-or-equal, 7 always */
    uint32_t swizzled;       /* fragment stage: the units whose texel is rearranged, as swizzle[unit] says */

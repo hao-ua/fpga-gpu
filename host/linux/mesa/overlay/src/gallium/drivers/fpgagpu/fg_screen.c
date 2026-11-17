@@ -265,9 +265,8 @@ fg_screen_is_format_supported(struct pipe_screen *pscreen, enum pipe_format form
       return false;
    if (f->depth) {
       /* a D24S8 image is sampled as its 32-bit word, which the fragment program turns into the depth (and compares,
-       * for a shadow sampler); a 16-bit depth has no such reading */
-      unsigned sampled = format == PIPE_FORMAT_Z24_UNORM_S8_UINT ?
-                         PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SAMPLER_VIEW_SUBOPTIMAL : 0;
+       * for a shadow sampler); Z16 is kept in such a word too, its depth 0 .. 65535 */
+      unsigned sampled = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SAMPLER_VIEW_SUBOPTIMAL;
 
       return !(usage & colour_binds & ~sampled);
    }
@@ -393,8 +392,9 @@ fg_init_screen_caps(struct fg_screen *screen)
    caps->min_line_width = caps->min_line_width_aa = 1.0f;
    caps->max_line_width = caps->max_line_width_aa = 64.0f;
    caps->line_width_granularity = 1.0f;
+   /* board A draws points of 1 .. 64 pixels, clamping gl_PointSize to that (a_setup) */
    caps->min_point_size = caps->min_point_size_aa = 1.0f;
-   caps->max_point_size = caps->max_point_size_aa = 1.0f;
+   caps->max_point_size = caps->max_point_size_aa = 64.0f;
    caps->point_size_granularity = 1.0f;
 
    caps->device_type = PIPE_DEVICE_TYPE_DISCRETE_GPU;

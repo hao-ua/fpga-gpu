@@ -1342,11 +1342,18 @@ static void emit_tex(fgc *c, nir_tex_instr *tex)
       emit(c, "MOV r%d r%d.y", g, r);
       emit(c, "MOV r%d r%d.z", b, r);
       emit(c, "MOV r%d r%d.w", a, r);
-      emit(c, "MUL r%d r%d r%d", z, g, kf(c, 0.99609375));
-      emit(c, "MUL r%d r%d r%d", q, b, kf(c, 0.003891));
-      emit(c, "ADD r%d r%d r%d", z, z, q);
-      emit(c, "MUL r%d r%d r%d", q, a, kf(c, 0.000016));
-      emit(c, "ADD r%d r%d r%d", z, z, q);
+      if (c->key->depth16_samplers & (1u << u)) {
+         /* a 16-bit depth: (B 256 + A) / 65535, the bytes read as / 255: 65280 / 65535 and 255 / 65535 */
+         emit(c, "MUL r%d r%d r%d", z, b, kf(c, 0.99610895));
+         emit(c, "MUL r%d r%d r%d", q, a, kf(c, 0.0038910506));
+         emit(c, "ADD r%d r%d r%d", z, z, q);
+      } else {
+         emit(c, "MUL r%d r%d r%d", z, g, kf(c, 0.99609375));
+         emit(c, "MUL r%d r%d r%d", q, b, kf(c, 0.003891));
+         emit(c, "ADD r%d r%d r%d", z, z, q);
+         emit(c, "MUL r%d r%d r%d", q, a, kf(c, 0.000016));
+         emit(c, "ADD r%d r%d r%d", z, z, q);
+      }
       emit(c, "MIN r%d r%d r%d", o, z, kf(c, 1.0));
       emit(c, "MOV r%d r%d", d, o);
       emit(c, "MOV.w r%d r%d", d, kf(c, 1.0));

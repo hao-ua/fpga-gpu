@@ -88,8 +88,18 @@ needs), copied back into the level and layer after each pass; the shadow takes t
 holds another or the image changed. The TMU starts at level 0 and reads the chain to its end: a view that starts at a
 higher level (GL_TEXTURE_BASE_LEVEL, a blit from a level) or a filtered chain cut short reads a copy of those levels
 of every layer, taken again when the image changed. `glGenerateMipmap` is Mesa's blit from each level to the next,
-linear 2:1: each texel the average of 2 x 2 (`fg_egl_gl` test 17). Depth or stencil of a level or layer above 0 is
-not rendered.
+linear 2:1: each texel the average of 2 x 2 (`fg_egl_gl` test 17). Depth and stencil of a level or layer above 0 (or
+of rows whose pitch is no multiple of 32 bytes) go through a shadow of their own the same way.
+
+Depth and stencil: board B loads and stores depth as D24S8 words only ({stencil, depth 24}); a FLUSH with DEPTH16
+keeps a 16-bit depth there as 0 .. 65535. Z16 is therefore a D24S8 image with DEPTH16 on its passes, converted on
+the PC in transfers (like L8 / A8 kept as RGBA8) and decoded as (B 256 + A) / 65535 when sampled. Board B also loads
+and stores a depth row in as many bursts as the colour row's times the bursts of a group (b_rop: twice an RGB565
+row), and takes a depth-stencil image of exactly the colour image's size: depth images get a pitch that is a multiple
+of 64 bytes (a narrower one, as for a mip level, goes through a shadow), and a bigger one is named by an alias of its
+top left corner. Without two-sided stencil back faces take the front's state and reference (Mesa's clear quads set
+the front reference alone: scissored stencil clears replaced the stencil with 0 where the quad was back-facing).
+Points: board A draws 1 .. 64 pixels and clamps gl_PointSize to that, the range reported.
 
 Clears outside a pass (`clear_render_target`, `clear_depth_stencil`, `clear_texture`) are FILL_IMAGE: the colour as
 the format stores it (an X format's alpha 1.0, an L / A / LA / R / RG format's fixed channels), depth rounded to its
@@ -148,8 +158,13 @@ contexts of one file: a context of the screen opening a pass waits until another
 kernel waits), and claims the boards inside its pass. Two threads drawing at once in two contexts with different
 programs drew wrong frames before (2 of 6 runs; `fg_egl_threads`), none since.
 
-Not yet: copies between buffers and images, instancing, importing buffers, depth or stencil of a level or layer above
-0, a target wider than 1280.
+Targets: board B renders at most 1280 wide. A framebuffer with a wider attachment (a texture level or a renderbuffer)
+is GL_FRAMEBUFFER_UNSUPPORTED, the spec's answer for what an implementation cannot render (`apply.sh` adds the check
+to Mesa's framebuffer validation for fpgagpu, as the Windows GLES library does; `fg_egl_gl` test 17).
+
+Not offered, so never asked of the driver at OpenGL 2.0 / ES 2.0: instancing and indirect draws (no extension for them
+is advertised; a draw of more than one instance would be drawn once), copies between a buffer and an image (pixel
+buffer objects go through maps), buffers imported from other processes.
 
 ## Apply and build
 

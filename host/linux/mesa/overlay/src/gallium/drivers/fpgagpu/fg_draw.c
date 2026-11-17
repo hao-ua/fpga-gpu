@@ -200,6 +200,7 @@ fg_create_dsa_state(struct pipe_context *pctx, const struct pipe_depth_stencil_a
    so->h2 = (uint32_t)b->valuemask << 8 | (uint32_t)b->writemask << 16 | (uint32_t)(b->func & 7) << 24;
    so->h3 = fg_stencil_op(f->fail_op) | fg_stencil_op(f->zfail_op) << 3 | fg_stencil_op(f->zpass_op) << 6 |
             fg_stencil_op(b->fail_op) << 16 | fg_stencil_op(b->zfail_op) << 19 | fg_stencil_op(b->zpass_op) << 22;
+   so->two_sided = cso->stencil[1].enabled;
    if (cso->alpha_enabled)
       FG_NOTE_ONCE("alpha test in the depth-stencil-alpha state");
    return so;
@@ -508,6 +509,8 @@ fg_fs_variant(struct fg_context *ctx, struct fg_fs_state *fs, const struct fg_vs
          continue;
       if (util_format_is_depth_or_stencil(view->texture->format))
          key.depth_samplers |= 1u << u;
+      if (view->texture->format == PIPE_FORMAT_Z16_UNORM)
+         key.depth16_samplers |= 1u << u;
       if (ctx->samplers[u] && ctx->samplers[u]->compare)
          key.shadow_func |= (uint32_t)(ctx->samplers[u]->compare - 1) << (3 * u);
       unsigned sw = view->swizzle_r | view->swizzle_g << 3 | view->swizzle_b << 6 | view->swizzle_a << 9;
@@ -1041,8 +1044,10 @@ fg_fill_state(struct fg_context *ctx, struct fg_hw_draw *d, const struct fg_fs_v
       h[0] |= 256u;
    if (rs->offset_tri)
       h[0] |= 512u;
+   /* (without a back-face state of their own back faces take the front's, its reference too: Mesa's clear quads set
+    * the front reference alone) */
    h[1] = dsa->h1 | CLAMP(ctx->stencil_ref.ref_value[0], 0, 255);
-   h[2] = dsa->h2 | CLAMP(ctx->stencil_ref.ref_value[1], 0, 255);
+   h[2] = dsa->h2 | CLAMP(ctx->stencil_ref.ref_value[dsa->two_sided ? 1 : 0], 0, 255);
    h[3] = dsa->h3;
    h[4] = ctx->blend->h4;
    h[5] = fg_c16(ctx->blend_color.color[0], t->bits[0]) | fg_c16(ctx->blend_color.color[1], t->bits[1]) << 13;

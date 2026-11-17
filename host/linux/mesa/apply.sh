@@ -151,5 +151,16 @@ edit("src/mesa/main/queryobj.c",
      ["      /* fpgagpu: no samples counter, but its queries say whether a draw ran (never 0 where samples passed) */",
       "      return !st->screen->caps.occlusion_query && strcmp(st->screen->get_name(st->screen), \"fpgagpu\") != 0;"],
      "replace")
+
+# fpgagpu's board B renders targets at most 1280 wide: a framebuffer with a wider attachment (a texture's level or a
+# renderbuffer) is GL_FRAMEBUFFER_UNSUPPORTED, the spec's answer for what an implementation cannot render
+edit("src/mesa/main/fbobject.c",
+     "   /* Only validate texture attachments for now, since",
+     ["   /* fpgagpu: board B renders targets at most 1280 wide */",
+      "   if (att->Renderbuffer && att->Renderbuffer->Width > 1280 &&",
+      "       strcmp(screen->get_name(screen), \"fpgagpu\") == 0)",
+      "      return GL_FALSE;",
+      ""],
+     "before")
 PY
 echo "done: configure with -Dgallium-drivers=fpgagpu,..."

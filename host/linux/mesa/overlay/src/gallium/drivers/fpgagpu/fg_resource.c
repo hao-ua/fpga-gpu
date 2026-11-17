@@ -41,13 +41,22 @@ static const struct fg_format fg_formats[] = {
    { PIPE_FORMAT_R8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 1, { 8, 0, 0, 0 }, false, false, FG_EXPAND_R },
    { PIPE_FORMAT_R8G8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 2, { 8, 8, 0, 0 }, false, false, FG_EXPAND_RG },
    { PIPE_FORMAT_Z24_UNORM_S8_UINT, FG_FMT_D24S8, FG_TF_RAW, 4, { 0, 0, 0, 0 }, false, true },
-   { PIPE_FORMAT_Z16_UNORM, FG_FMT_D16, FG_TF_RAW, 2, { 0, 0, 0, 0 }, false, true },
+   { PIPE_FORMAT_Z16_UNORM, FG_FMT_D24S8, FG_TF_RAW, 2, { 0, 0, 0, 0 }, false, true, FG_EXPAND_Z16 },
 };
 
-/* what an expanded format travels as */
+/* what an expanded format travels as: RGBA8, or (Z16) D24S8 words */
 static const struct fg_format fg_rgba8_wire = {
    PIPE_FORMAT_R8G8B8A8_UNORM, FG_FMT_RGBA8, FG_TF_RGBA8888, 4, { 8, 8, 8, 8 }, false, false, FG_EXPAND_NONE,
 };
+static const struct fg_format fg_d24s8_wire = {
+   PIPE_FORMAT_Z24_UNORM_S8_UINT, FG_FMT_D24S8, FG_TF_RAW, 4, { 0, 0, 0, 0 }, false, true, FG_EXPAND_NONE,
+};
+
+static const struct fg_format *
+fg_wire(const struct fg_format *f)
+{
+   return f->expand == FG_EXPAND_Z16 ? &fg_d24s8_wire : &fg_rgba8_wire;
+}
 
 /* RGBA8 and RGB565; and A8, R8, RG8, rendered with their own channels' writes into their RGBA8 storage, whose other
  * channels keep the values the format reads as */
@@ -60,7 +69,7 @@ fg_format_renderable(const struct fg_format *f)
           (f->storage == FG_FMT_RGBA8 || f->storage == FG_FMT_RGB565);
 }
 
-/* n pixels of an expanded format to RGBA8, and back */
+/* n pixels of an expanded format to RGBA8 (Z16: to D24S8 words, the depth 0 .. 65535, stencil 0), and back */
 static void
 fg_expand(const struct fg_format *f, const uint8_t *src, uint8_t *dst, size_t n)
 {
@@ -69,6 +78,7 @@ fg_expand(const struct fg_format *f, const uint8_t *src, uint8_t *dst, size_t n)
       uint8_t *d = dst + 4 * i;
 
       switch (f->expand) {
+      case FG_EXPAND_Z16: d[0] = s[0]; d[1] = s[1]; d[2] = d[3] = 0; break;
       case FG_EXPAND_A: d[0] = d[1] = d[2] = 0; d[3] = s[0]; break;
       case FG_EXPAND_L: d[0] = d[1] = d[2] = s[0]; d[3] = 255; break;
       case FG_EXPAND_LA: d[0] = d[1] = d[2] = s[0]; d[3] = s[1]; break;
@@ -89,7 +99,7 @@ fg_pack(const struct fg_format *f, const uint8_t *src, uint8_t *dst, size_t n)
       case FG_EXPAND_A: d[0] = s[3]; break;
       case FG_EXPAND_L: case FG_EXPAND_R: d[0] = s[0]; break;
       case FG_EXPAND_LA: d[0] = s[0]; d[1] = s[3]; break;
-      default: d[0] = s[0]; d[1] = s[1]; break;
+      default: d[0] = s[0]; d[1] = s[1]; break; /* RG8; Z16: the word's low 16 bits */
       }
    }
 }
@@ -175,11 +185,14 @@ fg_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * A single level that is only rendered into or scanned out gets a pitch that is a multiple of 32 bytes. A texture
     * that is also a render target keeps tight rows (the two agree when a row is a multiple of 32 bytes anyway); an
     * image with padded rows that is sampled after all (shared, scanned out, depth) is read from a tight-row copy */
+   /* (board B loads and stores a depth-stencil row in as many bursts as the colour target's row takes, times the bursts
+    * of a group: twice an RGB565 row's. A depth pitch that is a multiple of 64 holds that for a colour target of its
+    * width in either format) */
    row = templ->width0 * fg_storage_bpp(f);
    pitch = (levels > 1 || layers > 1 ||
             ((templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
              !(templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SHARED))))
-              ? row : align(row, 32);
+              ? row : align(row, f->depth ? 64 : 32);
 
    c.kind = FPGAGPU_BO_B_IMAGE;
    c.usage = FG_USE_SAMPLED | FG_USE_RT | FG_USE_TRANSFER;
@@ -640,7 +653,7 @@ fg_texture_unmap(struct pipe_context *pctx, struct pipe_transfer *ptransfer)
 
          if (wide) {
             fg_expand(rsc->fmt, t->staging, wide, n);
-            fg_write_image(ctx, rsc, &fg_rgba8_wire, ptransfer->level, b, wide, (uintptr_t)b->width * b->height * 4);
+            fg_write_image(ctx, rsc, fg_wire(rsc->fmt), ptransfer->level, b, wide, (uintptr_t)b->width * b->height * 4);
             free(wide);
          }
       } else {

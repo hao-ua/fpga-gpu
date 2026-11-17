@@ -370,6 +370,8 @@ fg_emit_flush(struct fg_context *ctx, uint32_t flags, const struct fg_flush_rect
    fg_use_resource(ctx, ctx->tgt.color);
    if (ctx->tgt.ds)
       fg_use_resource(ctx, ctx->tgt.ds);
+   if (ctx->tgt.ds_alias_gem)
+      fg_use_bo(ctx, ctx->tgt.ds_alias_gem);
 }
 
 /* the boards' render state for this process until the pass ends (another process's pass would land in the middle of
@@ -478,6 +480,11 @@ fg_end_pass(struct fg_context *ctx)
                    r.w, r.h);
       fg_resource(ctx->tgt.shadow_of)->initialized = true;
    }
+   if (ctx->tgt.ds_shadow_of) {
+      fg_emit_copy(ctx, ctx->tgt.ds, 0, 0, r.x, r.y, ctx->tgt.ds_shadow_of, ctx->tgt.ds_level, ctx->tgt.ds_layer, r.x,
+                   r.y, r.w, r.h);
+      fg_resource(ctx->tgt.ds_shadow_of)->initialized = true;
+   }
    fg_submit_stream(ctx);
    if (ctx->cl_flags & FG_FL_CLEAR_COLOR)
       fg_resource(ctx->tgt.color)->initialized = true;
@@ -495,6 +502,8 @@ fg_end_pass(struct fg_context *ctx)
       fg_resource_written(fg_resource(ctx->tgt.shadow_of));
    if (ctx->tgt.ds)
       fg_resource_written(fg_resource(ctx->tgt.ds));
+   if (ctx->tgt.ds_shadow_of)
+      fg_resource_written(fg_resource(ctx->tgt.ds_shadow_of));
    p_atomic_inc(&fg_screen(ctx->base.screen)->pass_seq);
    for (unsigned i = 0; i < ctx->npass_res; i++)
       pipe_resource_reference(&ctx->pass_res[i], NULL);
@@ -521,9 +530,9 @@ fg_target_hold(struct fg_context *ctx, const struct fg_target *t)
    ctx->tgt = t ? *t : (struct fg_target){ 0 };
    ctx->have_tgt = t != NULL;
    if (t) {
-      struct pipe_resource *hold[3] = { t->color, t->ds, t->shadow_of }, *p;
+      struct pipe_resource *hold[4] = { t->color, t->ds, t->shadow_of, t->ds_shadow_of }, *p;
 
-      for (unsigned i = 0; i < 3; i++) {
+      for (unsigned i = 0; i < 4; i++) {
          p = NULL;
          pipe_resource_reference(&p, hold[i]);    /* one more reference, kept by ctx->tgt */
       }
@@ -532,6 +541,7 @@ fg_target_hold(struct fg_context *ctx, const struct fg_target *t)
       pipe_resource_reference(&old.color, NULL);
       pipe_resource_reference(&old.ds, NULL);
       pipe_resource_reference(&old.shadow_of, NULL);
+      pipe_resource_reference(&old.ds_shadow_of, NULL);
    }
 }
 
@@ -546,7 +556,7 @@ fg_render_shadow(struct pipe_resource *c, unsigned level)
       struct pipe_resource templ = *c;
 
       templ.target = PIPE_TEXTURE_2D;
-      templ.bind = PIPE_BIND_RENDER_TARGET;
+      templ.bind = r->fmt->depth ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET;
       templ.width0 = u_minify(c->width0, level);
       templ.height0 = u_minify(c->height0, level);
       templ.last_level = 0;
@@ -564,10 +574,10 @@ fg_set_target(struct fg_context *ctx)
 {
    struct pipe_framebuffer_state *fb = &ctx->fb;
    struct pipe_resource *c = fb->nr_cbufs ? fb->cbufs[0].texture : NULL, *rt;
-   struct pipe_resource *z = fb->zsbuf.texture;
+   struct pipe_resource *z = fb->zsbuf.texture, *zt = z;
    struct fg_target t;
    const struct fg_format *f;
-   unsigned level, layer, w, h;
+   unsigned level, layer, w, h, zlevel = fb->zsbuf.level, zlayer = fb->zsbuf.first_layer;
 
    if (!c) {
       FG_NOTE_ONCE("rendering without a colour buffer");
@@ -585,8 +595,8 @@ fg_set_target(struct fg_context *ctx)
    w = u_minify(c->width0, level);
    h = u_minify(c->height0, level);
    if (level >= FG_MAX_LEVELS || w > FG_FLUSH_MAX_WIDTH ||
-       (z && (fb->zsbuf.level || fb->zsbuf.first_layer || z->width0 < w || z->height0 < h))) {
-      FG_NOTE_ONCE("rendering into a target wider than 1280, or with depth or stencil of a level or layer above 0");
+       (z && (zlevel >= FG_MAX_LEVELS || u_minify(z->width0, zlevel) < w || u_minify(z->height0, zlevel) < h))) {
+      FG_NOTE_ONCE("rendering into a target wider than 1280, or with depth or stencil smaller than the colour");
       return false;
    }
    f = fg_resource(c)->fmt;
@@ -598,14 +608,37 @@ fg_set_target(struct fg_context *ctx)
       if (!rt)
          return false;
    }
+   /* depth and stencil of a level or layer above 0, or of rows that are not such a pitch, or narrower than board B
+    * loads them (as many bursts as the colour row's times the bursts of a group, b_rop: pitch x 4 / colour bytes): in a
+    * shadow the same way (its pitch a multiple of 64) */
+   if (z && (zlevel || zlayer || fg_resource(z)->pitch % 32 ||
+             fg_resource(z)->pitch * fg_storage_bpp(f) < 4 * fg_resource(rt)->pitch)) {
+      zt = fg_render_shadow(z, zlevel);
+      if (!zt)
+         return false;
+      if (fg_resource(zt)->pitch * fg_storage_bpp(f) < 4 * fg_resource(rt)->pitch)
+         FG_NOTE_ONCE("a depth-stencil image narrower than its colour target's rows");
+   }
    memset(&t, 0, sizeof(t));
    t.color = rt;
    t.shadow_of = rt != c ? c : NULL;
    t.level = (uint8_t)level;
    t.layer = (uint8_t)layer;
-   t.ds = z;
+   t.ds = zt;
+   t.ds_shadow_of = zt != z ? z : NULL;
+   t.ds_level = (uint8_t)zlevel;
+   t.ds_layer = (uint8_t)zlayer;
    t.color_handle = fg_resource(rt)->board_handle;
-   t.ds_handle = z ? fg_resource(z)->board_handle : 0;
+   t.ds_handle = zt ? fg_resource(zt)->board_handle : 0;
+   /* board B's FLUSH takes a depth-stencil image of the colour image's size only: a bigger one is named by an alias of
+    * its top left corner (its pitch kept) */
+   if (zt && (zt->width0 != w || zt->height0 != h)) {
+      t.ds_handle = fg_rect_alias(ctx->base.screen, fg_resource(zt), 0, 0, w, h, &t.ds_alias_gem);
+      if (!t.ds_handle) {
+         FG_NOTE_ONCE("no alias of a depth-stencil image bigger than its colour target");
+         return false;
+      }
+   }
    t.width = w;
    t.height = h;
    t.depth16 = z && z->format == PIPE_FORMAT_Z16_UNORM;
@@ -624,6 +657,11 @@ fg_set_target(struct fg_context *ctx)
       fg_emit_copy(ctx, c, level, layer, 0, 0, rt, 0, 0, 0, 0, t.width, t.height);
       fg_resource(c)->shadow_layer[level] = (int)layer;
    }
+   if (t.ds_shadow_of && fg_resource(z)->shadow_layer[zlevel] != (int)zlayer) {
+      fg_emit_copy(ctx, z, zlevel, zlayer, 0, 0, zt, 0, 0, 0, 0, u_minify(z->width0, zlevel),
+                   u_minify(z->height0, zlevel));
+      fg_resource(z)->shadow_layer[zlevel] = (int)zlayer;
+   }
    return true;
 }
 
@@ -635,7 +673,7 @@ fg_context_pending_uses(struct fg_context *ctx, struct pipe_resource *prsc)
    if (ctx->cl_flags && ctx->have_tgt && (ctx->tgt.color == prsc || ctx->tgt.ds == prsc))
       return true;
    if ((ctx->pass_open || ctx->cl_flags) && ctx->have_tgt &&
-       (ctx->tgt.color == prsc || ctx->tgt.ds == prsc || ctx->tgt.shadow_of == prsc))
+       (ctx->tgt.color == prsc || ctx->tgt.ds == prsc || ctx->tgt.shadow_of == prsc || ctx->tgt.ds_shadow_of == prsc))
       return true;
    for (unsigned i = 0; i < ctx->npass_res; i++)
       if (ctx->pass_res[i] == prsc)
@@ -1165,7 +1203,8 @@ fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
       return;
    }
    if (s->fmt->depth || d->fmt->depth) {
-      if (s->fmt->storage != d->fmt->storage || info->alpha_blend) {
+      /* (Z16 and Z24S8 share their storage, not what a word means) */
+      if (s->fmt != d->fmt || info->alpha_blend) {
          FG_NOTE_ONCE("a blit of depth or stencil between formats");
          return;
       }
@@ -1330,10 +1369,11 @@ fg_fill_ds(struct fg_context *ctx, struct pipe_resource *z, unsigned level, unsi
 
    if (!f || !f->depth || !w || !h)
       return;
-   if (f->storage == FG_FMT_D16) {
+   if (f->expand == FG_EXPAND_Z16) {
+      /* (a D24S8 word whose depth DEPTH16 keeps as 0 .. 65535; no stencil) */
       if (flags & PIPE_CLEAR_DEPTH) {
          v = (uint32_t)rint(d * 65535.0);
-         mask = 0xF;
+         mask = 0xE;
       }
    } else {
       if (flags & PIPE_CLEAR_DEPTH) {

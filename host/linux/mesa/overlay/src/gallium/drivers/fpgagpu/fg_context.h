@@ -79,6 +79,7 @@ struct fg_dsa_state {
    uint32_t h0;               /* depth test [0], write [1], function [4:2], stencil [5] */
    uint32_t h1, h2;           /* front / back stencil without the reference: value mask, write mask, function */
    uint32_t h3;               /* stencil operations */
+   bool two_sided;            /* back faces have a stencil state of their own (and reference 1); else the front's */
 };
 
 struct fg_sampler_state {
@@ -104,6 +105,9 @@ struct fg_target {
    struct pipe_resource *color, *ds;
    struct pipe_resource *shadow_of; /* color is this image's render shadow: copied back after the FLUSH */
    uint8_t level, layer;      /* the level and layer of shadow_of it renders */
+   struct pipe_resource *ds_shadow_of; /* the same for ds */
+   uint8_t ds_level, ds_layer;
+   uint32_t ds_alias_gem;     /* ds_handle names an alias of ds of the colour's size (board B takes no other): its GEM */
    uint16_t color_handle, ds_handle;
    uint32_t width, height;
    bool depth16, has_stencil;

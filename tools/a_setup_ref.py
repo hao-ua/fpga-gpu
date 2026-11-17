@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """a_setup_ref — model of board A's setup / record / binning stage (src/rtl/a_setup.sv) on a
-draw of tools/a_vtx_ref.py: the primitive vertices (gl_Position, 8 varyings) go through the near-plane clip (clip_near,
-w >= 2^-7, Sutherland-Hodgman with FP24 lerps), the per-vertex setup (vtx_setup2: 1/w by the SFU reciprocal, NDC,
+draw of tools/a_vtx_ref.py: the primitive vertices (gl_Position, 8 varyings) go through the clip (clip_near: w >= 2^-7,
+near, far and the x / y guard band, Sutherland-Hodgman with lerps in the clipper's own wide format, lines through the
+same planes), the per-vertex setup (vtx_setup2: 1/w by the SFU reciprocal, NDC,
 viewport to 1/16-pixel window positions with round-half-even snapping and saturation to 16 bits, window z = ndc_z/2 +
 1/2), the triangle setup (signed area in 1/256 pixel^2, facing / cull, trivial rejection outside the target, bands of
 NL rows), and the TRIANGLE RECORD A keeps in its DDR (REC_BASE + id * 512 B) and streams to B: a raster header burst
@@ -87,43 +88,105 @@ def plane_d(v, p, gb, z0=0):
 def dpos(d): return (d >> (FMT.W - 1)) == 0  # inside: the sign clear (the boundary is inside)
 
 
-def lerp_in(vin, vout, din, dout):
+# ---- the clipper's own number format. A vertex far outside the view (a coordinate of 2^18 beside a w of 2^3) leaves
+#      FP24 no bits for the part of an edge that is inside: the plane distances, t and the intersections need the
+#      difference of two such numbers to a fraction of a pixel. So clip_near works in a format of its own — FP24's sign
+#      and exponent, a significand of CLIP_M + 1 bits — from the vertices in (FP24, converted exactly) to the vertices
+#      out (rounded to FP24, RNE, once): every distance, t and every stored intersection is of that format.
+CLIP_M = 31
+CFMT = fr.Fmt(FMT.E, CLIP_M, "fpclip")
+
+
+def cw(v, cf=CFMT):
+    """FP24 -> the clip format, exactly (the mantissa extended by zeros; zero, Inf and NaN stay what they are)"""
+    s = v >> (FMT.W - 1); e = (v >> FMT.M) & ((1 << FMT.E) - 1); m = v & ((1 << FMT.M) - 1)
+    return (s << (cf.W - 1)) | (e << cf.M) | (m << (cf.M - FMT.M))
+
+
+def c24(v, cf=CFMT):
+    """the clip format -> FP24: round to nearest even; a mantissa that rounds up to 2 raises the exponent, past the
+    largest one the result is Inf"""
+    s = v >> (cf.W - 1); e = (v >> cf.M) & ((1 << cf.E) - 1); m = v & ((1 << cf.M) - 1)
+    if e == 0: return s << (FMT.W - 1)
+    if e == cf.inf_exp: return (s << (FMT.W - 1)) | (FMT.inf_exp << FMT.M) | ((1 << (FMT.M - 1)) if m else 0)
+    sh = cf.M - FMT.M
+    q, g, st = m >> sh, (m >> (sh - 1)) & 1, (m & ((1 << (sh - 1)) - 1)) != 0
+    q += g & (1 if (st or (q & 1)) else 0)
+    if q >> FMT.M: q = 0; e += 1
+    if e >= FMT.inf_exp: return (s << (FMT.W - 1)) | (FMT.inf_exp << FMT.M)
+    return (s << (FMT.W - 1)) | (e << FMT.M) | q
+
+
+def plane_dw(v, p, gb, z0, cf):
+    """plane_d in the clip format: v and gb are of that format"""
+    m = lambda a, b: fr.fmul(a, b, cf)
+    a = lambda x, y: fr.fadd(x, y, cf)
+    n = lambda x: x ^ (1 << (cf.W - 1))
+    if p == 0: return a(v[3], n(cw(WEPS, cf)))
+    if p == 1: return a(v[2], 0 if z0 else v[3])
+    if p == 2: return a(v[3], n(v[2]))
+    if p == 3: return a(m(gb[1], v[3]), n(v[0]))
+    if p == 4: return a(v[0], n(m(gb[0], v[3])))
+    if p == 5: return a(m(gb[3], v[3]), n(v[1]))
+    return a(v[1], n(m(gb[2], v[3])))
+
+
+def clip_t(din, dout, cf=CFMT):
+    """t = d_in / (d_in - d_out) of a crossing edge: the FP24 reciprocal unit on the denominator rounded to FP24, then one
+    Newton step in the clip format, r1 = r0 (2 - den r0), and t = d_in r1"""
+    m = lambda a, b: fr.fmul(a, b, cf)
+    den = fr.fadd(din, dout ^ (1 << (cf.W - 1)), cf)
+    r0 = cw(rcp(c24(den, cf)), cf)
+    two = (cf.bias + 1) << cf.M
+    r1 = m(r0, fr.fadd(two, m(den, r0) ^ (1 << (cf.W - 1)), cf))
+    return m(din, r1)
+
+
+def lerp_in(vin, vout, din, dout, cf=CFMT):
     """the intersection of edge in -> out with the plane, lerped FROM THE INSIDE vertex: t = d_in / (d_in - d_out),
-    new = v_in + t (v_out - v_in) — the error is bounded by ulp(|v_in|), and the two triangles sharing the edge get the
-    same point whichever way they traverse it"""
-    t = mul(din, rcp(sub(din, dout)))
-    return [add(vin[k], mul(t, sub(vout[k], vin[k]))) for k in range(len(vin))]
+    new = v_in + t (v_out - v_in), all in the clip format — the two triangles sharing the edge get the same point
+    whichever way they traverse it"""
+    t = clip_t(din, dout, cf)
+    return [fr.fadd(vin[k], fr.fmul(t, fr.fadd(vout[k], vin[k] ^ (1 << (cf.W - 1)), cf), cf), cf) for k in range(len(vin))]
 
 
-def clip(tri, gb, z0=0):
+def clip(tri, gb, z0=0, cf=CFMT):
     """clip_near on one triangle: vertices = [x, y, z, w, 32 varying scalars]; Sutherland-Hodgman against the seven
     planes in order (a plane every vertex is inside leaves the polygon as it is), the polygon grows to at most 6 + 2
-    per further plane; returns the fan (0, i, i + 1) of the final polygon"""
-    poly = list(tri)
+    per further plane; returns the fan (0, i, i + 1) of the final polygon. FP24 in and out, the clip format between."""
+    poly = [[cw(x, cf) for x in v] for v in tri]
+    gbw = [cw(g, cf) for g in gb]
     for p in range(NPLANE):
-        d = [plane_d(v, p, gb, z0) for v in poly]
-        if all(dpos(x) for x in d): continue
+        d = [plane_dw(v, p, gbw, z0, cf) for v in poly]
+        if all(dpos_w(x, cf) for x in d): continue
         out = []; n = len(poly)
         for i in range(n):
             a, b = poly[i], poly[(i + 1) % n]; da, db = d[i], d[(i + 1) % n]
-            ia, ib = dpos(da), dpos(db)
+            ia, ib = dpos_w(da, cf), dpos_w(db, cf)
             if ia: out.append(a)
-            if ia != ib: out.append(lerp_in(a, b, da, db) if ia else lerp_in(b, a, db, da))
+            if ia != ib: out.append(lerp_in(a, b, da, db, cf) if ia else lerp_in(b, a, db, da, cf))
         poly = out
         if len(poly) < 3: return []
+    poly = [[c24(x, cf) for x in v] for v in poly]
     return [(poly[0], poly[i], poly[i + 1]) for i in range(1, len(poly) - 1)]
 
 
-def clip_line(va, vb, gb, z0=0):
-    """a line segment against the seven planes: None when it lies outside one of them, else the (possibly moved) ends"""
+def dpos_w(d, cf=CFMT): return (d >> (cf.W - 1)) == 0
+
+
+def clip_line(va, vb, gb, z0=0, cf=CFMT):
+    """a line segment against the seven planes (clip_near, its line mode): None when it lies outside one of them, else
+    the (possibly moved) ends — end 0 stays end 0. FP24 in and out, the clip format between."""
+    va = [cw(x, cf) for x in va]; vb = [cw(x, cf) for x in vb]
+    gbw = [cw(g, cf) for g in gb]
     for p in range(NPLANE):
-        da, db = plane_d(va, p, gb, z0), plane_d(vb, p, gb, z0)
-        ia, ib = dpos(da), dpos(db)
+        da, db = plane_dw(va, p, gbw, z0, cf), plane_dw(vb, p, gbw, z0, cf)
+        ia, ib = dpos_w(da, cf), dpos_w(db, cf)
         if not ia and not ib: return None
         if ia != ib:
-            if ia: vb = lerp_in(va, vb, da, db)
-            else: va = lerp_in(vb, va, db, da)
-    return va, vb
+            if ia: vb = lerp_in(va, vb, da, db, cf)
+            else: va = lerp_in(vb, va, db, da, cf)
+    return [c24(x, cf) for x in va], [c24(x, cf) for x in vb]
 
 
 def point_in(v, z0=0): return all(dpos(plane_d(v, p, None, z0)) for p in range(NPLANE_PT))
@@ -356,6 +419,17 @@ def clip_vectors(nvar=8, n=40, z0=0):
     for _ in range(n):
         tris.append([(rng.uniform(-12, 12), rng.uniform(-12, 12), rng.uniform(-3, 3), rng.choice([1, 1, 2, 0.5, 0.25]), rng.uniform(0, 1))
                      for _ in range(3)])
+    # vertices tens of thousands of times outside the view, the visible part a few units of an edge 2^19 long: the
+    # clip format's work (planes that cut each other's intersections again; a sliver along the view's diagonal)
+    tris += [[(0.0, 25776.4746, 0.0, 1.28882372, 0.2), (268361.031, 0.0, -268361.031, 13.4180517, 0.6), (-164292.984, 0.0, 164292.984, 8.2146492, 1.0)],
+             [(2.48581982, 3.72872996, 0.0, 12.4290991, 0.2), (-247127.188, 0.0, -247127.188, 8.23757267, 0.6), (454209.156, 0.0, 454209.156, 15.1403055, 1.0)],
+             [(-296358.5, -296358.5, 0.0, 14.8179, 0.2), (247388.0, 247388.0, 0.0, 12.3694, 0.6), (-179767.0, 0.0, -179767.0, 8.98835, 1.0)],
+             [(-0.9, 25000.0, 100000.0, 1.0, 0.2), (-0.5, -25000.0, -100000.0, 1.0, 0.6), (-0.2, 25000.0, 100000.0, 1.0, 1.0)],
+             [(0.0, 84000.0, 80000.0, 1.0, 0.2), (80000.0, -4000.0, 0.0, 1.0, 0.6), (0.0, -84000.0, -80000.0, 1.0, 1.0)],
+             [(0.5, 0.5, 0.0, 1.0, 0.2), (0.9, 50000.0, -100000.0, 1.0, 0.6), (25000.0, 0.0, -100000.0, 1.0, 1.0)]]
+    for _ in range(n):
+        tris.append([(rng.choice([-1, 0, 1]) * 20000 * w + rng.uniform(-2, 2), rng.choice([-1, 0, 1]) * 20000 * w + rng.uniform(-2, 2),
+                      rng.choice([-1, 0, 0, 1]) * 20000 * w, w, rng.uniform(0, 1)) for w in [rng.uniform(0.2, 16) for _ in range(3)]])
     cases = [([mkv(*v) for v in tri]) for tri in tris]
     with open(f"{GEN}/clipnear_vectors{'_z0' if z0 else ''}.hex", 'w') as fh:
         fh.write(f"{nvar}\n{len(cases)}\n" + " ".join(f"{q:0{hw}x}" for q in gb) + "\n")
@@ -366,12 +440,81 @@ def clip_vectors(nvar=8, n=40, z0=0):
             for t3 in out:
                 for v in t3: fh.write(" ".join(f"{q:0{hw}x}" for q in v) + "\n")
     print(f"clipnear_vectors{'_z0' if z0 else ''}.hex: {len(cases)} triangles, nvar {nvar}")
+    # lines (the clipper's line mode): the two ends, then 0 (dropped) or 1 and the two ends clip_line() returns
+    lines = [[(0.2, 0.1, 0.0, 1.0, 0.5), (0.4, -0.3, 0.0, 2.0, 1.0)],                                 # inside
+             [(0.2, 0.1, 0.0, 1.0, 0.5), (0.4, -0.3, 0.0, -0.5, 1.0)],                                # end 1 behind the eye
+             [(0.2, 0.1, 0.0, -1.0, 0.5), (0.4, -0.3, 0.0, 2.0, 1.0)],                                # end 0 behind the eye
+             [(0.2, 0.1, -1.5, 1.0, 0.5), (0.4, -0.3, 1.5, 1.0, 1.0)],                                # near and far: both ends move
+             [(0.2, 0.1, 2.0, 1.0, 0.5), (0.4, -0.3, 1.5, 1.0, 1.0)],                                 # beyond far: dropped
+             [(-9.0, 0.1, 0.0, 1.0, 0.5), (9.0, 0.3, 0.0, 1.0, 1.0)],                                 # both ends outside the guard band, the middle inside
+             [(0.2, -12.0, 0.0, 1.0, 0.5), (0.4, 12.0, 0.5, 1.0, 1.0)],
+             [(20.0, 20.0, 0.0, 1.0, 0.5), (21.0, 20.0, 0.0, 1.0, 1.0)],                              # outside the band: dropped
+             [(-41000.0, -40000.0, -1000000.0, 1.0, 0.5), (41000.0, 40000.0, 1000000.0, 1.0, 1.0)],   # eight pixels of a line 2^21 long
+             [(41000.0, -40000.0, 1000000.0, 1.0, 0.5), (-41000.0, 40000.0, -1000000.0, 1.0, 1.0)],
+             [(0.5, -40000.0, 100000.0, 1.0, 0.5), (0.5, 40000.0, -100000.0, 1.0, 1.0)],
+             [(-0.5, 40000.0, 100000.0, 1.0, 0.5), (-0.5, -40000.0, -100000.0, 1.0, 1.0)]]
+    for _ in range(n):
+        lines.append([(rng.uniform(-12, 12), rng.uniform(-12, 12), rng.uniform(-3, 3), rng.choice([1, 1, 2, 0.5, -0.5, 0.004]), rng.uniform(0, 1))
+                      for _ in range(2)])
+    for _ in range(n):
+        lines.append([(rng.choice([-1, 0, 1]) * 20000 * w + rng.uniform(-2, 2), rng.choice([-1, 0, 1]) * 20000 * w + rng.uniform(-2, 2),
+                       rng.choice([-1, 0, 0, 1]) * 20000 * w, w, rng.uniform(0, 1)) for w in [rng.uniform(0.2, 16) for _ in range(2)]])
+    lcases = [[mkv(*v) for v in ln] for ln in lines]
+    kept = 0
+    with open(f"{GEN}/clipnear_lines{'_z0' if z0 else ''}.hex", 'w') as fh:
+        fh.write(f"{nvar}\n{len(lcases)}\n" + " ".join(f"{q:0{hw}x}" for q in gb) + "\n")
+        for V in lcases:
+            out = clip_line(V[0], V[1], gb, z0)
+            for v in V: fh.write(" ".join(f"{q:0{hw}x}" for q in v) + "\n")
+            fh.write("0\n" if out is None else "1\n")
+            if out is not None:
+                kept += 1
+                for v in out: fh.write(" ".join(f"{q:0{hw}x}" for q in v) + "\n")
+    print(f"clipnear_lines{'_z0' if z0 else ''}.hex: {len(lcases)} lines, {kept} kept")
+
+
+def wide_vectors(n=6000):
+    """tools/gen/fpw_vectors.hex for sim/tb_float_w.sv: the clip format's adder and multiplier (float_addsub_w, float_mul_w)
+    against float_ref's exact arithmetic — 'op a b result', op 0 a + b, 1 a - b, 2 a * b"""
+    rng = random.Random(4242); cf = CFMT; sg = 1 << (cf.W - 1); hw = (cf.W + 3) // 4
+    def rnd_any(): return rng.getrandbits(cf.W)
+    def rnd_mid(spread=24):
+        return (rng.getrandbits(1) << (cf.W - 1)) | ((cf.bias + rng.randint(-spread, spread)) << cf.M) | rng.getrandbits(cf.M)
+    def few_bits(spread=24):                       # a short mantissa: products and sums that are exact or exact ties
+        k = rng.randint(1, cf.M)
+        return (rng.getrandbits(1) << (cf.W - 1)) | ((cf.bias + rng.randint(-spread, spread)) << cf.M) | (rng.getrandbits(k) << (cf.M - k))
+    spec = [0, sg, cf.inf_exp << cf.M, sg | (cf.inf_exp << cf.M), fr.qnan(cf), 1 << cf.M, (cf.inf_exp - 1) << cf.M | ((1 << cf.M) - 1),
+            cf.bias << cf.M, sg | (cf.bias << cf.M), (cf.bias << cf.M) | ((1 << cf.M) - 1), 5]
+    rows = []
+    for a in spec:
+        for b in spec:
+            for op in (0, 1, 2): rows.append((op, a, b))
+    while len(rows) < n:
+        k = rng.randrange(8); op = rng.randrange(3)
+        if k == 0: a, b = rnd_any(), rnd_any()
+        elif k == 1: a, b = rnd_mid(), rnd_mid(3)
+        elif k == 2:                                # nearly equal magnitudes: the difference cancels to a few bits
+            a = rnd_mid(); b = (a ^ rng.getrandbits(rng.randint(1, 12))) ^ (sg if rng.getrandbits(1) else 0); op = rng.randrange(2)
+        elif k == 3:                                # exponents one apart: the subtraction's one-bit shift
+            a = rnd_mid(); b = (a & ~(((1 << cf.E) - 1) << cf.M)) | ((((a >> cf.M) & ((1 << cf.E) - 1)) + rng.choice([-1, 1])) << cf.M)
+            b ^= rng.getrandbits(4); op = rng.randrange(2)
+        elif k == 4: a, b = few_bits(), few_bits()
+        elif k == 5: a, b = rnd_mid(60), rnd_mid(60)                 # overflow and underflow
+        elif k == 6: a, b = rnd_mid(), rnd_mid(cf.M + 6)             # far apart: the smaller one is the sticky bit alone
+        else: a, b = few_bits(2), rnd_mid(2)
+        rows.append((op, a & ((1 << cf.W) - 1), b & ((1 << cf.W) - 1)))
+    with open(f"{GEN}/fpw_vectors.hex", 'w') as fh:
+        fh.write(f"{len(rows)}\n")
+        for op, a, b in rows:
+            r = fr.fmul(a, b, cf) if op == 2 else fr.fadd(a, b ^ (sg if op == 1 else 0), cf)
+            fh.write(f"{op} {a:0{hw}x} {b:0{hw}x} {r:0{hw}x}\n")
+    print(f"fpw_vectors.hex: {len(rows)} operations of the clip format (mantissa {cf.M})")
 
 
 def main():
     a = sys.argv[1:]
     if '--check' in a: sys.exit(0 if check_dz_grad() else 1)
-    if '--clipvec' in a: clip_vectors(); clip_vectors(z0=1); return
+    if '--clipvec' in a: clip_vectors(); clip_vectors(z0=1); wide_vectors(); return
     seed, mode, nv, nidx, indexed, u8, first, ioff, types, far = parse_args(a)
     d = build_draw(seed, mode, nv, nidx, indexed, u8, first, ioff, types, far=far, proj='--noproj' not in a)
     rng = random.Random(seed * 31 + 7)

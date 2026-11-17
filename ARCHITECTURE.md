@@ -57,8 +57,11 @@ texture unit.
   - `vtx_asm`: assembles triangles, strips, fans, points and lines.
   - Draws overlap: uniforms and descriptors use two banks, chosen by the draw's parity.
 - **`a_setup`:**
-  - `clip_near` clips (Sutherland–Hodgman) against 7 planes: w ≥ 2⁻⁷, near, far and the ±2040-pixel x/y guard band.
-    Triangles that need no clipping take a fast path.
+  - `clip_near` clips triangles and lines (Sutherland–Hodgman) against 7 planes: w ≥ 2⁻⁷, near, far and the ±2040-pixel
+    x/y guard band. Primitives that need no clipping take a fast path.
+    - It works in a format of its own: FP24's sign and exponent with a 31-bit mantissa (`float_addsub_w`,
+      `float_mul_w`). Vertices are extended on the way in and rounded to FP24 once, on the way out.
+    - The lerp factor is FP24's reciprocal of the denominator refined by one Newton step in that format.
   - `vtx_setup2` computes window x/y in 1/16 pixel.
   - Then area and culling, depth gradients, integer edge steps, and conservative depth bounds per triangle (`zq_tri`).
   - Each primitive becomes a 512-byte record plus a bin push.

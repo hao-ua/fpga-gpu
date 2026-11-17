@@ -45,7 +45,7 @@ $rtl = @(
   "src\rtl\proto\fb_dispatch_a.sv",
   # board A 3D: the vertex core and its front end, setup / records, bins
   "src\rtl\shader_core_vs2.sv", "src\rtl\attr_conv.sv", "src\rtl\vtx_feed.sv", "src\rtl\vtx_rbuf.sv", "src\rtl\vtx_asm.sv", "src\rtl\a_vertex.sv",
-  "src\rtl\clip_near.sv", "src\rtl\vtx_setup2.sv", "src\rtl\zq_tri.sv", "src\rtl\zq_lane.sv", "src\rtl\a_setup.sv", "src\rtl\tri_binner2.sv", "src\rtl\a_render.sv", "src\rtl\a_geom.sv",
+  "src\rtl\clip_near.sv", "src\rtl\float_addsub_w.sv", "src\rtl\float_mul_w.sv", "src\rtl\vtx_setup2.sv", "src\rtl\zq_tri.sv", "src\rtl\zq_lane.sv", "src\rtl\a_setup.sv", "src\rtl\tri_binner2.sv", "src\rtl\a_render.sv", "src\rtl\a_geom.sv",
   "src\rtl\top\board_a_core.sv", "src\rtl\link\link_status_jtag.sv",
   # board B
   "src\rtl\res\img_pkg.sv", "src\rtl\res\img_table.sv", "src\rtl\res\img_write.sv", "src\rtl\res\img_xfer.sv", "src\rtl\res\img_geom.sv", "src\rtl\common\udiv.sv", "src\rtl\common\jtag_ctrl_reg.sv",

@@ -423,17 +423,22 @@ fg_screen_create(int fd, const struct pipe_screen_config *config, struct rendero
    if ((r = fg_get_param(fd, FPGAGPU_PARAM_A_FLAGS, &screen->a_flags)) ||
        (r = fg_get_param(fd, FPGAGPU_PARAM_B_FLAGS, &screen->b_flags)) ||
        (r = fg_get_param(fd, FPGAGPU_PARAM_LINK_FLAGS, &screen->link_flags)) ||
-       (r = fg_get_param(fd, FPGAGPU_PARAM_A_BUILD, &screen->a_build))) {
+       (r = fg_get_param(fd, FPGAGPU_PARAM_A_BUILD, &screen->a_build)) ||
+       (r = fg_get_param(fd, FPGAGPU_PARAM_STATUS_LAYOUT, &screen->status_layout))) {
       fprintf(stderr, "fpgagpu: GET_PARAM failed: %s\n", strerror(-r));
       goto fail;
    }
+   /* both boards skip bands: board A leaves out what has no bin and no clear, board B does not load or store it */
+   screen->band_skip = screen->status_layout >= 13 && (screen->b_flags >> 13 & 1u) &&
+                       !debug_get_bool_option("FPGAGPU_NOSKIP", false);
    if (!(screen->link_flags & 1))
       fprintf(stderr, "fpgagpu: board B is not alive (link flags 0x%x)\n", screen->link_flags);
    screen->debug = debug_get_bool_option("FPGAGPU_DEBUG", false);
    screen->debug_shaders = debug_get_num_option("FPGAGPU_SHADERS", 0);
    if (screen->debug)
-      fprintf(stderr, "fpgagpu: board A build %u, A flags 0x%08x, B flags 0x%08x, link flags 0x%x\n",
-              screen->a_build, screen->a_flags, screen->b_flags, screen->link_flags);
+      fprintf(stderr, "fpgagpu: board A build %u, STATUS layout %u, A flags 0x%08x, B flags 0x%08x, link flags 0x%x%s\n",
+              screen->a_build, screen->status_layout, screen->a_flags, screen->b_flags, screen->link_flags,
+              screen->band_skip ? ", band skipping" : "");
 
    screen->base.destroy = fg_screen_destroy;
    screen->base.get_screen_fd = fg_screen_get_fd;

@@ -262,6 +262,11 @@ counters and the last STATUS.
     stays the image's. `fg_egl_gl` test 15: 32 targets 21 x 29, each followed by an image: on the old module all 32
     images changed (36 bytes each), now none. Padded images taller than a multiple of 8 (a 300 x 300 DRI3 back
     buffer of rows of 1216 bytes) did the same to their neighbours.
+  - Band skipping (2026-11-17, boards A 160 / B 161 loaded by the band-skip session): Mesa sets FLUSH flag bit 10 when
+    both boards report it (A STATUS layout >= 13, B flags bit 13), so the bands no draw and no clear reaches are not
+    walked, loaded or stored. On a 800 x 600 target with depth (whole-target passes) a pass of an 8 x 8 quad costs 0.36
+    ms instead of 6.86 (`fg_egl_gl` test 16; `FPGAGPU_NOSKIP=1` for the old way). The flashed pair (A 154 / B 142)
+    ignores the flag.
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.

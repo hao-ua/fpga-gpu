@@ -435,7 +435,10 @@ fg_end_pass(struct fg_context *ctx)
       ctx->cl_stencil = ctx->tgt.has_stencil ? ctx->stencil_value : 0;
       ctx->cl_smask = 0xFF;
    }
-   fl = ctx->cl_flags | (ctx->tgt.depth16 ? FG_FL_DEPTH16 : 0);
+   /* the bands no draw and no clear reaches are left alone where both boards can (each band costs board B a load and
+    * a store otherwise, whatever is drawn) */
+   fl = ctx->cl_flags | (ctx->tgt.depth16 ? FG_FL_DEPTH16 : 0) |
+        (fg_screen(ctx->base.screen)->band_skip ? FG_FL_SKIP_BANDS : 0);
    fg_emit_flush(ctx, fl, &r);
    if (ctx->tgt.shadow_of) {
       /* rendered in the shadow: back into the image (what the FLUSH covered), after the FLUSH that rendered it */

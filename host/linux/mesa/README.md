@@ -64,6 +64,12 @@ draw). The first draw fixes the first row (a multiple of 8); a draw or clear abo
 passes in a row the next covers the whole target. `FPGAGPU_NOREGION=1` turns region passes off. A one-quad pass on
 800 x 600 costs 0.35 ms instead of 16 (`fg_egl_gl` test 13).
 
+Band skipping: where board A's STATUS layout is 13 or more and board B's flags have bit 13 (A 160 / B 161 on), every
+FLUSH sets flag bit 10: board A leaves out the bands no draw and no clear reaches, and board B neither loads nor stores
+them, so their pixels stay as they are. A pass then costs the bands it draws into, also on a target with depth (no
+region pass): 100 passes of an 8 x 8 quad on 800 x 600 with depth, 0.36 ms a pass, 6.86 without (`fg_egl_gl` test
+16). `FPGAGPU_NOSKIP=1` turns it off; older boards ignore the flag.
+
 Draw states: board B keeps 8191 of a context's draw states by id. When they run out the pass ends and the ids start
 again, before the next draw sends anything, with the images the draw reads on the next pass's list (`fg_egl_gl` test
 12).

@@ -50,6 +50,8 @@ struct pipe_screen_config;
 #define FG_FL_CLEAR_DEPTH	0x080
 #define FG_FL_CLEAR_STENCIL	0x100
 #define FG_FL_DEPTH16		0x200
+#define FG_FL_SKIP_BANDS	0x400		/* bands no draw and no clear reaches are left alone (not walked, loaded,
+						 * or stored): A STATUS layout 13, B flags bit 13; older boards ignore it */
 
 #define FG_MAX_DATA		1440u		/* data bytes of one WRITE_IMAGE */
 #define FG_SUBMIT_MAX		(4u << 20)	/* the kernel's limit on one SUBMIT's stream */
@@ -65,6 +67,8 @@ struct fg_screen {
    uint32_t a_flags;		/* bit 31 the vertex core has no SIN / COS, bit 30 no integer divider */
    uint32_t b_flags;		/* the same for the fragment core */
    uint32_t link_flags;		/* bit 0 board B alive, bit 2 the board link trained */
+   uint32_t status_layout;	/* board A's STATUS layout */
+   bool band_skip;		/* FLUSH may leave out the bands nothing reaches (FPGAGPU_NOSKIP=1: never) */
 
    bool debug;			/* FPGAGPU_DEBUG: flags at creation, the time each read map spends on stderr */
    unsigned debug_shaders;	/* FPGAGPU_SHADERS=1: each program's assembler text on stderr */

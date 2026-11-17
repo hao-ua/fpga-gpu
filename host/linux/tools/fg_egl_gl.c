@@ -35,7 +35,9 @@
  *      of its own target into rows it reads (drawn from a copy taken before its pass); a copy into a whole-target
  *      pass with a draw (drawn in it); 40 moves of a 374 x 298 window (into a temporary image and back) timed;
  *  15. 32 render targets 21 x 29 (rendered in shadows of 96-byte rows; board B stores whole bands of 8 rows), each
- *      followed by an image with a pattern: the targets rendered again, every image must be unchanged.
+ *      followed by an image with a pattern: the targets rendered again, every image must be unchanged;
+ *  16. an 800 x 600 target with depth (no region passes) filled with rows of their own colour, then 100 passes of an
+ *      8 x 8 quad: every row around the quads kept, the passes timed (with band skipping a pass costs its bands).
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -1305,6 +1307,94 @@ int main(int argc, char **argv)
 		free(pat);
 		free(got);
 		glColor3f(1, 1, 1);
+	}
+
+	printf("16. passes that draw into few bands of an 800 x 600 target with depth (no region passes: the whole target),\n"
+	       "    bands no draw reaches left alone: 100 passes of an 8 x 8 quad timed, every other row kept:\n");
+	{
+		GLuint rb16[2], fbo16;
+		uint8_t *p = malloc(800 * 600 * 4);
+		int bad = 0, bad_q = 0;
+		double t0, t1;
+		struct timespec ts;
+
+		glGenRenderbuffersEXT(2, rb16);
+		glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb16[0]);
+		glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_RGBA8, 800, 600);
+		glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb16[1]);
+		glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, 800, 600);
+		glGenFramebuffersEXT(1, &fbo16);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo16);
+		glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rb16[0]);
+		glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rb16[1]);
+		glViewport(0, 0, 800, 600);
+		glMatrixMode(GL_PROJECTION);
+		glPushMatrix();
+		glLoadIdentity();
+		glOrtho(0, 800, 0, 600, -1, 1);
+		glMatrixMode(GL_MODELVIEW);
+		glDisable(GL_TEXTURE_2D);
+		glDisable(GL_BLEND);
+		glDisable(GL_SCISSOR_TEST);
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LEQUAL);
+		glDepthMask(GL_TRUE);
+		/* every row its own colour, drawn: what the bands left alone must still hold */
+		glClearColor(0, 0, 0, 1);
+		glClearDepth(1.0);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glBegin(GL_QUADS);
+		for (int y = 0; y < 600; y += 4) {
+			glColor3ub((GLubyte)(y & 255), (GLubyte)(y >> 2), 200);
+			glVertex2f(0, y); glVertex2f(800, y); glVertex2f(800, y + 4); glVertex2f(0, y + 4);
+		}
+		glEnd();
+		glFinish();
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
+		glColor3f(1, 1, 1);
+		for (int i = 0; i < 100; i++) {
+			int x = 40 + (i * 37) % 720, y = 24 + (i * 7) % 560;
+
+			quad(x, y, x + 8, y + 8, 0);
+			glFlush();
+		}
+		glFinish();
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
+		memset(p, 0xA5, 800 * 600 * 4);
+		glReadPixels(0, 0, 800, 600, GL_RGBA, GL_UNSIGNED_BYTE, p);
+		for (int y = 0; y < 600; y++) {
+			for (int x = 0; x < 800; x++) {
+				const uint8_t *q = p + 4 * (y * 800 + x);
+				int in = 0;
+
+				for (int i = 0; i < 100 && !in; i++) {
+					int qx = 40 + (i * 37) % 720, qy = 24 + (i * 7) % 560;
+
+					in = x >= qx && x < qx + 8 && y >= qy && y < qy + 8;
+				}
+				if (in)
+					bad_q += !near(q, 255, 255, 255, 1);
+				else
+					bad += !near(q, (y & ~3) & 255, (y & ~3) >> 2, 200, 1);
+			}
+		}
+		printf("  100 passes of an 8 x 8 quad on 800 x 600 with depth: %.2f ms a pass\n", (t1 - t0) * 1e3 / 100);
+		if (bad || bad_q)
+			printf("  %d pixels outside the quads wrong, %d inside\n", bad, bad_q);
+		check(&fails, !bad, "the rows around the quads kept", p + 4 * (300 * 800 + 5));
+		check(&fails, !bad_q, "the quads white", (const uint8_t *)"\377\377\377\377");
+		check(&fails, (t1 - t0) * 1e3 / 100 < 4.0, "a pass costs the bands it draws into", (const uint8_t *)"\0\0\0\0");
+		glDisable(GL_DEPTH_TEST);
+		glMatrixMode(GL_PROJECTION);
+		glPopMatrix();
+		glMatrixMode(GL_MODELVIEW);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glDeleteFramebuffersEXT(1, &fbo16);
+		glDeleteRenderbuffersEXT(2, rb16);
+		free(p);
 	}
 
 	printf("GL error 0x%04x\n", glGetError());

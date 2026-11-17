@@ -26,7 +26,12 @@
  *  13. region passes (a pass renders only the rectangle its draws and clears reach): quads that grow a region and one
  *      above-left of it (a new pass), a quad in the corner (the rectangle ends at the image's end), scissored clears
  *      alone and inside a region pass, a textured quad, a 250-wide texture (a shadow); then 200 one-quad passes on an
- *      800 x 600 target timed (the whole target would cost about 16 ms a pass).
+ *      800 x 600 target timed (the whole target would cost about 16 ms a pass);
+ *  14. draws that copy (the X server's way: a program that samples one image at a varying running one to one with
+ *      the window position, quads of 16-bit positions), done as COPY_IMAGE: a rectangle, two in one draw, one cut by
+ *      the scissor, a repeating tile (fract) that wraps on both axes, an image with alpha into an RGB one and back
+ *      (alpha 1.0 survives), the same program magnified (drawn, not copied); 40 moves of a 374 x 298 window (into a
+ *      temporary image and back, as the X server moves one) timed.
  *   cc -O2 -Wall -I<prefix>/include fg_egl_gl.c -o fg_egl_gl -L<libdir> -Wl,-rpath-link,<libdir> \
  *      -lEGL -lGL -lgbm $(pkg-config --cflags --libs libdrm)
  *   fg_egl_gl [render node, default /dev/dri/renderD129]
@@ -862,6 +867,283 @@ int main(int argc, char **argv)
 		glDeleteRenderbuffersEXT(1, &rb7);
 		glDeleteTextures(1, &t_sh);
 		glDeleteTextures(1, &tw);
+		free(p);
+	}
+
+	printf("14. draws that copy (as the X server copies), done as COPY_IMAGE, on a 256 x 256 texture:\n");
+	{
+		static const char *vs_src =
+			"#version 110\n"
+			"attribute vec2 primitive;\n"
+			"uniform vec4 v_matrix;\n"
+			"uniform vec2 fill_offset;\n"
+			"uniform vec2 fill_size_inv;\n"
+			"varying vec2 fill_pos;\n"
+			"void main() {\n"
+			"  gl_Position = vec4(primitive * v_matrix.xz + v_matrix.yw, 0.0, 1.0);\n"
+			"  fill_pos = (fill_offset + primitive) * fill_size_inv;\n"
+			"}\n";
+		static const char *fs_copy =
+			"#version 110\n"
+			"uniform sampler2D sampler;\n"
+			"varying vec2 fill_pos;\n"
+			"void main() { gl_FragColor = texture2D(sampler, fill_pos); }\n";
+		static const char *fs_tile =
+			"#version 110\n"
+			"uniform sampler2D sampler;\n"
+			"varying vec2 fill_pos;\n"
+			"void main() { gl_FragColor = texture2D(sampler, fract(fill_pos)); }\n";
+		const char *fs_src[2] = { fs_copy, fs_tile };
+		GLuint prog[2], t_src, t_dst, t_rgb3, fbo9, fbo10;
+		uint8_t *pat = malloc(64 * 64 * 4), *p = malloc(800 * 600 * 4);
+		int bad;
+		double t0, t1;
+		struct timespec ts;
+
+		for (int k = 0; k < 2; k++) {
+			GLuint vs = glCreateShader(GL_VERTEX_SHADER), fs = glCreateShader(GL_FRAGMENT_SHADER);
+			GLint ok = 0;
+
+			glShaderSource(vs, 1, &vs_src, NULL);
+			glCompileShader(vs);
+			glShaderSource(fs, 1, &fs_src[k], NULL);
+			glCompileShader(fs);
+			prog[k] = glCreateProgram();
+			glAttachShader(prog[k], vs);
+			glAttachShader(prog[k], fs);
+			glBindAttribLocation(prog[k], 0, "primitive");
+			glLinkProgram(prog[k]);
+			glGetProgramiv(prog[k], GL_LINK_STATUS, &ok);
+			check(&fails, ok, k ? "the tile program links" : "the copy program links", (const uint8_t *)"\0\0\0\0");
+		}
+		/* the source: every texel its own (x * 4, y * 4, x ^ y), alpha 0 (an image with alpha; the RGB case shows it) */
+		for (int y = 0; y < 64; y++) {
+			for (int x = 0; x < 64; x++) {
+				uint8_t *q = pat + 4 * (y * 64 + x);
+
+				q[0] = x * 4;
+				q[1] = y * 4;
+				q[2] = (x ^ y) * 4 + 1;
+				q[3] = 0;
+			}
+		}
+		t_src = texture(64, 64, GL_RGBA, pat, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+		t_dst = texture(256, 256, GL_RGBA, NULL, GL_NEAREST);
+		glGenFramebuffersEXT(1, &fbo9);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo9);
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_dst, 0);
+		glViewport(0, 0, 256, 256);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_BLEND);
+		glDisable(GL_TEXTURE_2D);
+		glDisable(GL_SCISSOR_TEST);
+		glClearColor(0, 0, 1, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glEnableVertexAttribArray(0);
+
+/* quads of (x0, y0, x1, y1) boxes, the source at box + (ox, oy) (modulo the image for the tile), into a target
+ * tw x th */
+#define COPY_DRAW(k, boxes, nbox, ox, oy, sw, sh, tw, th)                                                       \
+		do {                                                                                                \
+			GLshort v_[8 * 8];                                                                              \
+			for (int b_ = 0; b_ < (nbox); b_++) {                                                           \
+				const int *q_ = (boxes) + 4 * b_;                                                           \
+				GLshort *o_ = v_ + 8 * b_;                                                                  \
+				o_[0] = q_[0]; o_[1] = q_[1]; o_[2] = q_[0]; o_[3] = q_[3];                                 \
+				o_[4] = q_[2]; o_[5] = q_[3]; o_[6] = q_[2]; o_[7] = q_[1];                                 \
+			}                                                                                               \
+			glUseProgram(prog[k]);                                                                          \
+			glUniform4f(glGetUniformLocation(prog[k], "v_matrix"), 2.0f / (tw), -1.0f, 2.0f / (th), -1.0f); \
+			glUniform2f(glGetUniformLocation(prog[k], "fill_offset"), (ox), (oy));                          \
+			glUniform2f(glGetUniformLocation(prog[k], "fill_size_inv"), 1.0f / (sw), 1.0f / (sh));          \
+			glUniform1i(glGetUniformLocation(prog[k], "sampler"), 0);                                       \
+			glVertexAttribPointer(0, 2, GL_SHORT, GL_FALSE, 0, v_);                                         \
+			glDrawArrays(GL_QUADS, 0, 4 * (nbox));                                                          \
+			glUseProgram(0);                                                                                \
+		} while (0)
+
+		glBindTexture(GL_TEXTURE_2D, t_src);
+		{
+			static const int one[4] = { 100, 50, 140, 80 };              /* source (5, 7) */
+			static const int two[8] = { 10, 10, 30, 20, 40, 10, 50, 60 }; /* both read box + (2, 3) */
+			static const int sc[4] = { 20, 100, 80, 140 };               /* scissored to x < 50 */
+			static const int tile[4] = { 100, 140, 250, 250 };           /* the tile from (20, 10) on, wrapping */
+
+			COPY_DRAW(0, one, 1, 5 - 100, 7 - 50, 64, 64, 256, 256);
+			COPY_DRAW(0, two, 2, 2, 3, 64, 64, 256, 256);
+			glEnable(GL_SCISSOR_TEST);
+			glScissor(0, 0, 50, 256);
+			COPY_DRAW(0, sc, 1, 1 - 20, 2 - 100, 64, 64, 256, 256);
+			glDisable(GL_SCISSOR_TEST);
+			COPY_DRAW(1, tile, 1, 20 - 100, 10 - 140, 64, 64, 256, 256);
+		}
+		memset(p, 0xA5, 256 * 256 * 4);
+		glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, p);
+		{
+			/* every pixel of the target against what it must hold */
+			int bad_in = 0, bad_out = 0, fx = -1, fy = -1;
+
+			for (int y = 0; y < 256; y++) {
+				for (int x = 0; x < 256; x++) {
+					const uint8_t *q = p + 4 * (y * 256 + x);
+					int sx = -1, sy = -1;
+
+					if (x >= 100 && x < 140 && y >= 50 && y < 80) { sx = x - 95; sy = y - 43; }
+					else if (((x >= 10 && x < 30 && y >= 10 && y < 20) || (x >= 40 && x < 50 && y >= 10 && y < 60))) { sx = x + 2; sy = y + 3; }
+					else if (x >= 20 && x < 50 && y >= 100 && y < 140) { sx = x - 19; sy = y - 98; }
+					else if (x >= 100 && x < 250 && y >= 140 && y < 250) { sx = (x - 80) % 64; sy = (y - 130) % 64; }
+					if (sx >= 0) {
+						const uint8_t *e = pat + 4 * (sy * 64 + sx);
+
+						if (memcmp(q, e, 4) && !bad_in++) { fx = x; fy = y; }
+					} else if (!(q[0] == 0 && q[1] == 0 && q[2] == 255 && q[3] == 255) && !bad_out++) {
+						if (fx < 0) { fx = x; fy = y; }
+					}
+				}
+			}
+			if (bad_in || bad_out)
+				printf("  %d copied pixels wrong, %d outside changed; the first at (%d, %d)\n", bad_in, bad_out, fx, fy);
+			check(&fails, !bad_in, "a rectangle, two in one draw, a scissored one, a tile: exact", p + 4 * (60 * 256 + 110));
+			check(&fails, !bad_out, "the pixels around them: blue", p + 4 * (5 * 256 + 5));
+		}
+
+		/* an RGB image (alpha kept at 1.0) takes the alpha-0 source; drawn back into the RGBA target its alpha is 1.0 */
+		t_rgb3 = texture(64, 64, GL_RGB, NULL, GL_NEAREST);
+		glGenFramebuffersEXT(1, &fbo10);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo10);
+		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_rgb3, 0);
+		glViewport(0, 0, 64, 64);
+		glBindTexture(GL_TEXTURE_2D, t_src);
+		{
+			static const int all[4] = { 0, 0, 64, 64 };
+			static const int back[4] = { 160, 20, 224, 84 };
+
+			COPY_DRAW(0, all, 1, 0, 0, 64, 64, 64, 64);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo9);
+			glViewport(0, 0, 256, 256);
+			glBindTexture(GL_TEXTURE_2D, t_rgb3);
+			COPY_DRAW(0, back, 1, -160, -20, 64, 64, 256, 256);
+		}
+		memset(p, 0xA5, 256 * 256 * 4);
+		glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, p);
+		bad = 0;
+		for (int y = 20; y < 84; y++) {
+			for (int x = 160; x < 224; x++) {
+				const uint8_t *q = p + 4 * (y * 256 + x), *e = pat + 4 * ((y - 20) * 64 + x - 160);
+
+				bad += q[0] != e[0] || q[1] != e[1] || q[2] != e[2] || q[3] != 255;
+			}
+		}
+		if (bad)
+			printf("  %d pixels wrong\n", bad);
+		check(&fails, !bad, "RGBA (alpha 0) -> RGB -> RGBA: colours, alpha 1.0", p + 4 * (30 * 256 + 170));
+
+		/* the same program magnified 2x: not a copy, drawn */
+		glBindTexture(GL_TEXTURE_2D, t_src);
+		{
+			static const int mag[4] = { 0, 160, 64, 224 };
+
+			COPY_DRAW(0, mag, 1, 0, -160, 128, 128, 256, 256);   /* texel = (box) / 2 */
+		}
+		memset(p, 0xA5, 256 * 256 * 4);
+		glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, p);
+		bad = 0;
+		for (int y = 160; y < 224; y++)
+			for (int x = 0; x < 64; x++)
+				bad += !near(p + 4 * (y * 256 + x), pat[4 * (((y - 160) / 2) * 64 + x / 2)],
+				             pat[4 * (((y - 160) / 2) * 64 + x / 2) + 1], pat[4 * (((y - 160) / 2) * 64 + x / 2) + 2], 1);
+		if (bad)
+			printf("  %d pixels wrong\n", bad);
+		check(&fails, !bad, "magnified 2x (drawn): each texel on 2 x 2 pixels", p + 4 * (170 * 256 + 10));
+
+		/* moves of an xterm-sized window inside an 800 x 600 image */
+		glBindTexture(GL_TEXTURE_2D, t_dst);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 800, 600, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo9);
+		glViewport(0, 0, 800, 600);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glBindTexture(GL_TEXTURE_2D, t_src);
+		{
+			static const int fill[4] = { 0, 0, 800, 600 };
+
+			COPY_DRAW(1, fill, 1, 0, 0, 64, 64, 800, 600);    /* the tile over all of it */
+		}
+		{
+			GLuint t_tmp = texture(374, 298, GL_RGBA, NULL, GL_NEAREST);
+			GLuint fbo11;
+
+			glGenFramebuffersEXT(1, &fbo11);
+			glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo11);
+			glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t_tmp, 0);
+			glFinish();
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
+			for (int i = 0; i < 40; i++) {
+				/* the X server's way: the window into a temporary image, then back at its new place, 8 right and 5
+				 * down; it starts at (40, 60) */
+				static const int tmp_box[4] = { 0, 0, 374, 298 };
+				int x = 40 + i * 8, y = 60 + i * 5;
+				int to[4] = { x + 8, y + 5, x + 8 + 374, y + 5 + 298 };
+
+				glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo11);
+				glViewport(0, 0, 374, 298);
+				glBindTexture(GL_TEXTURE_2D, t_dst);
+				COPY_DRAW(0, tmp_box, 1, x, y, 800, 600, 374, 298);
+				glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo9);
+				glViewport(0, 0, 800, 600);
+				glBindTexture(GL_TEXTURE_2D, t_tmp);
+				COPY_DRAW(0, to, 1, -to[0], -to[1], 374, 298, 800, 600);
+				glFlush();
+			}
+			glFinish();
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			t1 = ts.tv_sec + ts.tv_nsec * 1e-9;
+			printf("  40 moves of a 374 x 298 window (two copies each): %.2f ms a move\n", (t1 - t0) * 1e3 / 40);
+			/* two copies of 111 452 pixels at ~9 ns: ~2 ms; drawn (a pass over each target's rows): ~5 ms */
+			check(&fails, (t1 - t0) * 1e3 / 40 < 3.5, "a move costs its copies, not passes", (const uint8_t *)"\0\0\0\0");
+			/* the window at (360, 260) holds what was at (40, 60): the tile from there */
+			memset(p, 0xA5, 800 * 600 * 4);
+			glReadPixels(0, 0, 800, 600, GL_RGBA, GL_UNSIGNED_BYTE, p);
+			bad = 0;
+			for (int y = 0; y < 298; y++)
+				for (int x = 0; x < 374; x++)
+					bad += memcmp(p + 4 * ((260 + y) * 800 + 360 + x), pat + 4 * (((60 + y) % 64) * 64 + (40 + x) % 64), 4) != 0;
+			if (bad)
+				printf("  %d pixels of the moved window wrong\n", bad);
+			check(&fails, !bad, "the moved window holds what it held at the start", p + 4 * (300 * 800 + 400));
+			glDeleteFramebuffersEXT(1, &fbo11);
+			glDeleteTextures(1, &t_tmp);
+		}
+		/* into a pass of the whole target (64 x 64 with depth) that has a draw: drawn in that pass, not copied */
+		glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+		glViewport(0, 0, W, H);
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glColor3f(1, 1, 0);
+		quad(0, 0, 32, 64, 0);
+		glBindTexture(GL_TEXTURE_2D, t_src);
+		{
+			static const int b[4] = { 40, 8, 56, 24 };
+
+			COPY_DRAW(0, b, 1, 3 - 40, 5 - 8, 64, 64, W, H);
+		}
+		read_back();
+		check(&fails, near(at(16, 16), 255, 255, 0, 1), "a whole-target pass: its quad (yellow)", at(16, 16));
+		check(&fails, near(at(45, 10), pat[4 * (7 * 64 + 8)], pat[4 * (7 * 64 + 8) + 1], pat[4 * (7 * 64 + 8) + 2], 1),
+		      "and the copy drawn in it after the quad", at(45, 10));
+#undef COPY_DRAW
+		glDisableVertexAttribArray(0);
+		glClearColor(0, 0, 0, 1);
+		glDeleteFramebuffersEXT(1, &fbo9);
+		glDeleteFramebuffersEXT(1, &fbo10);
+		glDeleteTextures(1, &t_src);
+		glDeleteTextures(1, &t_dst);
+		glDeleteTextures(1, &t_rgb3);
+		glDeleteProgram(prog[0]);
+		glDeleteProgram(prog[1]);
+		free(pat);
 		free(p);
 	}
 

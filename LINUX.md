@@ -236,9 +236,17 @@ counters and the last STATUS.
     pieces drawn in small pixmaps in between), ~3 per move step. Mesa now renders a pass that reaches few rows into an
     alias of those rows only (region passes, `host/linux/mesa/README.md`; the kernel's alias takes an offset, and
     heap B keeps an 8 KB guard at its top). Measured with the same 30 steps: moves 1.5 s -> 0.7 s of board time;
-    during resizes glxgears kept 181 fps (4 fps before). What remains is window-sized copies (a moved window,
-    glxgears' frames): board B's COPY_IMAGE would do those at ~9 ns per copied pixel. The boards give no vblank, so
-    X's Present does not pace windowed clients: glxgears presents as fast as the board takes it.
+    during resizes glxgears kept 181 fps (4 fps before). The boards give no vblank, so X's Present does not pace
+    windowed clients: glxgears presents as fast as the board takes it.
+  - Moves still lagged with bigger windows. Since 2026-11-17 Mesa does a draw that copies an image one to one as
+    board B's COPY_IMAGE (~9 ns a copied pixel; `host/linux/mesa/README.md`, Copies): X's window copies and tiles all
+    became copies (190 in 10 moves, none drawn). 30 moves, until the boards were done: a 604 x 394 xterm 546 -> 279
+    ms, a 364 x 264 one 264 -> 151 ms (the moves themselves take 140 ms). What remains a move: X copies the window
+    into a temporary image and back (no GL_NV_texture_barrier: two copies), and the strip a move uncovers is
+    composited into a temporary of its bounds (glamor's composite program, a pass of ~613 x 428) before it is copied.
+  - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
+    sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
+    because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.
   - fpgagpu loads at boot (`kernel/fpgagpu-load.conf` as `/etc/modules-load.d/fpgagpu.conf`). While board A does not
     answer (the boards off; at boot, the network not up yet) the module stays loaded and greets it again every 5 s;
     the DRM device appears once it answers. LightDM waits up to 10 s for the card at its start

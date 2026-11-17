@@ -410,7 +410,7 @@ fg_create_vs_state(struct pipe_context *pctx, const struct pipe_shader_state *cs
       return so;
    }
    so->nir = cso->ir.nir;
-   fg_nir_lower(so->nir, &so->eval);
+   fg_nir_lower(so->nir, &so->ev, NULL);
    so->vmask = fg_varying_mask(so->nir->info.outputs_written);
    key.noops = fg_noops(screen->a_flags);
    if (fg_compile(so->nir, &key, &so->prog, err, sizeof(err)))
@@ -439,7 +439,7 @@ fg_delete_vs_state(struct pipe_context *pctx, void *hwcso)
    if (ctx->hw_prog == so)
       ctx->hw_prog = NULL;
    fg_program_free(&so->prog);
-   fg_eval_destroy(so->eval);
+   fg_vs_eval_free(&so->ev);
    ralloc_free(so->nir);
    FREE(so);
 }
@@ -456,7 +456,7 @@ fg_create_fs_state(struct pipe_context *pctx, const struct pipe_shader_state *cs
       return so;
    }
    so->nir = cso->ir.nir;
-   fg_nir_lower(so->nir, NULL);
+   fg_nir_lower(so->nir, NULL, &so->copy);
    return so;
 }
 
@@ -1189,6 +1189,58 @@ fg_stream_vertices(struct fg_context *ctx, struct fg_hw_draw *d, int lo, int hi,
    return true;
 }
 
+/* a draw's index data on the CPU (NULL: none to be had) */
+static const uint8_t *
+fg_index_data(const struct pipe_draw_info *info)
+{
+   return info->has_user_indices ? info->index.user :
+          (info->index.resource ? fg_resource(info->index.resource)->data : NULL);
+}
+
+/* the vertex of the j-th index of draw d (ib: the index data, NULL when not indexed); false: a negative one */
+static bool
+fg_vertex_index(const struct pipe_draw_info *info, const uint8_t *ib, const struct pipe_draw_start_count_bias *d,
+                unsigned j, int64_t *idx)
+{
+   if (!ib) {
+      *idx = (int64_t)d->start + j;
+      return true;
+   }
+   {
+      const uint8_t *p = ib + (size_t)(d->start + j) * info->index_size;
+
+      *idx = info->index_size == 1 ? *p : info->index_size == 2 ? *(const uint16_t *)p : *(const uint32_t *)p;
+   }
+   *idx += d->index_bias;
+   return *idx >= 0;
+}
+
+/* the attributes in need of vertex idx as floats (the others (0, 0, 0, 1)); false: one cannot be read */
+static bool
+fg_fetch_vertex(struct fg_context *ctx, int64_t idx, uint32_t need, float in[FG_MAX_ATTRIBS][4])
+{
+   const struct fg_velems_state *ve = ctx->velems;
+
+   for (unsigned a = 0; a < FG_MAX_ATTRIBS; a++) {
+      in[a][0] = in[a][1] = in[a][2] = 0.0f;
+      in[a][3] = 1.0f;
+      if (!(need & (1u << a)) || a >= ve->count || !ve->v[a].bytes)
+         continue;
+      {
+         const struct fg_velem *v = &ve->v[a];
+         const struct pipe_vertex_buffer *vb = &ctx->vb[v->e.vertex_buffer_index];
+         const uint8_t *base = v->e.vertex_buffer_index < ctx->nvb ? fg_vb_data(vb) : NULL;
+         int64_t at = v->e.instance_divisor ? 0 : idx;
+
+         if (!base)
+            return false;
+         util_format_unpack_rgba(v->e.src_format, in[a],
+                                 base + vb->buffer_offset + v->e.src_offset + at * v->e.src_stride, 1);
+      }
+   }
+   return true;
+}
+
 /* the pixels a draw can touch in the target (x0, y0, x1, y1): its rectangle (target, viewport, scissor), narrowed to
  * its vertices' window positions when the vertex program's position can be worked out on the CPU and the draw has
  * few vertices. A vertex behind the eye (w <= 0: clipping) keeps the rectangle */
@@ -1199,7 +1251,7 @@ fg_draw_bounds(struct fg_context *ctx, const struct pipe_draw_info *info, const 
    const struct pipe_rasterizer_state *rs = ctx->rast;
    const struct pipe_viewport_state *vp = &ctx->viewport;
    const struct fg_velems_state *ve = ctx->velems;
-   struct fg_eval *e = ctx->vs ? ctx->vs->eval : NULL;
+   struct fg_eval *e = ctx->vs ? ctx->vs->ev.pos : NULL;
    double sx = fabs(vp->scale[0]), sy = fabs(vp->scale[1]), pad = 1.0;
    double mnx = INFINITY, mny = INFINITY, mxx = -INFINITY, mxy = -INFINITY;
    const uint8_t *ib = NULL;
@@ -1242,41 +1294,17 @@ fg_draw_bounds(struct fg_context *ctx, const struct pipe_draw_info *info, const 
       pad += rs->line_width / 2.0;
    }
    if (info->index_size) {
-      ib = info->has_user_indices ? info->index.user :
-           (info->index.resource ? fg_resource(info->index.resource)->data : NULL);
+      ib = fg_index_data(info);
       if (!ib)
          return;
    }
    need = fg_eval_inputs(e);
    for (unsigned k = 0; k < num_draws; k++) {
       for (unsigned j = 0; j < draws[k].count; j++) {
-         int64_t idx = (int64_t)draws[k].start + j;
+         int64_t idx;
 
-         if (ib) {
-            const uint8_t *p = ib + (size_t)(draws[k].start + j) * info->index_size;
-
-            idx = info->index_size == 1 ? *p : info->index_size == 2 ? *(const uint16_t *)p : *(const uint32_t *)p;
-            idx += draws[k].index_bias;
-            if (idx < 0)
-               return;
-         }
-         for (unsigned a = 0; a < FG_MAX_ATTRIBS; a++) {
-            in[a][0] = in[a][1] = in[a][2] = 0.0f;
-            in[a][3] = 1.0f;
-            if (!(need & (1u << a)) || a >= ve->count || !ve->v[a].bytes)
-               continue;
-            {
-               const struct fg_velem *v = &ve->v[a];
-               const struct pipe_vertex_buffer *vb = &ctx->vb[v->e.vertex_buffer_index];
-               const uint8_t *base = v->e.vertex_buffer_index < ctx->nvb ? fg_vb_data(vb) : NULL;
-               int64_t at = v->e.instance_divisor ? 0 : idx;
-
-               if (!base)
-                  return;
-               util_format_unpack_rgba(v->e.src_format, in[a],
-                                       base + vb->buffer_offset + v->e.src_offset + at * v->e.src_stride, 1);
-            }
-         }
+         if (!fg_vertex_index(info, ib, &draws[k], j, &idx) || !fg_fetch_vertex(ctx, idx, need, in))
+            return;
          if (!fg_eval_position(e, (const float (*)[4])in, (const float *)ctx->cb[0], ctx->cb_size[0] / 16, pos) ||
              pos[3] < 1e-6f)
             return;
@@ -1301,6 +1329,402 @@ fg_draw_bounds(struct fg_context *ctx, const struct pipe_draw_info *info, const 
       b[2] = b[0];
       b[3] = b[1];
    }
+}
+
+/* ------------------------------------------------------------------ draws that copy an image */
+
+#define FG_COPY_MAX_VERTS  4096 /* the vertices a draw may have to be looked at as a copy */
+#define FG_COPY_MAX_PIECES 64   /* the COPY_IMAGEs it may become */
+#define FG_COPY_EPS        (1.0 / 64.0)
+
+struct fg_copy_piece {
+   int sx, sy, dx, dy, w, h;
+};
+
+static bool
+fg_copy_no(struct fg_context *ctx, const char *why)
+{
+   if (ctx->debug_copy)
+      fprintf(stderr, "fpgagpu: a copying draw is drawn: %s\n", why);
+   return false;
+}
+
+/* a window coordinate's pixel edge: pixels whose centres are at or right of (below) it; false when a centre lies on
+ * it (which pixel takes it is the rasterizer's rule) */
+static bool
+fg_copy_edge(double x, int *px)
+{
+   double e = x - 0.5;
+
+   if (fabs(e - rint(e)) < 1e-3)
+      return false;
+   *px = (int)ceil(e);
+   return true;
+}
+
+/* one axis of a copy: the destination run [d, d + n) reads the source from s on. A wrapping axis (a repeating tile)
+ * is cut where the source wraps; -1: a run past the image on an axis that does not wrap, or too many cuts */
+static int
+fg_copy_runs(int d, int n, int s, int size, bool wraps, int run[][3], int max)
+{
+   int k = 0;
+
+   if (!wraps) {
+      if (s < 0 || s + n > size)
+         return -1;
+      run[0][0] = d;
+      run[0][1] = s;
+      run[0][2] = n;
+      return 1;
+   }
+   s %= size;
+   if (s < 0)
+      s += size;
+   while (n > 0) {
+      int len = MIN2(n, size - s);
+
+      if (k == max)
+         return -1;
+      run[k][0] = d;
+      run[k][1] = s;
+      run[k][2] = len;
+      k++;
+      d += len;
+      n -= len;
+      s = 0;
+   }
+   return k;
+}
+
+/* the corner (bit 0: right, bit 1: bottom) of a rectangle with edges x0 < x1, y0 < y1 a point is at; -1 none */
+static int
+fg_copy_corner(const double p[2], double x0, double x1, double y0, double y1)
+{
+   int c = 0;
+
+   if (fabs(p[0] - x1) < 1e-3)
+      c |= 1;
+   else if (fabs(p[0] - x0) >= 1e-3)
+      return -1;
+   if (fabs(p[1] - y1) < 1e-3)
+      c |= 2;
+   else if (fabs(p[1] - y0) >= 1e-3)
+      return -1;
+   return c;
+}
+
+/* two triangles that together are an axis-aligned rectangle (they share its diagonal): its window edges */
+static bool
+fg_copy_rect(const double (*w)[2], const unsigned t[6], double r[4])
+{
+   double x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+   unsigned ma = 0, mb = 0;
+
+   for (unsigned i = 0; i < 6; i++) {
+      x0 = MIN2(x0, w[t[i]][0]);
+      x1 = MAX2(x1, w[t[i]][0]);
+      y0 = MIN2(y0, w[t[i]][1]);
+      y1 = MAX2(y1, w[t[i]][1]);
+   }
+   if (x1 - x0 < 1e-3 || y1 - y0 < 1e-3)
+      return false;
+   for (unsigned i = 0; i < 6; i++) {
+      int c = fg_copy_corner(w[t[i]], x0, x1, y0, y1);
+      unsigned *m = i < 3 ? &ma : &mb;
+
+      if (c < 0 || (*m & (1u << c)))
+         return false;
+      *m |= 1u << c;
+   }
+   /* all four corners, and the two the triangles share are opposite ones */
+   if ((ma | mb) != 0xF || ((ma & mb) != 0x9 && (ma & mb) != 0x6))
+      return false;
+   r[0] = x0;
+   r[1] = y0;
+   r[2] = x1;
+   r[3] = y1;
+   return true;
+}
+
+/* the vertices of the i-th triangle of a draw of n vertices */
+static void
+fg_copy_tri(enum mesa_prim mode, unsigned i, unsigned t[3])
+{
+   if (mode == MESA_PRIM_TRIANGLES) {
+      t[0] = 3 * i;
+      t[1] = 3 * i + 1;
+      t[2] = 3 * i + 2;
+   } else if (mode == MESA_PRIM_TRIANGLE_STRIP) {
+      t[0] = i;
+      t[1] = i + 1;
+      t[2] = i + 2;
+   } else {
+      t[0] = 0;
+      t[1] = i + 1;
+      t[2] = i + 2;
+   }
+}
+
+/* A draw whose fragment program copies an image (fg_fs_copy), with nothing that changes what it writes (blending,
+ * masks, depth, stencil, culling) and whose texture coordinates run one to one with the window position at an
+ * integer offset, over rectangles (pairs of triangles): its rectangles, clipped to the scissor, viewport and target,
+ * as board B's COPY_IMAGE (its copy engine moves about a pixel a clock and only the rectangle, where a pass loads and
+ * stores every row it reaches). The copies give what GL defines for such a draw: each pixel takes the texel under its
+ * centre. Where the alpha written is 1.0 (the board keeps the target's at 1.0, or the texel reads it so) and the
+ * source's stored alpha is not kept at 1.0, the copy's alpha is set to 1.0 after it. false: it is to be drawn */
+static bool
+fg_draw_as_copy(struct fg_context *ctx, const struct pipe_draw_info *info, const struct pipe_draw_start_count_bias *draws,
+                unsigned num_draws)
+{
+   const struct fg_fs_copy *cp = &ctx->fs->copy;
+   const struct fg_vs_state *vs = ctx->vs;
+   const struct pipe_rasterizer_state *rs = ctx->rast;
+   const struct pipe_viewport_state *vp = &ctx->viewport;
+   struct fg_copy_piece pieces[FG_COPY_MAX_PIECES];
+   struct pipe_sampler_view *view;
+   const struct fg_sampler_state *smp;
+   struct pipe_resource *src, *dst;
+   const struct fg_format *sf, *df, *vf;
+   struct fg_eval *ev[3];
+   uint32_t need, cmask, want;
+   const uint8_t *ib = NULL;
+   unsigned total = 0, npieces = 0, swa;
+   int clip[4], tw, th, sw, sh;
+   bool wraps[2], fill;
+   double (*win)[2] = NULL, (*tex)[2] = NULL;
+
+   if (ctx->no_copy || !cp->ok)
+      return false;
+   if (info->mode != MESA_PRIM_TRIANGLES && info->mode != MESA_PRIM_TRIANGLE_STRIP &&
+       info->mode != MESA_PRIM_TRIANGLE_FAN)
+      return fg_copy_no(ctx, "not triangles");
+   if (info->instance_count != 1 || !rs || !ctx->blend)
+      return fg_copy_no(ctx, "instanced, or no rasterizer or blend state");
+
+   /* (before the framebuffer becomes the pass's target: a draw that is a copy leaves the open pass alone unless it
+    * reads or writes the images, and a target with a render shadow need not take the image first) */
+   dst = ctx->fb.nr_cbufs ? ctx->fb.cbufs[0].texture : NULL;
+   if (!dst || dst->target != PIPE_TEXTURE_2D || ctx->fb.cbufs[0].level || ctx->fb.cbufs[0].first_layer ||
+       !(df = fg_resource(dst)->fmt))
+      return fg_copy_no(ctx, "not level 0 of a 2D image");
+
+   /* what is written is the texel as it is */
+   if (ctx->blend->h0 & 64u)
+      return fg_copy_no(ctx, "blending");
+   cmask = ctx->blend->h0 >> 16 & 0xF;
+   want = fg_board_cmask(fg_format_wmask(df));
+   for (unsigned c = 0; c < 4; c++)
+      if (!df->bits[c])
+         want &= ~fg_board_cmask(1u << c);
+   if (df->force_alpha)
+      want &= ~1u;
+   if ((cmask & want) != want)
+      return fg_copy_no(ctx, "a colour mask");
+   if (ctx->fb.zsbuf.texture && ctx->dsa && (ctx->dsa->h0 & (1u | 2u | 32u)))
+      return fg_copy_no(ctx, "depth or stencil");
+   if (rs->cull_face != PIPE_FACE_NONE || rs->fill_front != PIPE_POLYGON_MODE_FILL ||
+       rs->fill_back != PIPE_POLYGON_MODE_FILL || rs->poly_stipple_enable || rs->rasterizer_discard ||
+       rs->clip_plane_enable)
+      return fg_copy_no(ctx, "culling, a polygon mode, a stipple or clip planes");
+
+   /* the image: one level of a 2D texture, read as it is stored */
+   view = ctx->views[cp->unit];
+   smp = ctx->samplers[cp->unit];
+   if (!view || !view->texture || !smp)
+      return fg_copy_no(ctx, "no texture");
+   src = view->texture;
+   sf = fg_resource(src)->fmt;
+   vf = fg_format_info(view->format);
+   if (src->target != PIPE_TEXTURE_2D || view->target != PIPE_TEXTURE_2D || view->u.tex.first_level ||
+       view->u.tex.first_layer || smp->compare ||
+       (view->u.tex.last_level > view->u.tex.first_level && smp->filter != smp->filter_nomip))
+      return fg_copy_no(ctx, "not one level of a 2D texture");
+   /* a pass with draws that renders into the image would end for the copy and start again after it: one of the whole
+    * target (a frame with depth) would cost a second pass, so the draw goes into it */
+   if (ctx->pass_open && ctx->pass_draws && ctx->have_tgt && (ctx->tgt.color == dst || ctx->tgt.shadow_of == dst) &&
+       !(ctx->rg.on && !ctx->rg.full))
+      return fg_copy_no(ctx, "the open pass renders into the whole image");
+   if (!sf || !vf || !df || sf->depth || df->depth || !fg_resource(src)->gem || !fg_resource(dst)->gem ||
+       (sf->storage != FG_FMT_RGBA8 && sf->storage != FG_FMT_RGB565) || sf->storage != df->storage ||
+       vf->storage != sf->storage ||
+       ((sf->expand || df->expand || vf->expand) && !(sf == df && vf == sf)))
+      return fg_copy_no(ctx, "formats board B does not copy as they are sampled");
+   swa = view->swizzle_a;
+   if (view->swizzle_r != PIPE_SWIZZLE_X || view->swizzle_g != PIPE_SWIZZLE_Y || view->swizzle_b != PIPE_SWIZZLE_Z ||
+       (swa != PIPE_SWIZZLE_W && swa != PIPE_SWIZZLE_1))
+      return fg_copy_no(ctx, "a swizzle");
+   /* the alpha written is 1.0: the board keeps the target's at 1.0, or the texel reads it so; a source whose
+    * stored alpha is 1.0 (an X format) copies it */
+   fill = (df->force_alpha || swa == PIPE_SWIZZLE_1 || vf->force_alpha) && !sf->force_alpha &&
+          df->storage == FG_FMT_RGBA8;
+   wraps[0] = cp->fract[0] || (smp->wrap >> 20 & 3u) == 0;
+   wraps[1] = cp->fract[1] || (smp->wrap >> 22 & 3u) == 0;
+   sw = (int)src->width0;
+   sh = (int)src->height0;
+
+   /* the vertex program's position and coordinates on the CPU */
+   ev[0] = vs->ev.pos;
+   ev[1] = fg_vs_eval_varying(&vs->ev, cp->loc[0]);
+   ev[2] = fg_vs_eval_varying(&vs->ev, cp->loc[1]);
+   if (!ev[0] || !ev[1] || !ev[2])
+      return fg_copy_no(ctx, "the vertex program's position or coordinates cannot be worked out");
+   for (unsigned k = 0; k < num_draws; k++)
+      total += draws[k].count;
+   if (total > FG_COPY_MAX_VERTS)
+      return fg_copy_no(ctx, "too many vertices");
+   if (info->index_size && !(ib = fg_index_data(info)))
+      return fg_copy_no(ctx, "no index data");
+   need = fg_eval_inputs(ev[0]) | fg_eval_inputs(ev[1]) | fg_eval_inputs(ev[2]);
+
+   /* where it may write: scissor, viewport, target */
+   tw = (int)dst->width0;
+   th = (int)dst->height0;
+   clip[0] = MAX2(0, (int)ceil(vp->translate[0] - fabs(vp->scale[0]) - 0.5));
+   clip[1] = MAX2(0, (int)ceil(vp->translate[1] - fabs(vp->scale[1]) - 0.5));
+   clip[2] = MIN2(tw, (int)ceil(vp->translate[0] + fabs(vp->scale[0]) - 0.5));
+   clip[3] = MIN2(th, (int)ceil(vp->translate[1] + fabs(vp->scale[1]) - 0.5));
+   if (rs->scissor) {
+      clip[0] = MAX2(clip[0], (int)ctx->scissor.minx);
+      clip[1] = MAX2(clip[1], (int)ctx->scissor.miny);
+      clip[2] = MIN2(clip[2], (int)ctx->scissor.maxx);
+      clip[3] = MIN2(clip[3], (int)ctx->scissor.maxy);
+   }
+
+   win = malloc(total * sizeof(*win));
+   tex = malloc(total * sizeof(*tex));
+   if (!win || !tex) {
+      free(win);
+      free(tex);
+      return false;
+   }
+   {
+      const float *uni = (const float *)ctx->cb[0];
+      const unsigned nvec = ctx->cb_size[0] / 16;
+      const double zlo = rs->clip_halfz ? 0.0 : -1.0;
+      double off[2] = { 0.0, 0.0 }, w0 = 0.0;
+      unsigned first = 0;
+      const char *why = NULL;
+
+      for (unsigned k = 0; k < num_draws && !why; k++) {
+         unsigned n = draws[k].count, ntri;
+
+         /* every vertex: its window position, and its texel position at the same integer offset as the others */
+         for (unsigned j = 0; j < n && !why; j++) {
+            float in[FG_MAX_ATTRIBS][4], pos[4], s[4], t[4];
+            int64_t idx;
+            double o[2], *wv = win[first + j], *tv = tex[first + j];
+
+            if (!fg_vertex_index(info, ib, &draws[k], j, &idx) || !fg_fetch_vertex(ctx, idx, need, in)) {
+               why = "a vertex cannot be read";
+               break;
+            }
+            if (!fg_eval_position(ev[0], (const float (*)[4])in, uni, nvec, pos) ||
+                !(fg_eval_output(ev[1], (const float (*)[4])in, uni, nvec, s) & (1u << cp->comp[0])) ||
+                !(fg_eval_output(ev[2], (const float (*)[4])in, uni, nvec, t) & (1u << cp->comp[1]))) {
+               why = "a vertex's outputs cannot be worked out";
+               break;
+            }
+            if (pos[3] <= 0.0f || (first + j && fabs(pos[3] - w0) > 1e-6 * w0)) {
+               why = "w differs between vertices";
+               break;
+            }
+            w0 = pos[3];
+            if ((rs->depth_clip_near && pos[2] < zlo * pos[3]) || (rs->depth_clip_far && pos[2] > pos[3])) {
+               why = "a vertex past near or far";
+               break;
+            }
+            wv[0] = pos[0] / pos[3] * vp->scale[0] + vp->translate[0];
+            wv[1] = pos[1] / pos[3] * vp->scale[1] + vp->translate[1];
+            tv[0] = s[cp->comp[0]] * (double)sw;
+            tv[1] = t[cp->comp[1]] * (double)sh;
+            o[0] = tv[0] - wv[0];
+            o[1] = tv[1] - wv[1];
+            if (!(first + j)) {
+               off[0] = rint(o[0]);
+               off[1] = rint(o[1]);
+            }
+            if (fabs(o[0] - off[0]) > FG_COPY_EPS || fabs(o[1] - off[1]) > FG_COPY_EPS)
+               why = "the texture coordinates do not follow the window position one to one";
+         }
+         if (why)
+            break;
+
+         /* its triangles in pairs, each pair a rectangle */
+         ntri = info->mode == MESA_PRIM_TRIANGLES ? n / 3 : n >= 3 ? n - 2 : 0;
+         if (ntri & 1) {
+            why = "an odd number of triangles";
+            break;
+         }
+         for (unsigned i = 0; i < ntri && !why; i += 2) {
+            unsigned t[6];
+            double r[4];
+            int px[4], run_x[8][3], run_y[8][3], nx, ny;
+
+            fg_copy_tri(info->mode, i, t);
+            fg_copy_tri(info->mode, i + 1, t + 3);
+            for (unsigned v = 0; v < 6; v++)
+               t[v] += first;
+            if (!fg_copy_rect((const double (*)[2])win, t, r)) {
+               why = "triangles that are not rectangles";
+               break;
+            }
+            if (!fg_copy_edge(r[0], &px[0]) || !fg_copy_edge(r[1], &px[1]) || !fg_copy_edge(r[2], &px[2]) ||
+                !fg_copy_edge(r[3], &px[3])) {
+               why = "a rectangle's edge through pixel centres";
+               break;
+            }
+            px[0] = MAX2(px[0], clip[0]);
+            px[1] = MAX2(px[1], clip[1]);
+            px[2] = MIN2(px[2], clip[2]);
+            px[3] = MIN2(px[3], clip[3]);
+            if (px[2] <= px[0] || px[3] <= px[1])
+               continue;
+            nx = fg_copy_runs(px[0], px[2] - px[0], px[0] + (int)off[0], sw, wraps[0], run_x, 8);
+            ny = fg_copy_runs(px[1], px[3] - px[1], px[1] + (int)off[1], sh, wraps[1], run_y, 8);
+            if (nx < 0 || ny < 0) {
+               why = "texels past the image's edge";
+               break;
+            }
+            for (int a = 0; a < ny && !why; a++) {
+               for (int b = 0; b < nx; b++) {
+                  struct fg_copy_piece *p = &pieces[npieces];
+
+                  if (npieces == FG_COPY_MAX_PIECES) {
+                     why = "too many rectangles";
+                     break;
+                  }
+                  p->dx = run_x[b][0];
+                  p->sx = run_x[b][1];
+                  p->w = run_x[b][2];
+                  p->dy = run_y[a][0];
+                  p->sy = run_y[a][1];
+                  p->h = run_y[a][2];
+                  npieces++;
+               }
+            }
+         }
+         first += n;
+      }
+      free(win);
+      free(tex);
+      if (why)
+         return fg_copy_no(ctx, why);
+   }
+
+   fg_copy_begin(ctx, src, dst);
+   for (unsigned i = 0; i < npieces; i++) {
+      const struct fg_copy_piece *p = &pieces[i];
+
+      if (ctx->debug_copy)
+         fprintf(stderr, "fpgagpu: copy %dx%d from %d,%d of %s %ux%u to %d,%d of %s %ux%u%s\n", p->w, p->h, p->sx,
+                 p->sy, util_format_short_name(src->format), src->width0, src->height0, p->dx, p->dy,
+                 util_format_short_name(dst->format), dst->width0, dst->height0, fill ? ", alpha 1" : "");
+      fg_emit_copy(ctx, src, 0, 0, p->sx, p->sy, dst, 0, 0, p->dx, p->dy, p->w, p->h);
+      if (fill)
+         fg_emit_alpha_one(ctx, dst, p->dx, p->dy, p->w, p->h);
+   }
+   fg_copy_end(ctx, dst);
+   return true;
 }
 
 static void
@@ -1329,7 +1753,9 @@ fg_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info, unsign
    }
    if (info->instance_count != 1)
       FG_NOTE_ONCE("instancing (each draw is drawn once)");
-   if (!vs || !vs->ok || !ctx->fs || !ctx->velems || !fg_set_target(ctx))
+   if (!vs || !vs->ok || !ctx->fs || !ctx->velems)
+      return;
+   if (fg_draw_as_copy(ctx, info, draws, num_draws) || !fg_set_target(ctx))
       return;
    fs = fg_fs_variant(ctx, ctx->fs, vs);
    if (!fs)

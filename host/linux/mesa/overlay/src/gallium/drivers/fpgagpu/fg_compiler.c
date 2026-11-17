@@ -118,20 +118,20 @@ static bool fg_optimize_once(nir_shader *s)
    return progress;
 }
 
-/* ------------------------------------------------------------------ the position on the CPU */
+/* ------------------------------------------------------------------ outputs on the CPU */
 
-enum { EV_CONST, EV_INPUT, EV_UNIFORM, EV_ALU, EV_POS };
+enum { EV_CONST, EV_INPUT, EV_UNIFORM, EV_ALU, EV_OUT };
 
 struct fg_eval_op {
    uint8_t kind;
-   uint8_t nc;                  /* components of the value it defines (EV_POS: of the value it stores) */
+   uint8_t nc;                  /* components of the value it defines (EV_OUT: of the value it stores) */
    uint8_t nsrc;
-   uint8_t mask;                /* EV_POS: the components it stores */
+   uint8_t mask;                /* EV_OUT: the components it stores */
    uint16_t op;                 /* EV_ALU: the nir_op */
    uint32_t dst;                /* the value it defines (SSA index) */
    uint32_t src[3];
    uint8_t swz[3][4];
-   int base;                    /* EV_INPUT: the attribute; EV_UNIFORM: the vec4 slot; EV_POS: the first component */
+   int base;                    /* EV_INPUT: the attribute; EV_UNIFORM: the vec4 slot; EV_OUT: the first component */
    uint8_t comp;                /* EV_INPUT: the attribute's first component */
    float k[4];                  /* EV_CONST */
 };
@@ -160,10 +160,11 @@ fg_eval_op_ok(nir_op op)
    }
 }
 
-/* the instructions the position depends on, from the SSA form of a vertex program (one block, after the optimising
- * passes); NULL when it depends on something else: control flow, a uniform at a computed index, an operation above */
+/* the instructions the output at this location depends on, from the SSA form of a vertex program (one block, after
+ * the optimising passes); NULL when it depends on something else: control flow, a uniform at a computed index, an
+ * operation above */
 struct fg_eval *
-fg_eval_create(nir_shader *s)
+fg_eval_create(nir_shader *s, unsigned location)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(s);
    struct fg_eval *e = NULL;
@@ -188,8 +189,7 @@ fg_eval_create(nir_shader *s)
       if (instr->type == nir_instr_type_intrinsic) {
          nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
 
-         if (in->intrinsic == nir_intrinsic_store_output &&
-             nir_intrinsic_io_semantics(in).location == VARYING_SLOT_POS) {
+         if (in->intrinsic == nir_intrinsic_store_output && nir_intrinsic_io_semantics(in).location == location) {
             if (!nir_src_is_const(in->src[1]) || nir_src_as_uint(in->src[1]) || in->src[0].ssa->bit_size != 32)
                goto fail;
             BITSET_SET(need, in->src[0].ssa->index);
@@ -253,7 +253,7 @@ fg_eval_create(nir_shader *s)
          nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
 
          if (in->intrinsic == nir_intrinsic_store_output) {
-            o->kind = EV_POS;
+            o->kind = EV_OUT;
             o->nc = in->src[0].ssa->num_components;
             o->src[0] = in->src[0].ssa->index;
             o->base = nir_intrinsic_component(in);
@@ -359,8 +359,8 @@ fg_eval_alu1(nir_op op, float a, float b, float c)
    }
 }
 
-bool
-fg_eval_position(struct fg_eval *e, const float (*in)[4], const float *uni, unsigned nvec, float pos[4])
+unsigned
+fg_eval_output(struct fg_eval *e, const float (*in)[4], const float *uni, unsigned nvec, float pos[4])
 {
    unsigned have = 0;
 
@@ -378,11 +378,11 @@ fg_eval_position(struct fg_eval *e, const float (*in)[4], const float *uni, unsi
          break;
       case EV_UNIFORM:
          if ((unsigned)o->base >= nvec)
-            return false;
+            return 0;
          for (unsigned c = 0; c < o->nc; c++)
             d[c] = uni[4 * o->base + c];
          break;
-      case EV_POS:
+      case EV_OUT:
          for (unsigned c = 0; c < o->nc && o->base + c < 4; c++) {
             if (o->mask & (1u << c)) {
                pos[o->base + c] = e->v[o->src[0]][c];
@@ -431,15 +431,192 @@ fg_eval_position(struct fg_eval *e, const float (*in)[4], const float *uni, unsi
       }
       }
    }
-   if (have != 0xF)
-      return false;
    for (unsigned c = 0; c < 4; c++)
-      if (!isfinite(pos[c]))
+      if ((have & (1u << c)) && !isfinite(pos[c]))
+         have &= ~(1u << c);
+   return have;
+}
+
+bool
+fg_eval_position(struct fg_eval *e, const float (*in)[4], const float *uni, unsigned nvec, float pos[4])
+{
+   return fg_eval_output(e, in, uni, nvec, pos) == 0xF;
+}
+
+void
+fg_vs_eval_free(struct fg_vs_eval *ev)
+{
+   fg_eval_destroy(ev->pos);
+   for (unsigned i = 0; i < FG_EVAL_VARYINGS; i++)
+      fg_eval_destroy(ev->var[i]);
+   memset(ev, 0, sizeof(*ev));
+}
+
+struct fg_eval *
+fg_vs_eval_varying(const struct fg_vs_eval *ev, unsigned location)
+{
+   for (unsigned i = 0; i < FG_EVAL_VARYINGS; i++)
+      if (ev->var[i] && ev->var_loc[i] == location)
+         return ev->var[i];
+   return NULL;
+}
+
+/* the position, and the first generic and texture-coordinate varyings */
+static void
+fg_vs_eval_create(nir_shader *s, struct fg_vs_eval *ev)
+{
+   uint64_t outs = s->info.outputs_written;
+   unsigned n = 0;
+
+   memset(ev, 0, sizeof(*ev));
+   ev->pos = fg_eval_create(s, VARYING_SLOT_POS);
+   if (!ev->pos)
+      return;
+   u_foreach_bit64(loc, outs) {
+      if (n == FG_EVAL_VARYINGS)
+         break;
+      if (loc < VARYING_SLOT_VAR0 && !(loc >= VARYING_SLOT_TEX0 && loc <= VARYING_SLOT_TEX7))
+         continue;
+      ev->var[n] = fg_eval_create(s, loc);
+      if (ev->var[n])
+         ev->var_loc[n++] = (uint8_t)loc;
+   }
+}
+
+/* ------------------------------------------------------------------ fragment programs that copy */
+
+/* a texture coordinate that is a varying's component as it is, or its fract() (lowered: a - floor(a), a + -floor(a)) */
+static bool
+fg_copy_coord(nir_scalar v, uint8_t *loc, uint8_t *comp, bool *fract)
+{
+   nir_intrinsic_instr *in;
+   nir_src *off;
+   unsigned l;
+
+   *fract = false;
+   if (nir_scalar_is_alu(v)) {
+      nir_op op = nir_scalar_alu_op(v);
+
+      if (op == nir_op_ffract) {
+         v = nir_scalar_chase_alu_src(v, 0);
+         *fract = true;
+      } else if (op == nir_op_fsub || op == nir_op_fadd) {
+         for (unsigned i = 0; i < 2 && !*fract; i++) {
+            nir_scalar a = nir_scalar_chase_alu_src(v, i), f = nir_scalar_chase_alu_src(v, 1 - i);
+
+            if (op == nir_op_fsub && i)
+               break;
+            if (op == nir_op_fadd) {
+               if (!nir_scalar_is_alu(f) || nir_scalar_alu_op(f) != nir_op_fneg)
+                  continue;
+               f = nir_scalar_chase_alu_src(f, 0);
+            }
+            if (nir_scalar_is_alu(f) && nir_scalar_alu_op(f) == nir_op_ffloor &&
+                nir_scalar_equal(nir_scalar_chase_alu_src(f, 0), a)) {
+               v = a;
+               *fract = true;
+            }
+         }
+         if (!*fract)
+            return false;
+      } else {
          return false;
+      }
+   }
+   if (!nir_scalar_is_intrinsic(v))
+      return false;
+   in = nir_def_as_intrinsic(v.def);
+   if (in->intrinsic != nir_intrinsic_load_input && in->intrinsic != nir_intrinsic_load_interpolated_input)
+      return false;
+   off = nir_get_io_offset_src(in);
+   if (!off || !nir_src_is_const(*off) || nir_src_as_uint(*off))
+      return false;
+   l = nir_intrinsic_io_semantics(in).location;
+   if (l < VARYING_SLOT_VAR0 && !(l >= VARYING_SLOT_TEX0 && l <= VARYING_SLOT_TEX7))
+      return false;
+   *loc = (uint8_t)l;
+   *comp = (uint8_t)(nir_intrinsic_component(in) + v.comp);
    return true;
 }
 
-void fg_nir_lower(nir_shader *s, struct fg_eval **eval)
+/* one store of the colour, all four components the texel of one 2D texture read (as read: no swizzle), whose
+ * coordinates are varyings; nothing else with an effect (no discard, no depth) */
+static void
+fg_fs_copy_find(nir_shader *s, struct fg_fs_copy *c)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   nir_intrinsic_instr *st = NULL;
+   nir_tex_instr *tex = NULL;
+   int ci;
+
+   memset(c, 0, sizeof(*c));
+   if (!impl || s->info.stage != MESA_SHADER_FRAGMENT || exec_list_length(&impl->body) != 1)
+      return;
+   nir_foreach_instr(instr, nir_start_block(impl)) {
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+
+         switch (in->intrinsic) {
+         case nir_intrinsic_load_input:
+         case nir_intrinsic_load_interpolated_input:
+         case nir_intrinsic_load_barycentric_pixel:
+         case nir_intrinsic_load_barycentric_centroid:
+         case nir_intrinsic_load_uniform:
+            break;
+         case nir_intrinsic_store_output:
+            if (st)
+               return;
+            st = in;
+            break;
+         default:
+            return;
+         }
+      } else if (instr->type == nir_instr_type_tex) {
+         if (tex)
+            return;
+         tex = nir_instr_as_tex(instr);
+      } else if (instr->type != nir_instr_type_alu && instr->type != nir_instr_type_load_const) {
+         return;
+      }
+   }
+   if (!st || !tex)
+      return;
+   {
+      unsigned loc = nir_intrinsic_io_semantics(st).location;
+
+      if ((loc != FRAG_RESULT_COLOR && loc != FRAG_RESULT_DATA0) || nir_intrinsic_component(st) ||
+          (nir_intrinsic_write_mask(st) & 0xF) != 0xF || st->src[0].ssa->num_components != 4 ||
+          !nir_src_is_const(st->src[1]) || nir_src_as_uint(st->src[1]))
+         return;
+   }
+   for (unsigned k = 0; k < 4; k++) {
+      nir_scalar v = nir_scalar_resolved(st->src[0].ssa, k);
+
+      if (v.def != &tex->def || v.comp != k)
+         return;
+   }
+   if (tex->op != nir_texop_tex || tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array || tex->is_shadow ||
+       tex->texture_index != tex->sampler_index || tex->texture_index >= 8 || tex->def.num_components != 4)
+      return;
+   for (unsigned i = 0; i < tex->num_srcs; i++)
+      if (tex->src[i].src_type != nir_tex_src_coord)
+         return;
+   ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (ci < 0 || tex->coord_components != 2)
+      return;
+   for (unsigned k = 0; k < 2; k++)
+      if (!fg_copy_coord(nir_scalar_resolved(tex->src[ci].src.ssa, k), &c->loc[k], &c->comp[k], &c->fract[k]))
+         return;
+   nir_foreach_shader_in_variable(var, s) {
+      if ((var->data.location == c->loc[0] || var->data.location == c->loc[1]) &&
+          var->data.interpolation == INTERP_MODE_FLAT)
+         return;
+   }
+   c->unit = (uint8_t)tex->texture_index;
+   c->ok = true;
+}
+
+void fg_nir_lower(nir_shader *s, struct fg_vs_eval *ev, struct fg_fs_copy *copy)
 {
    bool progress;
 
@@ -469,9 +646,12 @@ void fg_nir_lower(nir_shader *s, struct fg_eval **eval)
    NIR_PASS(_, s, nir_opt_copy_prop);
    NIR_PASS(_, s, nir_opt_dce);
 
-   /* the last SSA form: a vertex program's position, for working out on the CPU what a draw can cover */
-   if (eval)
-      *eval = fg_eval_create(s);
+   /* the last SSA form: a vertex program's position and varyings, for working out on the CPU what a draw can cover
+    * and whether it is a copy; whether a fragment program is one */
+   if (ev)
+      fg_vs_eval_create(s, ev);
+   if (copy)
+      fg_fs_copy_find(s, copy);
 
    NIR_PASS(_, s, nir_convert_from_ssa, true, false);
    NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);

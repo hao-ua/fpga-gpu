@@ -43,19 +43,41 @@ struct fg_program {
 /* the varying locations a vertex stage passes on (VARYING_SLOT_* bits of its outputs_written); slot i is the i-th bit set */
 uint64_t fg_varying_mask(uint64_t outputs_written);
 
-/* a vertex program's clip position worked out on the CPU: the instructions of its SSA form the position depends on
- * (inputs, uniforms, constants, arithmetic). fg_eval_create gives NULL when it depends on anything else (control
- * flow, a uniform at a computed index, an operation the evaluator does not do) */
+/* an output of a vertex program (the clip position, a varying) worked out on the CPU: the instructions of its SSA form
+ * the output depends on (inputs, uniforms, constants, arithmetic). fg_eval_create gives NULL when it depends on
+ * anything else (control flow, a uniform at a computed index, an operation the evaluator does not do) */
 struct fg_eval;
-struct fg_eval *fg_eval_create(nir_shader *s);
+struct fg_eval *fg_eval_create(nir_shader *s, unsigned location);
 void fg_eval_destroy(struct fg_eval *e);
 uint32_t fg_eval_inputs(const struct fg_eval *e);   /* the attributes it reads */
-/* in[i]: attribute i; uni: nvec vec4s (constant buffer 0); false: no finite position */
+/* in[i]: attribute i; uni: nvec vec4s (constant buffer 0). fg_eval_output: the mask of the components it wrote with
+ * finite values; fg_eval_position: false when the position is not all there and finite */
+unsigned fg_eval_output(struct fg_eval *e, const float (*in)[4], const float *uni, unsigned nvec, float out[4]);
 bool fg_eval_position(struct fg_eval *e, const float (*in)[4], const float *uni, unsigned nvec, float pos[4]);
 
-/* the passes fg_compile needs first, on the driver's own copy of a shader (once per shader); eval, when not NULL,
- * gets the position's evaluator from the last SSA form (NULL for other stages or when it cannot be had) */
-void fg_nir_lower(nir_shader *s, struct fg_eval **eval);
+#define FG_EVAL_VARYINGS 4
+
+/* what the CPU can work out of a vertex program: its position and its first varyings, each on its own */
+struct fg_vs_eval {
+   struct fg_eval *pos;                     /* NULL: not to be had */
+   struct fg_eval *var[FG_EVAL_VARYINGS];
+   uint8_t var_loc[FG_EVAL_VARYINGS];       /* their VARYING_SLOT_* */
+};
+void fg_vs_eval_free(struct fg_vs_eval *ev);
+struct fg_eval *fg_vs_eval_varying(const struct fg_vs_eval *ev, unsigned location);
+
+/* a fragment program that samples one 2D image at a varying and writes what it read as its colour, and does nothing
+ * else: drawn with the varying running one to one with the window position, it copies the image */
+struct fg_fs_copy {
+   bool ok;
+   uint8_t unit;              /* the texture and sampler unit */
+   uint8_t loc[2], comp[2];   /* the varying location and component of the coordinates s, t */
+   bool fract[2];             /* the coordinate is fract() of it (a repeating tile) */
+};
+
+/* the passes fg_compile needs first, on the driver's own copy of a shader (once per shader). From the last SSA form:
+ * ev, when not NULL, gets a vertex program's evaluators; copy, when not NULL, whether a fragment program is a copy */
+void fg_nir_lower(nir_shader *s, struct fg_vs_eval *ev, struct fg_fs_copy *copy);
 
 /* 0, or -1 with the reason in err */
 int fg_compile(nir_shader *s, const struct fg_compile_key *key, struct fg_program *out, char *err, size_t errsize);

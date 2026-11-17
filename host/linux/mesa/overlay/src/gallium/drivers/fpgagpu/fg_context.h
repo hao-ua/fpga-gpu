@@ -44,7 +44,7 @@ struct fg_ctx_bo {
 /* shaders */
 struct fg_vs_state {
    nir_shader *nir;           /* lowered (fg_nir_lower) */
-   struct fg_eval *eval;      /* its position on the CPU (NULL: not to be had) */
+   struct fg_vs_eval ev;      /* its position and varyings on the CPU */
    struct fg_program prog;
    bool ok;
    uint64_t vmask;            /* fg_varying_mask of its outputs */
@@ -65,6 +65,7 @@ struct fg_fs_variant {
 struct fg_fs_state {
    nir_shader *nir;
    struct fg_fs_variant *variants;
+   struct fg_fs_copy copy;    /* it copies an image (a draw with it may be done as COPY_IMAGE) */
 };
 
 /* fixed-function state, as DRAW_STATE words */
@@ -203,6 +204,11 @@ struct fg_context {
    uint64_t frame_fence;      /* the end of the previous frame: one frame is kept in flight */
    bool frame_fence_valid;
    bool debug;
+
+   /* draws that copy an image one to one, done as COPY_IMAGE (FPGAGPU_NOCOPY=1: drawn; FPGAGPU_DEBUG_COPY=1: why a
+    * draw with a copying fragment program was drawn, and each copy, on stderr) */
+   bool no_copy;
+   bool debug_copy;
 };
 
 static inline struct fg_context *
@@ -242,6 +248,14 @@ uint32_t fg_stream(struct fg_context *ctx, const void *data, uint32_t bytes, uin
 void fg_emit_copy(struct fg_context *ctx, struct pipe_resource *src, unsigned slevel, unsigned slayer, unsigned sx,
                   unsigned sy, struct pipe_resource *dst, unsigned dlevel, unsigned dlayer, unsigned dx, unsigned dy,
                   unsigned w, unsigned h);
+/* the stored alpha of a rectangle of an RGBA8 image set to 1.0 (FILL_IMAGE with the alpha channel alone) */
+void fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned x, unsigned y, unsigned w,
+                       unsigned h);
+/* before COPY_IMAGEs from src into dst: a pass that reads or writes either ends (board B copies at once and renders
+ * at a FLUSH); after them: what dst's copies (shadow, tight rows) hold is old, and the stream goes out when no pass
+ * is open */
+void fg_copy_begin(struct fg_context *ctx, struct pipe_resource *src, struct pipe_resource *dst);
+void fg_copy_end(struct fg_context *ctx, struct pipe_resource *dst);
 /* the handle the TMU reads the image by: its tight-row copy when its rows are padded */
 uint16_t fg_sample_handle(struct fg_context *ctx, struct pipe_resource *prsc);
 

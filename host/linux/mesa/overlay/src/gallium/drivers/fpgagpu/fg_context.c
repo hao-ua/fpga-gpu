@@ -755,17 +755,52 @@ fg_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst, un
       FG_NOTE_ONCE("resource_copy_region between a buffer and an image, of depth, or between storage formats");
       return;
    }
-   /* board B copies at once and renders at a FLUSH: a pass that reads or writes either image ends first */
-   if (fg_context_pending_uses(ctx, src) || fg_context_pending_uses(ctx, dst))
-      fg_end_pass(ctx);
+   fg_copy_begin(ctx, src, dst);
    for (int z = 0; z < src_box->depth; z++)
       fg_emit_copy(ctx, src, src_level, src_box->z + z, src_box->x, src_box->y, dst, dst_level, dstz + z, dstx, dsty,
                    src_box->width, src_box->height);
+   fg_copy_end(ctx, dst);
+}
+
+void
+fg_copy_begin(struct fg_context *ctx, struct pipe_resource *src, struct pipe_resource *dst)
+{
+   /* board B copies at once and renders at a FLUSH: a pass that reads or writes either image ends first */
+   if (fg_context_pending_uses(ctx, src) || fg_context_pending_uses(ctx, dst))
+      fg_end_pass(ctx);
+   /* the image holds what the copies write: the next pass into it keeps its contents */
+   if (ctx->discard_color == dst)
+      pipe_resource_reference(&ctx->discard_color, NULL);
+}
+
+void
+fg_copy_end(struct fg_context *ctx, struct pipe_resource *dst)
+{
+   struct fg_resource *d = fg_resource(dst);
+
    d->initialized = true;
    d->shadow_stale = true;
    d->tight_stale = true;
    if (!ctx->pass_open)
       fg_submit_stream(ctx);
+}
+
+/* FILL_IMAGE: handle, level, layer, transfer format, channel mask, 0, x, y, w, h, value (bytes R, G, B, A) */
+void
+fg_emit_alpha_one(struct fg_context *ctx, struct pipe_resource *dst, unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   uint8_t b[20] = { 0 };
+
+   fg_put16(b, fg_resource(dst)->board_handle);
+   b[4] = FG_TF_RGBA8888;
+   b[5] = 0x8;
+   fg_put16(b + 8, x);
+   fg_put16(b + 10, y);
+   fg_put16(b + 12, w);
+   fg_put16(b + 14, h);
+   fg_put32(b + 16, 0xFF000000u);
+   fg_emit(ctx, FG_T_FILL_IMAGE, b, sizeof(b), NULL, 0);
+   fg_use_resource(ctx, dst);
 }
 
 /* COPY_IMAGE: src, level, layer, dst, level, layer, source x y w h, destination x y w h, flags, colour key. Both
@@ -923,17 +958,11 @@ fg_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    }
    if (info->filter != PIPE_TEX_FILTER_NEAREST && (sw != dw || sh != dh))
       FG_NOTE_ONCE("a linear stretching blit is done nearest");
-   /* board B copies at once and renders at a FLUSH: a pass that reads or writes either image ends first */
-   if (fg_context_pending_uses(ctx, src) || fg_context_pending_uses(ctx, dst))
-      fg_end_pass(ctx);
+   fg_copy_begin(ctx, src, dst);
    for (int z = 0; z < info->dst.box.depth; z++)
       fg_emit_copy_scaled(ctx, src, info->src.level, info->src.box.z + z, sx, sy, sw, sh, dst, info->dst.level,
                           info->dst.box.z + z, dx, dy, dw, dh, flags);
-   d->initialized = true;
-   d->shadow_stale = true;
-   d->tight_stale = true;
-   if (!ctx->pass_open)
-      fg_submit_stream(ctx);
+   fg_copy_end(ctx, dst);
 }
 
 static void
@@ -1170,6 +1199,8 @@ fg_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    pctx->priv = priv;
    ctx->debug = fg_screen(pscreen)->debug;
    ctx->no_region = debug_get_bool_option("FPGAGPU_NOREGION", false);
+   ctx->no_copy = debug_get_bool_option("FPGAGPU_NOCOPY", false);
+   ctx->debug_copy = debug_get_bool_option("FPGAGPU_DEBUG_COPY", false);
    ctx->cl_depth = 0xFFFFFF;
    ctx->cl_smask = 0xFF;
    ctx->next_id = 1;

@@ -71,6 +71,22 @@ again, before the next draw sends anything, with the images the draw reads on th
 Blits (`glBlitFramebuffer`) are board B's COPY_IMAGE: images of the same storage, a nearest stretch, mirrors, the
 scissor when nothing stretches (`fg_egl_gl` test 8); blended blits and blits between storage formats are not done.
 
+Copies: a draw whose fragment program samples one 2D image at a varying and writes the texel as its colour, and does
+nothing else (`fract()` of the coordinate allowed: a repeating tile), is board B's COPY_IMAGE when the varying runs one
+to one with the window position. The program is recognised once (`fg_fs_copy`, from its last SSA form). Per draw, the
+vertex program's position and that varying are worked out on the CPU for every vertex (`fg_eval`, up to 4096
+vertices); the texel must sit at the same integer offset from the window position at every vertex, and the triangles
+must pair into axis-aligned rectangles. Each rectangle, clipped to the scissor, viewport and target, is one COPY_IMAGE
+(a tile that wraps: one per piece, at most 64 a draw), which gives what GL defines: the texel under each pixel's
+centre. A copy into an image whose alpha the board keeps at 1.0 (an X format), or of a texel read with alpha 1, has
+its alpha set by a FILL_IMAGE of the alpha channel. Drawn as before: blending, a colour mask without one of the image's
+channels, depth or stencil tests, culling, clip planes, a compare or mip filtering in the sampler, swizzles other
+than alpha 1, images of different storage, texels past the edge of a clamped image, and a draw into the target of an
+open pass of the whole target that has draws (ending it for the copy would cost a frame with depth a second pass).
+This is how the X server copies (glamor's copy and tile programs): 30 moves of a 604 x 394 xterm took 279 ms until
+the boards were done instead of 546, of a 364 x 264 one 151 ms instead of 264 (`fg_egl_gl` test 14).
+`FPGAGPU_NOCOPY=1` turns it off; `FPGAGPU_DEBUG_COPY=1` prints each copy, and why a copying draw was drawn.
+
 Not yet: copies between buffers and images, mipmap generation, queries, instancing, importing buffers,
 rendering into a level or layer above 0 or a target wider than 1280, more than one context drawing at a time.
 

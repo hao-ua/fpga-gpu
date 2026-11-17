@@ -259,7 +259,7 @@ def main():
                 for s, d, sx, sy, sw, sh, dx, dy, dw, dh, kw in ext:
                     b.copy_image(s.handle, d.handle, sx, sy, sw, sh, dx, dy, dw, dh, **kw)
                     model_copy(s, d, sx, sy, sw, sh, dx, dy, dw, dh, **kw)
-                rects = [(40, 20, 30, 10), (5, 50, 60, 8), (90, 60, 25, 15)]                  # a list, source offset (-10, -5)
+                rects = [(40, 20, 30, 10), (15, 50, 60, 8), (90, 60, 25, 15)]                 # a list, source offset (-10, -5)
                 b.copy_image(B.handle, R.handle, 0, 0, 20, 10, 10, 5, rects=rects)
                 model_copy(B, R, 0, 0, 20, 10, 10, 5, 20, 10)
                 for x, y, rw, rh in rects:

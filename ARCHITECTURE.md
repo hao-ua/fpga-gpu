@@ -57,8 +57,11 @@ texture unit.
   - `vtx_asm`: assembles triangles, strips, fans, points and lines.
   - Draws overlap: uniforms and descriptors use two banks, chosen by the draw's parity.
 - **`a_setup`:**
-  - `clip_near` clips (Sutherland–Hodgman) against 7 planes: w ≥ 2⁻⁷, near, far and the ±2040-pixel x/y guard band.
-    Triangles that need no clipping take a fast path.
+  - `clip_near` clips triangles and lines (Sutherland–Hodgman) against 7 planes: w ≥ 2⁻⁷, near, far and the ±2040-pixel
+    x/y guard band. Primitives that need no clipping take a fast path.
+    - It works in a format of its own: FP24's sign and exponent with a 31-bit mantissa (`float_addsub_w`,
+      `float_mul_w`). Vertices are extended on the way in and rounded to FP24 once, on the way out.
+    - The lerp factor is FP24's reciprocal of the denominator refined by one Newton step in that format.
   - `vtx_setup2` computes window x/y in 1/16 pixel.
   - Then area and culling, depth gradients, integer edge steps, and conservative depth bounds per triangle (`zq_tri`).
   - Each primitive becomes a 512-byte record plus a bin push.
@@ -72,6 +75,10 @@ texture unit.
     edge values B forms; each draw's flags (VS_STATE, set by the libraries from its depth state) say what may be culled.
   - **Lazy TRI items:** a primitive's setup goes to B only in front of its first quad that is sent in a band.
   - Both are switched by the libraries (`GPU2_COARSE_Z`, `GPU2_LAZY_TRI`, on by default) and counted in STATUS.
+  - **Band skipping** (FLUSH flags bit 10): a band with an empty bin list that the pass's clear does not reach is left
+    out, so B neither loads nor writes it. A pass that draws into a few bands of a target it keeps costs those bands.
+    Each BAND item names the next band walked, so B preloads the right one. The libraries set the bit when both boards
+    report it (`GPU2_SKIP_BANDS=0` turns it off); STATUS counts the bands left out.
 - **`mem_arb`:** 5 read and 4 write ports onto the DDR3 controller.
 
 ## 3. Board B — fragments, images and display
@@ -82,7 +89,12 @@ texture unit.
 - **Images:**
   - `img_table` holds 1024 image descriptors.
   - `img_write` does WRITE_IMAGE with format conversion.
-  - `img_xfer` does READ / FILL / COPY, with colour key and stretch.
+  - `img_xfer` does READ / FILL / COPY, with colour key, stretch, mirrors, a channel swizzle, alpha = 255 and repeated
+    tiles. A 1:1 copy of one format without a key moves whole 32-byte bursts instead of a pixel a cycle (in simulation
+    2.6 RGBA8 pixels a cycle against 0.96, the DDR's read and write traffic being the limit); overlapping copies stay
+    exact. One COPY_IMAGE can carry a list of 1:1 rectangles.
+  - COPY and FILL_IMAGE end once their job is handed over: one job runs while the next waits, and the command processor
+    goes on with commands that do not touch images (FLUSH, FENCE, PRESENT and the transfers wait for the engine).
   - `img_geom` checks the rectangles.
 - **Display:** `disp_b`, `scan_reader`, `disp_post` (8-bit palette, 64×64 cursor), `disp_out_b`, `video_mmcm` (mode
   switching by DRP) and the TMDS encoder and serializer.
@@ -203,12 +215,13 @@ texture unit.
 - **Bands:** 8 pixel rows for targets up to 1024 wide, 4 rows above that, up to 1280 wide.
 - **B's band buffer:**
   - Three banks of 4096 cells. A cell is 2 pixels of colour, depth, stencil and an epoch.
-  - The next band is loaded while the current one renders.
+  - The next band is loaded while the current one renders: the one its BAND item names, else the band below.
   - A D24S8 target is loaded and flushed per band, so depth and stencil persist between passes.
 - **Render stream:** 64-bit beats.
   - QUAD items take 1 beat.
   - TRI items take 13 + 5 per varying beats.
-  - BAND, FRAME_END and NOP mark the structure.
+  - BAND, FRAME_END and NOP mark the structure. A BAND item carries its first row and the first row of the next band
+    walked.
 
 ## 9. Clocks and resources
 

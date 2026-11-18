@@ -300,6 +300,9 @@ module float_sfu #(
     // 10, their delay lines match it). =====
     wire [MAN_W:0] mr5=({1'b0,man5}+ (g5 & (st5|man5[0])));
     wire v6; wire [2:0] op6; wire z6,i6,n6,ng6,s6,sgn6,zero6; wire [MAN_W:0] mr; wire signed [EXW:0] ex6;
+    // the round's carry out (the mantissa rounds up to 2.0): all ones and a round up — known without the add, so the
+    // exponent's part of S6 does not wait for the mantissa's carry chain
+    wire carry;
     generate if (SPLIT6) begin : g_s6a
         reg v6r; reg [2:0] op6r; reg z6r,i6r,n6r,ng6r,s6r,sgn6r,zero6r; reg [MAN_W:0] mr6r; reg signed [EXW:0] ex6r;
         always @(posedge clk) begin
@@ -307,20 +310,26 @@ module float_sfu #(
         end
         assign v6=v6r; assign op6=op6r; assign z6=z6r; assign i6=i6r; assign n6=n6r; assign ng6=ng6r; assign s6=s6r;
         assign sgn6=sgn6r; assign zero6=zero6r; assign mr=mr6r; assign ex6=ex6r;
+        assign carry=mr6r[MAN_W];
     end else begin : g_s6
         assign v6=v5; assign op6=op5; assign z6=z5; assign i6=i5; assign n6=n5; assign ng6=ng5; assign s6=s5;
         assign sgn6=sgn5; assign zero6=zero5; assign mr=mr5; assign ex6=ex5;
+        assign carry=g5 & (&man5);
     end endgenerate
-    // ===== S6: pack + specials =====
-    wire carry=mr[MAN_W];
+    // ===== S6: pack + specials. The biased exponent, its overflow and its underflow are worked out for both values of
+    // the carry beside the round add, and the carry selects: one short chain each instead of the round add, the
+    // exponent's increment and its two comparisons one after the other. =====
     wire [MAN_W-1:0] man_f=mr[MAN_W-1:0];
-    wire signed [EXW:0] ex_f=ex6+(carry?1:0);
+    wire signed [EXW+2:0] exb0=ex6+BIAS, exb1=ex6+BIAS+1;       // ex_f + BIAS without / with the carry
+    wire ovf=carry ? (exb1>=INF_E) : (exb0>=INF_E);
+    wire unf=carry ? (exb1<=0) : (exb0<=0);
+    wire [EXP_W-1:0] exp_f=carry ? exb1[EXP_W-1:0] : exb0[EXP_W-1:0];
     reg [W-1:0] normres;
     always @* begin
         if (zero6)                       normres={sgn6,{(W-1){1'b0}}};
-        else if (ex_f+BIAS>=INF_E)       normres={sgn6,{EXP_W{1'b1}},{MAN_W{1'b0}}};
-        else if (ex_f+BIAS<=0)           normres={sgn6,{(W-1){1'b0}}};
-        else                             normres={sgn6,ex_f[EXP_W-1:0]+BIAS[EXP_W-1:0],man_f};
+        else if (ovf)                    normres={sgn6,{EXP_W{1'b1}},{MAN_W{1'b0}}};
+        else if (unf)                    normres={sgn6,{(W-1){1'b0}}};
+        else                             normres={sgn6,exp_f,man_f};
     end
     always @(posedge clk) begin
         out_valid <= v6 & ~rst;

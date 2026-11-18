@@ -1,8 +1,12 @@
 // a_render — board A's render side (model tools/a_raster_ref.py): after `go` (the host's FLUSH)
 // it walks the frame's bands in order and emits the render stream for board B:
-//   for band b = 0 .. ceil(scr_h / nl) - 1:  BAND {4, y0 = nl b}   (nl = 8 rows for targets up to BAND8_MAXW = 1024 wide,
-//                                                                    else NL = 4: B's band buffer holds 8 lines of such a
-//                                                                    target)
+//   for band b = 0 .. ceil(scr_h / nl) - 1:  BAND {4, 1, nv, ny0, y0 = nl b}   (nl = 8 rows for targets up to BAND8_MAXW =
+//                                                                    1024 wide, else NL = 4: B's band buffer holds 8 lines
+//                                                                    of such a target; ny0 = the first row of the next band
+//                                                                    the walk sends, nv = there is one: B preloads that band
+//                                                                    while this one renders)
+//     with `skip`, a band is left out (no BAND item, B neither loads nor writes it) when its bin list is empty and the
+//     frame's clear does not reach it: nothing changes its pixels, depth or stencil in B's DDR
 //     for every entry of band b's bin list (tri_binner: BIN_HEADS[b] -> BINLIST head .. next, oldest first):
 //       the primitive's record is read from A's DDR (REC_BASE + id * 128 words): the raster header burst gives the
 //       kind (triangle / line / point), the shift s, the area's sign, the window positions (1/16 pixel), a point's
@@ -72,6 +76,13 @@ module a_render #(
     input  wire        cz_d16,                   // with go: the depth attachment has 16 bits
     input  wire [23:0] cz_init,                  // with go: the depth every pixel starts the frame with (the largest when unknown)
     input  wire        lazy,                     // with go: TRI items only in front of a visit's first quad sent
+    // with go: bands with an empty bin list that the frame's clear does not reach are not walked (skip); the clear reaches a
+    // band when it writes something B keeps in its DDR (cl_any: colour with a non-zero mask, or depth / stencil into a
+    // depth-stencil image) in one of its rows — every row, or with cl_sc the rows cl_y0 <= y < cl_y1 of its scissor box
+    input  wire        skip,
+    input  wire        cl_any, cl_sc,
+    input  wire signed [12:0] cl_y0, cl_y1,
+    output reg  [31:0] c_bskip,                  // bands not walked, cumulative
     output reg  [31:0] c_vis,                    // primitive-band visits, cumulative (STATUS word 100: the walk's per-visit cost)
     // cumulative: quads culled, quads sent, TRI items sent, TRI items held back and dropped (no quad followed), TRI items
     // sent for a visit that then sent no quad, blocks whose bound an occluder pair lowered
@@ -107,7 +118,10 @@ module a_render #(
     wire out_free = !rs_valid || rs_ready;
 
     // ---- the fetcher: bin lists, headers, TRI bursts ahead of the rasterizer
-    typedef enum logic [2:0] {F_IDLE, F_BAND, F_QRY, F_QRY2, F_ENT, F_TRI} fs_t;
+    // F_SCAN asks the bin heads band by band (one query a cycle, the answer two cycles later) for the next band to walk:
+    // first the frame's first, then, before a band's marker goes into the visit queue, the one after it (the marker
+    // carries it, and its head and count are kept for when its turn comes)
+    typedef enum logic [2:0] {F_IDLE, F_SCAN, F_MARK, F_ENT, F_TRI, F_END} fs_t;
     fs_t fs;
     wire [28:0] rec_base = REC_BASE + (q_bank ? REC_BANK_W : 29'd0), pool_base = BINLIST_BASE + (q_bank ? POOL_W : 29'd0);
     // the band height: 8 rows up to BAND8_MAXW = 1024 wide — board
@@ -119,12 +133,27 @@ module a_render #(
     // size of the frame being flushed; the fetcher and the walk use them from the next cycle on. The same for the
     // frame's depth and the lazy switch.
     reg  [11:0] f_w, f_h; reg czf_d16; reg [23:0] czf_init; reg f_lazy;
-    always @(posedge clk) if (go) begin f_w <= scr_w; f_h <= scr_h; czf_d16 <= cz_d16; czf_init <= cz_init; f_lazy <= lazy; end
+    reg         f_skip, f_clany, f_clsc; reg signed [12:0] f_cly0, f_cly1;
+    always @(posedge clk) if (go) begin
+        f_w <= scr_w; f_h <= scr_h; czf_d16 <= cz_d16; czf_init <= cz_init; f_lazy <= lazy;
+        f_skip <= skip; f_clany <= cl_any; f_clsc <= cl_sc; f_cly0 <= cl_y0; f_cly1 <= cl_y1;
+    end
     wire        nl8  = (f_w <= 12'(BAND8_MAXW));
     wire [3:0]  nl   = nl8 ? 4'd8 : 4'(NL);
     wire [1:0]  nlsh = nl8 ? 2'd3 : 2'd2;        // log2 nl
     wire [BANDW-1:0] nbands = BANDW'((f_h + 12'(nl) - 12'd1) >> nlsh);
     reg  [BANDW-1:0] fband;                        // the band the fetcher walks
+    reg  [PTR_W-1:0] f_head; reg [COUNT_W-1:0] f_count;   // its bin list (head, entries)
+    reg              nx_v; reg [BANDW-1:0] nx_band; reg [PTR_W-1:0] nx_head; reg [COUNT_W-1:0] nx_count;   // the band after it
+    // the scan: sq = the next band to ask about, s1 / s2 = the queries in flight (s2 meets the binner's answer), whether the
+    // clear reaches the band (s1_t / s2_t, formed a stage early); sc_first: the scan looks for the frame's first band
+    reg  [BANDW-1:0] sq, s1_b, s2_b; reg s1_v, s2_v, s1_t, s2_t, sc_first;
+    wire signed [13:0] s_y0 = $signed({2'b00, 12'(sq) << nlsh});
+    wire signed [13:0] s_y1 = s_y0 + $signed({10'd0, nl});
+    wire signed [13:0] c_y0 = $signed({f_cly0[12], f_cly0}), c_y1 = $signed({f_cly1[12], f_cly1});
+    wire        s_t  = f_clany && (!f_clsc || (s_y0 < c_y1 && s_y1 > c_y0));
+    wire        s2_walk = !f_skip || (q_count != '0) || s2_t;   // the band in s2 is walked
+    wire        s_more  = (sq != nbands);                      // a band left to ask about
     reg  [COUNT_W-1:0] n_left;                     // the band's entries not yet issued
     reg  [COUNT_W-1:0] l_left;                     // the band's list lines not yet requested
     reg  [IDX_W-1:0] ftid;
@@ -169,6 +198,7 @@ module a_render #(
     localparam [1:0] V_BAND = 2'd0, V_PRIM = 2'd1, V_END = 2'd2;
     localparam int VQ = 16;
     reg  [1:0]  v_kind [0:VQ-1]; reg [BANDW-1:0] v_band [0:VQ-1]; reg v_first [0:VQ-1];
+    reg  [BANDW-1:0] v_nb [0:VQ-1]; reg v_nv [0:VQ-1];   // a band marker's next band (v_nv: there is one)
     reg  [IDX_W-1:0] v_tid [0:VQ-1]; reg [VQ-1:0] v_rdy;
     // v_hdr is block RAM (not 4 096 bits of LUTRAM feeding the popcount of beats_left in the same
     // cycle): hdr_q = the header at the head visit, read every cycle with the address it was read at (hdr_q_a). The walk
@@ -197,6 +227,7 @@ module a_render #(
 
     // ---- the walk (the rasterizer's side)
     reg  [BANDW-1:0] band; reg [10:0] y0;
+    reg  [10:0] ny0; reg nyv;                      // the next band's first row (nyv: a next band follows), for the BAND item
     reg  [IDX_W-1:0] tid;
     reg  [255:0] hdr;
     reg          vfirst; reg [6:0] vbeats;         // the visit's primitive is in its first band; its TRI item's record beats (11 + 5 nv)
@@ -359,6 +390,7 @@ module a_render #(
         if (rst) begin
             fs <= F_IDLE; r_en <= 1'b0; kq_w <= 6'd0; kq_r <= 6'd0; fetch_on <= 1'b0; lq_v <= 1'b0; lq_fly <= 1'b0;
             ln_w <= 2'd0; ln_r <= 2'd0; bq_w <= 6'd0; bres <= 6'd0; v_w <= 5'd0; v_rdy <= '0; q_band <= '0; q_bank <= 1'b0;
+            s1_v <= 1'b0; s2_v <= 1'b0; c_bskip <= 0;
         end else begin
             // the returns, in issue order (dropped after an abort: stale). A header lands in its visit slot (rt_hdr, the
             // write above), the depth-bound burst too and makes the visit ready, a line in the line FIFO; a line's last
@@ -375,7 +407,7 @@ module a_render #(
             if (tri_rt || tri_rsv) bres <= bres - 6'(tri_rt) + (tri_rsv ? 6'(fnb) : 6'd0);   // (the resets below win)
             if (abort || f_stop) begin                         // stale returns drain into nothing; no new reads until they have
                 fs <= F_IDLE; fetch_on <= 1'b0; r_en <= 1'b0; bq_w <= 6'd0; bres <= 6'd0; v_w <= 5'd0; v_rdy <= '0;
-                lq_v <= 1'b0; lq_fly <= 1'b0; ln_w <= 2'd0; ln_r <= 2'd0;
+                lq_v <= 1'b0; lq_fly <= 1'b0; ln_w <= 2'd0; ln_r <= 2'd0; s1_v <= 1'b0; s2_v <= 1'b0;
             end else begin
               // a band's next list line: requested as soon as its pointer is known and the FIFO has a place for it
               if (line_go) begin
@@ -383,26 +415,45 @@ module a_render #(
               end
               case (fs)
                 F_IDLE: if ((go || go_pend) && outstanding == 6'd0 && !r_en) begin
-                            fetch_on <= 1'b1; q_bank <= go_bank; fband <= '0; ln_w <= 2'd0; ln_r <= 2'd0; lq_v <= 1'b0; lq_fly <= 1'b0;
-                            bq_w <= 6'd0; bres <= 6'd0; v_w <= 5'd0; v_rdy <= '0; fs <= F_BAND;
+                            fetch_on <= 1'b1; q_bank <= go_bank; ln_w <= 2'd0; ln_r <= 2'd0; lq_v <= 1'b0; lq_fly <= 1'b0;
+                            bq_w <= 6'd0; bres <= 6'd0; v_w <= 5'd0; v_rdy <= '0;
+                            sq <= '0; s1_v <= 1'b0; s2_v <= 1'b0; sc_first <= 1'b1; fs <= F_SCAN;
                         end
-                // a band: its marker into the visit queue (ready at once), then its list
-                F_BAND: if (!v_full) begin
-                            v_kind[v_w[3:0]] <= (fband == nbands) ? V_END : V_BAND; v_band[v_w[3:0]] <= fband; v_rdy[v_w[3:0]] <= 1'b1;
-                            v_w <= v_w + 5'd1;
-                            if (fband == nbands) fs <= F_IDLE;
-                            else begin q_band <= fband; fs <= F_QRY; end
+                // the next band to walk: a query a cycle (the binner registers heads[q_band] at the next edge, s2 meets it);
+                // the first band in s2 that is walked ends the scan (the query behind it is dropped), so does the last answer
+                // with none. The first band found starts the scan for the one after it
+                F_SCAN: begin
+                            s1_v <= s_more; s1_b <= sq; s1_t <= s_t;
+                            if (s_more) begin q_band <= sq; sq <= sq + 1'b1; end
+                            s2_v <= s1_v; s2_b <= s1_b; s2_t <= s1_t;
+                            if (s2_v && !s2_walk) c_bskip <= c_bskip + 1;
+                            if ((s2_v && s2_walk) || (!s_more && !s1_v && !s2_v)) begin
+                                s1_v <= 1'b0; s2_v <= 1'b0;
+                                if (sc_first) begin
+                                    if (s2_v) begin fband <= s2_b; f_head <= q_head; f_count <= q_count; sq <= s2_b + 1'b1; sc_first <= 1'b0; end
+                                    else fs <= F_END;                        // no band to walk
+                                end else begin
+                                    nx_v <= s2_v; nx_band <= s2_b; nx_head <= q_head; nx_count <= q_count; fs <= F_MARK;
+                                end
+                            end
                         end
-                F_QRY:  fs <= F_QRY2;                                        // the binner registers heads[q_band] this edge
-                F_QRY2: begin                                                // the first line (a band's lines hold 4 entries each)
-                            n_left <= q_count; lane <= 2'd0;
-                            if (q_count != '0) begin lq_v <= 1'b1; lq_ptr <= q_head; l_left <= COUNT_W'((q_count - 1'b1) >> 2); end
+                // a band: its marker (ready at once, with the next band), then its list (a band's lines hold 4 entries each)
+                F_MARK: if (!v_full) begin
+                            v_kind[v_w[3:0]] <= V_BAND; v_band[v_w[3:0]] <= fband; v_nb[v_w[3:0]] <= nx_band; v_nv[v_w[3:0]] <= nx_v;
+                            v_rdy[v_w[3:0]] <= 1'b1; v_w <= v_w + 5'd1;
+                            n_left <= f_count; lane <= 2'd0;
+                            if (f_count != '0) begin lq_v <= 1'b1; lq_ptr <= f_head; l_left <= COUNT_W'((f_count - 1'b1) >> 2); end
                             fs <= F_ENT;
                         end
+                F_END:  if (!v_full) begin v_kind[v_w[3:0]] <= V_END; v_rdy[v_w[3:0]] <= 1'b1; v_w <= v_w + 5'd1; fs <= F_IDLE; end
                 // an entry: its header read, its visit queued (not ready: the header and the depth-bound words land later),
                 // its TRI bursts next — in every band (B does not re-read a revisited triangle's record from its DDR: A sends
-                // the TRI item again). The line goes when its last entry has been taken.
-                F_ENT:  if (n_left == '0) begin fband <= fband + 1'b1; fs <= F_BAND; end
+                // the TRI item again). The line goes when its last entry has been taken. After the band's last entry, the next
+                // band (its head and count found by the scan) and the scan for the one after it
+                F_ENT:  if (n_left == '0) begin
+                            if (nx_v) begin fband <= nx_band; f_head <= nx_head; f_count <= nx_count; sq <= nx_band + 1'b1; fs <= F_SCAN; end
+                            else fs <= F_END;
+                        end
                         else if (ln_cnt != 2'd0 && !v_full && can_issue && !line_go) begin
                             r_en <= 1'b1; r_addr <= rec_base + {ent_cur[IDX_W-1:0], 7'd0}; r_kind <= {v_w[3:0], K_HDR};
                             v_kind[v_w[3:0]] <= V_PRIM; v_first[v_w[3:0]] <= ent_cur[63]; v_tid[v_w[3:0]] <= ent_cur[IDX_W-1:0];
@@ -483,7 +534,10 @@ module a_render #(
                      else if (soft_pend) begin
                         if (oq_room) begin oq_push(Q_FEND, {32'h0, 4'd5, 27'd0, 1'b1}, 64'd0); soft_pend <= 1'b0; st <= W_ABWAIT; end
                      end else if (!v_empty && v_rdy[vr] && (v_kind[vr] != V_PRIM || (v_rdy_q[vr] && hdr_q_a == vr))) begin
-                        if (v_kind[vr] == V_BAND) begin band <= v_band[vr]; y0 <= 11'(v_band[vr]) << nlsh; st <= W_BANDB; end
+                        if (v_kind[vr] == V_BAND) begin
+                            band <= v_band[vr]; y0 <= 11'(v_band[vr]) << nlsh; ny0 <= v_nv[vr] ? 11'(v_nb[vr]) << nlsh : 11'd0; nyv <= v_nv[vr];
+                            st <= W_BANDB;
+                        end
                         else if (v_kind[vr] == V_END) begin v_r <= v_r + 5'd1; st <= W_FEND; end
                         else begin : VP
                             reg [6:0] nvb_c;
@@ -496,8 +550,8 @@ module a_render #(
                         end
                      end
             W_ABWAIT: if (oq_wp == oq_rp && o_idle) begin f_stop <= 1'b1; st <= W_IDLE; end
-            W_BANDB: if (oq_room) begin                                  // the BAND item
-                        oq_push(Q_BAND, {32'h0, 4'd4, 17'd0, y0}, 64'd0); v_r <= v_r + 5'd1; st <= W_VISIT;
+            W_BANDB: if (oq_room) begin                                  // the BAND item {4, 1, next band follows, its y0, 0, y0}
+                        oq_push(Q_BAND, {32'h0, 4'd4, 1'b1, nyv, ny0, 4'd0, y0}, 64'd0); v_r <= v_r + 5'd1; st <= W_VISIT;
                      end
             // ---------------------------------------------------------------- the visit's entry, once the sequencer is done: the
             // reference beats {er1, er0}, {0, er2} with the TRI item's facts in the second beat's high word {first, record beats,

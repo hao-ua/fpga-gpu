@@ -25,6 +25,8 @@ EGLDisplay EGLAPI eglGetDisplay(void *);
 int EGLAPI eglInitialize(EGLDisplay, EGLint *, EGLint *);
 int EGLAPI eglChooseConfig(EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *);
 EGLSurface EGLAPI eglCreateWindowSurface(EGLDisplay, EGLConfig, HWND, const EGLint *);
+EGLSurface EGLAPI eglCreatePbufferSurface(EGLDisplay, EGLConfig, const EGLint *);
+int EGLAPI eglDestroySurface(EGLDisplay, EGLSurface);
 EGLContext EGLAPI eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
 int EGLAPI eglMakeCurrent(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
 int EGLAPI eglSwapBuffers(EGLDisplay, EGLSurface);
@@ -214,6 +216,39 @@ static void test_attributes(void)
     glBindAttribLocation(p, 1, "gl_Vertex");
     err(GL_INVALID_OPERATION, "glBindAttribLocation gl_");
     glDeleteProgram(p);
+    /* §2.10.4: two attributes bound to one location (no path reads both) link, an attribute nothing reads is not active, and a binding made after a link waits for the next one */
+    {
+        static const char vs_alias[] = "attribute vec2 a_pos; attribute vec4 a_x; attribute vec4 a_y; attribute vec4 a_unused; uniform bool u; varying vec4 v;\n"
+                                       "void main() { if (u) v = a_x; else v = a_y; gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+        GLint n = 0;
+        p = glCreateProgram();
+        glBindAttribLocation(p, 3, "a_x");
+        glBindAttribLocation(p, 3, "a_y");
+        glBindAttribLocation(p, 0, "a_pos");
+        link_prog(p, shader(GL_VERTEX_SHADER, vs_alias), shader(GL_FRAGMENT_SHADER, "precision mediump float; varying vec4 v; void main() { gl_FragColor = v; }\n"));
+        ieq(glGetAttribLocation(p, "a_x"), 3, "aliased attribute a_x");
+        ieq(glGetAttribLocation(p, "a_y"), 3, "aliased attribute a_y");
+        ieq(glGetAttribLocation(p, "a_unused"), -1, "an attribute nothing reads has no location");
+        glGetProgramiv(p, GL_ACTIVE_ATTRIBUTES, &n);
+        ieq(n, 3, "active attributes: a_pos, a_x, a_y");
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "u"), 1);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, q);
+        glEnableVertexAttribArray(0);
+        glVertexAttrib4f(3, 1.0f, 0.5f, 0.0f, 1.0f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        px(100, 100, "aliased attributes, the path of a_x", 255, 128, 0, 255);
+        glUniform1i(glGetUniformLocation(p, "u"), 0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        px(100, 100, "aliased attributes, the path of a_y", 255, 128, 0, 255);
+        glBindAttribLocation(p, 7, "a_x");
+        ieq(glGetAttribLocation(p, "a_x"), 3, "a binding after the link waits for the next link");
+        glLinkProgram(p);
+        ieq(glGetAttribLocation(p, "a_x"), 7, "the next link takes the binding");
+        glDisableVertexAttribArray(0);
+        glDeleteProgram(p);
+        err(GL_NO_ERROR, "attribute locations");
+    }
 }
 
 static void test_uniforms(void)
@@ -868,10 +903,10 @@ static void test_primitives(void)
         g_checks++;
         if (c[0] < 150 || c[0] > 210 || c[1] > 90) { g_bad++; printf("FAIL point sprite: %d %d %d, gl_PointCoord right of centre, t grows downward\n", c[0], c[1], c[2]); }
     }
-    /* §2.13: a point goes by near and far only, whatever the viewport */
+    /* a point is kept to the viewport (test_point_viewport): of a wide point centred past its edge, the part inside is drawn, nothing beside it */
     {
         static const GLfloat past[2] = { 1.2f, 0 };
-        uint8_t c[4];
+        uint8_t c[4], d[4];
         clear_to(0, 0, 0, 1);
         glViewport(100, 100, 50, 50);
         glUseProgram(p);
@@ -880,9 +915,11 @@ static void test_primitives(void)
         glDrawArrays(GL_POINTS, 0, 1);
         glDisableVertexAttribArray((GLuint)a2);
         glViewport(0, 0, W, H);
-        glReadPixels(150, 125, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
-        g_checks++;
-        if (c[1] < 60) { g_bad++; printf("FAIL a point is not clipped by x and y: %d %d %d\n", c[0], c[1], c[2]); }
+        glReadPixels(148, 125, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+        glReadPixels(150, 125, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, d);
+        g_checks += 2;
+        if (c[1] < 60) { g_bad++; printf("FAIL a wide point centred past the viewport, inside it: %d %d %d\n", c[0], c[1], c[2]); }
+        if (d[0] > 8 || d[1] > 8) { g_bad++; printf("FAIL a wide point centred past the viewport, beside it: %d %d %d\n", d[0], d[1], d[2]); }
     }
     glDeleteProgram(p);
     color(0, 1, 0, 1);
@@ -2014,11 +2051,10 @@ typedef void (__stdcall *comp3d_t)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLsi
 typedef void (__stdcall *fbt3d_t)(GLenum, GLenum, GLenum, GLuint, GLint, GLint);
 typedef void (__stdcall *stor3d_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei);
 
-/* what the texel at (x, y) reads after RGB565: the nearest 5 and 6 bits, as the TMU brings them back */
-static void px565(int x, int y, int w, int h, const char *what, int r, int g, int b)
+/* the texel at (x, y) of a w x h texture drawn over the whole window: ETC1's 8 bits a channel, alpha 1 */
+static void texel(int x, int y, int w, int h, const char *what, int r, int g, int b)
 {
-    int r5 = (r * 31 + 127) / 255, g6 = (g * 63 + 127) / 255, b5 = (b * 31 + 127) / 255;
-    px((x * 2 + 1) * W / (2 * w), (y * 2 + 1) * H / (2 * h), what, r5 * 255 / 31, g6 * 255 / 63, b5 * 255 / 31, 255);
+    px((x * 2 + 1) * W / (2 * w), (y * 2 + 1) * H / (2 * h), what, r, g, b, 255);
 }
 
 static void no_compile(GLenum type, const char *src, const char *what);
@@ -2051,23 +2087,23 @@ static void test_etc1(void)
     glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_ETC1_RGB8_OES, 4, 4, 0, sizeof plain, plain);
     err(GL_NO_ERROR, "ETC1");
     full(g_tex_prog);
-    px565(0, 2, 4, 4, "ETC1 left half", 255, 2, 2);
-    px565(3, 1, 4, 4, "ETC1 right half", 2, 255, 2);
+    texel(0, 2, 4, 4, "ETC1 left half", 255, 2, 2);
+    texel(3, 1, 4, 4, "ETC1 right half", 2, 255, 2);
     glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_ETC1_RGB8_OES, 4, 4, 0, sizeof diff, diff);
     err(GL_NO_ERROR, "ETC1 differential");
     full(g_tex_prog);
-    px565(0, 0, 4, 4, "ETC1 index 1", 161, 95, 227);
-    px565(1, 3, 4, 4, "ETC1 index 2, clamped below", 109, 0, 151);
-    px565(3, 1, 4, 4, "ETC1 index 3", 103, 37, 169);
-    px565(2, 1, 4, 4, "ETC1 index 0, top half", 141, 75, 207);
-    px565(2, 2, 4, 4, "ETC1 index 0, bottom half", 203, 80, 245);
+    texel(0, 0, 4, 4, "ETC1 index 1", 161, 95, 227);
+    texel(1, 3, 4, 4, "ETC1 index 2, clamped below", 109, 0, 151);
+    texel(3, 1, 4, 4, "ETC1 index 3", 103, 37, 169);
+    texel(2, 1, 4, 4, "ETC1 index 0, top half", 141, 75, 207);
+    texel(2, 2, 4, 4, "ETC1 index 0, bottom half", 203, 80, 245);
     /* 6 x 2: two blocks, of which the second shows two columns */
     memcpy(two, plain, 8); memcpy(two + 8, diff, 8);
     glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_ETC1_RGB8_OES, 6, 2, 0, sizeof two, two);
     err(GL_NO_ERROR, "ETC1 6 x 2");
     full(g_tex_prog);
-    px565(1, 0, 6, 2, "ETC1 6 x 2, first block", 255, 2, 2);
-    px565(5, 1, 6, 2, "ETC1 6 x 2, second block", 141, 75, 207);
+    texel(1, 0, 6, 2, "ETC1 6 x 2, first block", 255, 2, 2);
+    texel(5, 1, 6, 2, "ETC1 6 x 2, second block", 141, 75, 207);
     glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_ETC1_RGB8_OES, 6, 2, 0, 8, two);
     err(GL_INVALID_VALUE, "ETC1 size");
     /* no sub-images of any kind, no generated levels */
@@ -2744,6 +2780,376 @@ static void test_depth_textures(void)
     err(GL_NO_ERROR, "depth textures");
 }
 
+/* every pixel of a 200 x 40 target: the left half (x < 100) one colour, the right half another */
+static void halves(const char *what, int r0, int g0, int b0, int r1, int g1, int b1)
+{
+    static uint8_t c[4 * 200 * 40];
+    int i, bad = 0, first = -1;
+    memset(c, 0x5A, sizeof c);
+    glReadPixels(0, 0, 200, 40, GL_RGBA, GL_UNSIGNED_BYTE, c);
+    for (i = 0; i < 200 * 40; i++) {
+        const uint8_t *q = c + 4 * i;
+        int l = i % 200 < 100, r = l ? r0 : r1, g = l ? g0 : g1, b = l ? b0 : b1;
+        if (abs(q[0] - r) > 2 || abs(q[1] - g) > 2 || abs(q[2] - b) > 2) { if (first < 0) first = i; bad++; }
+    }
+    g_checks++;
+    if (bad) {
+        g_bad++;
+        printf("FAIL %s: %d of 8000 pixels wrong, the first (%d, %d) = %d %d %d\n", what, bad, first % 200, first / 200, c[4 * first], c[4 * first + 1], c[4 * first + 2]);
+    }
+}
+
+/* a depth-stencil image beside an RGB565 target whose rows are no multiple of 16 pixels: board B loads a depth row in twice the colour row's
+   bursts (200 pixels: 13 bursts of colour, 26 of depth = 832 bytes, more than 200 x 4) and refuses a shorter pitch */
+static void test_ds_rows(void)
+{
+    static const char FS_R[] = "precision mediump float; varying vec2 v_uv; uniform sampler2D t; void main() { gl_FragColor = vec4(texture2D(t, v_uv).rrr, 1.0); }\n";
+    GLuint fb, rc, rd, c, d, p;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glViewport(0, 0, 200, 40);
+
+    /* renderbuffers: RGB565 and DEPTH24_STENCIL8 */
+    glGenRenderbuffers(1, &rc);
+    glBindRenderbuffer(GL_RENDERBUFFER, rc);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB565, 200, 40);
+    glGenRenderbuffers(1, &rd);
+    glBindRenderbuffer(GL_RENDERBUFFER, rd);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 200, 40);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rc);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rd);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rd);
+    ieq((int)glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE, "RGB565 200 x 40 with DEPTH24_STENCIL8");
+    glClearColor(0, 0, 0, 1); glClearDepthf(1.0f); glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST); glEnable(GL_STENCIL_TEST);
+    glStencilFunc(GL_ALWAYS, 1, 255); glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    zcolor(0.0f, 1, 0, 0, 1);                                   /* depth 0.5, stencil 1 everywhere */
+    full(g_zcol_prog);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    zcolor(0.5f, 0, 1, 0, 1);                                   /* behind: nowhere */
+    full(g_zcol_prog);
+    glStencilFunc(GL_EQUAL, 1, 255);
+    zcolor(-0.5f, 0, 0, 1, 1);                                  /* in front, where the stencil is 1: the left half */
+    rect(g_zcol_prog, -1, -1, 0, 1);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST);
+    glStencilFunc(GL_ALWAYS, 0, 255);
+    halves("RGB565 200 wide, depth and stencil renderbuffer", 0, 0, 255, 255, 0, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+
+    /* textures: RGB565 colour (rendered in an image of its own: 400-byte rows) and a depth texture whose own rows (800 bytes) are short */
+    c = make_tex(GL_RGB, GL_UNSIGNED_SHORT_5_6_5, 200, 40, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
+    d = make_tex(GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, 200, 40, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, d, 0);
+    ieq((int)glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE, "RGB565 texture 200 x 40 with a depth texture");
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    zcolor(0.0f, 1, 0, 0, 1);
+    full(g_zcol_prog);
+    zcolor(0.5f, 0, 1, 0, 1);
+    full(g_zcol_prog);
+    zcolor(-0.5f, 0, 0, 1, 1);
+    rect(g_zcol_prog, -1, -1, 0, 1);
+    glDisable(GL_DEPTH_TEST);
+    halves("RGB565 texture 200 wide, depth texture", 0, 0, 255, 255, 0, 0);
+    /* the depth texture as rendered: 0.25 on the left, 0.5 on the right */
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, rc);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 200, 40);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rc);
+    p = prog(VS, FS_R);
+    glBindTexture(GL_TEXTURE_2D, d);
+    full(p);
+    halves("the depth texture 200 wide sampled", 64, 64, 64, 128, 128, 128);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, W, H);
+    glDeleteProgram(p);
+    glDeleteTextures(1, &c);
+    glDeleteTextures(1, &d);
+    glDeleteRenderbuffers(1, &rc);
+    glDeleteRenderbuffers(1, &rd);
+    glDeleteFramebuffers(1, &fb);
+    err(GL_NO_ERROR, "depth rows beside RGB565");
+}
+
+/* ---------------------------------------------------------------- the API as dEQP-GLES2 checks it: one name space for shaders and programs, uniforms as given, format errors, framebuffer objects */
+#ifndef GL_BGRA8_EXT
+#define GL_BGRA8_EXT 0x93A1
+#endif
+
+static void test_name_space(void)
+{
+    GLuint sh = glCreateShader(GL_VERTEX_SHADER), pr = glCreateProgram(), none = 0x7FFFFFF0u, out[2];
+    GLint v = 0, iv[4];
+    GLfloat fv[4];
+    GLsizei len = 0;
+    char buf[64];
+    /* a name of the other kind is INVALID_OPERATION, a name of neither INVALID_VALUE */
+    glShaderSource(pr, 0, NULL, NULL); err(GL_INVALID_OPERATION, "glShaderSource of a program");
+    glCompileShader(pr); err(GL_INVALID_OPERATION, "glCompileShader of a program");
+    glCompileShader(none); err(GL_INVALID_VALUE, "glCompileShader of no object");
+    glGetShaderiv(pr, GL_SHADER_TYPE, &v); err(GL_INVALID_OPERATION, "glGetShaderiv of a program");
+    glGetShaderInfoLog(pr, sizeof buf, &len, buf); err(GL_INVALID_OPERATION, "glGetShaderInfoLog of a program");
+    glGetShaderSource(pr, sizeof buf, &len, buf); err(GL_INVALID_OPERATION, "glGetShaderSource of a program");
+    glAttachShader(sh, sh); err(GL_INVALID_OPERATION, "glAttachShader, a shader for the program");
+    glAttachShader(pr, pr); err(GL_INVALID_OPERATION, "glAttachShader, a program for the shader");
+    glAttachShader(pr, none); err(GL_INVALID_VALUE, "glAttachShader of no shader");
+    glDetachShader(sh, sh); err(GL_INVALID_OPERATION, "glDetachShader, a shader for the program");
+    glLinkProgram(sh); err(GL_INVALID_OPERATION, "glLinkProgram of a shader");
+    glUseProgram(sh); err(GL_INVALID_OPERATION, "glUseProgram of a shader");
+    glValidateProgram(sh); err(GL_INVALID_OPERATION, "glValidateProgram of a shader");
+    glGetProgramiv(sh, GL_LINK_STATUS, &v); err(GL_INVALID_OPERATION, "glGetProgramiv of a shader");
+    glGetProgramInfoLog(sh, sizeof buf, &len, buf); err(GL_INVALID_OPERATION, "glGetProgramInfoLog of a shader");
+    glGetAttachedShaders(sh, 2, &len, out); err(GL_INVALID_OPERATION, "glGetAttachedShaders of a shader");
+    glBindAttribLocation(sh, 0, "a"); err(GL_INVALID_OPERATION, "glBindAttribLocation of a shader");
+    glGetAttribLocation(sh, "a"); err(GL_INVALID_OPERATION, "glGetAttribLocation of a shader");
+    glGetAttribLocation(none, "a"); err(GL_INVALID_VALUE, "glGetAttribLocation of no object");
+    glGetUniformLocation(none, "a"); err(GL_INVALID_VALUE, "glGetUniformLocation of no object");
+    glGetUniformfv(none, 0, fv); err(GL_INVALID_VALUE, "glGetUniformfv of no object");
+    glGetUniformiv(sh, 0, iv); err(GL_INVALID_OPERATION, "glGetUniformiv of a shader");
+    glDeleteShader(pr); err(GL_INVALID_OPERATION, "glDeleteShader of a program");
+    glDeleteProgram(sh); err(GL_INVALID_OPERATION, "glDeleteProgram of a shader");
+    glDeleteShader(sh);
+    glDeleteProgram(pr);
+    err(GL_NO_ERROR, "name space");
+}
+
+static void test_uniform_values(void)
+{
+    static const GLfloat m3[9] = { -1, 0.1f, 4, 800, 13, 55, 12, 91, -55.1f }, two[2] = { 0.25f, 0.5f };
+    GLuint p = prog(VS, "precision mediump float; uniform float one[1]; uniform int big; uniform bool b; uniform mat3 m; uniform vec4 single;\n"
+                        "struct T { sampler2D s; float k; }; uniform T st;\n"
+                        "void main() { gl_FragColor = vec4(one[0], float(big) * 0.0, b ? 1.0 : 0.0, m[2][2]) + single * st.k + texture2D(st.s, vec2(0.5)) * 0.0; }\n");
+    GLint n = 0, mx = 0, size = 0, k, loc, iv[4];
+    GLfloat fv[9];
+    GLenum type = 0;
+    char name[64];
+    int arr = 0;
+    glUseProgram(p);
+    /* an array of one element is an array: its name reads "[0]", and the longest name with its NUL is the maximum length */
+    glGetProgramiv(p, GL_ACTIVE_UNIFORMS, &n);
+    for (k = 0; k < n; k++) {
+        glGetActiveUniform(p, (GLuint)k, sizeof name, NULL, &size, &type, name);
+        if (!strcmp(name, "one[0]") && size == 1 && type == GL_FLOAT) arr = 1;
+    }
+    ieq(arr, 1, "an array of one reads one[0]");
+    glGetProgramiv(p, GL_ACTIVE_UNIFORM_MAX_LENGTH, &mx);
+    ieq(mx, 7, "ACTIVE_UNIFORM_MAX_LENGTH: one[0] and its NUL");
+    ok(glGetUniformLocation(p, "one") != -1 && glGetUniformLocation(p, "one") == glGetUniformLocation(p, "one[0]"), "one and one[0]");
+    ieq(glGetUniformLocation(p, "big[0]"), -1, "no [0] on a uniform that is no array");
+    glUniform1fv(glGetUniformLocation(p, "one"), 2, two); err(GL_NO_ERROR, "a count past an array's end is no error");
+    glGetUniformfv(p, glGetUniformLocation(p, "one"), fv); ok(fv[0] == 0.25f, "an array of one reads back");
+    glGetUniformfv(p, glGetUniformLocation(p, "one") + 1, fv); err(GL_INVALID_OPERATION, "glGetUniformfv past the array");
+    /* values read back as given, not as the boards hold them */
+    glUniform4f(glGetUniformLocation(p, "single"), 0.1f, -55.1f, 12.2f, 1.1f);
+    glGetUniformfv(p, glGetUniformLocation(p, "single"), fv);
+    ok(fv[0] == 0.1f && fv[1] == -55.1f && fv[2] == 12.2f && fv[3] == 1.1f, "a vec4 reads back exactly");
+    glUniformMatrix3fv(glGetUniformLocation(p, "m"), 1, GL_FALSE, m3);
+    glGetUniformfv(p, glGetUniformLocation(p, "m"), fv);
+    ok(!memcmp(fv, m3, sizeof m3), "a mat3 reads back exactly");
+    glUniform1i(glGetUniformLocation(p, "big"), 123456789);
+    glGetUniformiv(p, glGetUniformLocation(p, "big"), iv); ieq(iv[0], 123456789, "an int reads back exactly");
+    glUniform1f(glGetUniformLocation(p, "b"), 0.5f);
+    glGetUniformiv(p, glGetUniformLocation(p, "b"), iv); ieq(iv[0], 1, "a bool set by a float reads 1");
+    glGetUniformfv(p, glGetUniformLocation(p, "b"), fv); ok(fv[0] == 1.0f, "a bool reads 1.0");
+    /* a sampler inside a struct takes Uniform1i{v} alone, in range */
+    loc = glGetUniformLocation(p, "st.s");
+    ok(loc != -1, "st.s has a location");
+    glUniform1i(loc, 3); err(GL_NO_ERROR, "glUniform1i of a sampler in a struct");
+    glGetUniformiv(p, loc, iv); ieq(iv[0], 3, "a sampler in a struct reads back");
+    glUniform1i(loc, 8); err(GL_INVALID_VALUE, "a sampler in a struct, unit 8");
+    glUniform1f(loc, 1.0f); err(GL_INVALID_OPERATION, "glUniform1f of a sampler in a struct");
+    glDeleteProgram(p);
+}
+
+static void test_format_errors(void)
+{
+    static const uint8_t bgra[4] = { 30, 20, 10, 40 };
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, 0, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL); err(GL_INVALID_VALUE, "internalformat 0");
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_SHORT_4_4_4_4, NULL); err(GL_INVALID_OPERATION, "RGB with UNSIGNED_SHORT_4_4_4_4");
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_SHORT_5_5_5_1, NULL); err(GL_INVALID_OPERATION, "RGB with UNSIGNED_SHORT_5_5_5_1");
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_6_5, NULL); err(GL_INVALID_OPERATION, "a sub-image, RGBA with UNSIGNED_SHORT_5_6_5");
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, 0, GL_UNSIGNED_BYTE, NULL); err(GL_INVALID_ENUM, "a sub-image of format 0");
+    /* EXT_texture_format_BGRA8888: BGRA8_EXT is the sized BGRA_EXT */
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA8_EXT, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL); err(GL_INVALID_OPERATION, "BGRA8_EXT with RGBA");
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA8_EXT, 1, 1, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, bgra); err(GL_NO_ERROR, "BGRA8_EXT");
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    clear_to(0, 0, 0, 0);
+    show_tex(t, "BGRA8_EXT", 10, 20, 30, 40);
+}
+
+static void test_fbo_objects(void)
+{
+    static const uint8_t green[4 * 16] = { 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255,
+                                           0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255 };
+    GLuint fb, fb2, t, cube, rb;
+    GLint v = 0;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glViewport(0, 0, 4, 4);
+    /* each attachment point keeps its own face and level */
+    glGenTextures(1, &cube);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, cube, 0);
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE, &v);
+    ieq(v, GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, "the depth attachment's cube face");
+    /* deleted while the bound framebuffer holds it, at any attachment point: detached */
+    glDeleteTextures(1, &cube);
+    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &v);
+    ieq(v, GL_NONE, "a texture deleted at the bound framebuffer's depth attachment");
+    /* deleted while a framebuffer that is not bound holds it: that framebuffer keeps the object, and a new texture under the old name is another one */
+    t = make_tex(GL_RGBA, GL_UNSIGNED_BYTE, 4, 4, NULL, GL_NEAREST, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+    ieq((int)glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE, "4 x 4 texture");
+    clear_to(1, 0, 0, 1);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, green);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    px(1, 1, "a deleted texture stays the framebuffer's image", 255, 0, 0, 255);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+    px(1, 1, "the new texture under the old name", 0, 255, 0, 255);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glDeleteTextures(1, &t);
+    /* the same for a renderbuffer */
+    glGenRenderbuffers(1, &rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 4, 4);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+    clear_to(0, 0, 1, 1);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteRenderbuffers(1, &rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 4, 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    px(1, 1, "a deleted renderbuffer stays the framebuffer's image", 0, 0, 255, 255);
+    /* EXT_texture_format_BGRA8888: BGRA_EXT and BGRA8_EXT are colour-renderable renderbuffer formats */
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_BGRA_EXT, 4, 4); err(GL_NO_ERROR, "BGRA_EXT renderbuffer");
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+    ieq((int)glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE, "BGRA_EXT renderbuffer");
+    clear_to(0.25f, 0.5f, 0.75f, 1);
+    px(1, 1, "BGRA_EXT renderbuffer", 64, 128, 191, 255);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_BGRA8_EXT, 4, 4); err(GL_NO_ERROR, "BGRA8_EXT renderbuffer");
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_INTERNAL_FORMAT, &v); ieq(v, GL_BGRA8_EXT, "BGRA8_EXT internal format");
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_ALPHA_SIZE, &v); ieq(v, 8, "BGRA8_EXT alpha bits");
+    clear_to(0.75f, 0.5f, 0.25f, 0.5f);
+    px(1, 1, "BGRA8_EXT renderbuffer", 191, 128, 64, 128);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_BGRA8_EXT, 16, 16);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
+    ieq((int)glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT, "BGRA8_EXT at the depth attachment");
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, 1, 1281); err(GL_INVALID_VALUE, "renderbuffer height above MAX_RENDERBUFFER_SIZE");
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteRenderbuffers(1, &rb);
+    glDeleteFramebuffers(1, &fb);
+    /* copies from a framebuffer that is not complete: INVALID_FRAMEBUFFER_OPERATION, of no pixels too, and the texture is left as it was */
+    t = make_tex(GL_RGBA, GL_UNSIGNED_BYTE, 4, 4, green, GL_NEAREST, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &fb2);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb2);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, 0, 0); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glCopyTexSubImage2D of no pixels from an incomplete framebuffer");
+    glCopyTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA, 0, 0, 2, 2, 0); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glCopyTexImage2D from an incomplete framebuffer");
+    glTexSubImage2D(GL_TEXTURE_2D, 1, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, green); err(GL_INVALID_OPERATION, "the failed copy defined no level");
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fb2);
+    glDeleteTextures(1, &t);
+    glViewport(0, 0, W, H);
+    err(GL_NO_ERROR, "framebuffer objects");
+}
+
+static void test_state_conversions(void)
+{
+    GLfloat f = 0;
+    GLint v = 0;
+    /* §6.1.2: an unsigned mask read as a float stays unsigned; a float read as an integer rounds to the nearest, unless it is a colour or a depth value */
+    glGetFloatv(GL_STENCIL_VALUE_MASK, &f); ok(f >= 255.0f, "STENCIL_VALUE_MASK as a float");
+    glGetFloatv(GL_STENCIL_BACK_WRITEMASK, &f); ok(f >= 255.0f, "STENCIL_BACK_WRITEMASK as a float");
+    glLineWidth(20.6f);
+    glGetIntegerv(GL_LINE_WIDTH, &v); ieq(v, 21, "LINE_WIDTH as an integer");
+    glLineWidth(1.0f);
+    glPolygonOffset(-4770.93f, 39542.6f);
+    glGetIntegerv(GL_POLYGON_OFFSET_FACTOR, &v); ieq(v, -4771, "POLYGON_OFFSET_FACTOR as an integer");
+    glGetIntegerv(GL_POLYGON_OFFSET_UNITS, &v); ieq(v, 39543, "POLYGON_OFFSET_UNITS as an integer");
+    glPolygonOffset(0, 0);
+    glSampleCoverage(0.75f, GL_FALSE);
+    glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, &v); ieq(v, 1, "SAMPLE_COVERAGE_VALUE rounds, it is no colour");
+    glSampleCoverage(1.0f, GL_FALSE);
+    err(GL_NO_ERROR, "state conversions");
+}
+
+static void test_read_draw_errors(void)
+{
+    static const uint8_t idx[1] = { 0 };
+    uint8_t c[16];
+    GLuint fb;
+    glReadPixels(0, 0, 1, 1, GL_LUMINANCE_ALPHA, GL_UNSIGNED_SHORT_4_4_4_4, c); err(GL_INVALID_OPERATION, "glReadPixels LUMINANCE_ALPHA, UNSIGNED_SHORT_4_4_4_4");
+    glReadPixels(0, 0, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, c); err(GL_INVALID_OPERATION, "glReadPixels RGB, UNSIGNED_BYTE");
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_SHORT_5_6_5, c); err(GL_INVALID_OPERATION, "glReadPixels RGBA, UNSIGNED_SHORT_5_6_5");
+    glReadPixels(0, 0, 1, 1, 0x1234, GL_UNSIGNED_BYTE, c); err(GL_INVALID_ENUM, "glReadPixels of format 0x1234");
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, c); err(GL_INVALID_ENUM, "glReadPixels of type FLOAT");
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glReadPixels(0, 0, 0, 0, GL_RGBA, GL_UNSIGNED_BYTE, c); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glReadPixels of no pixels, incomplete framebuffer");
+    /* a draw into a framebuffer that is not complete: an error also with no program, and of no vertices */
+    glUseProgram(0);
+    glDrawArrays(GL_POINTS, 0, 1); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawArrays, incomplete framebuffer, no program");
+    glDrawArrays(GL_POINTS, 0, 0); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawArrays of nothing, incomplete framebuffer");
+    glDrawElements(GL_POINTS, 1, GL_UNSIGNED_BYTE, idx); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawElements, incomplete framebuffer, no program");
+    glDrawElements(GL_POINTS, 0, GL_UNSIGNED_BYTE, idx); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawElements of nothing, incomplete framebuffer");
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fb);
+    glDrawElements(0x77, 0, GL_UNSIGNED_BYTE, idx); err(GL_INVALID_ENUM, "glDrawElements of nothing, mode 0x77");
+    glDrawArrays(GL_POINTS, 0, 1); err(GL_NO_ERROR, "glDrawArrays with no program");
+}
+
+/* wide points against a viewport smaller than the window: the scissor keeps them to it, and a point whose centre is just outside draws its part inside */
+static void test_point_viewport(void)
+{
+    static const GLfloat pts[12] = { 0.0f, 0.0f, 0.0f, 1.0f,  1.01f, 0.0f, 0.0f, 1.0f,  1.3f, 0.0f, 0.0f, 1.0f };
+    GLuint p = prog("attribute vec4 a_pos; void main() { gl_Position = a_pos; gl_PointSize = 5.0; }\n", "precision mediump float; void main() { gl_FragColor = vec4(1.0); }\n");
+    GLint a = glGetAttribLocation(p, "a_pos");
+    clear_to(0, 0, 0, 1);
+    glViewport(100, 100, 100, 100);
+    glUseProgram(p);
+    glVertexAttribPointer((GLuint)a, 4, GL_FLOAT, GL_FALSE, 0, pts);
+    glEnableVertexAttribArray((GLuint)a);
+    glDrawArrays(GL_POINTS, 0, 3);
+    glDisableVertexAttribArray((GLuint)a);
+    glViewport(0, 0, W, H);
+    px(150, 150, "a wide point inside the viewport", 255, 255, 255, 255);
+    px(199, 150, "a wide point whose centre is outside: its part inside the viewport", 255, 255, 255, 255);
+    px(201, 150, "nothing beside the viewport", 0, 0, 0, 255);
+    px(215, 150, "a point far outside the view volume", 0, 0, 0, 255);
+    glDeleteProgram(p);
+    err(GL_NO_ERROR, "points and the viewport");
+}
+
+/* EGL 1.4 §3.9.3: eglSwapBuffers on a pbuffer has no effect: its colour buffer keeps what was drawn */
+static void test_pbuffer_swap(void)
+{
+    static const EGLint pa[] = { 0x3057, 64, 0x3056, 64, 0x3038 };
+    EGLSurface pb = eglCreatePbufferSurface(g_dpy, g_cfg, pa);
+    ok(pb != NULL, "eglCreatePbufferSurface");
+    if (!pb) return;
+    ok(eglMakeCurrent(g_dpy, pb, pb, g_ctx), "eglMakeCurrent on a pbuffer");
+    clear_to(0.25f, 0.5f, 0.75f, 1);
+    ok(eglSwapBuffers(g_dpy, pb), "eglSwapBuffers on a pbuffer");
+    px(1, 1, "a pbuffer after eglSwapBuffers", 64, 128, 191, 255);
+    ok(eglSwapBuffers(g_dpy, pb), "eglSwapBuffers on a pbuffer, again");
+    px(1, 1, "a pbuffer after two eglSwapBuffers", 64, 128, 191, 255);
+    eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx);
+    ok(eglDestroySurface(g_dpy, pb), "eglDestroySurface");
+    err(GL_NO_ERROR, "pbuffer swap");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -2823,11 +3229,20 @@ int main(void)
     test_etc1();
     test_tex3d();
     test_depth_textures();
+    test_ds_rows();
     test_blit();
     test_program_binary();
     test_queries_and_stack();
+    test_name_space();
+    test_uniform_values();
+    test_format_errors();
+    test_fbo_objects();
+    test_state_conversions();
+    test_read_draw_errors();
+    test_point_viewport();
     test_scaled();
     test_configs();
+    test_pbuffer_swap();
     test_swap();
     printf("%d checks, %d failed\n", g_checks, g_bad);
     if (!g_bad) printf("OK gles_test\n");

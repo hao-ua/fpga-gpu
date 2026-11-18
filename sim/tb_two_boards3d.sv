@@ -10,6 +10,8 @@
 //   +BATCH      every sequenced command (B's resources and draw state, A's geometry, the FLUSHes, the FENCE) goes in
 //               BATCH datagrams of up to 1400 body bytes (fb_pkg T_BATCH); the FENCE's EVENT must come back from B with
 //               its sub-message index (B echoes the CMD header's byte 3)
+//   +SKIP       every FLUSH with flags bit 10: A leaves out the bands with nothing binned that the clear does not reach (the
+//               same image); A's STATUS word 122 must count ab_<seed>_skip_count.hex bands per frame A walked
 `default_nettype none
 module tb_two_boards3d;
     import net_pkg::*;
@@ -22,6 +24,8 @@ module tb_two_boards3d;
     reg  rstA = 1, rstB = 1, calA = 0, calB = 0;
     int  errs = 0;
     task automatic fail(input string m); errs++; $display("FAIL: %s", m); endtask
+    int  n_walked = 0;                                            // frames board A's render side started (g_render)
+    always @(posedge da.clk_sys) if (da.g_render) n_walked++;
 
     // ---------------- cables (tb_board_link) ----------------
     wire [31:0] cab1A, cab1B, cab2A, cab2B;
@@ -326,7 +330,10 @@ module tb_two_boards3d;
             r = $fscanf(fd, "%h", n);
             if (r != 1 || n == 0) break;
             for (int i = 0; i < n; i++) r = $fscanf(fd, "%h", w[i]);
-            if (w[0][23:16] == T_FLUSH) begin flush_n = n; for (int i = 0; i < n; i++) flush_w[i] = w[i]; end
+            if (w[0][23:16] == T_FLUSH) begin
+                flush_n = n; for (int i = 0; i < n; i++) flush_w[i] = w[i];
+                if ($test$plusargs("SKIP")) flush_w[2][26] = 1'b1;          // body word 0 {flags, image}: flags bit 10
+            end
             else if (w[0][23:16] == T_FENCE) begin fence_n = n; for (int i = 0; i < n; i++) fence_w[i] = w[i]; end
             else begin
                 send_words(w, n, s, 0, ix); nb++;
@@ -507,6 +514,17 @@ module tb_two_boards3d;
         $display("tb_two_boards3d final: cmds %0d errs %0d fwd %0d bev %0d | quads %0d rstream pkts %0d in flight %0d | resends %0d migA %0d migB %0d",
                  st_w[28], st_w[29], st_w[43], st_w[44], st_w[86], st_w[87][15:0], st_w[87][31:16], n_resend, a_mig_err, b_mig_err);
         if (n_err_ev != n_abort_ev) fail($sformatf("%0d error events (%0d expected)", n_err_ev, n_abort_ev));
+        begin : SKIPCNT                                           // the bands A left out: per frame it walked to the end
+            int nsk = 0;
+            if ($test$plusargs("SKIP")) begin
+                fd = $fopen({"tools/gen/ab_", seed, "_skip_count.hex"}, "r");
+                if (fd == 0 || $fscanf(fd, "%d", nsk) != 1) fail("no ab_<seed>_skip_count.hex");
+                if (fd != 0) $fclose(fd);
+            end
+            $display("tb_two_boards3d: A left out %0d bands in %0d frames (%0d per frame expected)", st_w[122], n_walked, nsk);
+            if (!lost_abort && !to_abort && !sync_abort && st_w[122] != 32'(nsk * n_walked))
+                fail($sformatf("A left out %0d bands, %0d expected", st_w[122], nsk * n_walked));
+        end
         if (st_w[87][31:16] != 0) fail("render beats still in flight");
         if (st_w[87][15:0] == 0) fail("no RSTREAM packet sent");
         errs += a_mig_err + b_mig_err;

@@ -71,7 +71,7 @@ if {$role eq "A"} {
       src/rtl/gpu_clk_mig.sv \
       src/rtl/proto/link_a_port.sv \
       src/rtl/shader_core_vs2.sv src/rtl/attr_conv.sv src/rtl/vtx_feed.sv src/rtl/vtx_rbuf.sv src/rtl/vtx_asm.sv src/rtl/a_vertex.sv \
-      src/rtl/clip_near.sv src/rtl/vtx_setup2.sv src/rtl/zq_tri.sv src/rtl/zq_lane.sv src/rtl/a_setup.sv src/rtl/tri_binner2.sv src/rtl/a_render.sv src/rtl/a_geom.sv \
+      src/rtl/clip_near.sv src/rtl/float_addsub_w.sv src/rtl/float_mul_w.sv src/rtl/vtx_setup2.sv src/rtl/zq_tri.sv src/rtl/zq_lane.sv src/rtl/a_setup.sv src/rtl/tri_binner2.sv src/rtl/a_render.sv src/rtl/a_geom.sv \
       src/rtl/float_addsub.sv src/rtl/float_cmp.sv src/rtl/float_cvt_f2i.sv src/rtl/float_cvt_i2f.sv src/rtl/float_madd.sv \
       src/rtl/float_mul.sv src/rtl/float_round.sv src/rtl/float_sfu.sv src/rtl/int_unit.sv src/rtl/sincos_sfu.sv \
       src/rtl/top/board_a_core.sv src/rtl/top/board_a_top.sv]

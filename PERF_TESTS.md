@@ -26,11 +26,12 @@ The Python tools run from `host/fb` (Python 3, standard library).
 
 | test | command | what it measures |
 |---|---|---|
-| **fb_bench** | `python3 fb_bench.py --mode M --secs 3 [--only a,b]` | 18 rates, each printed as a RESULT line and a PROFILE line (see below). About 1 min per mode. |
+| **fb_bench** | `python3 fb_bench.py --mode M --secs 3 [--only a,b]` | 21 rates, each printed as a RESULT line and a PROFILE line (see below). About 1 min per mode. |
 | **fb_cube** | `python3 fb_cube.py --check`; `--cubes N --nohold --secs 6` | exactness against the model (32 cubes, held to vsync); throughput |
 | **fb_texperf** | `python3 fb_texperf.py --all --mode M [--check]` | 21 texture cases, cycles per quad; 6 s per case |
 | **fb_shader** | `python3 fb_shader.py --shader raymarch\|spiral\|heart --mode M` | fragment-shader-bound full-screen scenes |
 | **fb_3d_test** | `python3 fb_3d_test.py 11` (also 13, 15) | exactness of the whole 3D path against the reference models (not speed) |
+| **fb_skip_test** | `python3 fb_skip_test.py` | band skipping: partial draws with and without it read back identical, ms per FLUSH |
 | **OpenArena timedemo** | `powershell -File tools/oa_timedemo.ps1 -Dll host/win/build/x86/gl/opengl32.dll -Tag <pair> -Mode 3\|4` | demo088-test1 frame rate (from `qconsole.log`), plus the library's statistics log at `GPU2_STATS=3` |
 | **timedemo statistics** | `powershell -File tools/oa_td_stats.ps1 -Tags a,b` | medians of the statistics lines of the runs named |
 | **JTAG status watch** | `vivado.bat -mode batch -nojournal -nolog -source tools/jtag_watch.tcl -tclargs <log> [interval_s]` | every STATUS word of both boards, and their temperatures, into `<log>.raw`. JTAG only, so it can run beside a game. |
@@ -47,6 +48,8 @@ The Python tools run from `host/fb` (Python 3, standard library).
 - **textures:** tex1 nearest / bilinear / trilinear, tex2, tex4, tex8;
 - **ALU:** alu_16, alu_64;
 - **triangles:** tri_culled, tri_8px, tri_32px, tri_128px, tri_512px;
+- **partial redraws:** partial_2bands, partial_8bands (a full-width strip of 16 / 64 rows into a target that is not
+  cleared), flush_empty (no draw, no clear): ms per pass with band skipping, `--no-skip` for every band walked;
 - **host transfer:** upload and read-back.
 
 Each test prints a **RESULT** line with fps, the rate, B's frame ms, A's geometry ms and the walk's band visits. Its
@@ -106,7 +109,8 @@ wait ms.
 - **blocks lowered:** the coarse-depth bounds that opaque draws lowered.
 
 The two board-A features have switches in the libraries, both on by default: `GPU2_COARSE_Z=0` (no culling) and
-`GPU2_LAZY_TRI=0` (every TRI item sent); the line names the one that is off.
+`GPU2_LAZY_TRI=0` (every TRI item sent); the line names the one that is off. The line ends with the **bands left out**
+per frame (STATUS layout 13; `GPU2_SKIP_BANDS=0` walks every band).
 
 ## Latest results
 
@@ -163,6 +167,18 @@ shorter than the game's (32 ms), and the stream is starved 10 % of the time.
   features off.
 - **fb_cube --check:** 0 mismatches; 32 cubes at 59.9 fps (vsync) for 5 minutes, no errors. **fb_3d_test** 11, 13, 15,
   `--abort` and the coarse-depth seeds 61–71: bit-exact (A 153 and A 154).
+- **Band skipping** (A 160 / B 161, from the Linux VM): `fb_skip_test.py` — the same partial draws with and without FLUSH
+  flags bit 10 read back byte-identical, the bands not drawn untouched (800×600 and 1280×720). FLUSH to FENCE for a
+  redraw of one band 0.78 ms against 4.38 ms (800×600), 0.68 against 7.49 ms (1280×720). fb_bench at 800×600:
+
+  | test | with skipping | every band walked |
+  |---|---|---|
+  | partial_2bands | 1 088 fps (B's frame 0.38 ms) | 234 fps (3.83 ms) |
+  | partial_8bands | 825 fps (0.70 ms) | 232 fps (3.87 ms) |
+  | flush_empty | 2 275 fps (0.01 ms) | 235 fps (3.82 ms) |
+
+  The other fb_bench rates are those of A 153 / B 142 within 1 % (tri_8px 2.56 against 2.67 M triangles/s);
+  fb_cube --check 0 mismatches, fb_3d_test 11 / 13 / 15 / 44 / 46 bit-exact, fb_2d all checks pass.
 - **fb_texperf, fb_shader:** to be measured on the current pair.
 
 ### Simulation (the current board B options)

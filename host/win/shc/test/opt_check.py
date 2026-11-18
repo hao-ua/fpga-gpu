@@ -26,14 +26,19 @@ def inputs(stage, seed, n_sets=3):
         else: inp.params = [[val() for _ in range(4)] for _ in range(isa64.NPARAM)]
     for l in range(len(inp.varin)):
         for i in range(len(inp.varin[l])): inp.varin[l][i] = [val() for _ in range(4)]
-    return inp
+    by_name = [[[val() for _ in range(4)] for _ in range(64)] for _ in inp.varin] if stage == 'vs' else None
+    return inp, by_name
 
 
-def run(words, stage, seed, prog):
-    """prog's constant pool in its slots, as a library loads it: a pass may take a constant for what it is (shape_opt's 0 and 1)"""
-    inp = inputs(stage, seed)
+def run(words, stage, seed, prog, names=()):
+    """prog's constant pool in its slots, as a library loads it: a pass may take a constant for what it is (shape_opt's 0 and 1).
+    A vertex program's attributes by name, as a library feeds them: a program that reads fewer of them numbers them otherwise"""
+    inp, by_name = inputs(stage, seed)
     for i, k in enumerate(prog['const_pool']):
         if prog['const_base'] + i < len(inp.params): inp.params[prog['const_base'] + i] = [isa64.fr.encode_real(isa64.F(c), isa64.FMT) for c in k]
+    for n, (slot, ty) in prog['attribs'].items() if by_name else ():
+        for c in range(glslc.MAT[ty] if glslc.is_mat(ty) else 1):
+            for l in range(len(inp.varin)): inp.varin[l][slot + c] = list(by_name[l][(names.index(n) * 4 + c) % 64])
     r = isa64.simulate_vs2(words, inp) if stage == 'vs' else isa64.simulate_fs2(words, inp)
     return r
 
@@ -95,9 +100,10 @@ def main():
             print('note', name, 'constant pool grew')
         ok = True
         ua = ub = 0
+        names = sorted(set(a['attribs']) | set(b['attribs']))
         for seed in range(3):
             try:
-                ra, rb = run(wa, stage, seed, a), run(wb, stage, seed, b)
+                ra, rb = run(wa, stage, seed, a, names), run(wb, stage, seed, b, names)
             except Exception as e:
                 print('skip', name, 'simulator:', str(e)[:100])
                 ok = None

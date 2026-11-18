@@ -73,6 +73,7 @@ struct g2r {
     uint8_t sh_uni_ok[256];
     double sh_vp[4], sh_dn, sh_df, sh_lw;
     int sh_z01, a_build;
+    int skip_fl;                        /* G2_FL_SKIP_BANDS or 0 on every FLUSH; -1 not decided yet */
     int sh_cull, sh_cw, sh_vs_ok;
     uint32_t sh_fsmask, sh_w, sh_h, sh_id, sh_zc;
 
@@ -104,6 +105,7 @@ g2r *g2r_create(g2_board *bd)
     uint32_t a, b, rn;
     if (!r) return NULL;
     r->bd = bd;
+    r->skip_fl = -1;
     r->heap_a = g2_heap_create(G2_HEAP_A, G2_HEAP_A_END);
     r->heap_b = g2_heap_create(G2_HEAP_B, G2_HEAP_B_END);
     r->next_id = 1;
@@ -170,15 +172,25 @@ static int handle_take(g2r *r, uint16_t *hd)
     return g2_handle_alloc(&r->h_img, G2_HK_IMG_B, hd);
 }
 
+/* board B loads and stores a depth-stencil row in as many 32-byte bursts as its colour target's row takes, times the bursts of a 16-pixel group
+   (two for a 16-bit colour format), and refuses a FLUSH whose depth-stencil pitch is shorter. A multiple of 64 bytes holds that for a colour
+   target of the same width in any format, at the pitch g2r_image_create gives it or at tight rows */
+uint32_t g2r_ds_pitch(uint32_t w) { return (w * 4 + 63) & ~63u; }
+
 static int image_alloc(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage, int tight, int bump)
 {
     uint32_t bpp = g2_storage_bpp(fmt), pitch, bytes, a;
     uint16_t hd;
-    /* a mip chain has tight rows; a single level gets a pitch that is a multiple of 32, as render targets and scanout need */
-    pitch = tight || levels > 1 || layers > 1 ? w * bpp : (w * bpp + 31) & ~31u;
+    /* a mip chain has tight rows; a single level gets a pitch that is a multiple of 32, as render targets and scanout need, and a depth-stencil
+       image (or the image whose bytes one aliases: tight 2) the pitch board B loads its rows at */
+    if (tight == 2 || (fmt == G2_FMT_D24S8 && !tight && levels == 1 && layers == 1)) pitch = g2r_ds_pitch(w);
+    else pitch = tight || levels > 1 || layers > 1 ? w * bpp : (w * bpp + 31) & ~31u;
     bytes = levels > 1 || layers > 1 ? g2_image_bytes(w, h, bpp, levels, layers) : pitch * h;
     if (handle_take(r, &hd) < 0) return -1;
-    a = g2_heap_alloc(r->heap_b, bytes, 32);
+    /* board B renders in bands of up to 8 rows and loads and stores every row of the last band (b_rop), also past an image
+     * whose height is no multiple of 8: those rows get memory of the image's own, or they would rewrite the next image's
+     * bytes, and zero those that fall in the row padding of a pitch wider than the image */
+    a = g2_heap_alloc(r->heap_b, bytes + (((h + 7) & ~7u) - h) * pitch, 32);
     if (!a) { g2_handle_free(&r->h_img, hd); return -1; }
     g2_create_image(r->bd, hd, a, w, h, fmt, pitch, origin, levels, layers, 0, usage);
     if (bump) r->id_gen++;
@@ -200,6 +212,11 @@ int g2r_image_create(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint3
 int g2r_image_create_tight(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage)
 {
     return image_create(r, handle, base, w, h, fmt, levels, layers, origin, usage, 1);
+}
+
+int g2r_image_create_ds_rows(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, int origin, uint32_t usage)
+{
+    return image_create(r, handle, base, w, h, fmt, 1, 1, origin, usage, 2);
 }
 
 int g2r_a_build(g2r *r)
@@ -284,8 +301,8 @@ void g2r_image_retire(g2r *r, uint16_t handle, uint32_t base)
 }
 
 /* A copy of the image under a new handle, which the caller then changes: draws of the open pass keep sampling the old one, which is retired.
-   Every level in level_mask (bit l: level l; levels the caller rewrites whole need no copy) of every layer is copied on board B. tight: the
-   layout of g2r_image_create_tight. The new handle starts no new draw-id generation: it is one no draw state of this generation names.
+   Every level in level_mask (bit l: level l; levels the caller rewrites whole need no copy) of every layer is copied on board B. tight: 1 the
+   layout of g2r_image_create_tight, 2 that of g2r_image_create_ds_rows. The new handle starts no new draw-id generation: it is one no draw state of this generation names.
    <0: no room (the caller ends the pass instead) */
 int g2r_image_rename(g2r *r, uint16_t *handle, uint32_t *base, uint32_t w, uint32_t h, uint32_t fmt, uint32_t levels, uint32_t layers, int origin, uint32_t usage, int tight,
                      uint32_t level_mask)
@@ -570,6 +587,22 @@ static uint32_t zc_flags(const uint32_t *h, const g2r_prog *p)
     return z;
 }
 
+/* board A leaves out the bands with nothing to draw that the pass's clear does not reach (FLUSH flags bit 10): board B neither loads nor
+   writes them, so a pass that draws into a few bands of the target costs those bands. Used when the last STATUS shows a board A that does it
+   (layout 13) and a board B that preloads the band a BAND item names (its flags bit 13). On by default; GPU2_SKIP_BANDS=0 turns it off for a
+   comparison */
+static uint32_t skip_bands(g2r *r)
+{
+    if (r->skip_fl < 0) {
+        uint32_t st[G2_ST_WORDS];
+        int on = g2e_get_int("GPU2_SKIP_BANDS", 1);
+        if (g2_last_status(r->bd, st) < 0) return 0;              /* no STATUS yet: decided at a later pass */
+        r->skip_fl = (on && st[G2_ST_LAYOUT] >= 13 && G2_B_FLAG_BAND_NEXT(st[G2_ST_B_FLAGS])) ? G2_FL_SKIP_BANDS : 0;
+        g2e_log("render: empty bands %s", r->skip_fl ? "left out (FLUSH flags bit 10)" : on ? "walked (the boards do not leave them out)" : "walked (GPU2_SKIP_BANDS=0)");
+    }
+    return (uint32_t)r->skip_fl;
+}
+
 /* A learns the target's size from VS_STATE and ends a frame's bands by it, and draws are what send VS_STATE: a pass that is only a clear would cover the last target's rows, past the end of a smaller image */
 static void send_target_size(g2r *r)
 {
@@ -607,7 +640,7 @@ void g2r_end_pass(g2r *r)
             r->cl_stencil = r->stencil_value;
             r->cl_smask = 0xFF;
         }
-        fl = r->cl_flags | (r->tgt.depth16 ? G2_FL_DEPTH16 : 0);
+        fl = r->cl_flags | (r->tgt.depth16 ? G2_FL_DEPTH16 : 0) | skip_bands(r);
         g2_flush(r->bd, r->tgt.color, fl, r->cl_c16, r->cl_depth, r->cl_stencil, (r->cl_flags & G2_FL_CLEAR_SCISSOR) ? r->cl_sc : none, r->tgt.ds, r->cl_smask);
     }
     g2_batch_end(r->bd);
@@ -929,11 +962,12 @@ void g2r_stats_tick(g2r *r)
             /* STATUS layout 12: board A's coarse depth and TRI items per frame (the quads A walked = culled + sent) */
             if (st[G2_ST_LAYOUT] >= 12) {
 #define AD(w) ((double)(st[w] - st0[w]) / n)
-                g2e_log("  A per frame: %.0f quads walked, %.0f culled (%.1f%%), %.0f sent | TRI items %.0f sent, %.0f held back, %.0f sent with no quad | %.0f blocks lowered%s%s",
+                g2e_log("  A per frame: %.0f quads walked, %.0f culled (%.1f%%), %.0f sent | TRI items %.0f sent, %.0f held back, %.0f sent with no quad | %.0f blocks lowered%s%s | %.1f bands left out",
                         AD(G2_ST_A_CZ_CULLED) + AD(G2_ST_A_CZ_QUADS_SENT), AD(G2_ST_A_CZ_CULLED),
                         AD(G2_ST_A_CZ_CULLED) + AD(G2_ST_A_CZ_QUADS_SENT) > 0 ? 100.0 * AD(G2_ST_A_CZ_CULLED) / (AD(G2_ST_A_CZ_CULLED) + AD(G2_ST_A_CZ_QUADS_SENT)) : 0.0,
                         AD(G2_ST_A_CZ_QUADS_SENT), AD(G2_ST_A_TRI_SENT), AD(G2_ST_A_TRI_HELD), AD(G2_ST_A_TRI_NOQUAD), AD(G2_ST_A_CZ_BLOCKS),
-                        g2e_get_int("GPU2_COARSE_Z", 1) ? "" : " (GPU2_COARSE_Z=0)", lazy_tri() ? "" : " (GPU2_LAZY_TRI=0)");
+                        g2e_get_int("GPU2_COARSE_Z", 1) ? "" : " (GPU2_COARSE_Z=0)", lazy_tri() ? "" : " (GPU2_LAZY_TRI=0)",
+                        st[G2_ST_LAYOUT] >= 13 ? AD(G2_ST_A_BANDS_SKIPPED) : 0.0);
 #undef AD
             }
             memcpy(st0, st, sizeof st);

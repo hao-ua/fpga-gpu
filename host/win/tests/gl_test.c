@@ -4377,6 +4377,69 @@ static void test_fbo_targets(void)
     plain();
 }
 
+/* targets whose height is no multiple of 8 (board B loads and stores whole bands of 8 rows) leave the next image intact: 32 textures 21 x
+ * 29 (rows of 96 bytes) rendered into once, each followed by a 64 x 8 texture with a pattern; every target rendered again, then every
+ * pattern read back. Without the bands' rows in the targets' memory, a pattern after a target had bytes zeroed where its 96-byte rows are
+ * padding */
+static void test_band_tail(void)
+{
+    enum { N = 32, TW = 21, TH = 29, VW = 64, VH = 8 };
+    static uint8_t pat[VW * VH * 4], got[VW * VH * 4];
+    GLuint t[N], v[N], fbo;
+    int i, k, imgs = 0, bytes = 0;
+    for (k = 0; k < VW * VH; k++) {
+        pat[4 * k] = (uint8_t)(k * 7 + 1);
+        pat[4 * k + 1] = (uint8_t)(k * 13 + 2);
+        pat[4 * k + 2] = (uint8_t)(k * 29 + 3);
+        pat[4 * k + 3] = 255;
+    }
+    glGenFramebuffersEXT(1, &fbo);
+    for (i = 0; i < N; i++) {
+        t[i] = fb_tex(GL_TEXTURE_2D, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, TW, TH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t[i], 0);
+        fb_view(TW, TH);
+        glColor3f(1, 0, 0);
+        quad(0, 0, TW, TH, 0);
+        glFinish();
+        fb_back();
+        v[i] = fb_tex(GL_TEXTURE_2D, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, VW, VH, 0, GL_RGBA, GL_UNSIGNED_BYTE, pat);
+    }
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+    for (i = 0; i < N; i++) {
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t[i], 0);
+        fb_view(TW, TH);
+        glColor3f(0, 1, 0);
+        quad(0, 0, TW, TH, 0);
+        glFlush();
+    }
+    for (i = 0; i < N; i++) {
+        int n = 0;
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, v[i], 0);
+        memset(got, 0xA5, sizeof got);
+        glReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        for (k = 0; k < VW * VH * 4; k++) n += got[k] != pat[k];
+        imgs += n != 0;
+        bytes += n;
+    }
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t[N - 1], 0);
+    fb_view(TW, TH);
+    px(10, 14, "the last 21 x 29 target: green", 0, 255, 0, 255);
+    px(20, 28, "its top-right pixel: green", 0, 255, 0, 255);
+    fb_back();
+    g_checks++;
+    if (imgs) {
+        g_bad++;
+        printf("FAIL %d of %d textures after 21 x 29 targets changed (%d bytes)\n", imgs, N, bytes);
+    }
+    glDeleteFramebuffersEXT(1, &fbo);
+    glDeleteTextures(N, t);
+    glDeleteTextures(N, v);
+    plain();
+}
+
 static void test_blit(void)
 {
     GLuint src, dst, fbo[2], ds, dd;
@@ -4859,6 +4922,87 @@ static void test_storage(void)
     val("32 bits, depth 24, stencil 8: what it was", pfd.cColorBits * 10000 + pfd.cDepthBits * 100 + pfd.cStencilBits, 322408, 0);
 }
 
+/* depth beside an RGB565 target whose rows are no multiple of 16 pixels: board B loads a depth row in twice the colour row's bursts (200
+   pixels: 13 bursts of colour, 26 of depth = 832 bytes, more than 200 x 4) and refuses a shorter pitch. A depth-stencil renderbuffer beside
+   an RGB5 renderbuffer, then a depth texture (its own rows are 800 bytes) beside an RGB5 texture, its depth read back after */
+static void test_ds_rows(void)
+{
+    static uint8_t c[200 * 40 * 4];
+    static float z[200 * 40];
+    GLuint fbo, rb, rbd, t, d;
+    int k, i, bad;
+    glDisable(GL_DITHER);
+    glGenFramebuffersEXT(1, &fbo);
+    p_GenRb(1, &rb);
+    p_BindRb(GL_RENDERBUFFER_EXT, rb);
+    p_RbStore(GL_RENDERBUFFER_EXT, GL_RGB5, 200, 40);
+    p_GenRb(1, &rbd);
+    p_BindRb(GL_RENDERBUFFER_EXT, rbd);
+    p_RbStore(GL_RENDERBUFFER_EXT, GL_DEPTH24_STENCIL8_EXT, 200, 40);
+    t = fb_tex(GL_TEXTURE_2D, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5, 200, 40, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    d = fb_tex(GL_TEXTURE_2D, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, 200, 40, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+    for (k = 0; k < 2; k++) {
+        if (!k) {
+            p_FbRb(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, rb);
+            p_FbRb(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rbd);
+            p_FbRb(GL_FRAMEBUFFER_EXT, GL_STENCIL_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, rbd);
+        } else {
+            p_FbRb(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_RENDERBUFFER_EXT, 0);
+            p_FbRb(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, 0);
+            p_FbRb(GL_FRAMEBUFFER_EXT, GL_STENCIL_ATTACHMENT_EXT, GL_RENDERBUFFER_EXT, 0);
+            glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, t, 0);
+            glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D, d, 0);
+        }
+        fb_done(k ? "an RGB5 texture 200 x 40 with a depth texture" : "RGB5 200 x 40 with DEPTH24_STENCIL8");
+        fb_view(200, 40);
+        glClearColor(0, 0, 0, 1); glClearDepth(1.0); glClearStencil(0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LESS);
+        if (!k) { glEnable(GL_STENCIL_TEST); glStencilFunc(GL_ALWAYS, 1, 255); glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE); }
+        glColor3f(1, 0, 0);
+        quad(0, 0, 200, 40, 0);                                 /* window z 0.5 (stencil 1) everywhere */
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glColor3f(0, 1, 0);
+        quad(0, 0, 200, 40, -0.5f);                             /* 0.75, behind: nowhere */
+        glStencilFunc(GL_EQUAL, 1, 255);
+        glColor3f(0, 0, 1);
+        quad(0, 0, 100, 40, 0.5f);                              /* 0.25, in front (where the stencil is 1): the left half */
+        glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST);
+        glStencilFunc(GL_ALWAYS, 0, 255);
+        glColor3f(1, 1, 1);
+        memset(c, 0x5A, sizeof c);
+        glReadPixels(0, 0, 200, 40, GL_RGBA, GL_UNSIGNED_BYTE, c);
+        for (i = bad = 0; i < 200 * 40; i++) {
+            const uint8_t *q = c + 4 * i;
+            int left = i % 200 < 100;
+            if (abs(q[0] - (left ? 0 : 255)) > 2 || q[1] > 2 || abs(q[2] - (left ? 255 : 0)) > 2) {
+                if (!bad) printf("  the first wrong pixel (%d, %d): %d %d %d\n", i % 200, i / 200, q[0], q[1], q[2]);
+                bad++;
+            }
+        }
+        val(k ? "RGB5 texture 200 wide, depth texture: pixels wrong" : "RGB5 200 wide, depth and stencil renderbuffer: pixels wrong", bad, 0, 0);
+    }
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D, 0, 0);
+    fb_back();
+    glBindTexture(GL_TEXTURE_2D, d);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, z);
+    val("a depth texture 200 wide: the depth in front", z[20 * 200 + 50], 0.25, 0.002);
+    val("a depth texture 200 wide: the depth behind", z[20 * 200 + 150], 0.5, 0.002);
+    val("a depth texture 200 wide: its last column", z[20 * 200 + 199], 0.5, 0.002);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDeleteTextures(1, &t);
+    glDeleteTextures(1, &d);
+    glDeleteFramebuffersEXT(1, &fbo);
+    {
+        PFNGLDELETERENDERBUFFERSEXTPROC del = (PFNGLDELETERENDERBUFFERSEXTPROC)wglGetProcAddress("glDeleteRenderbuffersEXT");
+        if (del) { del(1, &rb); del(1, &rbd); }
+    }
+}
+
 static void test_gaps(void)
 {
     const char *ext = (const char *)glGetString(GL_EXTENSIONS);
@@ -4883,10 +5027,12 @@ static void test_gaps(void)
     if (!p_Blit || !p_AttQ || !p_RbQ || !p_GenRb || !p_BindRb || !p_RbStore || !p_FbRb || !p_FbTex3) { g_bad++; printf("FAIL a framebuffer entry point is missing\n"); return; }
     SCENE(test_units());
     SCENE(test_fbo_targets());
+    SCENE(test_band_tail());
     SCENE(test_blit());
     SCENE(test_pbo());
     SCENE(test_lod_fs());
     SCENE(test_storage());
+    SCENE(test_ds_rows());
 }
 
 static void test_gl20(void)

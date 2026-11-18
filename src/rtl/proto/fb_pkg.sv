@@ -55,8 +55,8 @@ package fb_pkg;
     // board link (words 37-47), layout 3 the link diagnostics, B's receiver and B's transfer counters
     // (words 48-63), layout 4 B's receive diagnostics, the XOFF / ARQ / word counters of both boards
     // (words 64-75, see board_a_core)
-    localparam [31:0] STATUS_LAYOUT = 32'd12;         // layout 5: credit, cursor, palette, transfer counters (76-83);
-    localparam int    STATUS_WORDS  = 122;            // layout 6: A's geometry stage (84-87);
+    localparam [31:0] STATUS_LAYOUT = 32'd13;         // layout 5: credit, cursor, palette, transfer counters (76-83);
+    localparam int    STATUS_WORDS  = 123;            // layout 6: A's geometry stage (84-87);
                                                       // layout 7: B's per-frame cycle counters (88-95, its STATUS words
                                                       // 24-31) and A's cumulative ones (96-99);
                                                       // layout 8: quads A's coarse depth culled (100, cumulative);
@@ -71,7 +71,9 @@ package fb_pkg;
                                                       // integer divider / SIN / COS (0 on these boards);
                                                       // layout 12: A's coarse depth and TRI items, cumulative
                                                       // (116-121): quads culled, quads sent, TRI items sent,
-                                                      // held back, sent with no quad, blocks lowered
+                                                      // held back, sent with no quad, blocks lowered;
+                                                      // layout 13: bands A's walk left out (122, cumulative:
+                                                      // FLUSH flags bit 10, nothing binned, no clear)
 
     // board link packets: header word {type, seq (stamped by the
     // link ARQ layer), len = payload words}

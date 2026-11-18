@@ -26,7 +26,9 @@ CLI:
     python3 tools/b_ref.py fsi <prog.sasm>      -> tools/gen/<prog>_fsi_iram.mem + _fsil_iram.mem (tb_fs_interp)
     python3 tools/b_ref.py frame <seed> <ntri>  -> tools/gen/br_*.hex, bl_cmds.hex (tb_b_render, tb_board_b3d); the
         frame's target format / depth bits / depth-stencil image are drawn from the seed, or forced with BR_FMT=0..3,
-        BR_D16=0/1, BR_DS=0/1 in the environment
+        BR_D16=0/1, BR_DS=0/1 in the environment; BR_NOCLEAR=1: no clear, BR_CLEARSC=1: a colour clear in its scissor
+        box; BR_SKIPBANDS=1: the BAND items name the next
+        band and the bands with no quad that the clear does not reach are left out (board A with FLUSH flags bit 10)
     python3 tools/b_ref.py aframe <seed>        -> tools/gen/ab_<seed>_* : board A's draw <seed> (as_<seed>_stream.hex)
         rendered as B must (tb_two_boards3d)
 """
@@ -868,6 +870,8 @@ def gen_frame(seed, ntri=20, WID=64, HGT=32, NL=None):
               smask=rng.choice([0xFF, 0xFF, rng.randrange(256)]))
     cl['x1'] = cl['x0'] + rng.randrange(10, 40); cl['y1'] = cl['y0'] + rng.randrange(4, 20)
     if layers: cl.update(depth=umax(dbits), den=1, sc=0)        # the layers start from a cleared, farthest depth
+    if os.environ.get('BR_NOCLEAR') == '1': cl.update(en=0, den=0, sen=0)
+    if os.environ.get('BR_CLEARSC') == '1': cl.update(en=1, sc=1, cmask=15)    # a colour clear in its scissor box
     def dclear(x, y):
         t = bayer(x, y) if cl['dither'] else 0
         return sum((((cl['c16'] >> ((3 - c) * 13)) & 0x1FFF) + t >> 4) << ((3 - c) * 8) for c in range(4))
@@ -878,8 +882,28 @@ def gen_frame(seed, ntri=20, WID=64, HGT=32, NL=None):
         for k in range(0, len(words), 2): beats.append(words[k] | words[k + 1] << 32)
     sent = set(); nq = 0
     flog = []                                   # fragment log: Q qx qy tri draw / F x y c16 z (tb_b_render FRAGLOG)
-    for y0 in range(0, HGT, NL):
-        emit([(4 << 28) | y0, 0])
+    # BR_SKIPBANDS=1: the bands board A walks with FLUSH flags bit 10 — those with a quad, or that the clear reaches (it writes
+    # back colour under a non-zero mask, or depth / stencil under a non-zero mask into the depth-stencil image, in one of the
+    # band's rows); every BAND item names the next band walked
+    skipb = os.environ.get('BR_SKIPBANDS') == '1'
+    cl_any = bool(cl['en'] and cl['cmask']) or bool(ds and (cl['den'] or (cl['sen'] and cl['smask'])))
+    def band_has_quad(y0):
+        for T in tris:
+            bx0, bx1 = math.floor(min(p[0] for p in T.P)), math.ceil(max(p[0] for p in T.P))
+            by0, by1 = math.floor(min(p[1] for p in T.P)), math.ceil(max(p[1] for p in T.P))
+            for qy in range(max(y0 // 2, by0 // 2 - 1), min((y0 + NL) // 2, by1 // 2 + 2)):
+                for qx in range(max(0, bx0 // 2 - 1), min(WID // 2, bx1 // 2 + 2)):
+                    if quad_cover(T.P, qx, qy, WID, HGT): return True
+        return False
+    walk = [y0 for y0 in range(0, HGT, NL)
+            if not skipb or band_has_quad(y0) or (cl_any and (not cl['sc'] or (y0 < cl['y1'] and y0 + NL > cl['y0'])))]
+    nskip = len(range(0, HGT, NL)) - len(walk)
+    for wi, y0 in enumerate(walk):
+        if skipb:
+            ny = walk[wi + 1] if wi + 1 < len(walk) else None
+            emit([(4 << 28) | (1 << 27) | ((ny is not None) << 26) | ((ny if ny is not None else 0) << 15) | y0, 0])
+        else:
+            emit([(4 << 28) | y0, 0])
         cm32 = sum((0xFF << ((3 - c) * 8)) for c in range(4) if (cl['cmask'] >> (3 - c)) & 1)
         bc = [[0] * WID for _ in range(NL)]; bz = [[0] * WID for _ in range(NL)]; bs = [[0] * WID for _ in range(NL)]
         for l in range(NL):
@@ -1014,7 +1038,7 @@ def gen_frame(seed, ntri=20, WID=64, HGT=32, NL=None):
         fh.write("0\n")
     print(f"frame seed {seed}: {ntri} triangles, {nq} quads, {len(beats)} beats, {len(ddr)} DDR bursts, {len(cmds)} commands,"
           f" target {['RGBA8', 'RGBA4444', 'RGBA5551', 'RGB565'][fmt]} depth {dbits} bits{' + depth-stencil image' if ds else ''}"
-          f" -> tools/gen/br_*.hex, bl_cmds.hex")
+          + (f", {nskip} of {len(range(0, HGT, NL))} bands left out" if skipb else "") + f" -> tools/gen/br_*.hex, bl_cmds.hex")
     if os.environ.get('BR_VERBOSE'):
         for d in draws:
             print(f"  draw {d.id} {d.prog}: uniforms " + " ".join("".join(f"{c:06x}" for c in reversed(u)) for u in d.uni))
@@ -1345,9 +1369,15 @@ def gen_aframe(seed, NL=None):
     with open(os.path.join(GEN, f"ab_{seed}_cmds.hex"), "w") as fh:
         for c in cmds: fh.write(f"{len(c):x} " + " ".join(f"{w:08x}" for w in c) + "\n")
         fh.write("0\n")
+    # tb_two_boards3d +SKIP sends this FLUSH with flags bit 10: the bands board A leaves out per frame (a_raster_ref's walk;
+    # the image is the same — a band left out holds nothing to draw and nothing of the clear that is written back)
+    import a_raster_ref as ar
+    fw = list(cmds[-2][2:]); fw[0] |= 1 << 26
+    _, _, csk = ar.stream(ar.load_records(os.path.join(GEN, f"as_{seed}_rec.hex")), WID, HGT, skip=ar.flush_skip(fw))
+    with open(os.path.join(GEN, f"ab_{seed}_skip_count.hex"), "w") as fh: fh.write(f"{csk['bskip']}\n")
     print(f"aframe seed {seed}: draw{'s' if len(ids) > 1 else ''} {', '.join(map(str, ids))}, {len(tris)} triangles, {nq} quads, {len(beats)} beats, {len(ddr)} DDR bursts,"
           f" {len(cmds)} commands, target {WID} x {HGT} {['RGBA8', 'RGBA4444', 'RGBA5551', 'RGB565'][fmt]} depth {dbits} bits"
-          f"{' + depth-stencil image' if ds else ''} -> tools/gen/ab_{seed}_*")
+          f"{' + depth-stencil image' if ds else ''}, {csk['bskip']} bands left out with skip -> tools/gen/ab_{seed}_*")
 
 
 def frag_compare(rtl_path):

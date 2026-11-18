@@ -11,6 +11,11 @@
 //         (random o_ready back-pressure).
 // Directed: all 65536 RGB565 values -> RGBA8 (COPY) and -> RGBA8888 (READ); 256 grey levels RGBA8 -> RGB565;
 // same-format copies bit-exact; a 4096-pixel row (row buffer limit), stretch 4096 -> 1000 and 37 -> 4096.
+// COPY's swizzle (destination channel c <- source channel sel[2c +: 2] on the RGBA8 values), alpha = 255 (RGBA8
+// destinations) and the wrapped tile (destination (i, j) <- tile ((px + i) mod sw, (py + j) mod sh)) are in the model;
+// random burst-path copies (one format, 1:1, no key / horizontal mirror / swizzle / tile: whole bursts) at every 2-byte
+// alignment of source and destination, overlapping inside one surface in every direction, and the widest rows. The count
+// of burst-path commands is reported (dut.bm at the start).
 `default_nettype none
 module tb_img_xfer;
     reg clk = 0, rst = 1;
@@ -30,6 +35,7 @@ module tb_img_xfer;
     reg         cmd_mir_x, cmd_mir_y, cmd_bottom_up, cmd_key, cmd_rmw;
     reg  [31:0] cmd_key_lo, cmd_key_hi, cmd_value; reg [3:0] cmd_mask; reg [7:0] cmd_tfmt;
     reg  [12:0] cmd_j0, cmd_i0; reg [23:0] cmd_npix;
+    reg         cmd_alpha1, cmd_swz, cmd_wrap; reg [7:0] cmd_swz_sel; reg [12:0] cmd_px, cmd_py;
     wire        busy, o_valid; wire [31:0] o_data; reg o_ready = 1; wire [31:0] c_ops, c_pixels;
     wire        r_en, r_rdy, r_valid; wire [28:0] r_addr; wire [255:0] rd_data;
     wire        w_req, w_en, w_wren, w_wend, w_rdy, w_wdf_rdy; wire [28:0] w_addr; wire [255:0] w_data; wire [31:0] w_mask;
@@ -41,6 +47,7 @@ module tb_img_xfer;
         .cmd_hr2(cmd_hr2), .cmd_ha0(cmd_ha0), .cmd_vr2(cmd_vr2), .cmd_va0(cmd_va0),
         .cmd_mir_x(cmd_mir_x), .cmd_mir_y(cmd_mir_y), .cmd_bottom_up(cmd_bottom_up), .cmd_key(cmd_key),
         .cmd_key_lo(cmd_key_lo), .cmd_key_hi(cmd_key_hi), .cmd_value(cmd_value), .cmd_mask(cmd_mask), .cmd_rmw(cmd_rmw),
+        .cmd_alpha1(cmd_alpha1), .cmd_swz(cmd_swz), .cmd_swz_sel(cmd_swz_sel), .cmd_wrap(cmd_wrap), .cmd_px(cmd_px), .cmd_py(cmd_py),
         .cmd_tfmt(cmd_tfmt), .cmd_j0(cmd_j0), .cmd_i0(cmd_i0), .cmd_npix(cmd_npix), .busy(busy),
         .o_valid(o_valid), .o_data(o_data), .o_ready(o_ready), .c_ops(c_ops), .c_pixels(c_pixels),
         .r_en(r_en), .r_addr(r_addr), .r_rdy(r_rdy), .r_valid(r_valid), .rd_data(rd_data),
@@ -119,8 +126,10 @@ module tb_img_xfer;
     typedef struct {
         int op, sf, df; longint s0, d0; int sp, dp; int sx, sy, sw, sh, dx, dy, dw, dh;
         bit mx, my, key; bit [31:0] klo, khi, value; int mask; int tf; int first, npix;
+        bit alpha1, swz, wrap; bit [7:0] sel; int px, py;
     } cmd_t;
-    int unsigned n_cmd = 0; longint n_px = 0;
+    int unsigned n_cmd = 0, n_bm = 0; longint n_px = 0;
+    always @(posedge clk) if (cmd_valid && cmd_ready && dut.bm_go) n_bm++;
     bit [7:0] rd_got[$];
     always @(posedge clk) if (o_valid && o_ready) begin
         rd_got.push_back(o_data[7:0]); rd_got.push_back(o_data[15:8]); rd_got.push_back(o_data[23:16]); rd_got.push_back(o_data[31:24]);
@@ -143,7 +152,7 @@ module tb_img_xfer;
         if (c.op == 0 || c.op == 2) preset_rows(c.s0, c.sp, c.sy, c.sh, c.sx * sb, (c.sx + c.sw) * sb);
         if (c.op != 2)              preset_rows(c.d0, c.dp, c.dy, c.dh, c.dx * db, (c.dx + c.dw) * db);
         same = (c.op == 0) && (c.s0 == c.d0) && (c.sp == c.dp) && (c.sf == c.df);
-        bup = same && c.sw == c.dw && c.sh == c.dh && !c.my && c.dy > c.sy;
+        bup = same && c.sw == c.dw && c.sh == c.dh && !c.my && !c.wrap && c.dy > c.sy;
         rmw = (c.op == 1) && (c.df == 1) && ((c.mask & 7) != 0) && ((c.mask & 7) != 7);
         // ---- model ----
         if (c.op == 0) begin
@@ -157,6 +166,7 @@ module tb_img_xfer;
                 u = ((2 * i + 1) * c.sw) / (2 * c.dw); v = ((2 * j + 1) * c.sh) / (2 * c.dh);
                 if (c.mx) u = c.sw - 1 - u;
                 if (c.my) v = c.sh - 1 - v;
+                if (c.wrap) begin u = (c.px + i) % c.sw; v = (c.py + j) % c.sh; end
                 sv = snap[v][u];
                 tr = 0;
                 if (c.key) begin
@@ -168,7 +178,14 @@ module tb_img_xfer;
                 end
                 if (!tr) begin
                     if (c.sf == 2) dv = sv;
-                    else begin dec(c.sf, sv, r, g, b, a); dv = enc(c.df, r, g, b, a); end
+                    else begin
+                        int ch[4], o[4];
+                        dec(c.sf, sv, r, g, b, a);
+                        ch = '{r, g, b, a};
+                        for (int q = 0; q < 4; q++) o[q] = c.swz ? ch[c.sel[2*q +: 2]] : ch[q];
+                        if (c.alpha1) o[3] = 255;
+                        dv = enc(c.df, o[0], o[1], o[2], o[3]);
+                    end
                     put_px(c.d0 + (c.dy + j) * c.dp + (c.dx + i) * db, c.df, dv);
                 end
             end
@@ -223,6 +240,7 @@ module tb_img_xfer;
         cmd_mir_x <= c.mx; cmd_mir_y <= c.my; cmd_bottom_up <= bup; cmd_key <= c.key; cmd_key_lo <= c.klo; cmd_key_hi <= c.khi;
         cmd_value <= c.value; cmd_mask <= 4'(c.mask); cmd_rmw <= rmw; cmd_tfmt <= 8'(c.tf);
         cmd_j0 <= 13'(c.first / ((c.op == 2) ? c.sw : 1)); cmd_i0 <= 13'(c.first % ((c.op == 2) ? c.sw : 1)); cmd_npix <= 24'(c.npix);
+        cmd_alpha1 <= c.alpha1; cmd_swz <= c.swz; cmd_swz_sel <= c.sel; cmd_wrap <= c.wrap; cmd_px <= 13'(c.px); cmd_py <= 13'(c.py);
         rd_got.delete();
         @(posedge clk); cmd_valid <= 0;
         @(posedge clk);
@@ -255,6 +273,7 @@ module tb_img_xfer;
         c.op = 0; c.sf = 0; c.df = 0; c.s0 = 64'h0100_0000; c.d0 = 64'h0200_0000; c.sp = 0; c.dp = 0;
         c.sx = 0; c.sy = 0; c.sw = 1; c.sh = 1; c.dx = 0; c.dy = 0; c.dw = 1; c.dh = 1;
         c.mx = 0; c.my = 0; c.key = 0; c.klo = 0; c.khi = 0; c.value = 0; c.mask = 15; c.tf = 0; c.first = 0; c.npix = 1;
+        c.alpha1 = 0; c.swz = 0; c.wrap = 0; c.sel = 8'hE4; c.px = 0; c.py = 0;
         return c;
     endfunction
     function automatic int fmt_tf(input int k); int t[7] = '{0, 1, 2, 3, 4, 10, 11}; return t[k]; endfunction
@@ -358,6 +377,71 @@ module tb_img_xfer;
             rdy_pct = 100;
             if (n % 100 == 99) $display("ok: %0d random commands", n + 1);
         end
+        // ---- directed: the widest burst-path rows (RGBA8 4088 pixels at the worst alignment, RGB565 4096), alpha = 255 ----
+        c = blank(); c.sf = 0; c.df = 0; c.sp = 16384 + 64; c.dp = 16384 + 96; c.sw = 4088; c.sh = 3; c.dw = 4088; c.dh = 3;
+        c.s0 = 64'h0500_0000 + 28; c.d0 = 64'h0510_0000 + 4; run(c);
+        c.alpha1 = 1; c.s0 = 64'h0520_0000 + 4; c.d0 = 64'h0530_0000 + 28; run(c);
+        c = blank(); c.sf = 1; c.df = 1; c.sp = 8192 + 34; c.dp = 8192 + 62; c.sw = 4096; c.sh = 3; c.dw = 4096; c.dh = 3;
+        c.s0 = 64'h0540_0000 + 30; c.d0 = 64'h0550_0000 + 2; run(c);
+        $display("ok: widest burst-path rows (RGBA8 4088, RGB565 4096, worst alignments, alpha = 255)");
+        // ---- random burst-path copies: every 2-byte alignment, overlaps in one surface, mirror y, alpha = 255 ----
+        for (int n = 0; n < 400; n++) begin
+            int W, H, sb, al;
+            c = blank();
+            c.sf = urand(2); c.df = c.sf; sb = bpp(c.sf); al = (c.sf == 0) ? 4 : 2;
+            W = 1 + urand((n < 100) ? 40 : (n < 380) ? 700 : 2048); H = 1 + urand((n < 100) ? 6 : 24);
+            c.sp = W * sb + sb * urand(40); c.dp = W * sb + sb * urand(40);
+            c.s0 = 64'h0800_0000 + 32 * urand(8192) + al * urand(32 / al);
+            c.d0 = 64'h0C00_0000 + 32 * urand(8192) + al * urand(32 / al);
+            c.sx = urand(W); c.sy = urand(H); c.sw = 1 + urand(W - c.sx); c.sh = 1 + urand(H - c.sy);
+            c.dw = c.sw; c.dh = c.sh; c.dx = urand(W - c.sw + 1); c.dy = urand(20);
+            c.my = urand(4) == 0; c.alpha1 = urand(3) == 0;
+            if (urand(4) == 0) begin                                         // inside one surface, every direction
+                c.d0 = c.s0; c.dp = c.sp; c.my = 0;
+                c.dx = c.sx + int'(urand(81)) - 40; c.dy = c.sy + int'(urand(9)) - 4;
+                if (c.dx < 0) c.dx = 0;
+                if (c.dx + c.dw > W) c.dx = W - c.dw;
+                if (c.dy < 0) c.dy = 0;
+            end
+            run(c);
+            if (n % 100 == 99) $display("ok: %0d random burst-path copies", n + 1);
+        end
+        // ---- random swizzle / alpha = 255 / wrapped tiles (the pixel path), with stretch, mirrors and keys ----
+        for (int n = 0; n < 300; n++) begin
+            int W, H, sb, db;
+            c = blank();
+            c.sf = urand(2); c.df = urand(2); sb = bpp(c.sf); db = bpp(c.df);
+            W = 1 + urand((n < 60) ? 16 : 300); H = 1 + urand((n < 60) ? 6 : 20);
+            c.sp = W * sb + sb * urand(9); c.s0 = 64'h0800_0000 + 32 * urand(8192) + 4 * urand(8);
+            c.d0 = 64'h0C00_0000 + 32 * urand(8192) + 4 * urand(8);
+            c.sx = urand(W); c.sy = urand(H); c.sw = 1 + urand(W - c.sx); c.sh = 1 + urand(H - c.sy);
+            c.swz = urand(2) == 0; c.sel = urand(256); c.alpha1 = urand(2) == 0;
+            if (urand(2) == 0) begin                                         // a tile over a larger rectangle
+                c.wrap = 1; c.dw = 1 + urand(4 * c.sw + 40); c.dh = 1 + urand(3 * c.sh + 8);
+                if (c.dw > 4096) c.dw = 4096;
+                c.px = urand(c.sw); c.py = urand(c.sh);
+            end else begin
+                c.dw = (urand(2) == 0) ? c.sw : 1 + urand(2 * c.sw); c.dh = (urand(2) == 0) ? c.sh : 1 + urand(2 * c.sh);
+                c.mx = urand(3) == 0; c.my = urand(3) == 0;
+                if (urand(3) == 0) begin c.key = 1; c.klo = 32'h0000_0000; c.khi = {urand(65536), urand(65536)}; end
+            end
+            c.dx = urand(64); c.dy = urand(20); c.dp = (c.dx + c.dw) * db + db * urand(4) * 3;
+            run(c);
+            if (n % 100 == 99) $display("ok: %0d random swizzle / alpha / tile copies", n + 1);
+        end
+        // ---- speed: an 800 x 100 RGBA8 1:1 copy on the burst path, then on the pixel path (an identity swizzle) ----
+        begin
+            longint t0, tb_, tp_;
+            c = blank(); c.sf = 0; c.df = 0; c.sp = 3200; c.dp = 3200; c.sw = 800; c.sh = 100; c.dw = 800; c.dh = 100;
+            c.s0 = 64'h0600_0000 + 8; c.d0 = 64'h0640_0000 + 20;
+            t0 = $time; run(c); tb_ = ($time - t0) / 10;
+            c.swz = 1; c.sel = 8'hE4; c.d0 = 64'h0680_0000 + 20;
+            t0 = $time; run(c); tp_ = ($time - t0) / 10;
+            $display("INFO_TB 800 x 100 RGBA8 copy: %0d cycles on the burst path (%.2f pixels a cycle), %0d on the pixel path (%.2f)",
+                     tb_, 80000.0 / tb_, tp_, 80000.0 / tp_);
+        end
+        $display("INFO_TB %0d of the copies on the burst path", n_bm);
+        if (n_bm < 400) report($sformatf("only %0d burst-path copies", n_bm));
         if (c_ops != n_cmd) report($sformatf("c_ops %0d, expected %0d", c_ops, n_cmd));
         if (c_pixels != n_px) report($sformatf("c_pixels %0d, expected %0d", c_pixels, n_px));
         if (mig_err != 0) report($sformatf("MIG model errors %0d", mig_err));

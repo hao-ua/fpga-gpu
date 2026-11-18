@@ -2242,6 +2242,81 @@ static void test_depth_tex(void)
     }
 }
 
+/* every pixel of a 200 x 40 R5G6B5 target: the left half (x < 100) one colour, the right half another */
+static void halves565(IDirect3DSurface9 *rt, const char *what, int r0, int g0, int b0, int r1, int g1, int b1)
+{
+    IDirect3DSurface9 *s = NULL;
+    D3DLOCKED_RECT l;
+    int x, y, bad = 0, fx = 0, fy = 0, fr = 0, fg = 0, fb = 0;
+    HR(IDirect3DDevice9_CreateOffscreenPlainSurface(g_d, 200, 40, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM, &s, NULL));
+    if (!s) return;
+    g_checks++;
+    if (FAILED(IDirect3DDevice9_GetRenderTargetData(g_d, rt, s))) { g_bad++; printf("FAIL %s: GetRenderTargetData\n", what); IDirect3DSurface9_Release(s); return; }
+    IDirect3DSurface9_LockRect(s, &l, NULL, D3DLOCK_READONLY);
+    for (y = 0; y < 40; y++)
+        for (x = 0; x < 200; x++) {
+            unsigned v = ((const uint16_t *)((const uint8_t *)l.pBits + (ptrdiff_t)y * l.Pitch))[x];
+            int r = (int)(v >> 11) * 255 / 31, g = (int)(v >> 5 & 63) * 255 / 63, b = (int)(v & 31) * 255 / 31, left = x < 100;
+            if (abs(r - (left ? r0 : r1)) > 2 || abs(g - (left ? g0 : g1)) > 2 || abs(b - (left ? b0 : b1)) > 2) {
+                if (!bad) { fx = x; fy = y; fr = r; fg = g; fb = b; }
+                bad++;
+            }
+        }
+    IDirect3DSurface9_UnlockRect(s);
+    IDirect3DSurface9_Release(s);
+    if (bad) { g_bad++; printf("FAIL %s: %d of 8000 pixels wrong, the first (%d, %d) = %d %d %d\n", what, bad, fx, fy, fr, fg, fb); }
+}
+
+/* depth-stencil beside an R5G6B5 target whose rows are no multiple of 16 pixels: board B loads a depth row in twice the colour row's bursts
+   (200 pixels: 13 bursts of colour, 26 of depth = 832 bytes, more than 200 x 4) and refuses a shorter pitch. A depth surface, then an INTZ
+   texture (its own rows are 800 bytes) whose depth is sampled after */
+static void test_ds_rows(void)
+{
+    IDirect3DSurface9 *c = NULL, *z = NULL, *zs = NULL, *back = NULL, *ds = NULL;
+    IDirect3DTexture9 *t = NULL;
+    int k;
+    plain_state();
+    IDirect3DDevice9_GetRenderTarget(g_d, 0, &back);
+    IDirect3DDevice9_GetDepthStencilSurface(g_d, &ds);
+    HR(IDirect3DDevice9_CreateRenderTarget(g_d, 200, 40, D3DFMT_R5G6B5, D3DMULTISAMPLE_NONE, 0, FALSE, &c, NULL));
+    HR(IDirect3DDevice9_CreateDepthStencilSurface(g_d, 200, 40, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &z, NULL));
+    HR(IDirect3DDevice9_CreateTexture(g_d, 200, 40, 1, D3DUSAGE_DEPTHSTENCIL, FOURCC_INTZ, D3DPOOL_DEFAULT, &t, NULL));
+    if (!c || !z || !t) goto done;
+    IDirect3DTexture9_GetSurfaceLevel(t, 0, &zs);
+    HR(IDirect3DDevice9_SetRenderTarget(g_d, 0, c));
+    for (k = 0; k < 2; k++) {
+        HR(IDirect3DDevice9_SetDepthStencilSurface(g_d, k ? zs : z));
+        IDirect3DDevice9_Clear(g_d, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | (k ? 0 : D3DCLEAR_STENCIL), 0, 1.0f, 0);
+        rs(D3DRS_ZENABLE, TRUE); rs(D3DRS_ZWRITEENABLE, TRUE); rs(D3DRS_ZFUNC, D3DCMP_LESS);
+        if (!k) { rs(D3DRS_STENCILENABLE, TRUE); rs(D3DRS_STENCILFUNC, D3DCMP_ALWAYS); rs(D3DRS_STENCILREF, 1); rs(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE); }
+        quad(0, 0, 200, 40, 0.5f, 0xFFFF0000);                  /* depth 0.5 (stencil 1) everywhere */
+        if (!k) rs(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP);
+        quad(0, 0, 200, 40, 0.75f, 0xFF00FF00);                 /* behind: nowhere */
+        if (!k) rs(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+        quad(0, 0, 100, 40, 0.25f, 0xFF0000FF);                 /* in front (where the stencil is 1): the left half */
+        rs(D3DRS_ZENABLE, FALSE); rs(D3DRS_STENCILENABLE, FALSE); rs(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+        halves565(c, k ? "R5G6B5 200 wide, an INTZ texture as its depth" : "R5G6B5 200 wide, a D24S8 surface", 0, 0, 255, 255, 0, 0);
+    }
+    /* the INTZ texture's depth as rendered: 0.25 on the left, 0.5 on the right */
+    HR(IDirect3DDevice9_SetRenderTarget(g_d, 0, back));
+    IDirect3DDevice9_SetDepthStencilSurface(g_d, ds);
+    stage_tex(0, (IDirect3DBaseTexture9 *)t);
+    IDirect3DDevice9_Clear(g_d, 0, NULL, D3DCLEAR_TARGET, 0, 1.0f, 0);
+    quad_uv(0, 0, 200, 40, 0, 0, 1, 1);
+    px(50, 20, "an INTZ texture 200 wide sampled: the depth in front", 64, 64, 64);
+    px(150, 20, "an INTZ texture 200 wide sampled: the depth behind", 128, 128, 128);
+done:
+    plain_state();
+    if (zs) IDirect3DSurface9_Release(zs);
+    if (t) IDirect3DTexture9_Release(t);
+    if (z) IDirect3DSurface9_Release(z);
+    if (c) IDirect3DSurface9_Release(c);
+    IDirect3DDevice9_SetRenderTarget(g_d, 0, back);
+    IDirect3DDevice9_SetDepthStencilSurface(g_d, ds);
+    IDirect3DSurface9_Release(back);
+    if (ds) IDirect3DSurface9_Release(ds);
+}
+
 /* after a Present: what the window shows */
 static void test_front_data(void)
 {
@@ -2324,6 +2399,7 @@ int main(void)
     test_autogen();
     test_target_level();
     test_depth_tex();
+    test_ds_rows();
     IDirect3DDevice9_EndScene(g_d);
     test_present();
     test_front_data();

@@ -1,0 +1,2 @@
+#defin X
+void main() { }

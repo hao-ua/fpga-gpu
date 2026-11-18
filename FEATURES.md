@@ -10,7 +10,9 @@ only what the hardware can do exactly, or what the PC can do exactly beside it; 
   up to 64). Index counts are 32-bit.
 - **Attribute formats:** byte, unsigned byte, short, unsigned short, fixed, float and FP24, normalised or not.
 - **Clipping:**
-  - against w ≥ 2⁻⁷, near and far, and a ±2040-pixel x/y guard band;
+  - against w ≥ 2⁻⁷, near and far, and a ±2040-pixel x/y guard band, for triangles and lines;
+  - computed with a 32-bit significand inside the clipper (the shader format has 17): a vertex hundreds of thousands
+    of units outside the view still leaves the visible part of its edges exact to a fraction of a pixel;
   - a 0 ≤ z ≤ w volume, selected per draw, for reversed depth;
   - viewports smaller than the target are cut through the scissor;
   - each draw is bounded by its scissor rectangle.
@@ -18,6 +20,8 @@ only what the hardware can do exactly, or what the PC can do exactly beside it; 
 - **Coarse depth:** quads that board B's depth test would drop are not sent. A keeps a
   conservative depth bound per 4×2 block of each band from the draws' flags (a promise about each draw's depth state, sent
   by the libraries); the image is unchanged. A triangle's setup goes to B only in a band where it sends a quad.
+- **Band skipping:** bands with nothing to draw that the pass's clear does not reach are neither loaded nor written, so a
+  pass that redraws a small part of a kept target costs only the bands it touches.
 
 ### Fragments, depth and stencil (board B)
 - **Depth and stencil:**
@@ -89,6 +93,8 @@ only what the hardware can do exactly, or what the PC can do exactly beside it; 
 ### 2D and display (board B)
 - **Image operations:** READ, FILL and COPY_IMAGE.
   - They convert between RGBA8 and RGB565 and copy 8-bit palette images.
+  - COPY_IMAGE also swizzles channels, sets alpha to 255, repeats a tile over a rectangle and takes a list of rectangles
+    (clip regions); 1:1 copies of one format move whole bursts.
   - They do nearest-neighbour stretch, mirror and source colour-key ranges, and overlap-safe 1:1 copies.
   - FILL takes a channel mask.
 - **Scanout:**

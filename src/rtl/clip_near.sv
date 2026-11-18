@@ -9,7 +9,7 @@
 // ports: w and z / x / y of the vertex; the guard planes multiply first, the products feed the subtracter as they land)
 // and collected in order; a plane every vertex is inside leaves the polygon as it is (no walk); otherwise the edges are
 // walked: an inside start vertex is kept, a crossing edge appends the intersection with every ENABLED attribute lerped
-// FROM THE INSIDE vertex: t = d_in · rcp(d_in − d_out), new = v_in + t · (v_out − v_in) (bounded error, the same point for
+// FROM THE INSIDE vertex: t = d_in / (d_in − d_out), new = v_in + t · (v_out − v_in) (the same point for
 // both triangles sharing the edge). The lerp is PIPELINED (done one attribute at a time it costs a clipped triangle
 // ~900 cycles of setup): the enabled attributes' differences are issued one per cycle, each is multiplied by t as it
 // lands and added to the inside value as that lands (the adder is shared: an addition goes first, the walk waits a
@@ -19,15 +19,28 @@
 // fan (0, k, k + 1), up to 8, are emitted one at a time — TWO attributes per cycle into tri_out — tri_valid, then the
 // caller's tri_ack asks for the next; done when none is left (also when the polygon vanished). verts_in is sampled at
 // start. Model: tools/a_setup_ref.py clip().
+//   THE CLIP FORMAT. A vertex far outside the view — a coordinate of 2^18 beside a w of 2^3 — leaves the shader format
+// no bits for the part of an edge that is inside: the plane distances, t and the intersections need the difference of
+// two such numbers to a fraction of a pixel. So everything between the vertices in and the vertices out is of a format
+// of the clipper's own: the shader format's sign and exponent with a mantissa of CM_W bits. The vertices are extended
+// exactly on the way in (zeros below the mantissa), every distance, t and every stored intersection has the wide
+// mantissa, and a vertex is rounded to the shader format (to nearest even) once, in the output copy. t: the shader
+// format's reciprocal unit on the denominator rounded to that format, r0, then one Newton step and the product in the
+// clip format: t = d_in · r0 · (2 − den · r0) (model clip_t).
+//   LINES (line): the two ends are vertices 0 and 1 (vertex 2 = vertex 0, the caller's copy). The same planes: both
+// ends outside one -> done without a result; one outside -> it moves onto the plane (the edge 0 -> 1 alone is walked, so
+// end 0 stays end 0); the result is ONE output (0, 1, 0), pass when no end moved. Model: clip_line().
 `default_nettype none
 module clip_near #(
     parameter int EXP_W = 7,
     parameter int MAN_W = 16,
-    parameter int NVAR  = 32
+    parameter int NVAR  = 32,
+    parameter int CM_W  = 31                     // the clip format's mantissa
 )(
     input  wire clk,
     input  wire rst,
     input  wire start,
+    input  wire line,                            // with start: a line (vertices 0, 1), not a triangle
     input  wire [3*(4+NVAR)*(EXP_W+MAN_W+1)-1:0] verts_in,
     input  wire [NVAR/4-1:0] vmask,              // the varyings to lerp (the others of an intersection read 0)
     input  wire [4*(EXP_W+MAN_W+1)-1:0] gb,      // {gyhi, gylo, gxhi, gxlo}: the guard band's NDC bounds
@@ -43,19 +56,37 @@ module clip_near #(
     output reg  done                             // one cycle: no triangle (left)
 );
     localparam int W     = 1+EXP_W+MAN_W;
+    localparam int WC    = 1+EXP_W+CM_W;         // a number of the clip format
+    localparam int XB    = CM_W-MAN_W;           // its mantissa bits below the shader format's
     localparam int NATTR = 4+NVAR;
     localparam int VB    = NATTR*W;
     localparam int BIAS  = (1<<(EXP_W-1))-1;
+    localparam int INF_E = (1<<EXP_W)-1;
     localparam int NP    = 10;                   // polygon vertices at most (3 + one per plane)
     localparam int XS    = 14;                   // intersection slots (≤ 2 per plane)
     localparam int NPAIR = NATTR/2;              // attribute pairs of the output copy
     localparam [W-1:0] WEPS = (BIAS-7) << MAN_W; // 2^-7
+    localparam [WC-1:0] TWO = WC'(BIAS+1) << CM_W;   // 2.0 in the clip format
     if (NATTR % 2 != 0) $error("clip_near: NATTR must be even");
+    if (XB < 2) $error("clip_near: CM_W must exceed MAN_W by 2 at least");
+    // the shader format -> the clip format, exactly; and back: to nearest even, a mantissa that rounds up to 2 raises
+    // the exponent, past the largest one the result is Inf
+    function automatic [WC-1:0] cw(input [W-1:0] v); cw = {v, {XB{1'b0}}}; endfunction
+    function automatic [W-1:0] c24(input [WC-1:0] v);
+        reg [MAN_W:0] q; reg [EXP_W:0] e;
+        q = {1'b0, v[CM_W-1:XB]} + (MAN_W+1)'(v[XB-1] & ((|v[XB-2:0]) | v[XB]));
+        e = {1'b0, v[WC-2:CM_W]} + (EXP_W+1)'(q[MAN_W]);
+        if (v[WC-2:CM_W] == '0)      c24 = {v[WC-1], {(W-1){1'b0}}};
+        else if (&v[WC-2:CM_W])      c24 = {v[WC-1], {EXP_W{1'b1}}, |v[CM_W-1:0], {(MAN_W-1){1'b0}}};
+        else if (e >= (EXP_W+1)'(INF_E)) c24 = {v[WC-1], {EXP_W{1'b1}}, {MAN_W{1'b0}}};
+        else                         c24 = {v[WC-1], e[EXP_W-1:0], q[MAN_W-1:0]};
+    endfunction
 
     // ---- the polygon: references {is_intersection, index[3:0]}; the intersections' attributes in a small RAM
     reg [4:0] pin [0:NP-1], pout [0:NP-1]; reg [3:0] n_in, n_out, xs;
-    reg [W-1:0] dv [0:NP-1];                     // the plane distance of every polygon vertex
-    (* ram_style="distributed" *) reg [W-1:0] xmem [0:XS*NATTR-1];
+    reg ln;                                      // a line is being clipped
+    reg [WC-1:0] dv [0:NP-1];                    // the plane distance of every polygon vertex
+    (* ram_style="distributed" *) reg [WC-1:0] xmem [0:XS*NATTR-1];
     function automatic aen(input [5:0] ak);     // attribute enabled: x y z w always, a varying when its vec4 is masked in
         aen = (ak < 6'd4) ? 1'b1 : vmask[(ak - 6'd4) >> 2];
     endfunction
@@ -67,8 +98,8 @@ module clip_near #(
     reg  [4:0] ra, rb; reg [5:0] ak, akb;
     wire [6:0] oa_i = 7'(ra[1:0]*NATTR) + 7'(ak), ob_i = 7'(rb[1:0]*NATTR) + 7'(akb);
     wire [W-1:0] oa = vw[oa_i], ob = vw[ob_i];
-    wire [W-1:0] xa = aen(ak) ? xmem[ra[3:0]*NATTR + ak] : '0,   xb = aen(akb) ? xmem[rb[3:0]*NATTR + akb] : '0;   // a masked varying of an intersection reads 0 (never written)
-    wire [W-1:0] atta = ra[4] ? xa : oa, attb = rb[4] ? xb : ob;
+    wire [WC-1:0] xa = aen(ak) ? xmem[ra[3:0]*NATTR + ak] : '0,   xb = aen(akb) ? xmem[rb[3:0]*NATTR + akb] : '0;   // a masked varying of an intersection reads 0 (never written)
+    wire [WC-1:0] atta = ra[4] ? xa : cw(oa), attb = rb[4] ? xb : cw(ob);   // (an input vertex: extended)
     // the output triangle as words too (even / odd attribute of the pair written per cycle): a 54-way write decode each
     // instead of the flat vector's computed-offset write (~3800 LUTs)
     reg  [W-1:0] twe [0:3*NPAIR-1], two [0:3*NPAIR-1];             // written at word pair ov * NPAIR + pr (O_PAIR)
@@ -79,15 +110,16 @@ module clip_near #(
     end endgenerate
     // the output pair goes through a register — the two fetched words and a one-hot of the pair they go to — before the
     // write (timing at 120 MHz: the port's address arithmetic -> the vertex / intersection RAM read -> the 54-way write
-    // decode is too long for one cycle); the last pair lands with tri_valid (O_VALID is one cycle)
-    reg  ow_v; reg [3*NPAIR-1:0] ow_oh; reg [W-1:0] ow_a, ow_b;
+    // decode is too long for one cycle), and is rounded to the shader format on its way from that register into the
+    // triangle; the last pair lands with tri_valid (O_VALID is one cycle)
+    reg  ow_v; reg [3*NPAIR-1:0] ow_oh; reg [WC-1:0] ow_a, ow_b;
     wire [W-1:0] gxlo = gb[0*W +: W], gxhi = gb[1*W +: W], gylo = gb[2*W +: W], gyhi = gb[3*W +: W];
 
-    // ---- shared float units
-    reg as_in, as_op; reg [W-1:0] as_a, as_b; wire as_v; wire [W-1:0] as_r;
-    float_addsub #(EXP_W,MAN_W) U_AS(.clk,.rst,.in_valid(as_in),.a(as_a),.b(as_b),.op(as_op),.out_valid(as_v),.result(as_r));
-    reg mu_in; reg [W-1:0] mu_a, mu_b; wire mu_v; wire [W-1:0] mu_r;
-    float_mul #(EXP_W,MAN_W) U_MU(.clk,.rst,.in_valid(mu_in),.a(mu_a),.b(mu_b),.in_ready(),.out_valid(mu_v),.result(mu_r));
+    // ---- shared float units: the adder and the multiplier of the clip format, the reciprocal of the shader format
+    reg as_in, as_op; reg [WC-1:0] as_a, as_b; wire as_v; wire [WC-1:0] as_r;
+    float_addsub_w #(EXP_W,CM_W) U_AS(.clk,.rst,.in_valid(as_in),.a(as_a),.b(as_b),.op(as_op),.out_valid(as_v),.result(as_r));
+    reg mu_in; reg [WC-1:0] mu_a, mu_b; wire mu_v; wire [WC-1:0] mu_r;
+    float_mul_w #(EXP_W,CM_W) U_MU(.clk,.rst,.in_valid(mu_in),.a(mu_a),.b(mu_b),.out_valid(mu_v),.result(mu_r));
     reg rc_in; reg [W-1:0] rc_x; wire rc_v; wire [W-1:0] rc_r;
     float_sfu #(.EXP_W(EXP_W),.MAN_W(MAN_W),.K(EXP_W==7?12:8),.KLOG(EXP_W==7?11:8),
         .RCP_MEM(EXP_W==7?"tools/gen/fp24_rcp_seed.mem":"tools/gen/fp16_rcp_seed.mem"),
@@ -100,7 +132,7 @@ module clip_near #(
         X_ISS, X_COL, X_JUDGE,                            // the prescan: all seven planes' distances of the input triangle
         D_START, D_ISS, D_COL, D_JUDGE,                   // the distances of the polygon's vertices (pipelined), the verdict
         E_EDGE,                                           // the edge walk
-        T_DEN, T_DENW, T_RCP, T_RCPW, T_MUL, T_MULW,      // t of a crossing edge
+        T_DEN, T_DENW, T_RCPW, T_N1W, T_N2W, T_N3W, T_MULW,   // t of a crossing edge
         L_START, L_RUN, L_DRAIN,                          // the pipelined lerp of the enabled attributes
         P_NEXT, P_SKIP,                                   // the plane is done (walked / untouched)
         O_START, O_PAIR, O_VALID, O_HOLD,                 // the output triangles
@@ -108,12 +140,15 @@ module clip_near #(
     reg [2:0] plane; reg [3:0] vi, ei, ok, ci;           // vertex / edge / output triangle / collected index
     reg [1:0] ov; reg [4:0] pr;                           // output vertex 0..2, attribute pair
     reg       fvv;                                        // D_ISS: the fetched vertex vi's operands are on the ports
-    reg [4:0] rin, rout; reg [W-1:0] din, dout, treg;
+    reg [4:0] rin, rout; reg [WC-1:0] din, dout, treg;
+    reg [WC-1:0] den, r0;                                 // t's denominator d_in - d_out and its first reciprocal
     // the pipelined lerp: the walk over the enabled attributes (l_ak on the fetch ports), the queues that carry the inside
     // value and the attribute from the subtraction's issue to the addition's (inq) and from the addition's issue to its
-    // result (outq), and the kind of every adder result in issue order (kq: 0 = a difference -> the multiplier, 1 = final)
+    // result (outq), and the kind of every adder result in issue order (kq: 0 = a difference -> the multiplier, 1 = final).
+    // 16 entries each: an inq entry lives the adder's latency + the multiplier's + 2 cycles (13), and the walk issues one
+    // a cycle until the first product lands.
     reg        l_iss; reg [5:0] l_ak, l_n_iss, l_n_fin;
-    reg [W-1:0] inq [0:15]; reg [5:0] inq_ak [0:15]; reg [3:0] inq_wp, inq_rp;
+    reg [WC-1:0] inq [0:15]; reg [5:0] inq_ak [0:15]; reg [3:0] inq_wp, inq_rp;
     reg [5:0]  outq [0:15]; reg [3:0] outq_wp, outq_rp;
     reg        kq [0:15]; reg [3:0] kq_wp, kq_rp;
     function automatic [5:0] nxt_ak(input [5:0] a);    // the next enabled attribute after a (NATTR when none is left)
@@ -121,27 +156,28 @@ module clip_near #(
         for (int k = NATTR-1; k > 0; k--) if (6'(k) > a && aen(6'(k))) nxt_ak = 6'(k);
     endfunction
     // the output copy walks only the ENABLED attribute pairs: a masked-out varying's words of tri_out keep
-    // what they held, which the caller never reads (a_setup's difference stream, record and line clip take fsmask's
+    // what they held, which the caller never reads (a_setup's difference stream and record take fsmask's
     // varyings only; the clipper itself lerps and fetches enabled attributes only). With two varyings 6 pairs of 18.
     function automatic [4:0] nxt_pr(input [4:0] p);    // the next enabled pair after p (NPAIR when none is left)
         nxt_pr = 5'(NPAIR);
         for (int k = NPAIR-1; k > 0; k--) if (5'(k) > p && aen(6'(2*k))) nxt_pr = 5'(k);
     endfunction
-    reg [W-1:0] xyq [0:15]; reg xyq_hi [0:15]; reg [3:0] xy_wp, xy_rp;   // the x / y operands of the guard planes, in issue order (the mul's latency); hi: a g_hi plane
+    reg [WC-1:0] xyq [0:15]; reg xyq_hi [0:15]; reg [3:0] xy_wp, xy_rp;   // the x / y operands of the guard planes, in issue order (the mul's latency); hi: a g_hi plane
     reg       any_out, all_out;
     // the prescan (the input triangle against all seven planes in one pipelined batch, 21 issues): per plane the three
     // distances and whether any / every vertex is outside; while the polygon is still the input triangle (orig) a plane
-    // without an outside vertex is skipped at once and the first clipping plane uses the prescanned distances
-    reg [W-1:0] xdv [0:6][0:2]; reg [6:0] x_any, x_all; reg orig; reg [4:0] x_i, x_c;
+    // without an outside vertex is skipped at once and the first clipping plane uses the prescanned distances. (A line's
+    // vertex 2 is its vertex 0: any / every over the three is any / every over the two ends.)
+    reg [WC-1:0] xdv [0:6][0:2]; reg [6:0] x_any, x_all; reg orig; reg [4:0] x_i, x_c;
     wire [2:0] xi_pl = x_i / 3, xc_pl = x_c / 3; wire [1:0] xi_v = 2'(x_i % 3), xc_v = 2'(x_c % 3);   // issue / collect: plane, vertex
     wire [W-1:0] xg = (xi_pl == 3'd3) ? gxhi : (xi_pl == 3'd4) ? gxlo : (xi_pl == 3'd5) ? gyhi : gylo;
     wire [3:0] nxt = (ei == n_in - 4'd1) ? 4'd0 : ei + 4'd1;
-    wire ia = ~dv[ei][W-1], ib = ~dv[nxt][W-1];
+    wire ia = ~dv[ei][WC-1], ib = ~dv[nxt][WC-1];
     wire gplane = plane[2] | (plane == 3'd3);            // planes 3..6: a product first
     wire [W-1:0] gconst = (plane == 3'd3) ? gxhi : (plane == 3'd4) ? gxlo : (plane == 3'd5) ? gyhi : gylo;
     wire [5:0] akb_of_plane = (plane == 3'd1 || plane == 3'd2) ? 6'd2 : (plane == 3'd3 || plane == 3'd4) ? 6'd0 : 6'd1;
-    function automatic [4:0] tri_ref(input [1:0] v, input [3:0] k);   // the fan's triangle k: vertices 0, k, k + 1
-        tri_ref = (v == 2'd0) ? pin[0] : (v == 2'd1) ? pin[k] : pin[k + 4'd1];
+    function automatic [4:0] tri_ref(input [1:0] v, input [3:0] k);   // the fan's triangle k: vertices 0, k, k + 1 (a line: 0, 1, 0)
+        tri_ref = (v == 2'd0) ? pin[0] : (v == 2'd1) ? pin[k] : ln ? pin[0] : pin[k + 4'd1];
     endfunction
     // TRIVIAL ACCEPT: a triangle certainly inside all seven planes passes at once, without the 21-issue prescan
     // (about a third of a small triangle's setup). From the exponents alone, per vertex: w >= 2^-7 (plane 0); |z| < w
@@ -178,7 +214,7 @@ module clip_near #(
                 else          begin as_a<=xyq[xy_rp]; as_b<=mu_r; end       // planes 4, 6: x / y - g_lo w
             end
             if ((cs == D_ISS || cs == D_COL) && as_v) begin
-                dv[ci]<=as_r; any_out<=any_out | as_r[W-1]; all_out<=all_out & as_r[W-1]; ci<=ci+4'd1;
+                dv[ci]<=as_r; any_out<=any_out | as_r[WC-1]; all_out<=all_out & as_r[WC-1]; ci<=ci+4'd1;
             end
             // ---- the lerp pipeline (L_RUN / L_DRAIN): the adder's results in issue order, their kind from kq; a product lands
             //      -> its addition is issued at once (ahead of the walk, whose ports hold their attribute meanwhile)
@@ -207,12 +243,12 @@ module clip_near #(
                 else               begin as_a<=xyq[xy_rp]; as_b<=mu_r; end  // planes 4, 6: x / y - g_lo w
             end
             if ((cs == X_ISS || cs == X_COL) && as_v) begin
-                xdv[xc_pl][xc_v]<=as_r; x_any[xc_pl]<=x_any[xc_pl] | as_r[W-1]; x_all[xc_pl]<=x_all[xc_pl] & as_r[W-1]; x_c<=x_c+5'd1;
+                xdv[xc_pl][xc_v]<=as_r; x_any[xc_pl]<=x_any[xc_pl] | as_r[WC-1]; x_all[xc_pl]<=x_all[xc_pl] & as_r[WC-1]; x_c<=x_c+5'd1;
             end
             case (cs)
                 S_IDLE: if (start) begin
                     for (int i = 0; i < 3*NATTR; i++) vw[i]<=verts_in[i*W +: W];
-                    busy<=1; pin[0]<=5'd0; pin[1]<=5'd1; pin[2]<=5'd2; n_in<=4'd3; n_out<=4'd0; xs<=4'd0; plane<=3'd0; orig<=1'b1;
+                    busy<=1; pin[0]<=5'd0; pin[1]<=5'd1; pin[2]<=5'd2; n_in<=line ? 4'd2 : 4'd3; ln<=line; n_out<=4'd0; xs<=4'd0; plane<=3'd0; orig<=1'b1;
                     x_i<=5'd0; x_c<=5'd0; x_any<=7'd0; x_all<=7'h7F; xy_wp<=4'd0; xy_rp<=4'd0;
                     ra<=5'd0; rb<=5'd0; ak<=6'd3; akb<=6'd3;                                 // (vertex 0 of plane 0: w, w)
                     if (t_accept) begin ok<=4'd1; pass<=1'b1; cs<=O_VALID; end              // trivially inside: as X_JUDGE's pass
@@ -223,10 +259,10 @@ module clip_near #(
                     reg [4:0] n1; reg [2:0] npl; reg [1:0] nv;
                     n1 = x_i + 5'd1; npl = n1 / 3; nv = 2'(n1 % 3);
                     case (xi_pl)
-                        3'd0:    begin as_in<=1'b1; as_a<=atta; as_b<=WEPS; as_op<=1'b1; end      // w - eps
+                        3'd0:    begin as_in<=1'b1; as_a<=atta; as_b<=cw(WEPS); as_op<=1'b1; end  // w - eps
                         3'd1:    begin as_in<=1'b1; as_a<=attb; as_b<=z0 ? '0 : atta; as_op<=1'b0; end   // z + w (z0: z + 0)
                         3'd2:    begin as_in<=1'b1; as_a<=atta; as_b<=attb; as_op<=1'b1; end      // w - z
-                        default: begin mu_in<=1'b1; mu_a<=xg; mu_b<=atta; xyq[xy_wp]<=attb; xyq_hi[xy_wp]<=xi_pl[0]; xy_wp<=xy_wp+4'd1; end
+                        default: begin mu_in<=1'b1; mu_a<=cw(xg); mu_b<=atta; xyq[xy_wp]<=attb; xyq_hi[xy_wp]<=xi_pl[0]; xy_wp<=xy_wp+4'd1; end
                     endcase
                     if (x_i == 5'd20) cs<=X_COL;
                     else begin
@@ -252,10 +288,10 @@ module clip_near #(
                 D_ISS: begin
                     if (fvv) begin
                         case (plane)
-                            3'd0:    begin as_in<=1'b1; as_a<=atta; as_b<=WEPS; as_op<=1'b1; end      // w - eps
+                            3'd0:    begin as_in<=1'b1; as_a<=atta; as_b<=cw(WEPS); as_op<=1'b1; end  // w - eps
                             3'd1:    begin as_in<=1'b1; as_a<=attb; as_b<=z0 ? '0 : atta; as_op<=1'b0; end   // z + w (z0: z + 0)
                             3'd2:    begin as_in<=1'b1; as_a<=atta; as_b<=attb; as_op<=1'b1; end      // w - z
-                            default: begin mu_in<=1'b1; mu_a<=gconst; mu_b<=atta; xyq[xy_wp]<=attb; xyq_hi[xy_wp]<=plane[0]; xy_wp<=xy_wp+4'd1; end   // g w, then - x / y
+                            default: begin mu_in<=1'b1; mu_a<=cw(gconst); mu_b<=atta; xyq[xy_wp]<=attb; xyq_hi[xy_wp]<=plane[0]; xy_wp<=xy_wp+4'd1; end   // g w, then - x / y
                         endcase
                     end
                     if (vi == n_in - 4'd1) begin fvv<=1'b0; cs<=D_COL; end
@@ -267,22 +303,24 @@ module clip_near #(
                     else if (!any_out) cs<=P_SKIP;                       // untouched: the polygon stays
                     else begin ei<=4'd0; n_out<=4'd0; cs<=E_EDGE; end
                 end
-                // ---- the edge walk: ei -> nxt
+                // ---- the edge walk: ei -> nxt (a line: the edge 0 -> 1 alone crosses; at end 1 only that end is kept)
                 E_EDGE: begin
                     if (ia) begin pout[n_out]<=pin[ei]; n_out<=n_out+4'd1; end
-                    if (ia != ib) begin                                               // a crossing: lerp from the inside vertex
+                    if (ia != ib && !(ln && ei != 4'd0)) begin                        // a crossing: lerp from the inside vertex
                         rin<=ia ? pin[ei] : pin[nxt]; rout<=ia ? pin[nxt] : pin[ei];
                         din<=ia ? dv[ei] : dv[nxt];  dout<=ia ? dv[nxt] : dv[ei];
                         cs<=T_DEN;
                     end else if (ei == n_in - 4'd1) cs<=P_NEXT;
                     else ei<=ei+4'd1;
                 end
-                // t = d_in * rcp(d_in - d_out)
+                // t = d_in / (d_in - d_out): den, r0 = rcp(den rounded to the shader format), then in the clip format
+                // den r0, 2 - den r0, r0 (2 - den r0), and d_in times that
                 T_DEN:  begin as_a<=din; as_b<=dout; as_op<=1'b1; as_in<=1'b1; cs<=T_DENW; end
-                T_DENW: if (as_v) begin rc_x<=as_r; rc_in<=1'b1; cs<=T_RCP; end
-                T_RCP:  cs<=T_RCPW;
-                T_RCPW: if (rc_v) begin mu_a<=din; mu_b<=rc_r; mu_in<=1'b1; cs<=T_MUL; end
-                T_MUL:  cs<=T_MULW;
+                T_DENW: if (as_v) begin den<=as_r; rc_x<=c24(as_r); rc_in<=1'b1; cs<=T_RCPW; end
+                T_RCPW: if (rc_v) begin r0<=cw(rc_r); mu_a<=den; mu_b<=cw(rc_r); mu_in<=1'b1; cs<=T_N1W; end
+                T_N1W:  if (mu_v) begin as_a<=TWO; as_b<=mu_r; as_op<=1'b1; as_in<=1'b1; cs<=T_N2W; end
+                T_N2W:  if (as_v) begin mu_a<=r0; mu_b<=as_r; mu_in<=1'b1; cs<=T_N3W; end
+                T_N3W:  if (mu_v) begin mu_a<=din; mu_b<=mu_r; mu_in<=1'b1; cs<=T_MULW; end
                 T_MULW: if (mu_v) begin treg<=mu_r; cs<=L_START; end
                 // the lerp xmem[xs][k] = in + t (out - in) of every enabled attribute k, pipelined (the block above the case)
                 L_START: begin                                            // attribute 0 (x) on the ports, the queues empty
@@ -300,7 +338,7 @@ module clip_near #(
                 P_NEXT: begin
                     for (int i = 0; i < NP; i++) pin[i]<=pout[i];
                     n_in<=n_out; orig<=1'b0;
-                    if (n_out < 4'd3) cs<=S_DONE;
+                    if (n_out < (ln ? 4'd2 : 4'd3)) cs<=S_DONE;
                     else if (plane == 3'd6) begin ok<=4'd1; cs<=O_START; end
                     else begin plane<=plane+3'd1; cs<=D_START; end
                 end
@@ -337,7 +375,16 @@ module clip_near #(
     // the output pair's register and write (no reset: a stray write after a reset lands in words no triangle is read from)
     always @(posedge clk) begin
         ow_v <= (cs == O_PAIR); ow_oh <= (3*NPAIR)'(1) << (7'(ov)*7'(NPAIR) + 7'(pr)); ow_a <= atta; ow_b <= attb;
-        if (ow_v) for (int g = 0; g < 3*NPAIR; g++) if (ow_oh[g]) begin twe[g] <= ow_a; two[g] <= ow_b; end
+        if (ow_v) for (int g = 0; g < 3*NPAIR; g++) if (ow_oh[g]) begin twe[g] <= c24(ow_a); two[g] <= c24(ow_b); end
     end
+    // synthesis translate_off
+    // the lerp's queues: a write never lands on an entry still waiting, a read never finds its queue empty
+    always @(posedge clk) if (!rst && (cs == L_RUN || cs == L_DRAIN)) begin
+        if (4'(inq_wp - inq_rp) == 4'd15 || 4'(outq_wp - outq_rp) == 4'd15 || 4'(kq_wp - kq_rp) == 4'd15)
+            $fatal(1, "clip_near: a lerp queue is full (inq %0d, outq %0d, kq %0d)", 4'(inq_wp - inq_rp), 4'(outq_wp - outq_rp), 4'(kq_wp - kq_rp));
+        if (as_v && kq_wp == kq_rp) $fatal(1, "clip_near: an adder result that no issue owns");
+        if (mu_v && inq_wp == inq_rp) $fatal(1, "clip_near: a product that no difference owns");
+    end
+    // synthesis translate_on
 endmodule
 `default_nettype wire

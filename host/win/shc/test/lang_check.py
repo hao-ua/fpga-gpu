@@ -15,6 +15,14 @@ VS = 'attribute vec4 a0; uniform float n;\n'
 A = 'mat2 a = mat2(1.0, 2.0, 3.0, 4.0); mat2 b = mat2(5.0, 6.0, 7.0, 8.0); '
 P = 'mat2 p = mat2(1.0, 2.0, 4.0, 8.0); '
 K = 'int k = int(v0.x * 4.0); '                                        # 3 and 1
+
+
+def a71(x):
+    for k in range(70): x = x * 0.5 + k
+    return x
+
+
+A71 = (a71(0.75), a71(0.25))                                            # 70 steps of a = a * 0.5 + k: more constants than rows
 # name, program (a main that ends by writing gl_FragColor), the result where x > 0.5, the result elsewhere (None: the same)
 C = [
     ('mat + mat', A + 'mat2 c = a + b; gl_FragColor = vec4(c[0], c[1]);', (6, 8, 10, 12)),
@@ -107,7 +115,25 @@ W = [
     ('precision in a function', 'void main() { precision lowp float; lowp vec4 c = vec4(1.0); highp float h = 2.0; mediump int i = 3; const lowp float k = 4.0; gl_FragColor = c * h + float(i) + k; }\n', (9, 9, 9, 9)),
     ('a constructor starts a statement', 'void main() { float(1.0) + 2.0; vec2(1.0).x; gl_FragColor = vec4(1.0); }\n', (1, 1, 1, 1)),
     ('a uniform array of ints', 'uniform int a[2];\nvoid main() { gl_FragColor = vec4(float(a[1] + 1)); }\n', (1, 1, 1, 1)),
-    ('#line', '#line 40\nvoid main() { gl_FragColor = vec4(float(__LINE__)); }\n', (41, 41, 41, 41)),
+    ('#line', '#line 40\nvoid main() { gl_FragColor = vec4(float(__LINE__)); }\n', (40, 40, 40, 40)),
+    ('#line with a source number', '#line 7 3\nvoid main() { gl_FragColor = vec4(float(__LINE__), float(__FILE__), 0.0, 0.0); }\n', (7, 3, 0, 0)),
+    ('#if with C precedence', '#if (8 != 3 > 2) == 1 && (8 / ~2) == -2 && (7 % 3 << 1) == 2 && (1 | 2 ^ 3 & 1) == 3\nvoid main() { gl_FragColor = vec4(1.0); }\n#else\nvoid main() { gl_FragColor = vec4(0.0); }\n#endif\n', (1, 1, 1, 1)),
+    ('#if short circuits', '#if (1 || NOPE) && !(0 && NOPE)\nvoid main() { gl_FragColor = vec4(1.0); }\n#else\nvoid main() { gl_FragColor = vec4(0.0); }\n#endif\n', (1, 1, 1, 1)),
+    ('defined from a macro', '#define D defined(NOPE)\n#if !D\nvoid main() { gl_FragColor = vec4(1.0); }\n#else\nvoid main() { gl_FragColor = vec4(0.0); }\n#endif\n', (1, 1, 1, 1)),
+    ('a comment over lines in a #define', '#define K /* a\n b */ 3.0\nvoid main() { gl_FragColor = vec4(K); }\n', (3, 3, 3, 3)),
+    ('1e is one token', '#define e +1\nvoid main() { gl_FragColor = vec4(1e0); }\n', (1, 1, 1, 1)),
+    ('a function-like macro over lines', '#define F(a, b) (a + b)\nvoid main() { gl_FragColor = vec4(F(1.0,\n 2.0)); }\n', (3, 3, 3, 3)),
+    ('the same #define again', '#define V (1.0 + 2.0)\n#define V (1.0 /* */ + 2.0)\n#define G(a,b) (a  +b)\n#define G(a,b)(a /* */ +b)\nvoid main() { gl_FragColor = vec4(V, G(1.0, 1.0), 0.0, 0.0); }\n', (3, 2, 0, 0)),
+    ('a declaration under an if is a scope of its own', 'float a = 1.0;\nvoid main() { if (v0.x > 0.0) float a = 5.0; else float a = 7.0; gl_FragColor = vec4(a); }\n', (1, 1, 1, 1)),
+    ('an ivec component += counts a loop', 'void main() { vec4 r = vec4(1.0, 2.0, 3.0, 4.0); for (ivec4 i = ivec4(0, 1, 3, 0); i.x < i.z; i.x += i.y) { r = r.yzwx; } ivec2 k = ivec2(5, 2); k.y -= k.x; gl_FragColor = vec4(r.x, r.y, float(k.y), 0.0); }\n', (4, 1, -3, 0)),
+    ('an int local as an out and an inout argument', 'void f(out int a) { a = -1; }\nvoid g(inout int a) { a = -a; }\nvoid main() { int x = 1; f(x); int y = 3; g(y); gl_FragColor = vec4(float(x * int(n)), float(y), 0.0, 0.0); }\n', (-4, -3, 0, 0)),
+    ('a global as an out argument is a copy', 'float x = 1.0;\nbool d(out float y) { y = 2.0; return x == 1.0 && y == 2.0; }\nvoid main() { bool r = d(x); gl_FragColor = vec4(r ? 1.0 : 0.0, x, 0.0, 0.0); }\n', (1, 2, 0, 0)),
+    ('one array as two inout arguments', 'void neg(inout float a[2]) { a[0] = -a[0]; a[1] = -a[1]; }\nfloat f(inout float a[2], inout float b[2]) { neg(a); return a[0] == b[0] ? 1.0 : -1.0; }\nvoid main() { float r[2]; r[0] = 3.0; r[1] = 4.0; float m = f(r, r); gl_FragColor = vec4(m, 0.0, 0.0, 0.0); }\n', (-1, 0, 0, 0)),
+    ('arrays in a local struct written element by element', 'struct T { float a; vec2 b[2]; };\nstruct S { float a; float b[3]; T t[2]; };\nvoid main() { S s; s.a = 1.0; s.b[1] = 4.0; s.t[1].b[0] = vec2(5.0, 6.0); gl_FragColor = vec4(s.a, s.b[1], s.b[0], s.t[1].b[0].y); }\n', (1, 4, 0, 6)),
+    ('a loop whose step reads a uniform', 'float f() { for (int i = 1; i < 10; i += int(n) - 4) return 2.0; return 3.0; }\nvoid main() { gl_FragColor = vec4(f()); }\n', (2, 2, 2, 2)),
+    ('atan of a vector, a lane each', 'void main() { vec4 x = vec4(-3.9, -0.6, 1.7, 3.95); vec3 y = atan(x.wzy); gl_FragColor = atan(x) + vec4(0.0, 0.0, 0.0, y.x - atan(3.95)); }\n', (-1.31979, -0.54042, 1.03907, 1.32264)),
+    ('71 scalar constants','void main() { float a = v0.x; ' + ''.join('a = a * 0.5 + %d.0; ' % k for k in range(70)) + 'gl_FragColor = vec4(a); }\n', (A71[0],) * 4, (A71[1],) * 4),
+    ('invariant on varyings and gl_Position', 'invariant varying vec4 q;\nvoid main() { gl_FragColor = vec4(2.0); }\n', (2, 2, 2, 2)),
 ]
 # (name, stage, source): each must not compile
 B = 'precision mediump float; uniform vec4 u; uniform float f; uniform int ii; varying vec2 w;\n'
@@ -118,10 +144,58 @@ NO = [
     ('#extension require unknown', 'fs', '#extension GL_FOO : require\nvoid main() { }\n'),
     ('#if with no #endif', 'fs', '#if 1\nvoid main() { }\n'),
     ('#define GL_', 'fs', '#define GL_FOO 1\nvoid main() { }\n'),
+    ('#if of an undefined name', 'fs', '#if A || 1\n#endif\nvoid main() { }\n'),
+    ('#if with ++', 'fs', '#if + ++1\n#endif\nvoid main() { }\n'),
+    ('#if with something after it', 'fs', '#if 1 foobar\n#endif\nvoid main() { }\n'),
+    ('#if dividing by 0', 'fs', '#if 1 / 0\n#endif\nvoid main() { }\n'),
+    ('#if of a float', 'fs', '#if 1.0\n#endif\nvoid main() { }\n'),
+    ('defined((X))', 'fs', '#if defined((X))\n#endif\nvoid main() { }\n'),
+    ('defined(X with no )', 'fs', '#if defined(X\n#endif\nvoid main() { }\n'),
+    ('#else foo', 'fs', '#if 1\n#else foo\n#endif\nvoid main() { }\n'),
+    ('#endif foo', 'fs', '#if 1\n#endif foo\nvoid main() { }\n'),
+    ('#elif after #else', 'fs', '#if 0\n#else\n#elif 1\n#endif\nvoid main() { }\n'),
+    ('#else after #else', 'fs', '#if 0\n#else\n#else\n#endif\nvoid main() { }\n'),
+    ('#endif with no #if', 'fs', '#endif\nvoid main() { }\n'),
+    ('#ifdef 1', 'fs', '#ifdef 1\n#endif\nvoid main() { }\n'),
+    ('an unknown directive', 'fs', '#defin X\nvoid main() { }\n'),
+    ('#define 123', 'fs', '#define 123 321\nvoid main() { }\n'),
+    ('#undef 123', 'fs', '#undef 123\nvoid main() { }\n'),
+    ('#undef X Y', 'fs', '#define X 1\n#undef X Y\nvoid main() { }\n'),
+    ('#undef __LINE__', 'fs', '#undef __LINE__\nvoid main() { }\n'),
+    ('#define __FILE__', 'fs', '#define __FILE__ 1\nvoid main() { }\n'),
+    ('a macro defined again otherwise', 'fs', '#define V (1.0 - 2.0)\n#define V (1.0- 2.0)\nvoid main() { }\n'),
+    ('a function-like macro defined again otherwise', 'fs', '#define G(a,b) a+b\n#define G(b,a) a+b\nvoid main() { }\n'),
+    ('a parameter twice', 'fs', '#define G(a,a) a\nvoid main() { }\n'),
+    ('a macro called with too many', 'fs', '#define G(a,b) a\n' + B + 'void main() { float x = G(1.0, 2.0, 3.0); }\n'),
+    ('#extension after the code', 'fs', B + '#extension all : warn\nvoid main() { }\n'),
+    ('#line with a name left', 'fs', '#line X\nvoid main() { }\n'),
+    ('1e', 'fs', '#define e +1\n' + B + 'void main() { float x = 1e; }\n'),
     ('no main', 'fs', B),
     ('main with a type', 'fs', B + 'float main() { return 1.0; }\n'),
     ('main with an argument', 'fs', B + 'void main(float a) { }\n'),
     ('a reserved word', 'fs', B + 'void main() { int goto = 1; }\n'),
+    ('a keyword as a name', 'fs', B + 'void main() { float attribute = 1.0; }\n'),
+    ('invariant as a name', 'fs', B + 'void main() { float invariant = 1.0; }\n'),
+    ('a number as a name', 'fs', B + 'void main() { float 0123 = 1.0; }\n'),
+    ('a keyword as a parameter', 'fs', B + 'void g(float in) { }\nvoid main() { }\n'),
+    ('a keyword as a struct member', 'fs', B + 'struct S { float out; };\nvoid main() { }\n'),
+    ('a keyword as a function', 'fs', B + 'float discard() { return 1.0; }\nvoid main() { }\n'),
+    ('in before const', 'fs', B + 'float g(in const float a) { return a; }\nvoid main() { }\n'),
+    ('a precision before in', 'fs', B + 'float g(lowp in float a) { return a; }\nvoid main() { }\n'),
+    ('a precision before const', 'fs', B + 'float g(lowp const float a) { return a; }\nvoid main() { }\n'),
+    ('two prototypes', 'fs', B + 'float g(float a);\nfloat g(float a);\nfloat g(float a) { return a; }\nvoid main() { }\n'),
+    ('a prototype with other qualifiers', 'fs', B + 'void g(vec3 a);\nvoid g(const vec3 a) { }\nvoid main() { }\n'),
+    ('out in the prototype, inout in the definition', 'fs', B + 'void g(out vec3 a);\nvoid g(inout vec3 a) { }\nvoid main() { }\n'),
+    ('a built-in declared again', 'fs', B + 'float sin(float x);\nvoid main() { }\n'),
+    ('a built-in defined again', 'fs', B + 'float sin(float x) { return x; }\nvoid main() { }\n'),
+    ('a function and a struct of one name', 'fs', B + 'void q(int x);\nstruct q { int x; };\nvoid main() { }\n'),
+    ('a function and a variable of one name', 'fs', B + 'void q(int x);\nfloat q;\nvoid main() { }\n'),
+    ('a struct with an array returned', 'fs', B + 'struct S { float a[2]; };\nS g() { S s; return s; }\nvoid main() { }\n'),
+    ('the variable of an if seen after it', 'fs', B + 'void main() { if (f > 0.0) float a = 1.0; gl_FragColor = vec4(a); }\n'),
+    ('the loop variable declared again in the body', 'fs', B + 'void main() { for (int i = 0; i < 2; i++) { int i = 1; } }\n'),
+    ('gl_FragColor and gl_FragData', 'fs', B + 'void main() { gl_FragColor = vec4(1.0); gl_FragData[0] = vec4(1.0); }\n'),
+    ('invariant attribute', 'vs', 'invariant attribute vec4 a;\nvoid main() { gl_Position = a; }\n'),
+    ('invariant uniform', 'vs', 'invariant uniform vec4 a;\nvoid main() { gl_Position = a; }\n'),
     ('switch', 'fs', B + 'void main() { switch (1) { } }\n'),
     ('gl_ name', 'fs', B + 'float gl_x;\nvoid main() { }\n'),
     ('int + float', 'fs', B + 'void main() { float a = 1.0 + 1; }\n'),
@@ -300,6 +374,7 @@ def main():
         ('VS: uniform matrix at a run-time index', VS + 'uniform mat4 m;\nvoid main() { gl_Position = m[int(a0.x * 4.0)] + 1.0; }\n', (1, 1, 1, 1)),
         ('VS: a local vector at a run-time index', VS + 'void main() { vec4 q = vec4(1.0, 2.0, 3.0, 4.0); gl_Position = vec4(q[int(a0.x * 4.0)]); }\n', (4, 4, 4, 4), (2, 2, 2, 2)),
         ('VS: a sampler compiles, the link refuses', VS + 'uniform sampler2D s;\nvoid main() { gl_Position = texture2DLod(s, a0.xy, 0.0) + 1.0; }\n', (1, 1, 1, 1)),
+        ('VS: a float varying array written in a run-time loop', VS + 'varying float va[4];\nvoid main() { float c = a0.x; for (int i = 0; i < int(n); i++) { va[i] = c; c = c * 0.5; } gl_Position = vec4(va[0], va[1], va[2], va[3]); }\n', (.75, .375, .1875, .09375), (.25, .125, .0625, .03125)),
     ]
     for c in vs:
         bad += check(c[0], c[1], 'vs', c[2], c[3] if len(c) > 3 else c[2])

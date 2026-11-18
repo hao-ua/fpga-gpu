@@ -4,7 +4,9 @@ sends B for one frame, from the triangle records and the bin lists of a draw.
 
 Input: tools/gen/as_<seed>_rec.hex (a_setup_ref: per record "id band_lo band_hi nwords w0 w1 ..." — the raster header
 burst, then the TRI item) and as_<seed>_state.mem (the render target's width / height). The band walk (a_render):
-    for band b = 0 .. ceil(hgt / NL) - 1:  BAND {y0 = NL b}
+    for band b = 0 .. ceil(hgt / NL) - 1:  BAND {4, 1, nv, ny0, y0 = NL b}   (ny0 = the first row of the next band
+                                                                              walked, nv = there is one)
+        with skip (FLUSH flags bit 10), a band whose bin list is empty and that the clear does not reach is left out
         for each triangle of band b's bin list (push order = record id order; a triangle is in bands lo..hi):
             its TRI item when b == band_lo (the first band it touches) or when it is not the current one;
             every quad (2 x 2 pixels) of the triangle's bounding box inside the band and the target with a covered
@@ -15,7 +17,9 @@ burst, then the TRI item) and as_<seed>_state.mem (the render target's width / h
 Bands are 8 rows for targets up to 1024 wide, else 4 (b_ref.band_lines; a_setup bins with the same rule).
 Coverage: pixel centres with the tie rule (b_ref.pixel_covered), on the exact (unshifted) edge values, pixels inside
 the target (the same formulas as b_ref.pixel_edges, stepped incrementally here).
-Output: tools/gen/as_<seed>_stream.hex, one 64-bit beat per line.
+Output: tools/gen/as_<seed>_stream.hex, one 64-bit beat per line; with skip (tb_a_render +SKIP) as_<seed>_skip.hex (the
+FLUSH's seven words: a clear chosen from the seed), as_<seed>_stream_skip.hex and as_<seed>_skip_count.hex (bands left out),
+and from as_<seed>_cz.hex the same for the coarse-depth frame (as_<seed>_stream_cz_skip.hex, as_<seed>_cz_skip_count.hex).
     python3 tools/a_raster_ref.py <seed>
 """
 import os, sys
@@ -236,10 +240,40 @@ class Coarse:
         return cut
 
 
-def stream(recs, wid, hgt, cz=None, lazy=0):
+def sext13(v): return v - 0x2000 if v & 0x1000 else v
+
+
+def flush_skip(f):
+    """what board A takes from a FLUSH's seven words for leaving bands out (fb_dispatch_a): None without flags bit 10, else
+    (the clear writes something B keeps in its DDR, scissored, rows y0, y1 of the box): colour with a non-zero mask, or depth /
+    stencil (a non-zero mask) into a depth-stencil image"""
+    flags = f[0] >> 16
+    if not (flags >> 10) & 1: return None
+    ds = (f[6] & 0xFFFF) != 0
+    cl_any = bool((flags & 1) and (flags >> 2) & 0xF) or (ds and bool((flags >> 7) & 1 or ((flags >> 8) & 1 and (f[6] >> 16) & 0xFF)))
+    return (cl_any, (flags >> 1) & 1, sext13((f[4] >> 16) & 0x1FFF), sext13((f[5] >> 16) & 0x1FFF))
+
+
+def skip_flush(seed, wid, hgt):
+    """the FLUSH of tb_a_render +SKIP (image 0xC000, flags bit 10) with a clear chosen from the seed: 0 none; 1 colour (mask
+    0xF) in a box of rows; 2 colour with mask 0 and stencil with mask 0 into a depth-stencil image (nothing is written back:
+    no band is reached); 3 depth into a depth-stencil image in a box of rows. The box's rows start above the target for every
+    fifth seed"""
+    m = seed % 4
+    y0 = (seed * 13) % hgt - (6 if seed % 5 == 0 else 0)
+    y1 = y0 + 1 + (seed * 7) % max(1, hgt // 2)
+    flags, ds, smask = 1 << 10, 0, 0xFF
+    if m == 1: flags |= 1 | 2 | (0xF << 2)
+    elif m == 2: flags |= 1 | (1 << 8); ds, smask = 0xC001, 0
+    elif m == 3: flags |= 2 | (1 << 7); ds = 0xC001
+    return [0xC000 | flags << 16, 0, 0, 0xFFFFFF, (y0 & 0x1FFF) << 16, (wid & 0x1FFF) | (y1 & 0x1FFF) << 16, ds | smask << 16]
+
+
+def stream(recs, wid, hgt, cz=None, lazy=0, skip=None):
     """the render stream of the frame; cz = (d16, starting depth): through A's coarse depth (the quads it culls are left
     out); lazy: a primitive's TRI item goes out only in front of the visit's first quad sent (a visit that sends none sends no
-    TRI and leaves B's current primitive as it was). Returns (beats, quads walked, counters)"""
+    TRI and leaves B's current primitive as it was); skip = flush_skip's tuple: bands with an empty bin list that the clear
+    does not reach are left out. Returns (beats, quads walked, counters)"""
     global NL
     NL = b_ref.band_lines(wid)
     beats = []
@@ -249,11 +283,18 @@ def stream(recs, wid, hgt, cz=None, lazy=0):
     co = Coarse(*cz) if cz is not None else None
     cnt = dict(cut=0, qsent=0, trisent=0, trihold=0, trinq=0, occ=0)
     nbands = (hgt + NL - 1) // NL
+    def walked(b):
+        if skip is None or any(r['lo'] <= b <= r['hi'] for r in recs): return True
+        cl_any, sc, cy0, cy1 = skip
+        return cl_any and (not sc or (NL * b < cy1 and NL * b + NL > cy0))
+    walk = [b for b in range(nbands) if walked(b)]
+    cnt['bskip'] = nbands - len(walk)
     cur = None
     nq = 0
-    for b in range(nbands):
+    for i, b in enumerate(walk):
         y0 = NL * b
-        emit([(4 << 28) | y0, 0])
+        nx = walk[i + 1] if i + 1 < len(walk) else None
+        emit([(4 << 28) | (1 << 27) | ((nx is not None) << 26) | ((NL * nx if nx is not None else 0) << 15) | y0, 0])
         if co: co.band()
         for r in recs:                                        # the bin list of band b, oldest first
             if not (r['lo'] <= b <= r['hi']): continue
@@ -379,6 +420,15 @@ def main():
         for b in beats: f.write(f"{b:016x}\n")
     print(f"as_{seed}: {len(recs)} records, {wid} x {hgt}, {(hgt + NL - 1) // NL} bands -> {nq} quads, {len(beats)} beats"
           f" -> tools/gen/as_{seed}_stream.hex")
+    # the same frame with bands left out (tb_a_render +SKIP): the FLUSH the bench sends, the stream, the bands left out
+    fl = skip_flush(int(seed), wid, hgt)
+    beats, nq, c = stream(recs, wid, hgt, skip=flush_skip(fl))
+    with open(f"{GEN}/as_{seed}_skip.hex", 'w') as f: f.write(" ".join(f"{w:08x}" for w in fl) + "\n")
+    with open(f"{GEN}/as_{seed}_stream_skip.hex", 'w') as f:
+        for b in beats: f.write(f"{b:016x}\n")
+    with open(f"{GEN}/as_{seed}_skip_count.hex", 'w') as f: f.write(f"{c['bskip']}\n")
+    print(f"as_{seed}: skip (clear {flush_skip(fl)}) leaves out {c['bskip']} of {(hgt + NL - 1) // NL} bands -> {len(beats)} beats"
+          f" -> tools/gen/as_{seed}_stream_skip.hex")
     czl = load_cz(seed)
     if czl is not None:                                       # the same frame through A's coarse depth / lazy TRI items
         cz, lazy = czl
@@ -390,6 +440,16 @@ def main():
         print(f"as_{seed}: coarse depth (d16 {cz[0]}, starting depth {cz[1]:06x}, lazy {lazy}) culls {c['cut']} of {nq} quads "
               f"({c['occ']} block updates), TRI items sent {c['trisent']}, held back {c['trihold']}, sent with no quad {c['trinq']} "
               f"-> {len(beats)} beats -> tools/gen/as_{seed}_stream_cz.hex")
+        # with bands left out (tb_a_render +CZ +SKIP): the bench's coarse-depth FLUSH with flags bit 10 — a depth clear
+        # (scissored or not, its box empty) into the depth-stencil image when there is one
+        d16, ds, cden, csc, cdepth, _ = (int(v, 0) for v in open(f"{GEN}/as_{seed}_cz.hex").read().split())
+        fl = [0xC000 | (csc << 17) | (cden << 23) | (d16 << 25) | (1 << 26), 0, 0, cdepth, 0, 0, 0xC001 if ds else 0]
+        beats, nq, c2 = stream(recs, wid, hgt, cz, lazy, skip=flush_skip(fl))
+        assert all(c2[k] == c[k] for k in c if k != 'bskip'), "leaving bands out changed the coarse depth's counters"
+        with open(f"{GEN}/as_{seed}_stream_cz_skip.hex", 'w') as f:
+            for b in beats: f.write(f"{b:016x}\n")
+        with open(f"{GEN}/as_{seed}_cz_skip_count.hex", 'w') as f: f.write(f"{c2['bskip']}\n")
+        print(f"as_{seed}: coarse depth with skip leaves out {c2['bskip']} bands -> {len(beats)} beats -> tools/gen/as_{seed}_stream_cz_skip.hex")
 
 
 if __name__ == '__main__': main()

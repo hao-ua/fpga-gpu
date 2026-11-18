@@ -85,6 +85,9 @@ counts; "B underruns" and "B command errors" must stay 0.
 b.read_image(h, fp.TF_RGBA8888, x, y, w, h_, storage_fmt=fp.FMT_RGB565)      # glReadPixels / DirectDraw Lock
 b.fill_image(h, fp.TF_RAW, value, x, y, w, h_, mask=fp.MASK_R | fp.MASK_G)   # Blt colour fill / glClear
 b.copy_image(src, dst, sx, sy, sw, sh, dx, dy, dw, dh, mirror_x=True, key=(lo, hi))   # Blt: stretch, mirror, key
+b.copy_image(src, dst, sx, sy, sw, sh, dx, dy, alpha_one=True, swizzle=(2, 1, 0, 3))    # B STATUS flags bit 14: R <-> B, alpha 255
+b.copy_image(src, dst, tx, ty, tw, th, dx, dy, dw, dh, tile=(px, py))                    # the tile repeated from phase (px, py)
+b.copy_image(src, dst, sx, sy, w, h, dx, dy, rects=[(x, y, w, h), ...])                  # more 1:1 rectangles, same offset
 b.set_palette(0, [0xRRGGBB] * 256)          # P8 images (fp.FMT_P8) are shown through it, from the next frame on
 b.cursor_shape(words); b.cursor_show(fp.CUR_COLOR, hot=(0, 0), pos=(x, y)); b.cursor_pos(x, y)   # fast path
 ```

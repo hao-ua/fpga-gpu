@@ -115,32 +115,22 @@ module a_setup #(
     //      D1 = 0 for a point) with no extra data path; the kind steers the clip, the checks and the record's words.
     reg [W-1:0] vX [0:2], vY [0:2], vZ [0:2], vW [0:2]; reg [VWB-1:0] vVar [0:2];
     reg [1:0] vcnt, prim; reg [W-1:0] psz;
-    // a point's vertices 1 / 2 and a line's vertex 2 ARE vertex 0: they are written WITH vertex 0 (at assembly, and when
-    // the line clip moves vertex 0) instead of copied afterwards — a copy would be a write source of its own on 2 400
-    // flops; a dynamic vertex select on the readers costs more
+    // a point's vertices 1 / 2 and a line's vertex 2 ARE vertex 0: they are written WITH vertex 0 (at assembly; the
+    // clipper returns a line as vertices 0, 1, 0) instead of copied afterwards — a copy would be a write source of its
+    // own on 2 400 flops; a dynamic vertex select on the readers costs more
     function automatic w_in(input [W-1:0] w); w_in = ~w[W-1] & (w[W-2:0] >= WEPS[W-2:0]); endfunction
-    function automatic [W-1:0] attr(input [1:0] v, input [5:0] k);          // attribute k of vertex v: x y z w, then the varyings
-        attr = (k == 6'd0) ? vX[v] : (k == 6'd1) ? vY[v] : (k == 6'd2) ? vZ[v] : (k == 6'd3) ? vW[v] : vVar[v][(k - 6'd4)*W +: W];
-    endfunction
-    reg [5:0] lc_k; reg lc_out;                                            // the line clip: attribute index, the outside vertex
-    reg [3+NVAR:0] lc_oh;                                                  // one-hot of lc_k, a cycle late (lc_k stands >= 3 cycles before S_LC8 writes with it)
-    always @(posedge clk) lc_oh <= (4+NVAR)'(1) << lc_k;
-    reg [2:0] lc_p;                                                        // the clip plane being tested (points: 0..2; lines: 0..6 with the guard band)
-    reg       lc_v;                                                        // the line end whose guard-plane product is in flight
-    // the guard planes 3..6: d = g_hi w - x / y (3, 5), x / y - g_lo w (4, 6), with g from gb = {gyhi, gylo, gxhi, gxlo}
-    function automatic [W-1:0] gconst(input [2:0] p); gconst = (p == 3'd3) ? gb[1*W +: W] : (p == 3'd4) ? gb[0 +: W] : (p == 3'd5) ? gb[3*W +: W] : gb[2*W +: W]; endfunction
-    function automatic [W-1:0] gattr(input [1:0] v, input [2:0] p); gattr = (p == 3'd3 || p == 3'd4) ? vX[v] : vY[v]; endfunction
-    reg [W-1:0] lc_t, lc_da, lc_din;                                       // t, d of vertex 0, d of the inside vertex
+    reg [2:0] lc_p;                                                        // a point's clip plane being tested (0..2)
     reg ps_conv;                                                           // vtx_setup2 converts the point size (x = size, scale 16)
     wire [6:0] lw_c = (line_width == 7'd0) ? 7'd1 : (line_width > 7'(MAXLW)) ? 7'(MAXLW) : line_width;
-    // the clip volume's planes (clip_near, a_setup_ref plane_d): the signed distance of vertex v, inside when its sign is clear
+    // a point against the w, near and far planes (a_setup_ref point_in): the signed distance of vertex v, inside when its
+    // sign is clear
     function automatic [W-1:0] pd_a(input [1:0] v, input [2:0] p); pd_a = (p == 3'd1) ? vZ[v] : vW[v]; endfunction   // a - b or a + b
     function automatic [W-1:0] pd_b(input [1:0] v, input [2:0] p); pd_b = (p == 3'd0) ? WEPS : (p == 3'd1) ? (zclip0 ? '0 : vW[v]) : vZ[v]; endfunction
     function automatic pd_sub(input [2:0] p); pd_sub = (p != 3'd1); endfunction   // 0: w - eps, 1: z + w (zclip0: z + 0), 2: w - z
-    function automatic aen(input [5:0] k); aen = (k < 6'd4) ? 1'b1 : fsmask[(k - 6'd4) >> 2]; endfunction   // attribute k is used
+    // the clipper: triangles and lines (prim 1: the ends in vertices 0, 1)
     reg clip_start, clip_ack; wire clip_busy, clip_tv, clip_done, clip_pass; wire [3*VB-1:0] clip_to;
     wire [VB-1:0] cv0 = {vVar[0], vW[0], vZ[0], vY[0], vX[0]}, cv1 = {vVar[1], vW[1], vZ[1], vY[1], vX[1]}, cv2 = {vVar[2], vW[2], vZ[2], vY[2], vX[2]};
-    clip_near #(.EXP_W(EXP_W), .MAN_W(MAN_W), .NVAR(NVAR)) u_clip (.clk, .rst, .start(clip_start), .verts_in({cv2, cv1, cv0}), .vmask(fsmask), .gb(gb), .z0(zclip0),
+    clip_near #(.EXP_W(EXP_W), .MAN_W(MAN_W), .NVAR(NVAR)) u_clip (.clk, .rst, .start(clip_start), .line(prim == 2'd1), .verts_in({cv2, cv1, cv0}), .vmask(fsmask), .gb(gb), .z0(zclip0),
         .busy(clip_busy), .tri_valid(clip_tv), .tri_ack(clip_ack), .tri_out(clip_to), .pass(clip_pass), .done(clip_done));
     // ---- per-vertex setup
     reg sv_in; reg [W-1:0] svx, svy, svz, svw; wire sv_out; wire signed [15:0] s_sx, s_sy; wire [W-1:0] s_zw, s_iw; wire s_rej;
@@ -240,7 +230,7 @@ module a_setup #(
     reg mu_in; reg [W-1:0] mu_a, mu_b; wire mu_v; wire [W-1:0] mu_r;
     float_mul #(EXP_W, MAN_W) u_mu (.clk, .rst, .in_valid(mu_in), .a(mu_a), .b(mu_b), .in_ready(), .out_valid(mu_v), .result(mu_r));
     reg rc_in; reg [W-1:0] rc_x; wire rc_v; wire [W-1:0] rc_r;
-    // (both units below are used through their out_valid — the chain's collector and S_LC2 / S_LC4 wait for rc_v / cv_v — so
+    // (both units below are used through their out_valid — the chain's collector waits for rc_v / cv_v — so
     //  their split stages are latency-transparent here: rc latency 12, cv 3)
     float_sfu #(.EXP_W(EXP_W), .MAN_W(MAN_W), .K(12), .KLOG(11), .SPLIT1B(1'b1), .SPLIT6(1'b1),
         .RCP_MEM("tools/gen/fp24_rcp_seed.mem"), .RSQRT_MEM("tools/gen/fp24_rsqrt_seed.mem"),
@@ -340,7 +330,7 @@ module a_setup #(
     reg [2:0] fc_i; reg fd_ok;
     reg [2:0] cv_kind; reg [2:0] cvq [0:3]; reg [1:0] cvq_wp, cvq_rp; reg [2:0] cvq_n;
     typedef enum logic [5:0] {S_ASM, S_CLIPF, S_CLIPW, S_SETF, S_SETW, S_CHK, S_CHK1, S_CHK2, S_CHK3, S_NEXT,
-                              S_PT0, S_PTCW, S_PTS1, S_PTS2, S_LC0, S_LCP0, S_LCG, S_LCP1, S_LCP2, S_LC1, S_LC2, S_LC4, S_LC5, S_LC6, S_LC7, S_LC8, S_LCD,
+                              S_PT0, S_PTCW, S_PTS1, S_PTS2, S_LC0, S_LCW,
                               S_LAW} st_t;
     st_t st;
     wire rr_free = !bk_busy || ((bst == B_WR) && !hw_pend[1] && !zq_pend);
@@ -601,58 +591,20 @@ module a_setup #(
                     ps_u <= (s_sx < 16'sd8) ? 11'd16 : (s_sx > 16'sd512) ? 11'd1024 : {s_sx[9:0], 1'b0};   // clamped to 16 .. 16 MAXPT (<= 0, NaN, Inf -> the minimum)
                     ps_conv <= 1'b0; vert <= 2'd0; rej_any <= 1'b0; st <= S_SETF;
                 end
-                // ---------------- a line: against the w, near and far planes in turn — both ends outside -> dropped; one
-                //                  outside -> moved onto the plane by the lerp of every used attribute FROM THE INSIDE end
-                //                  (t = d_in rcp(d_in - d_out), as clip_near; a_setup_ref clip_line)
-                S_LC0: if (drop_n == 6'd0 && !bk_busy) begin lc_p <= 3'd0; st <= S_LCP0; end   // (a rejected triangle's results drained first, the back idle)
-                // d of end 0 (S_LCP0 -> S_LCP1) and end 1 (S_LCP1 -> S_LCP2): planes 0..2 one subtraction, the guard planes a
-                // product g w first (S_LCG issues the subtraction when it lands)
-                S_LCP0: begin
-                    if (lc_p < 3'd3) begin as_in <= 1'b1; as_op <= pd_sub(lc_p); as_a <= pd_a(2'd0, lc_p); as_b <= pd_b(2'd0, lc_p); st <= S_LCP1; end
-                    else begin mu_in <= 1'b1; mu_a <= gconst(lc_p); mu_b <= vW[0]; lc_v <= 1'b0; st <= S_LCG; end
-                end
-                S_LCG: if (mu_v) begin
-                    as_in <= 1'b1; as_op <= 1'b1;
-                    if (lc_p[0]) begin as_a <= mu_r; as_b <= gattr({1'b0, lc_v}, lc_p); end else begin as_a <= gattr({1'b0, lc_v}, lc_p); as_b <= mu_r; end
-                    st <= lc_v ? S_LCP2 : S_LCP1;
-                end
-                S_LCP1: if (as_v) begin
-                    lc_da <= as_r;
-                    if (lc_p < 3'd3) begin as_in <= 1'b1; as_op <= pd_sub(lc_p); as_a <= pd_a(2'd1, lc_p); as_b <= pd_b(2'd1, lc_p); st <= S_LCP2; end
-                    else begin mu_in <= 1'b1; mu_a <= gconst(lc_p); mu_b <= vW[1]; lc_v <= 1'b1; st <= S_LCG; end
-                end
-                S_LCP2: if (as_v) begin : LCP2
-                    reg ia, ib;
-                    ia = ~lc_da[W-1]; ib = ~as_r[W-1];
-                    if (!ia && !ib) st <= S_NEXT;                                         // outside this plane: dropped
-                    else if (ia != ib) begin                                              // a crossing: t from the inside end
-                        lc_out <= ia; lc_din <= ia ? lc_da : as_r;
-                        as_in <= 1'b1; as_op <= 1'b1; as_a <= ia ? lc_da : as_r; as_b <= ia ? as_r : lc_da; st <= S_LC1;   // d_in - d_out
-                    end
-                    else if (lc_p == 3'd6) st <= S_LCD;                                   // inside every plane
-                    else begin lc_p <= lc_p + 3'd1; st <= S_LCP0; end
-                end
-                S_LC1: if (as_v) begin rc_in <= 1'b1; rc_x <= as_r; st <= S_LC2; end                     // rcp(d_in - d_out)
-                S_LC2: if (rc_v) begin mu_in <= 1'b1; mu_a <= lc_din; mu_b <= rc_r; st <= S_LC4; end     // t = d_in rcp(..)
-                S_LC4: if (mu_v) begin lc_t <= mu_r; lc_k <= 6'd0; st <= S_LC5; end
-                S_LC5: if (!aen(lc_k)) begin                                               // an unused varying: left as it is
-                    if (lc_k == 6'(3 + NVAR)) begin if (lc_p == 3'd6) st <= S_LCD; else begin lc_p <= lc_p + 3'd1; st <= S_LCP0; end end
-                    else lc_k <= lc_k + 6'd1;
-                end else begin as_in <= 1'b1; as_op <= 1'b1; as_a <= attr({1'b0, lc_out}, lc_k); as_b <= attr({1'b0, ~lc_out}, lc_k); st <= S_LC6; end   // out_k - in_k
-                S_LC6: if (as_v) begin mu_in <= 1'b1; mu_a <= lc_t; mu_b <= as_r; st <= S_LC7; end                            // t (out_k - in_k)
-                S_LC7: if (mu_v) begin as_in <= 1'b1; as_op <= 1'b0; as_a <= attr({1'b0, ~lc_out}, lc_k); as_b <= mu_r; st <= S_LC8; end   // in_k + ..
-                S_LC8: if (as_v) begin                                   // the lerped attribute lands in the outside vertex (and in
-                    for (int i = 0; i < 3; i++)                          //  vertex 2, vertex 0's twin, when that is vertex 0)
-                        if (2'(i) == {1'b0, lc_out} || (i == 2 && !lc_out)) begin   // lc_oh: lc_k's registered one-hot (timing at
-                            // 120 MHz: the index decode stays out of the clock enable of every vVar flop)
-                            if (lc_oh[0]) vX[i] <= as_r; if (lc_oh[1]) vY[i] <= as_r; if (lc_oh[2]) vZ[i] <= as_r; if (lc_oh[3]) vW[i] <= as_r;
-                            for (int k = 0; k < NVAR; k++) if (lc_oh[4 + k]) vVar[i][k*W +: W] <= as_r;
+                // ---------------- a line: the clipper, in its line mode — outside a plane with both ends -> dropped; an end
+                //                  outside -> moved onto the plane (a_setup_ref clip_line). It hands back vertices 0, 1, 0
+                //                  (vertex 2 = vertex 0: dz2 = D2 = 0), or nothing; taken and acknowledged in one step
+                S_LC0: if (!clip_busy) begin clip_start <= 1'b1; st <= S_LCW; end
+                S_LCW: begin
+                    if (clip_tv) begin
+                        if (!clip_pass) for (int i = 0; i < 3; i++) begin   // (an untouched line is still in vX .. vVar)
+                            vX[i] <= clip_to[i*VB + 0*W +: W]; vY[i] <= clip_to[i*VB + 1*W +: W];
+                            vZ[i] <= clip_to[i*VB + 2*W +: W]; vW[i] <= clip_to[i*VB + 3*W +: W];
+                            vVar[i] <= clip_to[i*VB + 4*W +: VWB];
                         end
-                    if (lc_k == 6'(3 + NVAR)) begin                       // all 4 + NVAR attributes done: the next plane
-                        if (lc_p == 3'd6) st <= S_LCD; else begin lc_p <= lc_p + 3'd1; st <= S_LCP0; end
-                    end else begin lc_k <= lc_k + 6'd1; st <= S_LC5; end
+                        clip_ack <= 1'b1; vert <= 2'd0; rej_any <= 1'b0; st <= S_SETF;
+                    end else if (clip_done) st <= S_NEXT;                 // dropped
                 end
-                S_LCD: begin vert <= 2'd0; rej_any <= 1'b0; st <= S_SETF; end   // (vertex 2 holds vertex 0, the clip's writes included: dz2 = D2 = 0)
                 // ---------------- a triangle: clip_near emits its 0 .. 4 triangles one at a time (tri_valid / tri_ack)
                 S_CLIPF: begin clip_start <= 1'b1; st <= S_CLIPW; end
                 S_CLIPW: begin
@@ -809,6 +761,6 @@ module a_setup #(
     end
 `endif
     // synthesis translate_on
-    wire _unused = &{1'b0, clip_busy, sblk};
+    wire _unused = &{1'b0, sblk};
 endmodule
 `default_nettype wire

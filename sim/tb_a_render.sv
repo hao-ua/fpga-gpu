@@ -9,6 +9,10 @@
 // and bin lists must land in bank 1 (every DDR read of the render side is checked against its frame's bank), and the
 // stream must come out twice.
 //   +SEED_<n>   (small targets: seeds 11, 12 of tools/gen_a_goldens.sh)
+//   +SKIP       FLUSH flags bit 10: bands with nothing binned that the clear does not reach are left out — the FLUSH from
+//               as_<seed>_skip.hex (a clear chosen from the seed), the stream as_<seed>_stream_skip.hex and the bands left out
+//               (as_<seed>_skip_count.hex, the counter c_bskip twice: two frames); with +CZ the coarse-depth FLUSH plus the bit
+//               (as_<seed>_stream_cz_skip.hex, as_<seed>_cz_skip_count.hex)
 `default_nettype none
 module tb_a_render;
     import fb_pkg::*;
@@ -34,9 +38,11 @@ module tb_a_render;
     wire [2:0] g_ad_size, g_ad_type, g_dr_mode; wire [31:0] g_dr_first, g_dr_count; wire [1:0] g_st_cull; wire [6:0] g_st_lw; wire [12:0] g_st_did;
     wire [47:0] g_st_z, g_st_sc; wire [95:0] g_st_gb; wire [31:0] c_vis; wire [6*32-1:0] c_cz;
     wire [3:0] g_st_zc; wire g_st_lazy, g_cz_d16; wire [23:0] g_cz_init;
+    wire g_skip, g_cl_any, g_cl_sc; wire [12:0] g_cl_y0, g_cl_y1; wire [31:0] c_bskip;
     wire g_rbusy, g_fb_ok, g_draw_ok, g_copy_busy;
     fb_dispatch_a #(.B_WAIT(200)) disp (.clk, .rst, .q_valid, .q_data, .q_ready, .g_render_done, .g_render, .g_rbusy, .g_fb_ok, .g_draw_ok, .g_copy_busy,
         .g_ad_type, .g_ad_norm, .g_st_z, .g_st_gb, .g_st_sc, .g_st_zc, .g_st_lazy, .g_cz_d16, .g_cz_init,
+        .g_skip, .g_cl_any, .g_cl_sc, .g_cl_y0, .g_cl_y1,
         .x_cmd_valid(x_cv), .x_op, .x_addr, .x_len, .x_seed, .x_flags, .x_cmd_ready(1'b1), .x_busy(1'b0),
         .x_wd_valid(x_wdv), .x_wd_data(x_wdd), .x_wd_ready(1'b1), .x_rd_valid(1'b0), .x_rd_data(32'd0), .x_rd_ready(x_rdr),
         .x_mt_done(1'b0), .x_mt_errors(32'd0), .x_mt_first_bad(30'd0),
@@ -76,6 +82,7 @@ module tb_a_render;
         .g_ad_we, .g_ad_idx, .g_ad_en, .g_ad_type, .g_ad_norm, .g_ad_base, .g_ad_size, .g_ad_stride, .g_ad_off, .g_ac_we, .g_ac_idx, .g_ac_const,
         .g_st_we, .g_st_vp, .g_st_z, .g_st_gb, .g_st_sc, .g_st_cull, .g_st_cw, .g_st_z0, .g_st_lw, .g_st_fsmask, .g_st_w, .g_st_h, .g_st_did, .c_vis,
         .g_st_zc, .g_st_lazy, .g_cz_d16, .g_cz_init, .c_cz,
+        .g_skip, .g_cl_any, .g_cl_sc, .g_cl_y0, .g_cl_y1, .c_bskip,
         .g_dr_start, .g_dr_mode, .g_dr_indexed, .g_dr_u8, .g_dr_idx_base, .g_dr_first, .g_dr_count, .g_render, .g_render_done, .g_abort(1'b0), .g_abort_soft(1'b0),
         .g_busy, .err_stack, .rec_ovf(), .bin_ovf(), .tri_count, .c_quads,
         .r_en, .r_addr, .r_rdy, .r_valid, .rd_data, .w_req, .w_en, .w_addr, .w_data, .w_mask, .w_wren, .w_wend, .w_rdy, .w_wdf_rdy,
@@ -90,7 +97,9 @@ module tb_a_render;
     end
     // +VTRACE: every list entry the fetcher takes and every visit the rasterizer takes (the walk's order)
     always @(posedge clk) if ($test$plusargs("VTRACE")) begin
-        if (u_geom.u_rn.fs == u_geom.u_rn.F_QRY2) $display("VT %0t band %0d count %0d head %0h", $time, u_geom.u_rn.fband, u_geom.u_rn.q_count, u_geom.u_rn.q_head);
+        if (u_geom.u_rn.fs == u_geom.u_rn.F_MARK && !u_geom.u_rn.v_full)
+            $display("VT %0t band %0d count %0d head %0h next %0d (%0d)", $time, u_geom.u_rn.fband, u_geom.u_rn.f_count, u_geom.u_rn.f_head,
+                     u_geom.u_rn.nx_band, u_geom.u_rn.nx_v);
         if (u_geom.u_rn.rt_ent) $display("VT %0t line in: lane3 next %0h (l_left %0d)", $time, rd_data[224 +: 23], u_geom.u_rn.l_left);
         if (u_geom.u_rn.fs == u_geom.u_rn.F_ENT && u_geom.u_rn.n_left != 0 && u_geom.u_rn.ln_cnt != 0 && !u_geom.u_rn.v_full && u_geom.u_rn.can_issue && !u_geom.u_rn.line_go)
             $display("VT %0t entry band %0d lane %0d: tid %0d first %0d nb %0d (n_left %0d)", $time, u_geom.u_rn.fband, u_geom.u_rn.lane,
@@ -153,7 +162,9 @@ module tb_a_render;
     initial begin
         string seed; int fd, nexp, cyc, cyc_lim, b, k, n_first; reg [31:0] bi; reg [255:0] bd; reg [63:0] bt;
         reg [255:0] flb; int cz_d16, cz_ds, cz_cden, cz_csc, cz_cdepth, cz_lazy; bit cz; int czc [0:5];
+        bit skip; int nskip; reg [31:0] fw [0:6];
         if (!$value$plusargs("SEED_%s", seed)) seed = "11";
+        skip = $test$plusargs("SKIP"); nskip = 0;
         // +CZ (coarse depth / lazy TRI items): the FLUSH carries the frame's depth from as_<seed>_cz.hex (the draws' VS_STATE
         // their flags and the lazy bit, a_setup_ref.py --zc / --lazy), the expected stream is the culled one
         // (as_<seed>_stream_cz.hex) and A's counters must equal the model's (as_<seed>_cz_counts.hex, twice: two frames)
@@ -166,6 +177,18 @@ module tb_a_render;
             flb[3*32 +: 32] = 32'(cz_cdepth); flb[6*32 +: 32] = cz_ds ? 32'h0000_C001 : 32'h0;
             fd = $fopen({"tools/gen/as_", seed, "_cz_counts.hex"}, "r");
             if (fd == 0 || $fscanf(fd, "%d %d %d %d %d %d", czc[0], czc[1], czc[2], czc[3], czc[4], czc[5]) != 6) begin $display("TB_FAIL tb_a_render: no as_%s_cz_counts.hex", seed); $finish; end
+            $fclose(fd);
+        end
+        if (skip) begin
+            if (cz) flb[26] = 1'b1;                           // the coarse-depth FLUSH with flags bit 10
+            else begin                                        // the FLUSH of as_<seed>_skip.hex
+                fd = $fopen({"tools/gen/as_", seed, "_skip.hex"}, "r");
+                if (fd == 0 || $fscanf(fd, "%h %h %h %h %h %h %h", fw[0], fw[1], fw[2], fw[3], fw[4], fw[5], fw[6]) != 7) begin $display("TB_FAIL tb_a_render: no as_%s_skip.hex", seed); $finish; end
+                $fclose(fd);
+                for (int i = 0; i < 7; i++) flb[32*i +: 32] = fw[i];
+            end
+            fd = $fopen({"tools/gen/as_", seed, cz ? "_cz_skip_count.hex" : "_skip_count.hex"}, "r");
+            if (fd == 0 || $fscanf(fd, "%d", nskip) != 1) begin $display("TB_FAIL tb_a_render: no as_%s skip count", seed); $finish; end
             $fclose(fd);
         end
         for (k = 0; k < 4096; k++) cmds[k] = 'x;
@@ -210,7 +233,7 @@ module tb_a_render;
         if (fd == 0) begin $display("TB_FAIL tb_a_render: no DDR image"); $finish; end
         b = 0; while ($fscanf(fd, "%h %h", bi, bd) == 2) begin mig.mem[longint'(bi)] = bd; b++; end
         $fclose(fd);
-        fd = $fopen({"tools/gen/as_", seed, cz ? "_stream_cz.hex" : "_stream.hex"}, "r");
+        fd = $fopen({"tools/gen/as_", seed, cz ? "_stream_cz" : "_stream", skip ? "_skip.hex" : ".hex"}, "r");
         if (fd == 0) begin $display("TB_FAIL tb_a_render: no stream golden (python3 tools/a_raster_ref.py)"); $finish; end
         while ($fscanf(fd, "%h", bt) == 1) exp_beats.push_back(bt);
         $fclose(fd);
@@ -265,6 +288,8 @@ module tb_a_render;
             err++; $display("  counter %0d: %0d, the model's %0d (two frames)", i, c_cz[32*i +: 32], 2 * czc[i]);
         end
         if (mig_errors != 0) begin err++; $display("  MIG model errors %0d", mig_errors); end
+        $display("AR bands left out: %0d (the model's %0d, two frames)", c_bskip, 2 * nskip);
+        if (c_bskip != 32'(2 * nskip)) begin err++; $display("  bands left out %0d, the model's %0d (two frames)", c_bskip, 2 * nskip); end
         $display("AR seed %s: %0d records, %0d beats (%0d expected, two frames), %0d quads, %0d visits, %0d cycles, %0d DDR reads, %0d forwarded words, overlap %0d, errors = %0d",
                  seed, tri_count, nbeat, nexp, c_quads, c_vis, cyc, n_rd, fwd_words, overlap, err);
         $display("AR fetch: up to %0d reads in flight, the rasterizer waited %0d cycles for headers; render side busy %0d cycles (two frames)",

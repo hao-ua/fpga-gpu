@@ -43,12 +43,15 @@ enum { G2_ACKF_NAK = 1, G2_ACKF_FULL = 2 };
 enum { G2_AT_BYTE, G2_AT_UBYTE, G2_AT_SHORT, G2_AT_USHORT, G2_AT_FIXED, G2_AT_FLOAT, G2_AT_FP24 };   /* VERTEX_ATTR formats */
 enum { G2_CUR_SHAPE = 1, G2_CUR_SHOW = 2, G2_CUR_HIDE = 3, G2_CUR_MOVE = 4 };
 enum { G2_CUR_COLOR = 0, G2_CUR_ANDXOR = 1, G2_CUR_PREMUL = 2 };
-enum { G2_COPY_MIRROR_X = 1, G2_COPY_MIRROR_Y = 2, G2_COPY_KEY = 4 };
+enum { G2_COPY_MIRROR_X = 1, G2_COPY_MIRROR_Y = 2, G2_COPY_KEY = 4,
+       /* board B STATUS flags bit 14 (G2_B_FLAG_COPY_EXT): alpha = 255, swizzle, a tile (g2_copy_image_ex), a list (g2_copy_rects) */
+       G2_COPY_ALPHA_ONE = 8, G2_COPY_SWIZZLE = 16, G2_COPY_TILE = 32, G2_COPY_LIST = 64 };
 enum { G2_MASK_R = 1, G2_MASK_G = 2, G2_MASK_B = 4, G2_MASK_A = 8 };
 enum { G2_PRES_AT_ONCE = 1, G2_PRES_HOLD = 2 };
-/* FLUSH flags */
+/* FLUSH flags; G2_FL_SKIP_BANDS: board A leaves out the bands with nothing to draw that the clear does not reach (board B
+   neither loads nor writes them) */
 enum { G2_FL_CLEAR_COLOR = 1, G2_FL_CLEAR_SCISSOR = 2, G2_FL_DITHER = 64, G2_FL_CLEAR_DEPTH = 128, G2_FL_CLEAR_STENCIL = 256,
-       G2_FL_DEPTH16 = 512 };
+       G2_FL_DEPTH16 = 512, G2_FL_SKIP_BANDS = 1024 };
 #define G2_FL_CMASK(m) (((m) & 0xFu) << 2)
 enum { G2_FN_NEVER, G2_FN_LESS, G2_FN_EQUAL, G2_FN_LEQUAL, G2_FN_GREATER, G2_FN_NOTEQUAL, G2_FN_GEQUAL, G2_FN_ALWAYS };
 /* image storage formats */
@@ -61,7 +64,7 @@ enum { G2_USE_SAMPLED = 1, G2_USE_RT = 2, G2_USE_SCANOUT = 4, G2_USE_TRANSFER = 
 enum { G2_REG_IDELAY = 0x0000, G2_REG_PHYOPT = 0x0001, G2_REG_PHYAD = 0x0002, G2_REG_REINIT = 0x0003, G2_REG_SCRATCH = 0x0004,
        G2_REG_LINKCTL = 0x0005, G2_REG_BUILD = 0x0010 };
 
-/* STATUS word positions, fbproto.STATUS_NAMES order (layout 12, 122 words; older A builds send fewer, the rest reads 0) */
+/* STATUS word positions, fbproto.STATUS_NAMES order (layout 13, 123 words; older A builds send fewer, the rest reads 0) */
 enum {
     G2_ST_LAYOUT, G2_ST_BUILD, G2_ST_UPTIME_MS, G2_ST_FLAGS, G2_ST_PHY, G2_ST_RX_OK, G2_ST_RX_FCS, G2_ST_RX_LEN, G2_ST_RX_OVF,
     G2_ST_RX_ER, G2_ST_ARP, G2_ST_ICMP, G2_ST_UDP, G2_ST_IPCSUM, G2_ST_OTHER, G2_ST_PFDROP, G2_ST_ICMPDROP, G2_ST_TX,
@@ -90,10 +93,13 @@ enum {
     /* layout 12: the render side's coarse depth and TRI items, cumulative: quads culled, quads sent, TRI items sent, TRI items held back
        (no quad followed: dropped), TRI items sent for a visit that sent no quad, blocks an occluder pair lowered */
     G2_ST_A_CZ_CULLED, G2_ST_A_CZ_QUADS_SENT, G2_ST_A_TRI_SENT, G2_ST_A_TRI_HELD, G2_ST_A_TRI_NOQUAD, G2_ST_A_CZ_BLOCKS,
+    G2_ST_A_BANDS_SKIPPED,                           /* layout 13: bands A's walk left out (G2_FL_SKIP_BANDS), cumulative */
     G2_ST_WORDS
 };
 #define G2_B_FLAG_MODE(f)      (((f) >> 4) & 7u)     /* decode_b_flags: the video mode */
 #define G2_B_FLAG_XOPS(f)      (((f) >> 28) & 3u)    /* board B's fragment core: bit 0 SQRT / RCPM / RSQM, bit 1 CLAMP (0 on B builds without them): g2sc_set_target */
+#define G2_B_FLAG_BAND_NEXT(f) (((f) >> 13) & 1u)    /* board B preloads the band a BAND item names as the next: G2_FL_SKIP_BANDS may be used */
+#define G2_B_FLAG_COPY_EXT(f)  (((f) >> 14) & 1u)    /* board B's COPY_IMAGE takes G2_COPY_ALPHA_ONE / SWIZZLE / TILE / LIST */
 /* the units a core lacks, STATUS flags bits 30 / 31 (0 on every build that has them): bit 0 the integer divider, bit 1 SIN / COS — g2sc_set_absent */
 #define G2_A_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board A's flags (G2_ST_FLAGS): the vertex core */
 #define G2_B_FLAG_ABSENT(f)    (((f) >> 30) & 3u)    /* board B's flags (G2_ST_B_FLAGS): the fragment core */
@@ -123,6 +129,7 @@ void g2_set_log(void (*fn)(const char *line));       /* process-wide; every libr
 /* session */
 int g2_hello(g2_board *b, int new_session);          /* <0 on failure, else the expected seq */
 int g2_status(g2_board *b, uint32_t out[G2_ST_WORDS], int *nwords);
+int g2_last_status(g2_board *b, uint32_t out[G2_ST_WORDS]);   /* the last STATUS received (0) or none yet (-1); asks for nothing */
 int g2_check_boards(g2_board *b, int min_a_build);   /* build / link / B alive; <0 + error text when not usable */
 int g2_reg_read(g2_board *b, uint32_t addr, uint32_t *value);
 int g2_reg_write(g2_board *b, uint32_t addr, uint32_t value);
@@ -219,6 +226,21 @@ g2_ref g2_fill_image(g2_board *b, uint16_t handle, uint32_t tfmt, uint32_t value
 g2_ref g2_copy_image(g2_board *b, uint16_t src, uint16_t dst, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint32_t dx, uint32_t dy,
                      uint32_t dw, uint32_t dh, int mirror_x, int mirror_y, int use_key, uint32_t key_lo, uint32_t key_hi, uint32_t slevel,
                      uint32_t slayer, uint32_t dlevel, uint32_t dlayer);
+/* COPY_IMAGE with the options of a board B with G2_B_FLAG_COPY_EXT: flags G2_COPY_* (MIRROR_X / Y, KEY with key_lo / hi,
+   ALPHA_ONE, SWIZZLE with swizzle[4] = the source channel 0..3 (R G B A) of the destination's R, G, B, A, TILE: the source
+   rectangle repeats over the destination rectangle from phase (tile_px < sw, tile_py < sh), not with mirrors or a key) */
+typedef struct g2_copy_opts {
+    uint32_t flags, key_lo, key_hi;
+    uint8_t  swizzle[4];
+    uint32_t tile_px, tile_py;
+    uint32_t slevel, slayer, dlevel, dlayer;
+} g2_copy_opts;
+g2_ref g2_copy_image_ex(g2_board *b, uint16_t src, uint16_t dst, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint32_t dx, uint32_t dy,
+                        uint32_t dw, uint32_t dh, const g2_copy_opts *o);
+/* n 1:1 rectangles rects[4 k ..] = {dx, dy, w, h} of the destination, each from (dx + ox, dy + oy) of the source, in as few
+   COPY_IMAGEs as fit (G2_COPY_LIST; o: KEY, ALPHA_ONE, SWIZZLE and the levels / layers apply, no mirrors or tile). The
+   rectangles go in the given order (the caller orders overlapping ones inside one image). Returns the last command's ref */
+g2_ref g2_copy_rects(g2_board *b, uint16_t src, uint16_t dst, int32_t ox, int32_t oy, const uint32_t *rects, uint32_t n, const g2_copy_opts *o);
 
 /* palette and hardware cursor */
 g2_ref g2_set_palette(g2_board *b, uint32_t first, const uint32_t *colors, uint32_t count);

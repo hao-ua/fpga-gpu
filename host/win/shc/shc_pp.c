@@ -1,340 +1,516 @@
-/* shc_pp.c — glslc.preprocess(), line for line. The quirks are glslc's and kept on purpose: the comment passes run in
- * this order, a directive is recognized by its first whitespace-separated word (so `#if(X)` is no directive),
- * parameters substitute one after the other, unknown directives are ignored. */
+/* shc_pp.c — glslc.preprocess(), line for line: GLSL ES 1.00 §3.4, which is C++'s preprocessor. Preprocessing tokens; macros
+ * replaced token by token (a token carries the macros it came out of, so none expands inside itself); #if expressions of
+ * 32-bit ints with C's precedence, short-circuited. h->strict (a program from an application) reports every error §3.4 names;
+ * otherwise what cannot be read is let pass. */
 #include <string.h>
 #include "shc_internal.h"
 
-typedef struct Define { char **params; int nparams; int funclike; const char *body; } Define;
-typedef struct Hide { const char *name; struct Hide *next; } Hide;       /* the frozenset `hide` */
-typedef struct PP { Shc *h; Dict defines; } PP;
+enum { PT_ID = 1, PT_NUM, PT_OP, PT_OTHER };
+typedef struct Hide { const char *name; const struct Hide *next; } Hide;      /* the frozenset of macros a token came out of */
+typedef struct PT { int k; const char *v; int line, ws; const Hide *hide; } PT; /* kind, text, physical line, white space before it */
+typedef struct PTV { PT *t; int n, cap; } PTV;
+typedef struct PLine { int start; PTV t; } PLine;                               /* a logical line: its first physical line, its tokens */
+typedef struct Define { int funclike; const char **params; int nparams; PTV body; } Define;
+typedef struct PP { Shc *h; int strict, fs; Dict defines; long long lineoff, file; } PP;
 
-static int hidden(const Hide *hd, const char *name)
+/* ---------------- token lists ---------------- */
+static void ptv_push(Shc *h, PTV *v, PT t)
 {
-    for (; hd; hd = hd->next) if (!strcmp(hd->name, name)) return 1;
+    if (v->n == v->cap) {
+        int cap = v->cap ? v->cap * 2 : 16;
+        PT *n = (PT *)sh_alloc(h, (size_t)cap * sizeof(PT));
+        if (v->n) memcpy(n, v->t, (size_t)v->n * sizeof(PT));
+        v->t = n; v->cap = cap;
+    }
+    v->t[v->n++] = t;
+}
+
+/* v[i:j] = rep */
+static void ptv_splice(Shc *h, PTV *v, int i, int j, const PTV *rep)
+{
+    int n = v->n - (j - i) + rep->n;
+    PT *t = (PT *)sh_alloc(h, ((size_t)n + 1) * sizeof(PT));
+    memcpy(t, v->t, (size_t)i * sizeof(PT));
+    if (rep->n) memcpy(t + i, rep->t, (size_t)rep->n * sizeof(PT));
+    memcpy(t + i + rep->n, v->t + j, (size_t)(v->n - j) * sizeof(PT));
+    v->t = t; v->n = n; v->cap = n + 1;
+}
+
+static PTV ptv_copy(Shc *h, const PT *t, int n)
+{
+    PTV v;
+    v.cap = n + 1; v.n = n;
+    v.t = (PT *)sh_alloc(h, (size_t)v.cap * sizeof(PT));
+    if (n) memcpy(v.t, t, (size_t)n * sizeof(PT));
+    return v;
+}
+
+static int hidden(const Hide *s, const char *name)
+{
+    for (; s; s = s->next) if (!strcmp(s->name, name)) return 1;
     return 0;
 }
 
-static char *strip_copy(Shc *h, const char *s, size_t n)
+static const Hide *hide_add(Shc *h, const Hide *s, const char *name)
 {
-    const char *b = s, *e = s + n;
-    sh_strip(&b, &e);
-    return sh_strndup(h, b, (size_t)(e - b));
+    Hide *n;
+    if (hidden(s, name)) return s;
+    n = (Hide *)sh_alloc(h, sizeof(Hide));
+    n->name = name; n->next = s;
+    return n;
 }
 
-/* _pp_split_args: text[i] == '('. Returns the index after the closing paren (len + 1 when there is none). */
-static size_t split_args(PP *pp, const char *text, size_t n, size_t i, char ***pargs, int *pn)
+static const Hide *hide_union(Shc *h, const Hide *a, const Hide *b)
 {
+    for (; b; b = b->next) a = hide_add(h, a, b->name);
+    return a;
+}
+
+/* _pp_text: the tokens, one space apart */
+static char *pp_text(Shc *h, const PT *t, int n)
+{
+    SB b;
+    int i;
+    sb_init(&b, h, 64);
+    for (i = 0; i < n; i++) { if (i) sb_putc(&b, ' '); sb_puts(&b, t[i].v); }
+    return sb_str(&b);
+}
+
+static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v'; }
+static int is_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+
+/* _pp_lines: the source as logical lines; a comment is white space, so one that runs over lines joins them */
+static PLine *pp_lines(PP *pp, const char *src, int *nl, int *nphys)
+{
+    static const char *const OPS3[] = { "<<=", ">>=", NULL };
+    static const char *const OPS2[] = { "++","--","<<",">>","<=",">=","==","!=","&&","||","^^","+=","-=","*=","/=","%=","&=","^=","|=","##", NULL };
     Shc *h = pp->h;
-    SB cur; int depth = 1, na = 0, cap = 8;
-    char **args = (char **)sh_alloc(h, (size_t)cap * sizeof(char *));
-    const char *b, *e;
-    i++;
-    sb_init(&cur, h, 64);
-    while (i < n && depth > 0) {
-        char c = text[i];
-        if (c == '(') { depth++; sb_putc(&cur, c); }
-        else if (c == ')') {
-            depth--;
-            if (depth == 0) break;
-            sb_putc(&cur, c);
-        }
-        else if (c == ',' && depth == 1) {
-            if (na == cap) {
-                char **na2 = (char **)sh_alloc(h, (size_t)cap * 2 * sizeof(char *));
-                memcpy(na2, args, (size_t)na * sizeof(char *)); args = na2; cap *= 2;
-            }
-            args[na++] = strip_copy(h, cur.p, cur.n);
-            cur.n = 0;
-        }
-        else sb_putc(&cur, c);
-        i++;
-    }
-    b = cur.p; e = cur.p + cur.n;
-    sh_strip(&b, &e);
-    if (b != e || na) {
-        if (na == cap) {
-            char **na2 = (char **)sh_alloc(h, (size_t)cap * 2 * sizeof(char *));
-            memcpy(na2, args, (size_t)na * sizeof(char *)); args = na2; cap *= 2;
-        }
-        args[na++] = sh_strndup(h, b, (size_t)(e - b));
-    }
-    *pargs = args; *pn = na;
-    return i + 1;
-}
-
-static int word_at(const char *s, size_t n, size_t pos) { return pos < n && sh_is_word((unsigned char)s[pos]); }
-static int boundary(const char *s, size_t n, size_t pos) { return (pos > 0 && word_at(s, n, pos - 1)) != word_at(s, n, pos); }
-
-/* re.sub(r'\b' + re.escape(p) + r'\b', a, rep), with p possibly empty (an empty match at every word boundary) */
-static char *sub_param(Shc *h, const char *rep, const char *p, const char *a)
-{
-    size_t n = strlen(rep), lp = strlen(p), pos = 0, m;
-    SB o;
-    sb_init(&o, h, n + 16);
-    while (pos <= n) {
-        for (m = pos; m + lp <= n; m++)
-            if (!memcmp(rep + m, p, lp) && boundary(rep, n, m) && boundary(rep, n, m + lp)) break;
-        if (m + lp > n) break;
-        sb_putn(&o, rep + pos, m - pos);
-        sb_puts(&o, a);
-        if (lp == 0) {
-            if (m < n) sb_putc(&o, rep[m]);
-            pos = m + 1;
-        }
-        else pos = m + lp;
-    }
-    if (pos < n) sb_putn(&o, rep + pos, n - pos);
-    return sb_str(&o);
-}
-
-static void expand(PP *pp, const char *text, size_t n, Hide *hide, SB *out)
-{
-    Shc *h = pp->h;
-    size_t i = 0;
-    SH_ENTER(h, 1);
+    size_t i = 0, n = strlen(src);
+    int line = 1, ws = 0, cap = 64, nlines = 0;
+    PLine *ls = (PLine *)sh_alloc(h, (size_t)cap * sizeof(PLine));
+    PTV cur; memset(&cur, 0, sizeof cur);
+    ls[0].start = 1;
     while (i < n) {
-        unsigned char ch = (unsigned char)text[i];
+        unsigned char c = (unsigned char)src[i];
         size_t j;
-        ShMark mk;
-        char *name;
-        DictEnt *de;
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_')) { sb_putc(out, (char)ch); i++; continue; }
-        for (j = i + 1; j < n && sh_is_word((unsigned char)text[j]); j++) { }
-        mk = sh_mark(h);
-        name = sh_strndup(h, text + i, j - i);
-        de = dict_find(&pp->defines, name);
-        if (de && !hidden(hide, name)) {
-            Define *d = (Define *)de->p;
-            Hide hn; hn.name = name; hn.next = hide;
-            if (!d->funclike) {
-                expand(pp, d->body, strlen(d->body), &hn, out);
-                i = j;
-            } else {
-                size_t k = j;
-                while (k < n && (text[k] == ' ' || text[k] == '\t' || text[k] == '\n')) k++;
-                if (k < n && text[k] == '(') {
-                    char **args, *rep; int na, a;
-                    k = split_args(pp, text, n, k, &args, &na);
-                    for (a = 0; a < na; a++) {
-                        SB t; sb_init(&t, h, 64);
-                        expand(pp, args[a], strlen(args[a]), hide, &t);
-                        args[a] = sb_str(&t);
-                    }
-                    rep = (char *)d->body;
-                    for (a = 0; a < na && a < d->nparams; a++) rep = sub_param(h, rep, d->params[a], args[a]);
-                    expand(pp, rep, strlen(rep), &hn, out);
-                    i = k;
-                } else {
-                    sb_putn(out, name, j - i);
-                    i = j;
-                }
+        PT t;
+        if (c == '\n') {
+            ls[nlines].t = cur; nlines++;
+            if (nlines == cap) {
+                PLine *nn = (PLine *)sh_alloc(h, (size_t)cap * 2 * sizeof(PLine));
+                memcpy(nn, ls, (size_t)nlines * sizeof(PLine)); ls = nn; cap *= 2;
             }
-        } else {
-            sh_release(h, mk);                  /* before the write: `out` may grow */
-            sb_putn(out, text + i, j - i);
+            memset(&cur, 0, sizeof cur);
+            line++; ls[nlines].start = line; ws = 0; i++;
+            continue;
+        }
+        if (is_ws((char)c)) { ws = 1; i++; continue; }
+        if (c == '/' && src[i + 1] == '/') {
+            while (i < n && src[i] != '\n') i++;
+            ws = 1;
+            continue;
+        }
+        if (c == '/' && src[i + 1] == '*') {
+            const char *q = strstr(src + i + 2, "*/"), *p;
+            if (!q) sh_compile_error(h, "a comment does not end");
+            for (p = src + i; p < q; p++) if (*p == '\n') line++;
+            i = (size_t)(q - src) + 2; ws = 1;
+            continue;
+        }
+        t.line = line; t.ws = ws; t.hide = NULL;
+        if (is_alpha(c)) {
+            for (j = i + 1; j < n && sh_is_word((unsigned char)src[j]); j++) { }
+            t.k = PT_ID;
+        }
+        else if (sh_is_digit(c) || (c == '.' && sh_is_digit((unsigned char)src[i + 1]))) {      /* \.?\d(?:[eE][+-]|[\w.])* */
+            j = i + (c == '.' ? 2 : 1);
+            for (;;) {
+                if (j + 1 < n && (src[j] == 'e' || src[j] == 'E') && (src[j + 1] == '+' || src[j + 1] == '-')) j += 2;
+                else if (j < n && (sh_is_word((unsigned char)src[j]) || src[j] == '.')) j++;
+                else break;
+            }
+            t.k = PT_NUM;
+        }
+        else {
+            int k, len = 0;
+            for (k = 0; OPS3[k]; k++) if (!strncmp(src + i, OPS3[k], 3)) { len = 3; break; }
+            for (k = 0; !len && OPS2[k]; k++) if (!strncmp(src + i, OPS2[k], 2)) { len = 2; break; }
+            if (!len && strchr("-+*/%<>=!&|^~?:.,;(){}[]#", (char)c)) len = 1;
+            if (len) t.k = PT_OP;
+            else {                                                  /* any other character, a UTF-8 sequence whole */
+                len = 1;
+                if (c >= 0xC0) while (i + (size_t)len < n && ((unsigned char)src[i + len] & 0xC0) == 0x80) len++;
+                t.k = PT_OTHER;
+            }
+            j = i + (size_t)len;
+        }
+        t.v = sh_strndup(h, src + i, j - i);
+        ptv_push(h, &cur, t);
+        ws = 0; i = j;
+    }
+    ls[nlines].t = cur; nlines++;
+    *nl = nlines; *nphys = line;
+    return ls;
+}
+
+/* _pp_int: an integer literal of a #if (0 = none); *v its value, 32 bits */
+static int pp_int(const char *s, int32_t *v)
+{
+    uint32_t u = 0;
+    size_t n = strlen(s), i;
+    if (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        for (i = 2; i < n; i++) {
+            char c = s[i];
+            int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return 0;
+            u = u * 16 + (uint32_t)d;
+        }
+    }
+    else if (s[0] == '0') {
+        for (i = 1; i < n; i++) { if (s[i] < '0' || s[i] > '7') return 0; u = u * 8 + (uint32_t)(s[i] - '0'); }
+    }
+    else if (s[0] >= '1' && s[0] <= '9') {
+        for (i = 0; i < n; i++) { if (!sh_is_digit((unsigned char)s[i])) return 0; u = u * 10 + (uint32_t)(s[i] - '0'); }
+    }
+    else return 0;
+    *v = (int32_t)u;
+    return 1;
+}
+
+static int32_t w32(long long x) { return (int32_t)(uint32_t)(unsigned long long)x; }
+
+static Define *def_of(PP *pp, const char *name) { DictEnt *e = dict_find(&pp->defines, name); return e ? (Define *)e->p : NULL; }
+
+/* call_end: toks[i] names a function-like macro: 1 and the indices of its '(' and the ')' that closes it; 0 when no '(' follows;
+ * -1 when the call does not end in toks */
+static int call_end(const PTV *t, int i, int *lp, int *rp)
+{
+    int j = i + 1, depth = 0, k;
+    if (j >= t->n) return -1;
+    if (strcmp(t->t[j].v, "(")) return 0;
+    for (k = j; k < t->n; k++) {
+        if (!strcmp(t->t[k].v, "(")) depth++;
+        else if (!strcmp(t->t[k].v, ")") && --depth == 0) { *lp = j; *rp = k; return 1; }
+    }
+    return -1;
+}
+
+static PT num_tok(Shc *h, const char *v, int line, int ws) { PT t; t.k = PT_NUM; t.v = sh_strdup(h, v); t.line = line; t.ws = ws; t.hide = NULL; return t; }
+
+/* expand: macro replacement of a token list; ifexpr: `defined X` and `defined ( X )` become 1 or 0, also where a replacement
+ * brings them */
+static PTV expand(PP *pp, const PT *in, int nin, int ifexpr)
+{
+    Shc *h = pp->h;
+    PTV toks = ptv_copy(h, in, nin), out;
+    int i = 0;
+    memset(&out, 0, sizeof out);
+    SH_ENTER(h, 1);
+    while (i < toks.n) {
+        PT t = toks.t[i];
+        Define *d;
+        if (ifexpr && t.k == PT_ID && !strcmp(t.v, "defined")) {
+            int j = i + 1, paren = j < toks.n && !strcmp(toks.t[j].v, "(");
+            const char *nm;
+            if (paren) j++;
+            if (j >= toks.n || toks.t[j].k != PT_ID) sh_compile_error(h, "defined needs a macro name");
+            nm = toks.t[j].v; j++;
+            if (paren) {
+                if (j >= toks.n || strcmp(toks.t[j].v, ")")) sh_compile_error(h, "defined( needs a )");
+                j++;
+            }
+            ptv_push(h, &out, num_tok(h, def_of(pp, nm) || !strcmp(nm, "__LINE__") || !strcmp(nm, "__FILE__") ? "1" : "0", t.line, t.ws));
             i = j;
+            continue;
+        }
+        if (t.k != PT_ID || hidden(t.hide, t.v)) { ptv_push(h, &out, t); i++; continue; }
+        if (!strcmp(t.v, "__LINE__") || !strcmp(t.v, "__FILE__")) {
+            SB b;
+            sb_init(&b, h, 24);
+            sb_putll(&b, t.v[2] == 'L' ? (long long)t.line + pp->lineoff : pp->file);
+            ptv_push(h, &out, num_tok(h, sb_str(&b), t.line, t.ws));
+            i++;
+            continue;
+        }
+        if ((d = def_of(pp, t.v)) == NULL) { ptv_push(h, &out, t); i++; continue; }
+        if (!d->funclike) {
+            PTV rep; int n;
+            const Hide *hd = hide_add(h, t.hide, t.v);
+            memset(&rep, 0, sizeof rep);
+            for (n = 0; n < d->body.n; n++) {
+                PT b = d->body.t[n];
+                b.line = t.line; b.ws = n == 0 ? t.ws : b.ws; b.hide = hd;
+                ptv_push(h, &rep, b);
+            }
+            ptv_splice(h, &toks, i, i + 1, &rep);
+            continue;
+        }
+        {
+            int lp, rp, ce = call_end(&toks, i, &lp, &rp), depth = 0, na = 1, cap = 4, k, n, line;
+            PTV *args, rep;
+            const Hide *hd;
+            if (ce != 1) { ptv_push(h, &out, t); i++; continue; }
+            args = (PTV *)sh_zalloc(h, (size_t)cap * sizeof(PTV));
+            for (k = lp + 1; k < rp; k++) {
+                const char *v = toks.t[k].v;
+                if (!strcmp(v, "(")) depth++;
+                else if (!strcmp(v, ")")) depth--;
+                if (!strcmp(v, ",") && depth == 0) {
+                    if (na == cap) {
+                        PTV *nn = (PTV *)sh_zalloc(h, (size_t)cap * 2 * sizeof(PTV));
+                        memcpy(nn, args, (size_t)na * sizeof(PTV)); args = nn; cap *= 2;
+                    }
+                    na++;
+                    continue;
+                }
+                ptv_push(h, &args[na - 1], toks.t[k]);
+            }
+            if (na == 1 && args[0].n == 0 && d->nparams == 0) na = 0;
+            if (na != d->nparams) {
+                if (pp->strict) sh_compile_error(h, "macro %s takes %d arguments, not %d", t.v, d->nparams, na);
+                if (d->nparams > cap) {
+                    PTV *nn = (PTV *)sh_zalloc(h, (size_t)d->nparams * sizeof(PTV));
+                    memcpy(nn, args, (size_t)(na < d->nparams ? na : d->nparams) * sizeof(PTV)); args = nn;
+                }
+                for (k = na; k < d->nparams; k++) memset(&args[k], 0, sizeof(PTV));
+                na = d->nparams;
+            }
+            for (k = 0; k < na; k++) args[k] = expand(pp, args[k].t, args[k].n, 0);
+            hd = hide_add(h, t.hide, t.v);
+            line = toks.t[rp].line;
+            memset(&rep, 0, sizeof rep);
+            for (n = 0; n < d->body.n; n++) {
+                PT b = d->body.t[n];
+                int ws = n == 0 ? t.ws : b.ws, p = -1, m;
+                if (b.k == PT_ID) for (m = 0; m < d->nparams; m++) if (!strcmp(d->params[m], b.v)) { p = m; break; }
+                if (p >= 0) {
+                    for (m = 0; m < args[p].n; m++) {
+                        PT x = args[p].t[m];
+                        if (m == 0) x.ws = ws;
+                        x.hide = hide_union(h, x.hide, hd);
+                        ptv_push(h, &rep, x);
+                    }
+                }
+                else { b.line = line; b.ws = ws; b.hide = hd; ptv_push(h, &rep, b); }
+            }
+            ptv_splice(h, &toks, i, rp + 1, &rep);
         }
     }
     SH_LEAVE(h, 1);
+    return out;
 }
 
-/* text ends inside a call of a function-like macro: the arguments go on over the next line, as in C++ */
-static int open_call(PP *pp, const char *text, size_t n)
+/* ---------------- #if ---------------- */
+typedef struct EV { PP *pp; PTV x; int pos; } EV;
+static const char *const LEVELS[10][4] = {
+    { "||", NULL }, { "&&", NULL }, { "|", NULL }, { "^", NULL }, { "&", NULL }, { "==", "!=", NULL },
+    { "<", ">", "<=", ">=" }, { "<<", ">>", NULL }, { "+", "-", NULL }, { "*", "/", "%", NULL }
+};
+
+static const char *peek_v(EV *e) { return e->pos < e->x.n ? e->x.t[e->pos].v : NULL; }
+
+static int at_level(EV *e, int lvl)
 {
-    size_t i = 0;
-    while (i < n) {
-        unsigned char ch = (unsigned char)text[i];
-        size_t j, k;
-        ShMark mk;
-        DictEnt *de;
-        int depth = 0;
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_')) { i++; continue; }
-        for (j = i + 1; j < n && sh_is_word((unsigned char)text[j]); j++) { }
-        mk = sh_mark(pp->h);
-        de = dict_find(&pp->defines, sh_strndup(pp->h, text + i, j - i));
-        sh_release(pp->h, mk);
-        i = j;
-        if (!de || !((Define *)de->p)->funclike) continue;
-        for (k = j; k < n && (text[k] == ' ' || text[k] == '\t' || text[k] == '\n'); k++) { }
-        if (k == n) return 1;                   /* the '(' may be on the next line */
-        if (text[k] != '(') continue;
-        for (; k < n; k++) {
-            if (text[k] == '(') depth++;
-            else if (text[k] == ')' && --depth == 0) break;
-        }
-        if (k == n) return 1;
-        i = k + 1;
-    }
+    const char *v = peek_v(e);
+    int k;
+    if (!v) return 0;
+    for (k = 0; k < 4 && LEVELS[lvl][k]; k++) if (!strcmp(LEVELS[lvl][k], v)) return 1;
     return 0;
 }
 
-/* ---------------- eval_if ---------------- */
-static const char *skip_ws(const char *s, const char *e)
+static int32_t binary(EV *e, int lvl, int ev);
+
+static int32_t unary(EV *e, int ev)
 {
-    int k;
-    while ((k = sh_ws_len(s, e)) != 0) s += k;
-    return s;
+    Shc *h = e->pp->h;
+    PT t;
+    int32_t a = 0;
+    SH_ENTER(h, 1);
+    if (e->pos >= e->x.n) sh_compile_error(h, "#if: the expression ends early");
+    t = e->x.t[e->pos++];
+    if (!strcmp(t.v, "+") || !strcmp(t.v, "-") || !strcmp(t.v, "~") || !strcmp(t.v, "!")) {
+        a = unary(e, ev);
+        a = t.v[0] == '+' ? a : t.v[0] == '-' ? w32(-(long long)a) : t.v[0] == '~' ? w32(~(long long)a) : !a;
+    }
+    else if (!strcmp(t.v, "(")) {
+        const char *v;
+        a = binary(e, 0, ev);
+        v = peek_v(e);
+        if (!v || strcmp(v, ")")) sh_compile_error(h, "#if: ) expected");
+        e->pos++;
+    }
+    else if (t.k == PT_NUM) { if (!pp_int(t.v, &a)) sh_compile_error(h, "#if: %s is no integer", t.v); }
+    else if (t.k == PT_ID) { if (ev) sh_compile_error(h, "#if: '%s' is not defined", t.v); a = 0; }
+    else sh_compile_error(h, "#if: unexpected '%s'", t.v);
+    SH_LEAVE(h, 1);
+    return a;
 }
 
-static int is_defined(PP *pp, const char *b, const char *e)
+static int32_t binary(EV *e, int lvl, int ev)
 {
-    ShMark mk = sh_mark(pp->h);
-    int r = dict_find(&pp->defines, sh_strndup(pp->h, b, (size_t)(e - b))) != NULL;
-    sh_release(pp->h, mk);
+    Shc *h = e->pp->h;
+    int32_t a;
+    SH_ENTER(h, 1);
+    if (lvl == 10) a = unary(e, ev);
+    else {
+        a = binary(e, lvl + 1, ev);
+        while (at_level(e, lvl)) {
+            const char *op = peek_v(e);
+            int32_t b;
+            e->pos++;
+            if (!strcmp(op, "||")) { b = binary(e, lvl + 1, ev && !a); a = a || b; continue; }
+            if (!strcmp(op, "&&")) { b = binary(e, lvl + 1, ev && a); a = a && b; continue; }
+            b = binary(e, lvl + 1, ev);
+            if (!strcmp(op, "/") || !strcmp(op, "%")) {
+                long long q, la = a, lb = b;
+                if (b == 0) {
+                    if (ev) sh_compile_error(h, "#if: division by zero");
+                    a = 0;
+                    continue;
+                }
+                q = (la < 0 ? -la : la) / (lb < 0 ? -lb : lb);
+                if ((la < 0) != (lb < 0)) q = -q;
+                a = op[0] == '/' ? w32(q) : w32(la - lb * q);
+                continue;
+            }
+            if (!strcmp(op, "<<")) a = w32((long long)((uint32_t)a << (b & 31)));
+            else if (!strcmp(op, ">>")) a = a >> (b & 31);
+            else if (!strcmp(op, "==")) a = a == b;
+            else if (!strcmp(op, "!=")) a = a != b;
+            else if (!strcmp(op, "<")) a = a < b;
+            else if (!strcmp(op, ">")) a = a > b;
+            else if (!strcmp(op, "<=")) a = a <= b;
+            else if (!strcmp(op, ">=")) a = a >= b;
+            else if (!strcmp(op, "|")) a = a | b;
+            else if (!strcmp(op, "^")) a = a ^ b;
+            else if (!strcmp(op, "&")) a = a & b;
+            else if (!strcmp(op, "+")) a = w32((long long)a + b);
+            else if (!strcmp(op, "-")) a = w32((long long)a - b);
+            else a = w32((long long)a * b);
+        }
+    }
+    SH_LEAVE(h, 1);
+    return a;
+}
+
+/* eval_if: a #if / #elif expression, 1 or 0 */
+static int eval_if(PP *pp, const PT *t, int n)
+{
+    EV e;
+    int32_t r;
+    e.pp = pp; e.pos = 0;
+    e.x = expand(pp, t, n, 1);
+    if (!e.x.n) sh_compile_error(pp->h, "#if needs an expression");
+    r = binary(&e, 0, 1);
+    if (e.pos != e.x.n) sh_compile_error(pp->h, "#if: unexpected '%s' after the expression", e.x.t[e.pos].v);
+    return r != 0;
+}
+
+/* if_value: a CompileError of a library's own program reads as 0; any other error goes on */
+static int if_value(PP *pp, const PT *t, int n)
+{
+    Shc *h = pp->h;
+    jmp_buf save;
+    volatile int depth = h->depth;
+    int r;
+    char err[sizeof h->err];
+    if (pp->strict) return eval_if(pp, t, n);
+    memcpy(save, h->jb, sizeof(jmp_buf));
+    memcpy(err, h->err, sizeof err);
+    if (setjmp(h->jb)) {
+        memcpy(h->jb, save, sizeof(jmp_buf));
+        if (!h->compile_error) longjmp(h->jb, 1);
+        memcpy(h->err, err, sizeof err);
+        h->compile_error = 0;
+        h->depth = depth;
+        return 0;
+    }
+    r = eval_if(pp, t, n);
+    memcpy(h->jb, save, sizeof(jmp_buf));
     return r;
 }
 
-/* re.sub(r'defined\s*\(\s*(\w+)\s*\)', ...), then re.sub(r'defined\s+(\w+)', ...) */
-static char *sub_defined(PP *pp, const char *s, int paren)
+/* ---------------- directives ---------------- */
+static int is_fixed(const char *nm) { return !strcmp(nm, "__LINE__") || !strcmp(nm, "__FILE__") || !strcmp(nm, "__VERSION__") || !strcmp(nm, "GL_ES"); }
+
+/* name_of: the one name a directive takes */
+static const char *name_of(PP *pp, const PT *t, int n, const char *what)
 {
-    const char *p = s, *e = s + strlen(s);
-    SB o;
-    sb_init(&o, pp->h, (size_t)(e - s) + 16);
-    while (p < e) {
-        if ((size_t)(e - p) >= 7 && !memcmp(p, "defined", 7)) {
-            const char *q = p + 7, *wb, *we;
-            if (paren) {
-                q = skip_ws(q, e);
-                if (q < e && *q == '(') {
-                    q = skip_ws(q + 1, e);
-                    wb = q;
-                    while (q < e && sh_is_word((unsigned char)*q)) q++;
-                    we = q;
-                    q = skip_ws(q, e);
-                    if (we > wb && q < e && *q == ')') {
-                        sb_putc(&o, is_defined(pp, wb, we) ? '1' : '0');
-                        p = q + 1;
-                        continue;
-                    }
+    if (pp->strict && (n != 1 || t[0].k != PT_ID)) sh_compile_error(pp->h, "#%s takes one macro name", what);
+    return n ? t[0].v : "";
+}
+
+static void no_more(PP *pp, const PT *t, int n, const char *what)
+{
+    if (pp->strict && n) sh_compile_error(pp->h, "#%s: unexpected '%s'", what, t[0].v);
+}
+
+static int same_body(const PTV *a, const PTV *b)
+{
+    int i;
+    if (a->n != b->n) return 0;
+    for (i = 0; i < a->n; i++)
+        if (a->t[i].k != b->t[i].k || strcmp(a->t[i].v, b->t[i].v) || (i && !a->t[i].ws != !b->t[i].ws)) return 0;
+    return 1;
+}
+
+static int same_params(const Define *d, int funclike, const char **params, int np)
+{
+    int i;
+    if (d->funclike != funclike || d->nparams != np) return 0;
+    for (i = 0; i < np; i++) if (strcmp(d->params[i], params[i])) return 0;
+    return 1;
+}
+
+static void define(PP *pp, const PT *t, int n)
+{
+    Shc *h = pp->h;
+    const char *nm, **params = NULL;
+    int funclike = 0, np = 0, cap = 4, i = 1;
+    Define *d, *was;
+    if (!n || t[0].k != PT_ID) sh_compile_error(h, "#define needs a macro name");
+    nm = t[0].v;
+    if (i < n && !strcmp(t[i].v, "(") && !t[i].ws) {               /* a function-like macro: '(' right after the name */
+        funclike = 1; i++;
+        params = (const char **)sh_alloc(h, (size_t)cap * sizeof(char *));
+        if (i < n && !strcmp(t[i].v, ")")) i++;
+        else {
+            for (;;) {
+                int k;
+                if (i >= n || t[i].k != PT_ID) {
+                    if (pp->strict) sh_compile_error(h, "#define %s: a parameter must be a name", nm);
+                    while (i < n && strcmp(t[i].v, ")")) i++;
+                    i++;
+                    break;
                 }
-            } else {
-                const char *r = skip_ws(q, e);
-                if (r > q) {
-                    wb = r;
-                    while (r < e && sh_is_word((unsigned char)*r)) r++;
-                    if (r > wb) {
-                        sb_putc(&o, is_defined(pp, wb, r) ? '1' : '0');
-                        p = r;
-                        continue;
-                    }
+                if (pp->strict) for (k = 0; k < np; k++) if (!strcmp(params[k], t[i].v)) sh_compile_error(h, "#define %s: the parameter %s twice", nm, t[i].v);
+                if (np == cap) {
+                    const char **nn = (const char **)sh_alloc(h, (size_t)cap * 2 * sizeof(char *));
+                    memcpy(nn, params, (size_t)np * sizeof(char *)); params = nn; cap *= 2;
                 }
+                params[np++] = t[i].v; i++;
+                if (i < n && !strcmp(t[i].v, ",")) { i++; continue; }
+                if (i < n && !strcmp(t[i].v, ")")) { i++; break; }
+                if (pp->strict) sh_compile_error(h, "#define %s: ) expected", nm);
+                break;
             }
         }
-        sb_putc(&o, *p++);
     }
-    return sb_str(&o);
-}
-
-/* re.sub(r'\b[A-Za-z_]\w*\b', '0', expr) */
-static char *sub_idents(Shc *h, const char *s)
-{
-    size_t n = strlen(s), p = 0;
-    SB o;
-    sb_init(&o, h, n + 16);
-    while (p < n) {
-        unsigned char c = (unsigned char)s[p];
-        if (((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') && !(p > 0 && sh_is_word((unsigned char)s[p - 1]))) {
-            while (p < n && sh_is_word((unsigned char)s[p])) p++;
-            sb_putc(&o, '0');
-            continue;
-        }
-        sb_putc(&o, s[p++]);
-    }
-    return sb_str(&o);
-}
-
-static char *replace_all(Shc *h, const char *s, const char *from, const char *to)
-{
-    size_t n = strlen(s), lf = strlen(from), p = 0;
-    SB o;
-    sb_init(&o, h, n + 16);
-    while (p < n) {
-        if (n - p >= lf && !memcmp(s + p, from, lf)) { sb_puts(&o, to); p += lf; }
-        else sb_putc(&o, s[p++]);
-    }
-    return sb_str(&o);
-}
-
-/* re.sub(r'\bnot=', '!=', expr) */
-static char *sub_not_eq(Shc *h, const char *s)
-{
-    size_t n = strlen(s), p = 0;
-    SB o;
-    sb_init(&o, h, n + 16);
-    while (p < n) {
-        if (n - p >= 4 && !memcmp(s + p, "not=", 4) && !(p > 0 && sh_is_word((unsigned char)s[p - 1]))) { sb_puts(&o, "!="); p += 4; }
-        else sb_putc(&o, s[p++]);
-    }
-    return sb_str(&o);
-}
-
-static int eval_if(PP *pp, const char *b, const char *e)
-{
-    Shc *h = pp->h;
-    char *x = sh_strndup(h, b, (size_t)(e - b));
-    SB t;
-    x = sub_defined(pp, x, 1);
-    x = sub_defined(pp, x, 0);
-    sb_init(&t, h, strlen(x) + 16);
-    expand(pp, x, strlen(x), NULL, &t);
-    x = sub_idents(h, sb_str(&t));
-    x = replace_all(h, x, "||", " or ");
-    x = replace_all(h, x, "&&", " and ");
-    x = replace_all(h, x, "!", "not ");
-    x = sub_not_eq(h, x);
-    return sh_pyeval_truth(h, x);
-}
-
-/* ---------------- directives ---------------- */
-static void do_define(PP *pp, const char *rest, const char *rend)
-{
-    /* re.match(r'(\w+)(\(([^)]*)\))?\s*(.*)', rest, re.S) */
-    Shc *h = pp->h;
-    const char *p = rest, *gb = NULL, *ge = NULL, *bb, *be;
-    Define *d;
-    char *nm;
-    int funclike = 0;
-    while (p < rend && sh_is_word((unsigned char)*p)) p++;
-    if (p == rest) sh_py_error(h, "AttributeError: bad #define");        /* m is None */
-    nm = sh_strndup(h, rest, (size_t)(p - rest));
-    if (p < rend && *p == '(') {
-        const char *q = p + 1;
-        while (q < rend && *q != ')') q++;
-        if (q < rend) { gb = p + 1; ge = q; p = q + 1; funclike = 1; }
-    }
-    p = skip_ws(p, rend);
-    bb = p; be = rend;
-    sh_strip(&bb, &be);
+    if (i > n) i = n;
     d = (Define *)sh_alloc(h, sizeof(Define));
-    d->funclike = funclike; d->nparams = 0; d->params = NULL;
-    d->body = sh_strndup(h, bb, (size_t)(be - bb));
-    if (funclike) {
-        int n = 1;
-        const char *q;
-        for (q = gb; q < ge; q++) if (*q == ',') n++;
-        d->params = (char **)sh_alloc(h, (size_t)n * sizeof(char *));
-        n = 0;
-        for (q = gb; ; ) {
-            const char *c = q;
-            while (c < ge && *c != ',') c++;
-            d->params[n++] = strip_copy(h, q, (size_t)(c - q));
-            if (c >= ge) break;
-            q = c + 1;
-        }
-        if (n == 1 && !d->params[0][0]) n = 0;      /* params == [''] -> [] */
-        d->nparams = n;
-    }
-    if (h->strict && !strncmp(nm, "GL_", 3)) sh_compile_error(h, "macro name '%s' is reserved", nm);
+    d->funclike = funclike; d->params = params; d->nparams = np;
+    d->body = ptv_copy(h, t + i, n - i);
+    if (pp->strict && (!strncmp(nm, "GL_", 3) || is_fixed(nm))) sh_compile_error(h, "macro name '%s' is reserved", nm);
+    was = def_of(pp, nm);
+    if (pp->strict && was && (!same_params(was, funclike, params, np) || !same_body(&was->body, &d->body)))
+        sh_compile_error(h, "macro %s is defined again otherwise", nm);
     dict_put(h, &pp->defines, nm)->p = d;
 }
 
-typedef struct Ifs { int pa, taken, any; } Ifs;
-int snprintf(char *s, size_t n, const char *fmt, ...);
-
-static void pp_const(PP *pp, const char *name, const char *body)
+static void pp_const(PP *pp, const char *name, const char *v)
 {
-    Define *d = (Define *)sh_alloc(pp->h, sizeof(Define));
-    d->params = NULL; d->nparams = 0; d->funclike = 0; d->body = body;
+    Define *d = (Define *)sh_zalloc(pp->h, sizeof(Define));
+    ptv_push(pp->h, &d->body, num_tok(pp->h, v, 0, 0));
     dict_put(pp->h, &pp->defines, name)->p = d;
 }
 
@@ -347,73 +523,72 @@ static int ext_bit(const char *nm)
     return 0;
 }
 
-/* #extension name : behavior */
-static void do_extension(Shc *h, const char *r, const char *re, int fs, int *exts)
+static int word_tok(const PT *t)
 {
-    const char *a = r, *ae, *b, *be;
-    char *nm, *beh;
-    while (r < re && sh_is_word((unsigned char)*r)) r++;
-    ae = r;
-    r = skip_ws(r, re);
-    b = NULL;
-    if (ae > a && r < re && *r == ':') {
-        b = r = skip_ws(r + 1, re);
-        while (r < re && sh_is_word((unsigned char)*r)) r++;
-        be = r;
-        r = skip_ws(r, re);
-        if (be == b || r != re) b = NULL;
-    }
-    nm = b ? sh_strndup(h, a, (size_t)(ae - a)) : NULL;
-    beh = b ? sh_strndup(h, b, (size_t)(be - b)) : NULL;
-    if (!b || (strcmp(beh, "require") && strcmp(beh, "enable") && strcmp(beh, "warn") && strcmp(beh, "disable")))
-        sh_compile_error(h, "bad #extension: %s", sh_strndup(h, a, (size_t)(re - a)));
+    const char *p;
+    for (p = t->v; *p; p++) if (!sh_is_word((unsigned char)*p)) return 0;
+    return t->v[0] != 0;
+}
+
+/* #extension name : behavior */
+static void do_extension(PP *pp, const PT *t, int n, int code, int *exts)
+{
+    Shc *h = pp->h;
+    const char *nm, *beh;
+    if (n != 3 || !word_tok(&t[0]) || strcmp(t[1].v, ":") || !word_tok(&t[2]) ||
+        (strcmp(t[2].v, "require") && strcmp(t[2].v, "enable") && strcmp(t[2].v, "warn") && strcmp(t[2].v, "disable")))
+        sh_compile_error(h, "bad #extension: %s", pp_text(h, t, n));
+    if (pp->strict && code) sh_compile_error(h, "#extension comes before the code");
+    nm = t[0].v; beh = t[2].v;
     if (!strcmp(nm, "all")) {
         if (!strcmp(beh, "require") || !strcmp(beh, "enable")) sh_compile_error(h, "#extension all : %s", beh);
         if (!strcmp(beh, "disable")) *exts = 0;
-        else *exts = fs ? SH_EXT_DERIV | SH_EXT_LOD | SH_EXT_FRAGDEPTH | SH_EXT_3D : SH_EXT_3D;
+        else *exts = pp->fs ? SH_EXT_DERIV | SH_EXT_LOD | SH_EXT_FRAGDEPTH | SH_EXT_3D : SH_EXT_3D;
     }
-    else if (!(ext_bit(nm) == SH_EXT_3D || (fs && ext_bit(nm)))) {
+    else if (!(ext_bit(nm) == SH_EXT_3D || (pp->fs && ext_bit(nm)))) {
         if (!strcmp(beh, "require")) sh_compile_error(h, "extension %s is not supported", nm);
     }
     else if (!strcmp(beh, "disable")) *exts &= ~ext_bit(nm);
     else *exts |= ext_bit(nm);
 }
 
+/* #line line [source]: the next line is line */
+static void do_line(PP *pp, const PT *t, int n, int next)
+{
+    Shc *h = pp->h;
+    PTV x = expand(pp, t, n, 0);
+    long long v[2];
+    int i;
+    if (x.n < 1 || x.n > 2) sh_compile_error(h, "bad #line: %s", pp_text(h, t, n));
+    for (i = 0; i < x.n; i++) {
+        const char *p = x.t[i].v;
+        if (x.t[i].k != PT_NUM || !*p) sh_compile_error(h, "bad #line: %s", pp_text(h, t, n));
+        v[i] = 0;
+        for (; *p; p++) {
+            if (!sh_is_digit((unsigned char)*p)) sh_compile_error(h, "bad #line: %s", pp_text(h, t, n));
+            v[i] = v[i] * 10 + (*p - '0');
+            if (v[i] > 0x7FFFFFFF) v[i] = 0x7FFFFFFF;
+        }
+    }
+    pp->lineoff = v[0] - next;
+    if (x.n == 2) pp->file = v[1];
+}
+
+typedef struct Ifs { int pa, taken, any, el; } Ifs;
+
 char *sh_preprocess(Shc *h, const char *src, int fs, int *exts)
 {
     PP pp;
-    SB s1, s2, out;
-    const char *p, *e, *line;
-    size_t n = strlen(src), i;
-    Ifs *stack; int sp = 0, spcap = 16, lineno = 0, lineoff = 0, begun = 0;
-    pp.h = h; memset(&pp.defines, 0, sizeof pp.defines);
-    /* re.sub(r'/\*.*?\*\/', newlines, src, flags=re.S): the block comments first, so one can start inside a // comment */
-    sb_init(&s1, h, n + 16);
-    for (i = 0; i < n; ) {
-        if (src[i] == '/' && src[i + 1] == '*') {
-            const char *q = strstr(src + i + 2, "*/");
-            if (q) {
-                const char *c;
-                for (c = src + i; c < q; c++) if (*c == '\n') sb_putc(&s1, '\n');
-                i = (size_t)(q - src) + 2;
-                continue;
-            }
-        }
-        sb_putc(&s1, src[i++]);
-    }
-    /* re.sub(r'//[^\n]*', '', src) */
-    sb_init(&s2, h, s1.n + 16);
-    sb_str(&s1);
-    for (i = 0; i < s1.n; ) {
-        if (s1.p[i] == '/' && s1.p[i + 1] == '/') {
-            while (i < s1.n && s1.p[i] != '\n') i++;
-            continue;
-        }
-        sb_putc(&s2, s1.p[i++]);
-    }
+    PLine *ls;
+    int nl, nphys, li = 0, sp = 0, spcap = 16, begun = 0, code = 0, i;
+    char **out;
+    Ifs *stack;
+    SB o;
+    memset(&pp, 0, sizeof pp);
+    pp.h = h; pp.strict = h->strict; pp.fs = fs;
+    ls = pp_lines(&pp, src, &nl, &nphys);
     pp_const(&pp, "GL_ES", "1");
     pp_const(&pp, "__VERSION__", "100");
-    pp_const(&pp, "__FILE__", "0");
     if (fs) {
         pp_const(&pp, "GL_FRAGMENT_PRECISION_HIGH", "1");
         pp_const(&pp, "GL_OES_standard_derivatives", "1");
@@ -421,50 +596,30 @@ char *sh_preprocess(Shc *h, const char *src, int fs, int *exts)
         pp_const(&pp, "GL_EXT_frag_depth", "1");
     }
     pp_const(&pp, "GL_OES_texture_3D", "1");                  /* glslc.EXT_ANY */
+    out = (char **)sh_zalloc(h, (size_t)nphys * sizeof(char *));
     stack = (Ifs *)sh_alloc(h, (size_t)spcap * sizeof(Ifs));
-    sb_init(&out, h, s2.n + 16);
-    p = s2.p; e = s2.p + s2.n;
-    for (line = p; ; ) {
-        const char *le = line, *st, *ste;
-        int first = line == p, active, k;
-        char *ln = (char *)sh_alloc(h, 16);
-        lineno++;
-        snprintf(ln, 16, "%d", lineno + lineoff);
-        pp_const(&pp, "__LINE__", ln);
-        while (le < e && *le != '\n') le++;
-        if (!first) sb_putc(&out, '\n');
-        st = line; ste = le;
-        sh_strip(&st, &ste);
-        active = 1;
+    while (li < nl) {
+        int start = ls[li].start, active = 1, k;
+        PTV toks = ls[li].t;
+        li++;
         for (k = 0; k < sp; k++) if (!stack[k].taken) active = 0;
-        if (st < ste && *st == '#') {
-            const char *d = st + 1, *de = ste, *ke, *rest, *rb, *re_;
-            sh_strip(&d, &de);
-            ke = d;
-            while (ke < de && !sh_ws_len(ke, de)) ke++;
-            rest = skip_ws(ke, de);
-            rb = rest; re_ = de;
-            sh_strip(&rb, &re_);
-#define KEY(w) ((size_t)(ke - d) == sizeof(w) - 1 && !memcmp(d, w, sizeof(w) - 1))
-            if (KEY("version") && active) {
-                char *v = sh_strndup(h, rb, (size_t)(re_ - rb));
-                if (begun || strcmp(v, "100")) {
-                    if (!strcmp(v, "100")) sh_compile_error(h, "#version must come first");
-                    sh_compile_error(h, "#version %s is not supported: GLSL ES 1.00 only", v);
-                }
-            }
-            if (ke > d) begun = 1;
-            if (KEY("define") && active) do_define(&pp, rest, de);
-            else if (KEY("undef") && active) { dict_del(&pp.defines, sh_strndup(h, rb, (size_t)(re_ - rb))); }
-            else if (KEY("error") && active) sh_compile_error(h, "#error %s", sh_strndup(h, rb, (size_t)(re_ - rb)));
-            else if (KEY("ifdef") || KEY("ifndef") || KEY("if")) {
-                Ifs f; f.pa = active;
-                if (KEY("if")) f.taken = active && eval_if(&pp, rest, de);
+        if (toks.n && !strcmp(toks.t[0].v, "#")) {
+            const PT *d = toks.t + 1, *rest;
+            int nd = toks.n - 1, nr;
+            const char *key = nd && d[0].k == PT_ID ? d[0].v : "";
+            rest = d + 1; nr = nd ? nd - 1 : 0;
+            if (nd && !*key && pp.strict && active) sh_compile_error(h, "bad directive #%s", d[0].v);
+#define KEY(w) (!strcmp(key, w))
+            if (KEY("if") || KEY("ifdef") || KEY("ifndef")) {
+                Ifs f;
+                int t;
+                if (!active) t = 0;
+                else if (KEY("if")) t = if_value(&pp, rest, nr);
                 else {
-                    int def = dict_find(&pp.defines, sh_strndup(h, rb, (size_t)(re_ - rb))) != NULL;
-                    f.taken = active && (KEY("ifdef") ? def : !def);
+                    const char *nm = name_of(&pp, rest, nr, key);
+                    t = (def_of(&pp, nm) || !strcmp(nm, "__LINE__") || !strcmp(nm, "__FILE__")) == KEY("ifdef");
                 }
-                f.any = f.taken;
+                f.pa = active; f.taken = t; f.any = t; f.el = 0;
                 if (sp == spcap) {
                     Ifs *ns = (Ifs *)sh_alloc(h, (size_t)spcap * 2 * sizeof(Ifs));
                     memcpy(ns, stack, (size_t)sp * sizeof(Ifs)); stack = ns; spcap *= 2;
@@ -472,64 +627,80 @@ char *sh_preprocess(Shc *h, const char *src, int fs, int *exts)
                 stack[sp++] = f;
             }
             else if (KEY("elif")) {
+                Ifs *f;
                 int t;
-                if (!sp) sh_py_error(h, "IndexError: #elif without #if");
-                t = stack[sp - 1].pa && !stack[sp - 1].any && eval_if(&pp, rest, de);
-                stack[sp - 1].taken = t;
-                stack[sp - 1].any = stack[sp - 1].any || t;
+                if (!sp) sh_compile_error(h, "#elif without #if");
+                f = &stack[sp - 1];
+                if (f->el && pp.strict) sh_compile_error(h, "#elif after #else");
+                t = f->pa && !f->any && if_value(&pp, rest, nr);
+                f->taken = t; f->any = f->any || t;
             }
             else if (KEY("else")) {
-                if (!sp) sh_py_error(h, "IndexError: #else without #if");
-                stack[sp - 1].taken = stack[sp - 1].pa && !stack[sp - 1].any;
-                stack[sp - 1].any = 1;
+                Ifs *f;
+                if (!sp) sh_compile_error(h, "#else without #if");
+                f = &stack[sp - 1];
+                if (f->el && pp.strict) sh_compile_error(h, "#else after #else");
+                no_more(&pp, rest, nr, "else");
+                f->taken = f->pa && !f->any; f->any = 1; f->el = 1;
             }
             else if (KEY("endif")) {
-                if (!sp) sh_py_error(h, "IndexError: #endif without #if");
+                if (!sp) sh_compile_error(h, "#endif without #if");
+                no_more(&pp, rest, nr, "endif");
                 sp--;
             }
-            else if (KEY("extension") && active) do_extension(h, rb, re_, fs, exts);
-            else if (KEY("line") && active) {
-                SB x;
-                const char *q, *qe, *w;
-                long long v = 0;
-                sb_init(&x, h, 32);
-                expand(&pp, rb, (size_t)(re_ - rb), NULL, &x);
-                q = sb_str(&x); qe = q + x.n;
-                w = q;
-                while (w < qe && sh_is_digit((unsigned char)*w)) { v = v * 10 + (*w - '0'); if (v > 0x7FFFFFFF) v = 0x7FFFFFFF; w++; }
-                if (w == q) sh_compile_error(h, "bad #line: %s", sh_strndup(h, rb, (size_t)(re_ - rb)));
-                w = skip_ws(w, qe);
-                while (w < qe && sh_is_digit((unsigned char)*w)) w++;
-                w = skip_ws(w, qe);
-                if (w != qe) sh_compile_error(h, "bad #line: %s", sh_strndup(h, rb, (size_t)(re_ - rb)));
-                lineoff = (int)v - lineno;              /* ES 1.00: the next line counts as line + 1 */
+            else if (active) {
+                if (KEY("version")) {
+                    char *v = pp_text(h, rest, nr);
+                    if (begun || strcmp(v, "100")) {
+                        if (!strcmp(v, "100")) sh_compile_error(h, "#version must come first");
+                        sh_compile_error(h, "#version %s is not supported: GLSL ES 1.00 only", v);
+                    }
+                }
+                else if (KEY("define")) define(&pp, rest, nr);
+                else if (KEY("undef")) {
+                    const char *nm = name_of(&pp, rest, nr, "undef");
+                    if (pp.strict && (!strncmp(nm, "GL_", 3) || is_fixed(nm))) sh_compile_error(h, "macro name '%s' is reserved", nm);
+                    dict_del(&pp.defines, nm);
+                }
+                else if (KEY("error")) sh_compile_error(h, "#error %s", pp_text(h, rest, nr));
+                else if (KEY("extension")) do_extension(&pp, rest, nr, code, exts);
+                else if (KEY("line")) do_line(&pp, rest, nr, li < nl ? ls[li].start : nphys + 1);
+                else if (KEY("pragma") || !nd) { }
+                else if (pp.strict) sh_compile_error(h, "unknown directive #%s", key);
             }
 #undef KEY
+            if (*key) begun = 1;
+            continue;
         }
-        else if (active) {
-            SB j;
-            const char *t = line;
-            size_t tn = (size_t)(le - line);
-            int joined = 0, m;
-            if (st < ste) begun = 1;
-            while (le < e && open_call(&pp, t, tn)) {
-                const char *nb = le + 1, *ne = nb, *sb_, *se;
-                while (ne < e && *ne != '\n') ne++;
-                sb_ = nb; se = ne;
-                sh_strip(&sb_, &se);
-                if (sb_ < se && *sb_ == '#') break;
-                if (!joined) { sb_init(&j, h, tn + (size_t)(ne - nb) + 16); sb_putn(&j, line, tn); }
-                sb_putc(&j, ' ');
-                sb_putn(&j, nb, (size_t)(ne - nb));
-                t = j.p; tn = j.n;
-                le = ne; lineno++; joined++;
+        if (!active) continue;
+        if (toks.n) { begun = 1; code = 1; }
+        while (li < nl && !(ls[li].t.n && !strcmp(ls[li].t.t[0].v, "#"))) {     /* a call of a function-like macro may go on over lines */
+            int open = 0, lp, rp, m;
+            PTV nx;
+            for (m = 0; m < toks.n && !open; m++) {
+                Define *df;
+                if (toks.t[m].k == PT_ID && (df = def_of(&pp, toks.t[m].v)) != NULL && df->funclike && call_end(&toks, m, &lp, &rp) == -1) open = 1;
             }
-            expand(&pp, t, tn, NULL, &out);
-            for (m = 0; m < joined; m++) sb_putc(&out, '\n');   /* the lines joined: blank, the line numbers stay */
+            if (!open) break;
+            nx = ptv_copy(h, ls[li].t.t, ls[li].t.n);
+            if (nx.n) nx.t[0].ws = 1;
+            {
+                PTV j = ptv_copy(h, toks.t, toks.n);
+                for (m = 0; m < nx.n; m++) ptv_push(h, &j, nx.t[m]);
+                toks = j;
+            }
+            li++;
         }
-        if (le >= e) break;
-        line = le + 1;
+        {
+            PTV x = expand(&pp, toks.t, toks.n, 0);
+            out[start - 1] = pp_text(h, x.t, x.n);
+        }
     }
     if (sp) sh_compile_error(h, "#if without #endif");
-    return sb_str(&out);
+    sb_init(&o, h, strlen(src) + 64);
+    for (i = 0; i < nphys; i++) {
+        if (i) sb_putc(&o, '\n');
+        if (out[i]) sb_puts(&o, out[i]);
+    }
+    return sb_str(&o);
 }

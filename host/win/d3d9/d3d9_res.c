@@ -446,16 +446,16 @@ uint16_t d3_tex_ds(d3tex *t)
 {
     d3dev *d = t->dev;
     tex_storage(t);
-    if (!(t->w * 4 % 32)) {
+    if (t->w * 4 == g2r_ds_pitch(t->w)) {                       /* its tight rows are as long as board B loads a depth row */
         if (!t->ds_alias && g2r_image_alias(d->r, &t->ds_alias, t->base, t->w, t->h, G2_FMT_D24S8, t->w * 4, 0, 1, G2_USE_RT) < 0) t->ds_alias = 0;
         return t->ds_alias;
     }
     if (!t->rt) {
-        if (g2r_image_create(d->r, &t->rt, &t->rt_base, t->w, t->h, G2_FMT_RGBA8, 1, 1, 0, G2_USE_RT | G2_USE_TRANSFER) < 0) { t->rt = 0; return 0; }
+        if (g2r_image_create_ds_rows(d->r, &t->rt, &t->rt_base, t->w, t->h, G2_FMT_RGBA8, 0, G2_USE_RT | G2_USE_TRANSFER) < 0) { t->rt = 0; return 0; }
         t->rt_w = (int)t->w; t->rt_h = (int)t->h; t->rt_level = t->rt_face = 0;
         tex_copy_rt(t, 0);
     }
-    if (!t->rt_ds && g2r_image_alias(d->r, &t->rt_ds, t->rt_base, t->w, t->h, G2_FMT_D24S8, (t->w * 4 + 31) & ~31u, 0, 1, G2_USE_RT) < 0) t->rt_ds = 0;
+    if (!t->rt_ds && g2r_image_alias(d->r, &t->rt_ds, t->rt_base, t->w, t->h, G2_FMT_D24S8, g2r_ds_pitch(t->w), 0, 1, G2_USE_RT) < 0) t->rt_ds = 0;
     t->rt_dirty = 1;
     return t->rt_ds;
 }

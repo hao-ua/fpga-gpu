@@ -1,7 +1,8 @@
 /* libGLESv2.dll — OpenGL ES 2.0 and EGL on the two-board GPU. The hardware's native API: every ES 2.0 feature maps onto g2_render, the work here is the object model.
  *
  * Shaders compile at glCompileShader (for the log) and again at link, the fragment stage with the vertex stage's varying order: GLSL matches varyings by name, the compiler numbers them by declaration, the hardware by number.
- * Storage is the real one for the ES formats (RGBA8, RGB565, RGBA4444, RGBA5551); RGB / L / A / LA expand to RGBA8 at upload, as the TMU samples no 8-bit format. DXT decodes on the host to RGBA8, ETC1 to RGB565.
+ * Storage is the real one for the ES formats (RGBA8, RGB565, RGBA4444, RGBA5551); RGB / L / A / LA expand to RGBA8 at upload, as the TMU samples no 8-bit format. DXT and ETC1 decode on the host to RGBA8:
+ * ETC1's texels have 8 bits a channel, which RGB565 would not keep.
  * A 3D texture is a volume of the TMU on a board B that has them, in the same storage. GL_OES_texture_3D is not advertised on another B.
  * The TMU's descriptor has no pitch, so a texture has tight rows; B renders into a pitch that is a multiple of 32 and into one layer. A texture that cannot be both renders into a second image, copied across before it is sampled.
  * B's WRITE_IMAGE / READ_IMAGE move 4444 and 5551 RAW only, so every conversion to or from those is done here. Level 0 creates the image on B; a level that does not fit its chain waits in host memory (es_pend).
@@ -74,6 +75,12 @@
 #define GL_TRANSLATED_SHADER_SOURCE_LENGTH_ANGLE 0x93A0
 #define GL_TEXTURE_IMMUTABLE_FORMAT_EXT 0x912F
 #define GL_BGRA8_EXT 0x93A1
+#ifndef GL_UNSIGNED_SHORT_4_4_4_4_REV_EXT
+#define GL_UNSIGNED_SHORT_4_4_4_4_REV_EXT 0x8365
+#endif
+#ifndef GL_UNSIGNED_SHORT_1_5_5_5_REV_EXT
+#define GL_UNSIGNED_SHORT_1_5_5_5_REV_EXT 0x8366
+#endif
 #define GL_LUMINANCE8_EXT 0x8040
 #define GL_ALPHA8_EXT 0x803C
 #define GL_LUMINANCE8_ALPHA8_EXT 0x8045
@@ -110,10 +117,16 @@ typedef struct es_tex {
     uint32_t rt_base;
     int rt_face, rt_level, rt_w, rt_h, rt_dirty, rt_stale;  /* dirty: rendered, the texture lags; stale: the texture changed, rt lags */
     uint16_t rt_ds, ds_alias;                   /* a depth texture as a depth-stencil target: rt's memory, or its own */
+    int att_refs, orphan;                       /* framebuffer attachments that hold it; orphan: its name was deleted, it lives until the last one lets go */
 } es_tex;
 
-typedef struct es_rb { struct es_rb *next; GLuint name; GLenum ifmt; int w, h; uint16_t handle; uint32_t base, g2fmt; } es_rb;
-typedef struct es_fb { struct es_fb *next; GLuint name; GLenum ct, dt, st; GLuint c, d, s; GLenum face; int z, lvl; uint16_t blind; uint32_t blind_base; int blind_w, blind_h; } es_fb;     /* z: the slice of a 3D colour attachment; lvl: its level; blind: a framebuffer without colour, B has no colourless pass */
+typedef struct es_rb { struct es_rb *next; GLuint name; GLenum ifmt; int w, h; uint16_t handle; uint32_t base, g2fmt; int att_refs, orphan; } es_rb;
+/* an attachment holds the object, not its name: a texture or renderbuffer deleted while attached to a framebuffer that is not bound stays that framebuffer's image, and a new object under the old
+   name is another one. face: the cube map face (or GL_TEXTURE_2D); lvl: the level; z: the slice of a 3D texture */
+typedef struct es_att { GLenum type; GLuint name; struct es_tex *tex; es_rb *rb; GLenum face; int lvl, z; } es_att;
+enum { ATT_COLOR, ATT_DEPTH, ATT_STENCIL };
+typedef struct es_fb { struct es_fb *next; GLuint name; es_att a[3]; uint16_t blind; uint32_t blind_base; int blind_w, blind_h; } es_fb;     /* blind: a framebuffer without colour, B has no colourless pass */
+static int att_index(GLenum a) { return a == GL_DEPTH_ATTACHMENT ? ATT_DEPTH : a == GL_STENCIL_ATTACHMENT ? ATT_STENCIL : ATT_COLOR; }
 
 typedef struct es_shader {
     struct es_shader *next;
@@ -128,11 +141,17 @@ typedef struct es_uni {
     char name[96];
     GLenum type;
     int size;                                   /* array elements */
+    int isarr;                                  /* declared as an array, also of one element: its name reads "[0]" */
     int stride, comps;                          /* slots per element, floats per slot */
+    int voff;                                   /* where its values start in the program's uval */
     int vs, fs;                                 /* base slot, -1: not in that stage */
     int sampler;                                /* first sampler slot, -1: not a sampler */
     int vc, fc;                                 /* the lane it starts at in each stage, when a link packed it */
 } es_uni;
+
+/* an active attribute: loc is its location, the generic attribute it reads, and the vertex core's input the program reads it from; n: locations, a matrix one a column */
+typedef struct es_attr { char name[64]; int loc, n; GLenum type; } es_attr;
+typedef struct es_bind { char name[64]; GLuint loc; } es_bind;
 
 typedef struct es_prog {
     struct es_prog *next;
@@ -143,13 +162,16 @@ typedef struct es_prog {
     char log[800];
     g2r_prog *p;
     es_uni *uni; int nuni;
-    struct { char name[64]; int loc, idx, n; GLenum type; } attr[MAX_ATTR];    /* n: locations, a matrix takes one per column */
+    uint32_t *uval;                             /* every uniform's value as the application gave it, 32 bits a component: float bits, or an int (int, bool, sampler); glGetUniform reads these */
+    es_attr *attr;                              /* the active attributes; two may share a location (§2.10.4 aliasing), so there can be more than locations */
     int nattr;
     struct { uint32_t mask; g2r_prog *p; } dv[8];  /* the program with these samplers reading depth textures */
     int ndv, dv_next;
     uint32_t dnow;                              /* the samplers that do at this draw */
-    struct { char name[64]; GLuint loc; } bind[32];
+    es_bind bind[32];                           /* glBindAttribLocation's */
     int nbind;
+    es_bind lbind[32];                          /* the bindings the last link used: a link again for depth sampling takes these, later ones wait for glLinkProgram */
+    int nlbind;
     int samp_unit[MAX_UNITS], nsamp;
     int dr_vs, dr_fs;            /* gl_DepthRange's first slot in each stage, -1 if the stage does not read it */
     int ts[MAX_UNITS];           /* the slot of the texture size a unit's texture*GradEXT reads, -1 for none */
@@ -225,6 +247,12 @@ static es_shader *sh_of(GLuint n) { FIND(shaders, n, es_shader); return o; }
 static es_prog *pr_of(GLuint n) { FIND(progs, n, es_prog); return o; }
 #define NEW(tab, nm, ty, out) do { ty *x_ = (ty *)calloc(1, sizeof(ty)); if (x_) { x_->name = (nm); x_->next = S.tab[(nm) % HASH]; S.tab[(nm) % HASH] = x_; } (out) = x_; } while (0)
 #define DEL(tab, nm, ty, on) do { ty **pp_ = &S.tab[(nm) % HASH]; while (*pp_) { ty *x_ = *pp_; if (x_->name == (nm)) { *pp_ = x_->next; on; free(x_); break; } pp_ = &x_->next; } } while (0)
+/* the object out of its name's table, not freed; NULL: no object has the name */
+#define UNLINK(tab, nm, ty, out) do { ty **pp_ = &S.tab[(nm) % HASH]; (out) = NULL; while (*pp_) { if ((*pp_)->name == (nm)) { (out) = *pp_; *pp_ = (out)->next; break; } pp_ = &(*pp_)->next; } } while (0)
+
+/* §2.10.1: shaders and programs share one name space. A name of the other kind is INVALID_OPERATION, a name of neither INVALID_VALUE */
+static es_shader *shader_arg(GLuint n) { es_shader *s = sh_of(n); if (!s) SET_ERR(pr_of(n) ? GL_INVALID_OPERATION : GL_INVALID_VALUE); return s; }
+static es_prog *prog_arg(GLuint n) { es_prog *p = pr_of(n); if (!p) SET_ERR(sh_of(n) ? GL_INVALID_OPERATION : GL_INVALID_VALUE); return p; }
 
 /* ---------------------------------------------------------------- the default framebuffer */
 static int dev_up(void)
@@ -370,6 +398,7 @@ static void swap_buffers(void)
 }
 
 static int mip_dim(int d, int l);
+static int is_face(GLenum t);
 
 static int rb_bits(uint32_t fmt, int c)
 {
@@ -384,6 +413,7 @@ static int stencil_rb(GLenum f) { return f == GL_STENCIL_INDEX8 || f == GL_DEPTH
 static GLenum fb_target(es_tg *g)
 {
     es_fb *f = S.fb ? fb_of(S.fb) : NULL;
+    const es_att *c, *da, *sa;
     GLenum unsupported = 0;
     memset(g, 0, sizeof *g);
     g->fmt = G2_FMT_RGBA8;
@@ -398,23 +428,24 @@ static GLenum fb_target(es_tg *g)
         g->kx = (double)S.fb_w / S.vw; g->ky = (double)S.fb_h / S.vh;
         return GL_FRAMEBUFFER_COMPLETE;
     }
-    if (!f->ct && !f->dt && !f->st) return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
-    if (f->ct == GL_TEXTURE) {
-        es_tex *x = tex_of(f->c);
-        int face = f->face >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && f->face <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(f->face - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
-        if (x && x->target == GL_TEXTURE_3D_OES && f->z >= x->d) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+    c = &f->a[ATT_COLOR]; da = &f->a[ATT_DEPTH]; sa = &f->a[ATT_STENCIL];
+    if (!c->type && !da->type && !sa->type) return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+    if (c->type == GL_TEXTURE) {
+        es_tex *x = c->tex;
+        int face = is_face(c->face) ? (int)(c->face - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
+        if (x && x->target == GL_TEXTURE_3D_OES && c->z >= x->d) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         if (!x || !x->handle || !x->lkey[x->target == GL_TEXTURE_3D_OES ? 0 : face][0] || x->compressed || (x->format != GL_RGBA && x->format != GL_RGB && x->format != GL_BGRA_EXT)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         g->fmt = x->g2fmt;
         g->t.color = x->handle; g->t.width = (uint32_t)x->w; g->t.height = (uint32_t)x->h;
         g->no_alpha = x->format == GL_RGB && x->g2fmt == G2_FMT_RGBA8;
         g->tex = x;
-        g->face = x->target == GL_TEXTURE_3D_OES ? f->z : face;
-        g->level = f->lvl;
-        g->t.width = (uint32_t)mip_dim(x->w, f->lvl); g->t.height = (uint32_t)mip_dim(x->h, f->lvl);
-        if (x->lkey[x->target == GL_TEXTURE_3D_OES ? 0 : face][f->lvl] == 0) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        g->face = x->target == GL_TEXTURE_3D_OES ? c->z : face;
+        g->level = c->lvl;
+        g->t.width = (uint32_t)mip_dim(x->w, c->lvl); g->t.height = (uint32_t)mip_dim(x->h, c->lvl);
+        if (x->lkey[x->target == GL_TEXTURE_3D_OES ? 0 : face][c->lvl] == 0) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         if (g->t.width > MAX_RT_W) unsupported = GL_FRAMEBUFFER_UNSUPPORTED;
-    } else if (f->ct == GL_RENDERBUFFER) {
-        es_rb *b = rb_of(f->c);
+    } else if (c->type == GL_RENDERBUFFER) {
+        es_rb *b = c->rb;
         if (!b || !b->handle || depth_rb(b->ifmt) || stencil_rb(b->ifmt)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         g->fmt = b->g2fmt;
         g->t.color = b->handle; g->t.width = (uint32_t)b->w; g->t.height = (uint32_t)b->h;
@@ -422,18 +453,18 @@ static GLenum fb_target(es_tg *g)
     }
     g->fb = f;
     g->t.bits_r = rb_bits(g->fmt, 0); g->t.bits_g = rb_bits(g->fmt, 1); g->t.bits_b = rb_bits(g->fmt, 2); g->t.bits_a = rb_bits(g->fmt, 3);
-    if (f->dt == GL_TEXTURE || f->st == GL_TEXTURE) {           /* OES_depth_texture: one word holds depth and stencil, so one texture */
-        es_tex *x = tex_of(f->dt == GL_TEXTURE ? f->d : f->s);
-        if (!x || !x->handle || !x->lkey[0][0] || (x->format != GL_DEPTH_COMPONENT && x->format != GL_DEPTH_STENCIL_OES) || (f->st == GL_TEXTURE && x->format != GL_DEPTH_STENCIL_OES)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
-        if ((f->dt && f->dt != GL_TEXTURE) || (f->st && f->st != GL_TEXTURE) || (f->dt && f->st && f->d != f->s)) unsupported = GL_FRAMEBUFFER_UNSUPPORTED;
+    if (da->type == GL_TEXTURE || sa->type == GL_TEXTURE) {     /* OES_depth_texture: one word holds depth and stencil, so one texture */
+        es_tex *x = da->type == GL_TEXTURE ? da->tex : sa->tex;
+        if (!x || !x->handle || !x->lkey[0][0] || (x->format != GL_DEPTH_COMPONENT && x->format != GL_DEPTH_STENCIL_OES) || (sa->type == GL_TEXTURE && x->format != GL_DEPTH_STENCIL_OES)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        if ((da->type && da->type != GL_TEXTURE) || (sa->type && sa->type != GL_TEXTURE) || (da->type && sa->type && da->tex != sa->tex)) unsupported = GL_FRAMEBUFFER_UNSUPPORTED;
         if (g->t.width && ((uint32_t)x->w != g->t.width || (uint32_t)x->h != g->t.height)) return GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS;
         if (x->w > MAX_RT_W) unsupported = GL_FRAMEBUFFER_UNSUPPORTED;
         g->t.width = (uint32_t)x->w; g->t.height = (uint32_t)x->h;
         g->dtex = x;
-        g->has_d = f->dt != 0; g->has_s = f->st != 0;
-    } else if (f->dt || f->st) {
-        es_rb *d = f->dt ? rb_of(f->d) : NULL, *s = f->st ? rb_of(f->s) : NULL, *b = d ? d : s;
-        if ((f->dt && (!d || !d->handle || !depth_rb(d->ifmt))) || (f->st && (!s || !s->handle || !stencil_rb(s->ifmt)))) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        g->has_d = da->type != 0; g->has_s = sa->type != 0;
+    } else if (da->type || sa->type) {
+        es_rb *d = da->type ? da->rb : NULL, *s = sa->type ? sa->rb : NULL, *b = d ? d : s;
+        if ((da->type && (!d || !d->handle || !depth_rb(d->ifmt))) || (sa->type && (!s || !s->handle || !stencil_rb(s->ifmt)))) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         if (g->t.color && ((uint32_t)b->w != g->t.width || (uint32_t)b->h != g->t.height)) return GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS;
         if (d && s && (d != s)) unsupported = GL_FRAMEBUFFER_UNSUPPORTED;
         g->t.ds = b->handle;
@@ -484,12 +515,14 @@ static void tex_drop_rt(es_tex *t)
     t->rt = 0; t->rt_dirty = t->rt_stale = 0;
 }
 
-/* what a framebuffer renders in when it cannot be the texture: another level, another layer, a pitch that is no multiple of 32 */
-static int tex_rt(es_tex *x, int face, int level, int w, int h)
+/* what a framebuffer renders in when it cannot be the texture: another level, another layer, a pitch that is no multiple of 32; for a depth
+   texture (ds) rows as long as board B loads a depth row, which its D24S8 alias renders through */
+static int tex_rt(es_tex *x, int face, int level, int w, int h, int ds)
 {
     if (x->rt && (x->rt_w != w || x->rt_h != h)) { tex_resolve(x); if (x->rt_ds) { g2r_end_pass(S.r); g2r_alias_destroy(S.r, x->rt_ds); x->rt_ds = 0; } g2r_end_pass(S.r); g2r_image_destroy(S.r, x->rt, x->rt_base); x->rt = 0; x->rt_stale = 0; }
     if (!x->rt) {
-        if (g2r_image_create(S.r, &x->rt, &x->rt_base, (uint32_t)w, (uint32_t)h, x->g2fmt, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER) < 0) { x->rt = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
+        if ((ds ? g2r_image_create_ds_rows(S.r, &x->rt, &x->rt_base, (uint32_t)w, (uint32_t)h, x->g2fmt, 1, G2_USE_RT | G2_USE_TRANSFER)
+                : g2r_image_create(S.r, &x->rt, &x->rt_base, (uint32_t)w, (uint32_t)h, x->g2fmt, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER)) < 0) { x->rt = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
         x->rt_stale = 1; x->rt_face = face; x->rt_level = level; x->rt_w = w; x->rt_h = h;
     }
     if (x->rt_face != face || x->rt_level != level) { tex_resolve(x); x->rt_face = face; x->rt_level = level; x->rt_stale = 1; }
@@ -502,14 +535,14 @@ static int bind_target(es_tg *g)
 {
     if (fb_target(g) != GL_FRAMEBUFFER_COMPLETE) { SET_ERR(GL_INVALID_FRAMEBUFFER_OPERATION); return -1; }
     if (g->tex && (tex_needs_rt(g->tex) || g->level)) {
-        if (tex_rt(g->tex, g->face, g->level, (int)g->t.width, (int)g->t.height) < 0) return -1;
+        if (tex_rt(g->tex, g->face, g->level, (int)g->t.width, (int)g->t.height, 0) < 0) return -1;
         g->t.color = g->tex->rt;
     }
     if (g->dtex) {
         es_tex *x = g->dtex;
-        if (tex_needs_rt(x)) {
-            if (tex_rt(x, 0, 0, x->w, x->h) < 0) return -1;
-            if (!x->rt_ds && g2r_image_alias(S.r, &x->rt_ds, x->rt_base, (uint32_t)x->w, (uint32_t)x->h, G2_FMT_D24S8, ((uint32_t)x->w * 4 + 31) & ~31u, 1, 1, G2_USE_RT) < 0) { x->rt_ds = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
+        if (tex_needs_rt(x) || (uint32_t)x->w * 4 != g2r_ds_pitch((uint32_t)x->w)) {     /* its tight rows are shorter than a depth row of board B */
+            if (tex_rt(x, 0, 0, x->w, x->h, 1) < 0) return -1;
+            if (!x->rt_ds && g2r_image_alias(S.r, &x->rt_ds, x->rt_base, (uint32_t)x->w, (uint32_t)x->h, G2_FMT_D24S8, g2r_ds_pitch((uint32_t)x->w), 1, 1, G2_USE_RT) < 0) { x->rt_ds = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
             g->t.ds = x->rt_ds;
         } else {
             if (!x->ds_alias && g2r_image_alias(S.r, &x->ds_alias, x->base, (uint32_t)x->w, (uint32_t)x->h, G2_FMT_D24S8, (uint32_t)x->w * 4, 1, 1, G2_USE_RT) < 0) { x->ds_alias = 0; SET_ERR(GL_OUT_OF_MEMORY); return -1; }
@@ -659,6 +692,15 @@ static uint32_t natural_fmt(GLenum format, GLenum type)
     default: return NOFMT;
     }
 }
+/* §3.7.1, table 3.4 and the extensions' rows: 0 = format and type are accepted values and go together; INVALID_ENUM: one of them is not an accepted value; INVALID_OPERATION: accepted values that do not
+   go together */
+static GLenum format_type_error(GLenum format, GLenum type)
+{
+    int fok = format == GL_RGBA || format == GL_RGB || format == GL_LUMINANCE_ALPHA || format == GL_LUMINANCE || format == GL_ALPHA || format == GL_BGRA_EXT || format == GL_DEPTH_COMPONENT || format == GL_DEPTH_STENCIL_OES;
+    int tok = type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_SHORT_5_6_5 || type == GL_UNSIGNED_SHORT_4_4_4_4 || type == GL_UNSIGNED_SHORT_5_5_5_1 || type == GL_UNSIGNED_SHORT || type == GL_UNSIGNED_INT || type == GL_UNSIGNED_INT_24_8_OES;
+    if (!fok || !tok) return GL_INVALID_ENUM;
+    return natural_fmt(format, type) == NOFMT ? GL_INVALID_OPERATION : 0;
+}
 static int client_bpp(GLenum format, GLenum type) { return type == GL_UNSIGNED_INT || type == GL_UNSIGNED_INT_24_8_OES ? 4 : type != GL_UNSIGNED_BYTE ? 2 : format == GL_LUMINANCE || format == GL_ALPHA ? 1 : format == GL_LUMINANCE_ALPHA ? 2 : format == GL_RGB ? 3 : 4; }
 
 static void px_rgba8(const uint8_t *s, int c, GLenum format, GLenum type, uint8_t *d)
@@ -764,17 +806,48 @@ static void tex_free(es_tex *t)
     /* the open pass ends only if it used the texture: its draws wait for the FLUSH and still need the texels */
     if (t->handle && S.r) { if (t->used_pass == g2r_pass_id(S.r)) g2r_end_pass(S.r); g2r_image_destroy(S.r, t->handle, t->base); }
 }
+static void rb_free(es_rb *b) { if (b->handle && S.r) { g2r_end_pass(S.r); g2r_image_destroy(S.r, b->handle, b->base); } }
+
+/* an attachment point let go of its image: an object whose name is gone dies with the last attachment that held it */
+static void att_release(es_att *a)
+{
+    if (a->tex && !--a->tex->att_refs && a->tex->orphan) { tex_free(a->tex); free(a->tex); }
+    if (a->rb && !--a->rb->att_refs && a->rb->orphan) { rb_free(a->rb); free(a->rb); }
+    memset(a, 0, sizeof *a);
+}
+static void att_set(es_att *a, GLenum type, GLuint name, es_tex *t, es_rb *b, GLenum face, int lvl, int z)
+{
+    if (t) t->att_refs++;
+    if (b) b->att_refs++;
+    att_release(a);
+    if (!t && !b) return;
+    a->type = type; a->name = name; a->tex = t; a->rb = b; a->face = face; a->lvl = lvl; a->z = z;
+}
+/* §4.4.2: an image deleted while attached to the bound framebuffer (draw or read) is detached from it, as if attached again with name 0. Other framebuffers keep it */
+static void detach_bound(es_tex *t, es_rb *b)
+{
+    GLuint bound[2];
+    int i, k;
+    bound[0] = S.fb; bound[1] = S.read_fb;
+    for (i = 0; i < 2; i++) {
+        es_fb *f = bound[i] ? fb_of(bound[i]) : NULL;
+        if (!f) continue;
+        for (k = 0; k < 3; k++) if ((t && f->a[k].tex == t) || (b && f->a[k].rb == b)) att_release(&f->a[k]);
+    }
+}
 void ES_APIENTRY glDeleteTextures(GLsizei n, const GLuint *t)
 {
-    es_fb *f = S.fb ? fb_of(S.fb) : NULL;
     GLsizei i;
     int u;
     if (n < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     for (i = 0; i < n; i++) {
-        if (!t[i]) continue;
+        es_tex *x;
+        if (!t[i] || !(x = tex_of(t[i]))) continue;
         for (u = 0; u < MAX_UNITS; u++) { if (S.tex2d[u] == t[i]) S.tex2d[u] = 0; if (S.cube[u] == t[i]) S.cube[u] = 0; if (S.tex3d[u] == t[i]) S.tex3d[u] = 0; }
-        if (f && f->ct == GL_TEXTURE && f->c == t[i]) { f->ct = 0; f->c = 0; }                  /* §4.4.2: detached from the bound framebuffer */
-        DEL(texs, t[i], es_tex, tex_free(x_));
+        detach_bound(x, NULL);
+        UNLINK(texs, t[i], es_tex, x);
+        if (x->att_refs) x->orphan = 1;
+        else { tex_free(x); free(x); }
     }
 }
 static void tex_param(GLenum target, GLenum p, GLint v)
@@ -915,12 +988,17 @@ void ES_APIENTRY glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w,
     uint32_t fmt, etf = 0;
     int ebpp = 0;
     uint8_t *px = NULL;
+    GLenum e;
     if (!image_target(target)) return;
     if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0 || w > MAX_TEX >> level || h > MAX_TEX >> level || border) { SET_ERR(GL_INVALID_VALUE); return; }
     if (is_face(target) && w != h) { SET_ERR(GL_INVALID_VALUE); return; }
+    switch ((GLenum)ifmt) {                                     /* internalformat is no enum here: one it does not take is INVALID_VALUE */
+    case GL_ALPHA: case GL_LUMINANCE: case GL_LUMINANCE_ALPHA: case GL_RGB: case GL_RGBA: case GL_BGRA_EXT: case GL_BGRA8_EXT: case GL_DEPTH_COMPONENT: case GL_DEPTH_STENCIL_OES: break;
+    default: SET_ERR(GL_INVALID_VALUE); return;
+    }
+    if ((e = format_type_error(format, type))) { SET_ERR(e); return; }
     fmt = natural_fmt(format, type);
-    if (fmt == NOFMT) { SET_ERR(GL_INVALID_ENUM); return; }
-    if ((GLenum)ifmt != format) { SET_ERR(GL_INVALID_OPERATION); return; }
+    if ((GLenum)ifmt == GL_BGRA8_EXT ? format != GL_BGRA_EXT : (GLenum)ifmt != format) { SET_ERR(GL_INVALID_OPERATION); return; }     /* EXT_texture_format_BGRA8888: BGRA8_EXT is BGRA_EXT's sized form */
     if ((format == GL_DEPTH_COMPONENT || format == GL_DEPTH_STENCIL_OES) && (target != GL_TEXTURE_2D || level)) { SET_ERR(GL_INVALID_OPERATION); return; }    /* OES_depth_texture: one level of a 2D texture */
     if (!S.live) return;
     if (unit_tex(S.active, is_face(target))->immutable && !S.tex_storing) { SET_ERR(GL_INVALID_OPERATION); return; }
@@ -934,9 +1012,10 @@ void ES_APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, G
     int ebpp, face = face_of(target);
     uint8_t *px;
     es_tex *t;
+    GLenum e;
     if (!image_target(target)) return;
     if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0 || x < 0 || y < 0) { SET_ERR(GL_INVALID_VALUE); return; }
-    if (natural_fmt(format, type) == NOFMT) { SET_ERR(GL_INVALID_ENUM); return; }
+    if ((e = format_type_error(format, type))) { SET_ERR(e); return; }
     t = unit_tex(S.active, is_face(target));
     if (!S.live) return;
     if (!t->lkey[face][level] || (t->lkey[face][level] & 0xFFFF) != format) { SET_ERR(GL_INVALID_OPERATION); return; }
@@ -969,13 +1048,12 @@ void ES_APIENTRY glCompressedTexImage2D(GLenum target, GLint level, GLenum f, GL
     if ((uint32_t)size != (etc ? g2_etc1_bytes(w, h) : g2_dxt_bytes(k, w, h))) { SET_ERR(GL_INVALID_VALUE); return; }
     if (!S.live) return;
     if (data && w && h) {
-        px = (uint8_t *)malloc((size_t)w * h * (etc ? 2 : 4));
+        px = (uint8_t *)malloc((size_t)w * h * 4);
         if (!px) { SET_ERR(GL_OUT_OF_MEMORY); return; }
-        if (etc) g2_etc1_decode((const uint8_t *)data, w, h, (uint16_t *)px);
+        if (etc) g2_etc1_decode((const uint8_t *)data, w, h, px);
         else g2_dxt_decode(k, (const uint8_t *)data, w, h, px);
     }
-    if (etc) tex_image(target, level, w, h, (uint32_t)f, f, G2_FMT_RGB565, 1, px, G2_TF_RAW, 2);
-    else tex_image(target, level, w, h, (uint32_t)f, f, G2_FMT_RGBA8, 1, px, G2_TF_RGBA8888, 4);
+    tex_image(target, level, w, h, (uint32_t)f, f, G2_FMT_RGBA8, 1, px, G2_TF_RGBA8888, 4);
 }
 
 void ES_APIENTRY glCompressedTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLsizei size, const void *data)
@@ -1083,10 +1161,11 @@ void ES_APIENTRY glTexImage3DOES(GLenum target, GLint level, GLenum ifmt, GLsize
     uint32_t fmt, etf = 0;
     int ebpp = 0;
     uint8_t *px = NULL;
+    GLenum e;
     if (target != GL_TEXTURE_3D_OES || !has_3d()) { SET_ERR(GL_INVALID_ENUM); return; }
     if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0 || d < 0 || w > G2R_VOL_WH >> level || h > G2R_VOL_WH >> level || d > G2R_VOL_D >> level || border) { SET_ERR(GL_INVALID_VALUE); return; }
+    if ((e = format_type_error(format, type))) { SET_ERR(e); return; }
     fmt = natural_fmt(format, type);
-    if (fmt == NOFMT) { SET_ERR(GL_INVALID_ENUM); return; }
     if (ifmt != format) { SET_ERR(GL_INVALID_OPERATION); return; }
     if (!S.live) return;
     if (unit_tex(S.active, 2)->immutable && !S.tex_storing) { SET_ERR(GL_INVALID_OPERATION); return; }
@@ -1100,9 +1179,10 @@ void ES_APIENTRY glTexSubImage3DOES(GLenum target, GLint level, GLint x, GLint y
     int ebpp;
     uint8_t *px;
     es_tex *t;
+    GLenum e;
     if (target != GL_TEXTURE_3D_OES || !has_3d()) { SET_ERR(GL_INVALID_ENUM); return; }
     if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0 || d < 0 || x < 0 || y < 0 || z < 0) { SET_ERR(GL_INVALID_VALUE); return; }
-    if (natural_fmt(format, type) == NOFMT) { SET_ERR(GL_INVALID_ENUM); return; }
+    if ((e = format_type_error(format, type))) { SET_ERR(e); return; }
     t = unit_tex(S.active, 2);
     if (!S.live) return;
     if (!t->lkey[0][level] || (t->lkey[0][level] & 0xFFFF) != format) { SET_ERR(GL_INVALID_OPERATION); return; }
@@ -1265,6 +1345,20 @@ static int read_rgba8(const es_tg *g, int x, int y, int w, int h, uint8_t *out)
     return rc;
 }
 
+/* §4.4.5: a command that reads the framebuffer reads none that is not complete. g: what it would read */
+static int read_fb_target(es_tg *g)
+{
+    GLuint draw_fb = S.fb;
+    GLenum st;
+    S.fb = S.read_fb;
+    st = fb_target(g);
+    S.fb = draw_fb;
+    if (st == GL_FRAMEBUFFER_COMPLETE) return 1;
+    SET_ERR(GL_INVALID_FRAMEBUFFER_OPERATION);
+    return 0;
+}
+static int read_fb_complete(void) { es_tg g; return read_fb_target(&g); }
+
 /* table 3.6: which channels of the framebuffer a copy takes */
 static void copy_into(es_tex *t, int level, int face, int xo, int yo, int x, int y, int w, int h, GLenum tformat)
 {
@@ -1328,6 +1422,7 @@ void ES_APIENTRY glCopyTexSubImage3DOES(GLenum target, GLint level, GLint xo, GL
     if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0 || xo < 0 || yo < 0 || zo < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     t = unit_tex(S.active, 2);
     if (!S.live) return;
+    if (!read_fb_complete()) return;
     if (!t->lkey[0][level]) { SET_ERR(GL_INVALID_OPERATION); return; }
     if (xo + w > t->lw[0][level] || yo + h > t->lh[0][level] || zo >= t->ld[level]) { SET_ERR(GL_INVALID_VALUE); return; }
     if (w && h) copy_into(t, level, zo, xo, yo, x, y, w, h, t->lkey[0][level] & 0xFFFF);
@@ -1341,6 +1436,7 @@ void ES_APIENTRY glCopyTexSubImage2D(GLenum target, GLint level, GLint xo, GLint
     if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0 || xo < 0 || yo < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     t = unit_tex(S.active, is_face(target));
     if (!S.live) return;
+    if (!read_fb_complete()) return;
     if (!t->lkey[face][level] || (t->lkey[face][level] >> 16) == 0) { SET_ERR(GL_INVALID_OPERATION); return; }
     if (xo + w > t->lw[face][level] || yo + h > t->lh[face][level]) { SET_ERR(GL_INVALID_VALUE); return; }
     if (w && h) copy_into(t, level, face, xo, yo, x, y, w, h, t->lkey[face][level] & 0xFFFF);
@@ -1351,8 +1447,20 @@ void ES_APIENTRY glCopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint
     es_tex *t;
     if (!image_target(target)) return;
     if (ifmt != GL_ALPHA && ifmt != GL_LUMINANCE && ifmt != GL_LUMINANCE_ALPHA && ifmt != GL_RGB && ifmt != GL_RGBA) { SET_ERR(GL_INVALID_ENUM); return; }
-    glTexImage2D(target, level, (GLint)ifmt, w, h, border, ifmt, GL_UNSIGNED_BYTE, NULL);
-    if (S.error != GL_NO_ERROR || !S.live || !w || !h) return;
+    if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0 || w > MAX_TEX >> level || h > MAX_TEX >> level || border || (is_face(target) && w != h)) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (S.live) {                                               /* before the image is defined: a command that fails changes nothing */
+        es_tg g;
+        if (!read_fb_target(&g)) return;
+        if ((ifmt == GL_ALPHA || ifmt == GL_LUMINANCE_ALPHA || ifmt == GL_RGBA) && (g.no_alpha || g.fmt == G2_FMT_RGB565)) { SET_ERR(GL_INVALID_OPERATION); return; }    /* table 3.6 */
+    }
+    {
+        GLenum before = S.error, now;
+        S.error = GL_NO_ERROR;
+        glTexImage2D(target, level, (GLint)ifmt, w, h, border, ifmt, GL_UNSIGNED_BYTE, NULL);
+        now = S.error;
+        S.error = before != GL_NO_ERROR ? before : now;
+        if (now != GL_NO_ERROR || !S.live || !w || !h) return;
+    }
     t = unit_tex(S.active, is_face(target));
     copy_into(t, level, face_of(target), 0, 0, x, y, w, h, ifmt);
 }
@@ -1392,18 +1500,16 @@ void ES_APIENTRY glBindRenderbuffer(GLenum t, GLuint b)
 }
 void ES_APIENTRY glDeleteRenderbuffers(GLsizei n, const GLuint *b)
 {
-    es_fb *f = S.fb ? fb_of(S.fb) : NULL;
     GLsizei i;
     if (n < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     for (i = 0; i < n; i++) {
-        if (!b[i]) continue;
+        es_rb *x;
+        if (!b[i] || !(x = rb_of(b[i]))) continue;
         if (S.rb == b[i]) S.rb = 0;
-        if (f) {
-            if (f->ct == GL_RENDERBUFFER && f->c == b[i]) { f->ct = 0; f->c = 0; }
-            if (f->dt == GL_RENDERBUFFER && f->d == b[i]) { f->dt = 0; f->d = 0; }
-            if (f->st == GL_RENDERBUFFER && f->s == b[i]) { f->st = 0; f->s = 0; }
-        }
-        DEL(rbs, b[i], es_rb, if (x_->handle && S.r) { g2r_end_pass(S.r); g2r_image_destroy(S.r, x_->handle, x_->base); });
+        detach_bound(NULL, x);
+        UNLINK(rbs, b[i], es_rb, x);
+        if (x->att_refs) x->orphan = 1;
+        else { rb_free(x); free(x); }
     }
 }
 void ES_APIENTRY glRenderbufferStorage(GLenum t, GLenum ifmt, GLsizei w, GLsizei h)
@@ -1417,10 +1523,11 @@ void ES_APIENTRY glRenderbufferStorage(GLenum t, GLenum ifmt, GLsizei w, GLsizei
     case GL_RGB5_A1: f = G2_FMT_RGBA5551; break;
     case GL_RGB565: f = G2_FMT_RGB565; break;
     case GL_RGBA8: case GL_RGB8: f = G2_FMT_RGBA8; break;
+    case GL_BGRA_EXT: case GL_BGRA8_EXT: f = G2_FMT_RGBA8; break;     /* EXT_texture_format_BGRA8888's colour-renderable formats of table 4.5; the order of the bytes in memory is no renderbuffer's business */
     case GL_DEPTH_COMPONENT16: case GL_DEPTH_COMPONENT24: case GL_STENCIL_INDEX8: case GL_DEPTH24_STENCIL8: f = G2_FMT_D24S8; break;
     default: SET_ERR(GL_INVALID_ENUM); return;
     }
-    if (w < 0 || h < 0 || w > MAX_RT_W || h > MAX_TEX) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (w < 0 || h < 0 || w > MAX_RT_W || h > MAX_RT_W) { SET_ERR(GL_INVALID_VALUE); return; }     /* both against MAX_RENDERBUFFER_SIZE */
     if (!S.live) return;
     if (b->handle) { g2r_end_pass(S.r); g2r_image_destroy(S.r, b->handle, b->base); b->handle = 0; }
     b->ifmt = ifmt; b->w = w; b->h = h; b->g2fmt = f;
@@ -1459,8 +1566,19 @@ void ES_APIENTRY glBindFramebuffer(GLenum t, GLuint b)
 void ES_APIENTRY glDeleteFramebuffers(GLsizei n, const GLuint *b)
 {
     GLsizei i;
+    int k;
     if (n < 0) { SET_ERR(GL_INVALID_VALUE); return; }
-    for (i = 0; i < n; i++) { if (S.fb == b[i]) S.fb = 0; if (b[i]) DEL(fbs, b[i], es_fb, (void)x_); }
+    for (i = 0; i < n; i++) {
+        es_fb *f;
+        if (!b[i]) continue;
+        if (S.fb == b[i]) S.fb = 0;
+        if (S.read_fb == b[i]) S.read_fb = 0;
+        UNLINK(fbs, b[i], es_fb, f);
+        if (!f) continue;
+        for (k = 0; k < 3; k++) att_release(&f->a[k]);
+        if (f->blind && S.r) { g2r_end_pass(S.r); g2r_image_destroy(S.r, f->blind, f->blind_base); }
+        free(f);
+    }
 }
 GLenum ES_APIENTRY glCheckFramebufferStatus(GLenum t)
 {
@@ -1480,9 +1598,7 @@ void ES_APIENTRY glFramebufferTexture2D(GLenum t, GLenum att, GLenum tt, GLuint 
         if (!x || x->target == GL_TEXTURE_3D_OES || (x->target == GL_TEXTURE_2D) != (tt == GL_TEXTURE_2D)) { SET_ERR(GL_INVALID_OPERATION); return; }
         if (level < 0 || level >= MAX_LEVELS || (level && att != GL_COLOR_ATTACHMENT0)) { SET_ERR(GL_INVALID_VALUE); return; }     /* OES_fbo_render_mipmap */
     }
-    if (att == GL_COLOR_ATTACHMENT0) { f->ct = tex ? GL_TEXTURE : 0; f->c = tex; f->face = tt; f->z = 0; f->lvl = level; }
-    else if (att == GL_DEPTH_ATTACHMENT) { f->dt = tex ? GL_TEXTURE : 0; f->d = tex; }
-    else { f->st = tex ? GL_TEXTURE : 0; f->s = tex; }
+    att_set(&f->a[att_index(att)], GL_TEXTURE, tex, tex ? tex_of(tex) : NULL, NULL, tt, level, 0);
 }
 void ES_APIENTRY glFramebufferTexture3DOES(GLenum t, GLenum att, GLenum tt, GLuint tex, GLint level, GLint z)
 {
@@ -1496,9 +1612,7 @@ void ES_APIENTRY glFramebufferTexture3DOES(GLenum t, GLenum att, GLenum tt, GLui
         if (!x || x->target != GL_TEXTURE_3D_OES) { SET_ERR(GL_INVALID_OPERATION); return; }
         if (level < 0 || level >= MAX_LEVELS || z < 0 || z >= G2R_VOL_D) { SET_ERR(GL_INVALID_VALUE); return; }
     }
-    if (att == GL_COLOR_ATTACHMENT0) { f->ct = tex ? GL_TEXTURE : 0; f->c = tex; f->face = tt; f->z = z; f->lvl = level; }
-    else if (att == GL_DEPTH_ATTACHMENT) { f->dt = tex ? GL_TEXTURE : 0; f->d = tex; }
-    else { f->st = tex ? GL_TEXTURE : 0; f->s = tex; }
+    att_set(&f->a[att_index(att)], GL_TEXTURE, tex, tex ? tex_of(tex) : NULL, NULL, tt, level, z);
 }
 void ES_APIENTRY glFramebufferRenderbuffer(GLenum t, GLenum att, GLenum rt, GLuint rb)
 {
@@ -1506,24 +1620,22 @@ void ES_APIENTRY glFramebufferRenderbuffer(GLenum t, GLenum att, GLenum rt, GLui
     if (t != GL_FRAMEBUFFER || (rt != GL_RENDERBUFFER && rb)) { SET_ERR(GL_INVALID_ENUM); return; }
     if (att != GL_COLOR_ATTACHMENT0 && att != GL_DEPTH_ATTACHMENT && att != GL_STENCIL_ATTACHMENT) { SET_ERR(GL_INVALID_ENUM); return; }
     if (!f || (rb && !rb_of(rb))) { SET_ERR(GL_INVALID_OPERATION); return; }
-    if (att == GL_COLOR_ATTACHMENT0) { f->ct = rb ? GL_RENDERBUFFER : 0; f->c = rb; f->lvl = 0; }
-    else if (att == GL_DEPTH_ATTACHMENT) { f->dt = rb ? GL_RENDERBUFFER : 0; f->d = rb; }
-    else { f->st = rb ? GL_RENDERBUFFER : 0; f->s = rb; }
+    att_set(&f->a[att_index(att)], GL_RENDERBUFFER, rb, NULL, rb ? rb_of(rb) : NULL, 0, 0, 0);
 }
 void ES_APIENTRY glGetFramebufferAttachmentParameteriv(GLenum t, GLenum att, GLenum p, GLint *v)
 {
     es_fb *f = S.fb ? fb_of(S.fb) : NULL;
-    GLenum ty = 0;
-    GLuint n = 0;
+    const es_att *a;
     if (t != GL_FRAMEBUFFER) { SET_ERR(GL_INVALID_ENUM); return; }
     if (!f) { SET_ERR(GL_INVALID_OPERATION); return; }
-    if (att == GL_COLOR_ATTACHMENT0) { ty = f->ct; n = f->c; } else if (att == GL_DEPTH_ATTACHMENT) { ty = f->dt; n = f->d; } else if (att == GL_STENCIL_ATTACHMENT) { ty = f->st; n = f->s; } else { SET_ERR(GL_INVALID_ENUM); return; }
+    if (att != GL_COLOR_ATTACHMENT0 && att != GL_DEPTH_ATTACHMENT && att != GL_STENCIL_ATTACHMENT) { SET_ERR(GL_INVALID_ENUM); return; }
+    a = &f->a[att_index(att)];
     switch (p) {
-    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE: *v = ty ? (GLint)ty : GL_NONE; break;
-    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: if (!ty) SET_ERR(GL_INVALID_ENUM); else *v = (GLint)n; break;
-    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: if (ty != GL_TEXTURE) SET_ERR(GL_INVALID_ENUM); else *v = att == GL_COLOR_ATTACHMENT0 ? f->lvl : 0; break;
-    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE: if (ty != GL_TEXTURE) SET_ERR(GL_INVALID_ENUM); else *v = is_face(f->face) ? (GLint)f->face : 0; break;
-    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_3D_ZOFFSET_OES: if (ty != GL_TEXTURE || !has_3d()) SET_ERR(GL_INVALID_ENUM); else *v = f->z; break;
+    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE: *v = a->type ? (GLint)a->type : GL_NONE; break;
+    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: if (!a->type) SET_ERR(GL_INVALID_ENUM); else *v = (GLint)a->name; break;
+    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: if (a->type != GL_TEXTURE) SET_ERR(GL_INVALID_ENUM); else *v = a->lvl; break;
+    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE: if (a->type != GL_TEXTURE) SET_ERR(GL_INVALID_ENUM); else *v = is_face(a->face) ? (GLint)a->face : 0; break;
+    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_3D_ZOFFSET_OES: if (a->type != GL_TEXTURE || !has_3d()) SET_ERR(GL_INVALID_ENUM); else *v = a->z; break;
     default: SET_ERR(GL_INVALID_ENUM); break;
     }
 }
@@ -1542,19 +1654,20 @@ GLuint ES_APIENTRY glCreateShader(GLenum type)
 static void shader_free(GLuint n) { DEL(shaders, n, es_shader, { free(x_->src); free(x_->compiled_src); }); }
 void ES_APIENTRY glDeleteShader(GLuint n)
 {
-    es_shader *s = n ? sh_of(n) : NULL;
+    es_shader *s;
     if (!n) return;
-    if (!s) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!(s = shader_arg(n))) return;
     s->del = 1;
     if (!s->refs) shader_free(n);
 }
 GLboolean ES_APIENTRY glIsShader(GLuint n) { return n && sh_of(n); }
 void ES_APIENTRY glShaderSource(GLuint n, GLsizei count, const GLchar *const *str, const GLint *len)
 {
-    es_shader *s = sh_of(n);
+    es_shader *s = shader_arg(n);
     size_t total = 0, o = 0;
     GLsizei i;
-    if (!s || count < 0) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!s) return;
+    if (count < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     for (i = 0; i < count; i++) total += len && len[i] >= 0 ? (size_t)len[i] : strlen(str[i]);
     free(s->src);
     s->src = (char *)malloc(total + 1);
@@ -1568,9 +1681,9 @@ void ES_APIENTRY glShaderSource(GLuint n, GLsizei count, const GLchar *const *st
 }
 void ES_APIENTRY glCompileShader(GLuint n)
 {
-    es_shader *s = sh_of(n);
+    es_shader *s = shader_arg(n);
     g2sc_result r;
-    if (!s) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!s) return;
     s->compiled = 0;
     if (!s->src) { snprintf(s->log, sizeof s->log, "no source"); return; }
     memset(&r, 0, sizeof r);
@@ -1587,8 +1700,8 @@ void ES_APIENTRY glCompileShader(GLuint n)
 }
 void ES_APIENTRY glGetShaderiv(GLuint n, GLenum p, GLint *v)
 {
-    es_shader *s = sh_of(n);
-    if (!s) { SET_ERR(GL_INVALID_VALUE); return; }
+    es_shader *s = shader_arg(n);
+    if (!s) return;
     switch (p) {
     case GL_SHADER_TYPE: *v = (GLint)s->type; break;
     case GL_DELETE_STATUS: *v = s->del; break;
@@ -1601,18 +1714,20 @@ void ES_APIENTRY glGetShaderiv(GLuint n, GLenum p, GLint *v)
 }
 void ES_APIENTRY glGetShaderInfoLog(GLuint n, GLsizei max, GLsizei *len, GLchar *log)
 {
-    es_shader *s = sh_of(n);
+    es_shader *s = shader_arg(n);
     int l;
-    if (!s || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!s) return;
+    if (max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     if (!max) { if (len) *len = 0; return; }
     l = snprintf(log, (size_t)max, "%s", s->log);
     if (len) *len = l < max ? l : max - 1;
 }
 void ES_APIENTRY glGetShaderSource(GLuint n, GLsizei max, GLsizei *len, GLchar *src)
 {
-    es_shader *s = sh_of(n);
+    es_shader *s = shader_arg(n);
     int l;
-    if (!s || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!s) return;
+    if (max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     if (!max) { if (len) *len = 0; return; }
     l = snprintf(src, (size_t)max, "%s", s->src ? s->src : "");
     if (len) *len = l < max ? l : max - 1;
@@ -1637,47 +1752,49 @@ static void prog_free(es_prog *p)
     GLuint n = p->name;
     if (p->vs) { es_shader *s = sh_of(p->vs); if (s && !--s->refs && s->del) shader_free(p->vs); }
     if (p->fs) { es_shader *s = sh_of(p->fs); if (s && !--s->refs && s->del) shader_free(p->fs); }
-    DEL(progs, n, es_prog, { free(x_->uni); free(x_->bin_vs); free(x_->bin_fs); });
+    DEL(progs, n, es_prog, { free(x_->uni); free(x_->uval); free(x_->attr); free(x_->bin_vs); free(x_->bin_fs); });
 }
 void ES_APIENTRY glDeleteProgram(GLuint n)
 {
-    es_prog *p = n ? pr_of(n) : NULL;
+    es_prog *p;
     if (!n) return;
-    if (!p) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!(p = prog_arg(n))) return;
     p->del = 1;
     if (S.cur != p) prog_free(p);                               /* else when it stops being in use */
 }
 void ES_APIENTRY glAttachShader(GLuint pn, GLuint sn)
 {
-    es_prog *p = pr_of(pn);
-    es_shader *s = sh_of(sn);
-    if (!p || !s) { SET_ERR(GL_INVALID_VALUE); return; }
+    es_prog *p = prog_arg(pn);
+    es_shader *s;
+    if (!p || !(s = shader_arg(sn))) return;
     if ((s->type == GL_VERTEX_SHADER ? p->vs : p->fs)) { SET_ERR(GL_INVALID_OPERATION); return; }
     if (s->type == GL_VERTEX_SHADER) p->vs = sn; else p->fs = sn;
     s->refs++;
 }
 void ES_APIENTRY glDetachShader(GLuint pn, GLuint sn)
 {
-    es_prog *p = pr_of(pn);
-    es_shader *s = sh_of(sn);
-    if (!p || !s) { SET_ERR(GL_INVALID_VALUE); return; }
+    es_prog *p = prog_arg(pn);
+    es_shader *s;
+    if (!p || !(s = shader_arg(sn))) return;
     if (p->vs == sn) p->vs = 0; else if (p->fs == sn) p->fs = 0; else { SET_ERR(GL_INVALID_OPERATION); return; }
     if (!--s->refs && s->del) shader_free(sn);
 }
 void ES_APIENTRY glGetAttachedShaders(GLuint pn, GLsizei max, GLsizei *n, GLuint *out)
 {
-    es_prog *p = pr_of(pn);
+    es_prog *p = prog_arg(pn);
     int c = 0;
-    if (!p || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!p) return;
+    if (max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     if (p->vs && c < max) out[c++] = p->vs;
     if (p->fs && c < max) out[c++] = p->fs;
     if (n) *n = c;
 }
 void ES_APIENTRY glBindAttribLocation(GLuint pn, GLuint loc, const GLchar *name)
 {
-    es_prog *p = pr_of(pn);
+    es_prog *p = prog_arg(pn);
     int i;
-    if (!p || loc >= MAX_ATTR) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!p) return;
+    if (loc >= MAX_ATTR) { SET_ERR(GL_INVALID_VALUE); return; }
     if (!strncmp(name, "gl_", 3)) { SET_ERR(GL_INVALID_OPERATION); return; }
     for (i = 0; i < p->nbind; i++) if (!strcmp(p->bind[i].name, name)) break;
     if (i == p->nbind) {
@@ -1731,6 +1848,7 @@ static es_uni *uni_add(es_prog *p, const char *name, const char *type, int size,
     snprintf(u->name, sizeof u->name, "%s", name);
     u->type = e;
     u->size = size ? size : 1;
+    u->isarr = size > 0;
     u->vs = vs; u->fs = fs; u->sampler = -1; u->vc = u->fc = 0;
     type_shape(u->type, &u->stride, &u->comps);
     return u;
@@ -1760,17 +1878,19 @@ static const char *sym_type(const g2sc_sym *y) { return y->ltype ? y->ltype : y-
 
 void ES_APIENTRY glLinkProgram(GLuint pn)
 {
-    es_prog *p = pr_of(pn);
+    es_prog *p = prog_arg(pn);
     es_shader *vs, *fs;
     g2sc_result rv, rf;
     g2sc_linked l;
-    uint32_t fsmask = 0;
+    uint32_t fsmask = 0, *uval;
     int *umv = NULL, *umf = NULL;
-    int i, k, used[MAX_ATTR], next, units = 0;
+    int i, units = 0, nval, old_nuni;
     g2r_prog *hw;
     es_uni *old;
+    es_attr *na = NULL;
+    g2sc_bind gb[sizeof p->bind / sizeof p->bind[0]];
     char err[sizeof p->log];
-    if (!p) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!p) return;
     p->linked = 0; p->validated = 0; err[0] = 0;
     p->ndv = 0;
     vs = p->vs ? sh_of(p->vs) : NULL; fs = p->fs ? sh_of(p->fs) : NULL;
@@ -1778,43 +1898,25 @@ void ES_APIENTRY glLinkProgram(GLuint pn)
     if (!vs || !fs) { snprintf(p->log, sizeof p->log, "a program needs a vertex and a fragment shader"); return; }
     if (!vs->compiled || !fs->compiled || !vs->compiled_src || !fs->compiled_src) { snprintf(p->log, sizeof p->log, "a shader did not compile"); return; }
     if (!S.r) { snprintf(p->log, sizeof p->log, "no current context"); return; }
-    if (g2sc_link(vs->compiled_src, fs->compiled_src, &l) < 0) { snprintf(err, sizeof err, "%s", l.error); goto done; }
+    /* §2.10.4: the compiler places the active attributes, a bound one at its location (two may share one), the rest at the lowest free locations; a location is the vertex core's input */
+    for (i = 0; i < p->nbind; i++) { gb[i].name = p->bind[i].name; gb[i].loc = (int)p->bind[i].loc; }
+    if (g2sc_link_bound(vs->compiled_src, fs->compiled_src, gb, p->nbind, 0, &l) < 0) { snprintf(err, sizeof err, "%s", l.error); goto done; }
     rv = l.vs; rf = l.fs; umv = l.umap_vs; umf = l.umap_fs; fsmask = l.fsmask;
     if (rv.vs_tex) { snprintf(err, sizeof err, "the vertex stage has no texture units (MAX_VERTEX_TEXTURE_IMAGE_UNITS is 0)"); goto done; }    /* declared and unused is legal: Cocos2d declares them in every shader */
     for (i = 0, units = 0; i < rf.nsamplers; i++) units += rf.samplers[i].has_array ? rf.samplers[i].array : 1;
     if (units > MAX_UNITS) { snprintf(err, sizeof err, "%d samplers, the hardware has %d", units, MAX_UNITS); goto done; }
-    /* attribute locations: bound names first, the rest take free slots (a matrix: consecutive) */
-    memset(used, 0, sizeof used);
-    if (rv.nattribs > MAX_ATTR) { snprintf(err, sizeof err, "too many attributes"); goto done; }
+    na = (es_attr *)calloc((size_t)(rv.nattribs ? rv.nattribs : 1), sizeof *na);
+    if (!na) { snprintf(err, sizeof err, "out of memory"); goto done; }
     for (i = 0; i < rv.nattribs; i++) {
-        const char *n = sym_name(&rv.attribs[i]);
         int c;
-        snprintf(p->attr[i].name, sizeof p->attr[i].name, "%s", n);
-        p->attr[i].idx = rv.attribs[i].loc;
-        p->attr[i].type = type_enum(sym_type(&rv.attribs[i]));
-        type_shape(p->attr[i].type, &p->attr[i].n, &c);
-        p->attr[i].loc = -1;
-        for (k = 0; k < p->nbind; k++) {
-            if (!strcmp(p->bind[k].name, n)) {
-                p->attr[i].loc = (int)p->bind[k].loc;
-                if (p->attr[i].loc + p->attr[i].n > MAX_ATTR) { snprintf(err, sizeof err, "attribute %s does not fit at its location", n); goto done; }
-                for (c = 0; c < p->attr[i].n; c++) used[p->attr[i].loc + c] = 1;
-            }
-        }
+        snprintf(na[i].name, sizeof na[i].name, "%s", sym_name(&rv.attribs[i]));
+        na[i].type = type_enum(sym_type(&rv.attribs[i]));
+        type_shape(na[i].type, &na[i].n, &c);
+        na[i].loc = rv.attribs[i].loc;
     }
-    for (i = 0; i < rv.nattribs; i++) {
-        if (p->attr[i].loc >= 0) continue;
-        for (next = 0; next + p->attr[i].n <= MAX_ATTR; next++) {
-            for (k = 0; k < p->attr[i].n; k++) if (used[next + k]) break;
-            if (k == p->attr[i].n) break;
-        }
-        if (next + p->attr[i].n > MAX_ATTR) { snprintf(err, sizeof err, "too many attributes"); goto done; }
-        p->attr[i].loc = next;
-        for (k = 0; k < p->attr[i].n; k++) used[next + k] = 1;
-    }
-    p->nattr = rv.nattribs;
-    old = p->uni;
+    old = p->uni; old_nuni = p->nuni;
     p->uni = (es_uni *)calloc(MAX_UNI, sizeof *p->uni);
+    if (!p->uni) { snprintf(err, sizeof err, "out of memory"); p->uni = old; goto done; }
     p->nuni = 0;
     p->dr_vs = p->dr_fs = -1;
     for (i = 0; i < MAX_UNITS; i++) p->ts[i] = -1;
@@ -1832,16 +1934,26 @@ void ES_APIENTRY glLinkProgram(GLuint pn)
         es_uni *u = uni_add(p, sym_name(&rf.samplers[i]), sym_type(&rf.samplers[i]), rf.samplers[i].has_array ? rf.samplers[i].array : 0, -1, -1, err, sizeof err);
         if (u) { u->sampler = rf.samplers[i].loc; u->stride = 1; u->comps = 1; }
     }
-    if (err[0]) { free(p->uni); p->uni = old; goto done; }
+    if (err[0]) { free(p->uni); p->uni = old; p->nuni = old_nuni; goto done; }
     for (i = 0; umv && i < p->nuni; i++) if (p->uni[i].vs >= 0) { int at = umv[p->uni[i].vs]; p->uni[i].vs = at >> 2; p->uni[i].vc = at & 3; }
     for (i = 0; umf && i < p->nuni; i++) if (p->uni[i].fs >= 0) { int at = umf[p->uni[i].fs]; p->uni[i].fs = at >> 2; p->uni[i].fc = at & 3; }
     if (umv && p->dr_vs >= 0) p->dr_vs = umv[p->dr_vs] >> 2;
     if (umf && p->dr_fs >= 0) p->dr_fs = umf[p->dr_fs] >> 2;
     for (i = 0; umf && i < MAX_UNITS; i++) if (p->ts[i] >= 0) p->ts[i] = umf[p->ts[i]] >> 2;
+    for (i = 0, nval = 0; i < p->nuni; i++) { p->uni[i].voff = nval; nval += p->uni[i].size * p->uni[i].stride * p->uni[i].comps; }
+    uval = (uint32_t *)calloc((size_t)(nval ? nval : 1), 4);    /* §2.10.4: a link sets every uniform to 0 */
+    if (!uval) { snprintf(err, sizeof err, "out of memory"); free(p->uni); p->uni = old; p->nuni = old_nuni; goto done; }
     hw = g2r_prog_create(S.r, rv.words, (uint32_t)rv.nwords, (const double (*)[4])rv.const_pool, (uint32_t)rv.nconst, (uint32_t)rv.const_base, rf.words, (uint32_t)rf.nwords,
                          (const double (*)[4])rf.const_pool, (uint32_t)rf.nconst, (uint32_t)rf.const_base, fsmask);
-    if (!hw) { snprintf(err, sizeof err, "no room for the programs on the boards"); free(p->uni); p->uni = old; goto done; }
+    if (!hw) { snprintf(err, sizeof err, "no room for the programs on the boards"); free(uval); free(p->uni); p->uni = old; p->nuni = old_nuni; goto done; }
     free(old);
+    free(p->uval);
+    p->uval = uval;
+    free(p->attr);
+    p->attr = na; na = NULL;
+    p->nattr = rv.nattribs;
+    memcpy(p->lbind, p->bind, sizeof p->lbind);
+    p->nlbind = p->nbind;
     p->p = hw;
     p->nsamp = units;
     memset(p->samp_unit, 0, sizeof p->samp_unit);
@@ -1850,6 +1962,7 @@ void ES_APIENTRY glLinkProgram(GLuint pn)
     free(p->bin_vs); free(p->bin_fs);
     p->bin_vs = _strdup(vs->compiled_src); p->bin_fs = _strdup(fs->compiled_src);
 done:
+    free(na);
     free(umv); free(umf);
     g2sc_free(&rv); g2sc_free(&rf);
     snprintf(p->log, sizeof p->log, "%s", err);
@@ -1858,18 +1971,18 @@ done:
 
 void ES_APIENTRY glUseProgram(GLuint n)
 {
-    es_prog *p = n ? pr_of(n) : NULL, *old = S.cur;
-    if (n && !p) { SET_ERR(GL_INVALID_VALUE); return; }
+    es_prog *p = NULL, *old = S.cur;
+    if (n && !(p = prog_arg(n))) return;
     if (p && !p->linked) { SET_ERR(GL_INVALID_OPERATION); return; }
     S.cur = p;
     if (old && old != p && old->del) prog_free(old);
 }
-void ES_APIENTRY glValidateProgram(GLuint n) { es_prog *p = pr_of(n); if (!p) { SET_ERR(GL_INVALID_VALUE); return; } p->validated = p->linked; }
+void ES_APIENTRY glValidateProgram(GLuint n) { es_prog *p = prog_arg(n); if (!p) return; p->validated = p->linked; }
 void ES_APIENTRY glGetProgramiv(GLuint n, GLenum q, GLint *v)
 {
-    es_prog *p = pr_of(n);
+    es_prog *p = prog_arg(n);
     int i, m = 0;
-    if (!p) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!p) return;
     switch (q) {
     case GL_DELETE_STATUS: *v = p->del; break;
     case GL_LINK_STATUS: *v = p->linked; break;
@@ -1880,43 +1993,47 @@ void ES_APIENTRY glGetProgramiv(GLuint n, GLenum q, GLint *v)
     case GL_ACTIVE_ATTRIBUTES: *v = p->nattr; break;
     case GL_ACTIVE_ATTRIBUTE_MAX_LENGTH: for (i = 0; i < p->nattr; i++) { int l = (int)strlen(p->attr[i].name) + 1; if (l > m) m = l; } *v = m; break;
     case GL_ACTIVE_UNIFORMS: *v = p->nuni; break;
-    case GL_ACTIVE_UNIFORM_MAX_LENGTH: for (i = 0; i < p->nuni; i++) { int l = (int)strlen(p->uni[i].name) + 4; if (l > m) m = l; } *v = m; break;
+    case GL_ACTIVE_UNIFORM_MAX_LENGTH: for (i = 0; i < p->nuni; i++) { int l = (int)strlen(p->uni[i].name) + (p->uni[i].isarr ? 3 : 0) + 1; if (l > m) m = l; } *v = m; break;     /* glGetActiveUniform's name and its NUL */
     default: SET_ERR(GL_INVALID_ENUM); break;
     }
 }
 void ES_APIENTRY glGetProgramInfoLog(GLuint n, GLsizei max, GLsizei *len, GLchar *log)
 {
-    es_prog *p = pr_of(n);
+    es_prog *p = prog_arg(n);
     int l;
-    if (!p || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!p) return;
+    if (max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     if (!max) { if (len) *len = 0; return; }
     l = snprintf(log, (size_t)max, "%s", p->log);
     if (len) *len = l < max ? l : max - 1;
 }
 void ES_APIENTRY glGetActiveAttrib(GLuint n, GLuint i, GLsizei max, GLsizei *len, GLint *size, GLenum *type, GLchar *name)
 {
-    es_prog *p = pr_of(n);
+    es_prog *p = prog_arg(n);
     int l;
-    if (!p || (int)i >= p->nattr || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
+    if (!p) return;
+    if ((int)i >= p->nattr || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
     l = max ? snprintf(name, (size_t)max, "%s", p->attr[i].name) : 0;
     if (len) *len = l < max ? l : (max ? max - 1 : 0);
     *size = 1; *type = p->attr[i].type;
 }
 GLint ES_APIENTRY glGetAttribLocation(GLuint n, const GLchar *name)
 {
-    es_prog *p = pr_of(n);
+    es_prog *p = prog_arg(n);
     int i;
-    if (!p) { SET_ERR(GL_INVALID_OPERATION); return -1; }
+    if (!p) return -1;
     if (!p->linked) { SET_ERR(GL_INVALID_OPERATION); return -1; }
     for (i = 0; i < p->nattr; i++) if (!strcmp(p->attr[i].name, name)) return p->attr[i].loc;
     return -1;
 }
+/* §2.10.4: an array's name with "[0]", also of an array of one */
 void ES_APIENTRY glGetActiveUniform(GLuint n, GLuint i, GLsizei max, GLsizei *len, GLint *size, GLenum *type, GLchar *name)
 {
-    es_prog *p = pr_of(n);
+    es_prog *p = prog_arg(n);
     int l;
-    if (!p || (int)i >= p->nuni || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
-    l = max ? snprintf(name, (size_t)max, "%s%s", p->uni[i].name, p->uni[i].size > 1 ? "[0]" : "") : 0;
+    if (!p) return;
+    if ((int)i >= p->nuni || max < 0) { SET_ERR(GL_INVALID_VALUE); return; }
+    l = max ? snprintf(name, (size_t)max, "%s%s", p->uni[i].name, p->uni[i].isarr ? "[0]" : "") : 0;
     if (len) *len = l < max ? l : (max ? max - 1 : 0);
     *size = p->uni[i].size; *type = p->uni[i].type;
 }
@@ -1924,11 +2041,12 @@ void ES_APIENTRY glGetActiveUniform(GLuint n, GLuint i, GLsizei max, GLsizei *le
 /* a location: uniform index << 8 | array element */
 GLint ES_APIENTRY glGetUniformLocation(GLuint n, const GLchar *name)
 {
-    es_prog *p = pr_of(n);
+    es_prog *p = prog_arg(n);
     char base[96];
     char *br;
     int el, i;
-    if (!p || !p->linked) { SET_ERR(GL_INVALID_OPERATION); return -1; }
+    if (!p) return -1;
+    if (!p->linked) { SET_ERR(GL_INVALID_OPERATION); return -1; }
     if (!strncmp(name, "gl_", 3)) return -1;                    /* §2.10.4: names with the reserved prefix have no location */
     snprintf(base, sizeof base, "%s", name);
     for (i = 0; i < p->nuni; i++) if (!strcmp(p->uni[i].name, base)) return i << 8;
@@ -1936,7 +2054,7 @@ GLint ES_APIENTRY glGetUniformLocation(GLuint n, const GLchar *name)
     if (br && br[strlen(br) - 1] == ']') {
         el = atoi(br + 1);
         *br = 0;
-        for (i = 0; i < p->nuni; i++) if (!strcmp(p->uni[i].name, base) && el >= 0 && el < p->uni[i].size) return i << 8 | el;
+        for (i = 0; i < p->nuni; i++) if (!strcmp(p->uni[i].name, base) && p->uni[i].isarr && el >= 0 && el < p->uni[i].size) return i << 8 | el;
     }
     return -1;
 }
@@ -1957,7 +2075,11 @@ static int uni_base(GLenum t)
     }
 }
 
-/* §2.10.4. kind: 'f', 'i', 'm' (a matrix of comps columns). Int uniforms are stored as floats: the compiler keeps them that way, FTOI on load */
+static int is_sampler_type(GLenum t) { return t == GL_SAMPLER_2D || t == GL_SAMPLER_CUBE || t == GL_SAMPLER_3D_OES; }
+
+/* §2.10.4. kind: 'f', 'i', 'm' (a matrix of comps columns). Int uniforms are stored as floats: the compiler keeps them that way, FTOI on load. uval keeps what was given.
+   A sampler is set by Uniform1i{v} alone. One the compiler listed (a struct's member too, under its full name) has its units in samp_unit; one it did not (u->sampler < 0)
+   keeps its value for glGetUniform, and no draw reads it */
 static void uni_set(GLint loc, GLsizei n, int kind, int comps, const float *v, const int *iv)
 {
     es_prog *p = S.cur;
@@ -1969,21 +2091,28 @@ static void uni_set(GLint loc, GLsizei n, int kind, int comps, const float *v, c
     idx = loc >> 8; el = loc & 255;
     if (idx < 0 || idx >= p->nuni || el >= p->uni[idx].size) { SET_ERR(GL_INVALID_OPERATION); return; }
     u = &p->uni[idx];
-    if (n > 1 && u->size == 1) { SET_ERR(GL_INVALID_OPERATION); return; }
-    if (u->sampler >= 0) {
+    if (n > 1 && !u->isarr) { SET_ERR(GL_INVALID_OPERATION); return; }
+    if (is_sampler_type(u->type)) {
         if (kind != 'i' || comps != 1) { SET_ERR(GL_INVALID_OPERATION); return; }
         for (e = 0; e < n; e++) if (iv[e] < 0 || iv[e] >= MAX_UNITS) { SET_ERR(GL_INVALID_VALUE); return; }
-        for (e = 0; e < n && el + e < u->size; e++) p->samp_unit[u->sampler + el + e] = iv[e];
+        for (e = 0; e < n && el + e < u->size; e++) {
+            p->uval[u->voff + el + e] = (uint32_t)iv[e];
+            if (u->sampler >= 0) p->samp_unit[u->sampler + el + e] = iv[e];
+        }
         return;
     }
     base = uni_base(u->type);
     ismat = u->stride > 1;
     if (kind == 'm' ? !ismat || u->stride != comps : ismat || u->comps != comps || (kind == 'f' && base == 1) || (kind == 'i' && base == 0)) { SET_ERR(GL_INVALID_OPERATION); return; }
-    per = kind == 'm' ? comps * comps : comps;
+    per = kind == 'm' ? comps * comps : comps;                  /* = stride * comps: one element */
     for (e = 0; e < n && el + e < u->size; e++) {
         for (c = 0; c < per; c++) {
-            double d = kind == 'i' ? (double)iv[e * per + c] : (double)v[e * per + c];
-            if (base == 2) d = d != 0.0;
+            uint32_t raw;
+            double d;
+            if (base == 2) { int b = kind == 'i' ? iv[e * per + c] != 0 : v[e * per + c] != 0.0f; raw = (uint32_t)b; d = b; }
+            else if (base == 1) { raw = (uint32_t)iv[e * per + c]; d = iv[e * per + c]; }
+            else { memcpy(&raw, &v[e * per + c], 4); d = v[e * per + c]; }
+            p->uval[u->voff + (el + e) * per + c] = raw;
             uni_store(p, u, (el + e) * u->stride + c / u->comps, c % u->comps, g2_fp24(d));
         }
     }
@@ -2011,30 +2140,35 @@ void ES_APIENTRY glUniformMatrix2fv(GLint l, GLsizei n, GLboolean t, const GLflo
 void ES_APIENTRY glUniformMatrix3fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { if (t) { SET_ERR(GL_INVALID_VALUE); return; } uni_set(l, n, 'm', 3, v, NULL); }
 void ES_APIENTRY glUniformMatrix4fv(GLint l, GLsizei n, GLboolean t, const GLfloat *v) { if (t) { SET_ERR(GL_INVALID_VALUE); return; } uni_set(l, n, 'm', 4, v, NULL); }
 
-void ES_APIENTRY glGetUniformfv(GLuint n, GLint loc, GLfloat *v)
+/* §6.1.2: a floating-point value asked for as an integer is rounded to the nearest one, and clamped to what GLint holds */
+static GLint round_int(double f)
 {
-    es_prog *p = pr_of(n);
+    if (!(f == f)) return 0;
+    if (f >= 2147483647.0) return 2147483647;
+    if (f <= -2147483648.0) return (GLint)(-2147483647 - 1);
+    return (GLint)floor(f + 0.5);
+}
+
+/* §6.1.8: the value the uniform holds, as Uniform* gave it: fv as floats, else iv as integers. A location is valid for the program it came from, the whole uniform or an element of an array */
+static void uni_get(GLuint n, GLint loc, GLfloat *fv, GLint *iv)
+{
+    es_prog *p = prog_arg(n);
     const es_uni *u;
-    int e, c, k;
-    if (!p || !p->linked || loc < 0 || (loc >> 8) >= p->nuni) { SET_ERR(GL_INVALID_OPERATION); return; }
+    int e, c, cnt, base;
+    if (!p) return;
+    if (!p->linked || loc < 0 || (loc >> 8) >= p->nuni || (loc & 255) >= p->uni[loc >> 8].size) { SET_ERR(GL_INVALID_OPERATION); return; }
     u = &p->uni[loc >> 8]; e = loc & 255;
-    if (u->sampler >= 0) { v[0] = (GLfloat)p->samp_unit[u->sampler + e]; return; }
-    for (k = 0; k < u->stride; k++) {
-        for (c = 0; c < u->comps; c++) {
-            uint32_t b = u->vs >= 0 ? p->vu[4 * (u->vs + e * u->stride + k) + u->vc + c] : p->fu[4 * (u->fs + e * u->stride + k) + u->fc + c];
-            v[k * u->comps + c] = (GLfloat)g2_fp24_to_double(b);
-        }
+    cnt = u->stride * u->comps;
+    base = is_sampler_type(u->type) ? 1 : uni_base(u->type);
+    for (c = 0; c < cnt; c++) {
+        uint32_t raw = p->uval[u->voff + e * cnt + c];
+        if (base == 0) { float f; memcpy(&f, &raw, 4); if (fv) fv[c] = f; else iv[c] = round_int(f); }
+        else if (fv) fv[c] = (GLfloat)(int32_t)raw;
+        else iv[c] = (GLint)(int32_t)raw;
     }
 }
-void ES_APIENTRY glGetUniformiv(GLuint n, GLint loc, GLint *v)
-{
-    es_prog *p = pr_of(n);
-    float f[16];
-    int i, c = 1;
-    if (p && p->linked && loc >= 0 && (loc >> 8) < p->nuni) c = p->uni[loc >> 8].comps * p->uni[loc >> 8].stride;
-    glGetUniformfv(n, loc, f);
-    for (i = 0; i < c; i++) v[i] = (GLint)f[i];
-}
+void ES_APIENTRY glGetUniformfv(GLuint n, GLint loc, GLfloat *v) { uni_get(n, loc, v, NULL); }
+void ES_APIENTRY glGetUniformiv(GLuint n, GLint loc, GLint *v) { uni_get(n, loc, NULL, v); }
 
 /* ---------------------------------------------------------------- vertex attributes */
 static es_va *va_of(GLuint i) { if (i >= MAX_ATTR) { SET_ERR(GL_INVALID_VALUE); return NULL; } return &S.va[i]; }
@@ -2319,9 +2453,9 @@ void ES_APIENTRY glGetIntegerv(GLenum p, GLint *v)
     int n, i;
     if (get_int(p, v)) return;
     if ((n = get_float(p, f))) {
-        /* §6.1.2: colours and depth values convert to the integer range */
-        int norm = p == GL_COLOR_CLEAR_VALUE || p == GL_BLEND_COLOR || p == GL_DEPTH_CLEAR_VALUE || p == GL_DEPTH_RANGE || p == GL_SAMPLE_COVERAGE_VALUE;
-        for (i = 0; i < n; i++) v[i] = norm ? (GLint)((double)f[i] * 2147483647.0) : (GLint)f[i];
+        /* §6.1.2: colours, depth range and the depth clear value map onto the integer range, any other value rounds to the nearest integer */
+        int norm = p == GL_COLOR_CLEAR_VALUE || p == GL_BLEND_COLOR || p == GL_DEPTH_CLEAR_VALUE || p == GL_DEPTH_RANGE;
+        for (i = 0; i < n; i++) v[i] = norm ? (GLint)((double)f[i] * 2147483647.0) : round_int(f[i]);
         return;
     }
     *v = glIsEnabled(p);
@@ -2331,7 +2465,12 @@ void ES_APIENTRY glGetFloatv(GLenum p, GLfloat *v)
     GLint iv[8];
     int n, i;
     if (get_float(p, v)) return;
-    if ((n = get_int(p, iv))) { for (i = 0; i < n; i++) v[i] = (GLfloat)iv[i]; return; }
+    if ((n = get_int(p, iv))) {
+        /* the stencil masks are unsigned: all ones is 2^32 - 1, not -1 */
+        int uns = p == GL_STENCIL_VALUE_MASK || p == GL_STENCIL_BACK_VALUE_MASK || p == GL_STENCIL_WRITEMASK || p == GL_STENCIL_BACK_WRITEMASK;
+        for (i = 0; i < n; i++) v[i] = uns ? (GLfloat)(GLuint)iv[i] : (GLfloat)iv[i];
+        return;
+    }
     *v = glIsEnabled(p);
 }
 void ES_APIENTRY glGetBooleanv(GLenum p, GLboolean *v)
@@ -2350,13 +2489,18 @@ void ES_APIENTRY glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum for
     uint8_t *tmp;
     int row, r, c, x0, y0, x1, y1;
     if (w < 0 || h < 0) { SET_ERR(GL_INVALID_VALUE); return; }
-    if ((format != GL_RGBA && format != GL_BGRA_EXT && format != GL_RGB && format != GL_ALPHA) ||
-        (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT_5_6_5 && type != GL_UNSIGNED_SHORT_4_4_4_4 && type != GL_UNSIGNED_SHORT_5_5_5_1)) { SET_ERR(GL_INVALID_ENUM); return; }
+    /* §4.3.1: format and type from table 3.4 (EXT_read_format_bgra adds BGRA_EXT and its two packed types), of which RGBA / UNSIGNED_BYTE and the
+       IMPLEMENTATION_COLOR_READ pair go, and BGRA_EXT / UNSIGNED_BYTE; any other pair of accepted values is INVALID_OPERATION */
+    if ((format != GL_RGBA && format != GL_BGRA_EXT && format != GL_RGB && format != GL_ALPHA && format != GL_LUMINANCE && format != GL_LUMINANCE_ALPHA) ||
+        (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT_5_6_5 && type != GL_UNSIGNED_SHORT_4_4_4_4 && type != GL_UNSIGNED_SHORT_5_5_5_1 &&
+         type != GL_UNSIGNED_SHORT_4_4_4_4_REV_EXT && type != GL_UNSIGNED_SHORT_1_5_5_5_REV_EXT)) { SET_ERR(GL_INVALID_ENUM); return; }
     if ((format != GL_RGBA && format != GL_BGRA_EXT) || type != GL_UNSIGNED_BYTE) { SET_ERR(GL_INVALID_OPERATION); return; }
+    if (!S.live) return;
     {
         GLuint draw_fb = S.fb;
         int bound;
-        if (!S.live || !w || !h) return;
+        if (!read_fb_target(&g)) return;                        /* also when it reads no pixels */
+        if (!w || !h) return;
         S.fb = S.read_fb;
         bound = bind_target(&g);
         S.fb = draw_fb;
@@ -2472,11 +2616,13 @@ static int at_type(GLenum t, int *bytes)
 static g2r_prog *depth_variant(es_prog *p)
 {
     g2sc_linked l;
+    g2sc_bind gb[sizeof p->lbind / sizeof p->lbind[0]];
     g2r_prog *hw;
     int i;
     if (!p->dnow) return p->p;
     for (i = 0; i < p->ndv; i++) if (p->dv[i].mask == p->dnow) return p->dv[i].p;
-    if (g2sc_link_depth(p->bin_vs, p->bin_fs, p->dnow, &l) < 0) { g2e_log("gles: depth sampling: %s", l.error); return p->p; }
+    for (i = 0; i < p->nlbind; i++) { gb[i].name = p->lbind[i].name; gb[i].loc = (int)p->lbind[i].loc; }     /* the link's attribute locations, not today's bindings */
+    if (g2sc_link_bound(p->bin_vs, p->bin_fs, gb, p->nlbind, p->dnow, &l) < 0) { g2e_log("gles: depth sampling: %s", l.error); return p->p; }
     hw = g2r_prog_create(S.r, l.vs.words, (uint32_t)l.vs.nwords, (const double (*)[4])l.vs.const_pool, (uint32_t)l.vs.nconst, (uint32_t)l.vs.const_base, l.fs.words, (uint32_t)l.fs.nwords,
                          (const double (*)[4])l.fs.const_pool, (uint32_t)l.fs.nconst, (uint32_t)l.fs.const_base, l.fsmask);
     g2sc_link_free(&l);
@@ -2498,7 +2644,9 @@ static void do_draw(GLenum mode, const uint32_t *idx, uint32_t n, uint32_t first
     uint32_t lo = first, hi = first + n - 1, i, ioff = 0;
     int a, c;
     if (mode > GL_TRIANGLE_FAN) { SET_ERR(GL_INVALID_ENUM); return; }
-    if (!S.live || !p || !n) return;                            /* §2.11: no current program, the draw has no effect */
+    if (!S.live) return;
+    if (fb_target(&g) != GL_FRAMEBUFFER_COMPLETE) { SET_ERR(GL_INVALID_FRAMEBUFFER_OPERATION); return; }     /* §4.4.5: also a draw of nothing, or with no program */
+    if (!p || !n) return;                                       /* §2.11: no current program, the draw has no effect */
     if (bind_target(&g) < 0) return;
     if (idx) {
         lo = 0xFFFFFFFFu; hi = 0;
@@ -2506,16 +2654,18 @@ static void do_draw(GLenum mode, const uint32_t *idx, uint32_t n, uint32_t first
     }
     memset(&s, 0, sizeof s);
     fill_state(&s, p, &g);
-    if (mode != GL_POINTS) g2r_scissor_viewport(&s, g.t.width, g.t.height);     /* §2.13: a point goes by near and far only */
+    /* board A drops what is outside x and y of the view volume only at its guard band: the scissor keeps every primitive to the viewport. So a point goes by near and far, and
+       of a wide point the part inside the viewport is drawn, also when its centre is just outside */
+    g2r_scissor_viewport(&s, g.t.width, g.t.height);
     s.prog = depth_variant(p);
     for (a = 0; a < 16; a++) { s.attr[a].size = 4; s.attr[a].type = G2_AT_FP24; s.attr[a].constant[3] = g2_fp24(1.0); }
     memset(v, 0, sizeof v);
     memset(tmp, 0, sizeof tmp);
     memset(from, 0, sizeof from);
     for (a = 0; a < p->nattr; a++) {
-        for (c = 0; c < p->attr[a].n; c++) {                    /* a matrix: one generic attribute per column */
-            es_va *va = &S.va[p->attr[a].loc + c];
-            int k = p->attr[a].idx + c, b, cc;
+        for (c = 0; c < p->attr[a].n; c++) {                    /* a matrix: one generic attribute per column; a location is also the vertex core's input */
+            int k = p->attr[a].loc + c, b, cc;
+            es_va *va = &S.va[k];
             g2r_attr *d = &s.attr[k];
             if (!va->enabled) {
                 for (cc = 0; cc < 4; cc++) d->constant[cc] = g2_fp24(va->cur[cc]);
@@ -2648,7 +2798,7 @@ static void draw_elements(GLenum m, GLsizei n, GLenum type, const void *indices,
         if (!o || !o->data || (uintptr_t)indices + (uint64_t)n * bytes > (uint64_t)o->size) { SET_ERR(GL_INVALID_OPERATION); return; }
         ip = o->data + (uintptr_t)indices;
     }
-    if (!n) return;
+    if (!n) { do_draw(m, NULL, 0, 0); return; }                 /* no vertices: the mode and the framebuffer are still checked */
     idx = (uint32_t *)malloc((size_t)n * 4);
     if (!idx) { SET_ERR(GL_OUT_OF_MEMORY); return; }
     for (i = 0; i < (uint32_t)n; i++) {
@@ -3274,7 +3424,7 @@ EGLBoolean EGLAPI eglSwapBuffers(EGLDisplay d, EGLSurface s)
 {
     CHECK_DPY(d, 0);
     if (s != g_cur_surf || !s) { g_egl_err = EGL_BAD_SURFACE; return 0; }
-    if (S.live) swap_buffers();
+    if (S.live && ((egl_surf *)s)->hwnd) swap_buffers();        /* EGL 1.4 §3.9.3: on a pbuffer it has no effect, its colour buffer stays as it is */
     E_OK();
     return 1;
 }

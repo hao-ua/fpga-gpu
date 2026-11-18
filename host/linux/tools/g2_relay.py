@@ -5,9 +5,9 @@ The boards answer only the most recent sender on their own network. A Linux mach
 talks to them through two relay ends. Each forwards datagrams unchanged, so the remote side speaks the ordinary
 protocol (host/fb/fbproto.py, the fpgagpu kernel module):
 
-  remote:  python3 g2_relay.py remote --listen 192.168.53.1:5100 --allow 192.168.73.30 --local 127.0.0.1:5000
+  remote:  python3 g2_relay.py remote --listen <remote-address>:5100 --allow <pc-address> --local 127.0.0.1:5000
            programs on the remote host send to 127.0.0.1:5000 (the kernel module: ip=127.0.0.1)
-  pc:      python3 g2_relay.py pc --remote 192.168.53.1:5100 --board 192.168.1.10:5000
+  pc:      python3 g2_relay.py pc --remote <remote-address>:5100 --board 192.168.1.10:5000
 
 The PC end starts the flow: it sends a keepalive to the remote end every 2 s. So no inbound firewall rule is needed on
 the PC, and NAT on the way (WSL, a router) keeps the flow open. Keepalives start with KA_MAGIC and are never forwarded.
@@ -16,7 +16,7 @@ known. The latest local sender gets the board's replies, as the boards themselve
 
 Between the two ends every datagram travels in pieces of at most PIECE bytes, each with an 8-byte header {PIECE_MAGIC,
 message id, index, count}, and is put together again on the other side. The protocol's datagrams are up to 1472 bytes
-(WRITE_* data, READ_DATA chunks), and a VPN path (WireGuard: MTU 1420) would fragment them; IP fragments are often
+(WRITE_* data, READ_DATA chunks), and a VPN path (an MTU of 1420, say) would fragment them; IP fragments are often
 dropped on the way, which loses every large datagram. Pieces fit any common path unfragmented. A message whose pieces do
 not all arrive within REASSEMBLY_S is dropped; the protocol resends it.
 

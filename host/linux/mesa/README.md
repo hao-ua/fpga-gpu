@@ -195,18 +195,22 @@ buffer objects go through maps), buffers imported from other processes.
 
 ## Apply and build
 
+`$MESA` is a Mesa source tree at the tag `mesa-26.3.0`; run `apply.sh` from this repository's root.
+
 ```sh
-sh host/linux/mesa/apply.sh /root/fpgagpu/src/mesa
-cd /root/fpgagpu/src/mesa
-meson setup /root/fpgagpu/build/mesa-fg -Dprefix=/opt/fpgagpu-mesa -Dbuildtype=debugoptimized \
+sh host/linux/mesa/apply.sh "$MESA"
+cd "$MESA"
+meson setup build-fg -Dprefix=/opt/fpgagpu-mesa -Dbuildtype=debugoptimized \
   -Dgallium-drivers=fpgagpu,softpipe -Dvulkan-drivers= -Dllvm=disabled -Dplatforms=x11,wayland -Degl=enabled \
   -Dgbm=enabled -Dglx=dri -Dgles2=enabled -Dvideo-codecs= -Dtools=
-nice -n 19 ionice -c3 ninja -C /root/fpgagpu/build/mesa-fg -j2
-ninja -C /root/fpgagpu/build/mesa-fg install
+ninja -C build-fg
+ninja -C build-fg install
 ```
 
-On Debian 13 use `-Dplatforms=x11`: its `wayland-scanner` rejects the Wayland protocols Mesa 26.3 takes as a
-subproject. Stop an X server that runs on `/opt/fpgagpu-mesa` before `ninja install`, which rewrites the libraries it
+Use `-Dplatforms=x11` where the system's `wayland-scanner` rejects the Wayland protocols Mesa 26.3 takes as a
+subproject.
+
+Stop any X server that runs on `/opt/fpgagpu-mesa` before `ninja install`, which rewrites the libraries the server
 has mapped.
 
 ## Test

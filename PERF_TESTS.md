@@ -167,7 +167,7 @@ shorter than the game's (32 ms), and the stream is starved 10 % of the time.
   features off.
 - **fb_cube --check:** 0 mismatches; 32 cubes at 59.9 fps (vsync) for 5 minutes, no errors. **fb_3d_test** 11, 13, 15,
   `--abort` and the coarse-depth seeds 61–71: bit-exact (A 153 and A 154).
-- **Band skipping** (A 160 / B 161, from the Linux VM): `fb_skip_test.py` — the same partial draws with and without FLUSH
+- **Band skipping** (A 160 / B 161, from Linux): `fb_skip_test.py` — the same partial draws with and without FLUSH
   flags bit 10 read back byte-identical, the bands not drawn untouched (800×600 and 1280×720). FLUSH to FENCE for a
   redraw of one band 0.78 ms against 4.38 ms (800×600), 0.68 against 7.49 ms (1280×720). fb_bench at 800×600:
 

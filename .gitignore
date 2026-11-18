@@ -54,3 +54,7 @@ tools/refresh_hw.tcl
 tools/slack_census.tcl
 tools/sweep_*.ps1
 tools/synth_*.tcl
+# one machine's desktop setup (autologin, keyboard and mouse from another computer)
+host/linux/x11/deskflow-client.desktop
+host/linux/x11/fpgagpu-deskflow-client
+host/linux/x11/lightdm-fpgagpu.conf

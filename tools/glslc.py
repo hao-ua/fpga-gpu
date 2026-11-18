@@ -4331,7 +4331,7 @@ def _mad_fuse(lines, isa64):
     return lines
 
 # --------------- top-level program build ---------------
-def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, noops=0):
+def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, noops=0, attrs=None):
     # Auto-fallback: if a shader exceeds the 31-register file with the default (constant-pinning) allocation,
     # retry with constant rematerialization (fresh LDP per use) — trades a few more instructions for far lower
     # register pressure, letting heavy shaders (e.g. the Seascape) compile transparently through g.program().
@@ -4345,18 +4345,46 @@ def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True,
     # RSQRT feeding one scalar MUL), 2 CLAMP. Bit for bit the code they replace; a fragment program only (the vertex core has none), isa64 only.
     # noops: the units this stage's core lacks, as its STATUS flags bits 30 / 31 say (>> 30; board A's for the vertex stage, board
     # B's b_flags for the fragment stage): 1 the integer divider (int / becomes _idiv_lowered), 2 SIN / COS (_sincos_lowered); isa64.
+    # attrs: a vertex stage's attribute bindings at a link, name -> location (place_attribs).
     # A spill retries first without the loop-invariant hoist (licm: what it takes out of a loop stays live across all of it, so a long
     # program can need more registers with it than without), then with the constants rematerialized, without the hoist either: never a
     # refusal that the code before the hoist did not have.
     if not remat_consts:
         for hoist in (True, False):
             try:
-                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist, noops=noops)
+                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist, noops=noops, attrs=attrs)
             except CompileError as e:
                 if 'register spill' not in str(e): raise
-    return _compile_stage(src, stage, optimize, remat_consts=True, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=False, noops=noops)
+    return _compile_stage(src, stage, optimize, remat_consts=True, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=False, noops=noops, attrs=attrs)
 
-def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True, noops=0):
+# Attribute locations (§2.10.4): an attribute the program reads is active and takes a location, a matrix one a column, in a run; the
+# others leave the table. attrs (a link's glBindAttribLocation table, name -> location) puts a bound one at its location, two of them
+# also at one (aliasing: no path reads both); the rest, in declaration order, take the lowest run no active one holds. The code reads
+# them there; the table keeps the active ones in declaration order. Past 16 locations the assembler refuses the LDV, a link the program.
+def place_attribs(code, attribs, attrs):
+    read=set()
+    for ln in code:
+        t=ln.split(' ')
+        if t[0].split('.')[0]=='LDV': read.add(int(t[2].split('.')[0]))
+    act=[(n,i,ty,ncomp2(ty) if is_mat(ty) else 1) for n,(i,ty) in attribs.items()]
+    act=[a for a in act if any(a[1]+k in read for k in range(a[3]))]
+    loc={}; held=set()
+    for n,i,ty,w in act:
+        if attrs and n in attrs: loc[n]=attrs[n]; held.update(range(attrs[n], attrs[n]+w))
+    for n,i,ty,w in act:
+        if n in loc: continue
+        at=0
+        while any(at+k in held for k in range(w)): at+=1
+        loc[n]=at; held.update(range(at, at+w))
+    new={i+k:loc[n]+k for n,i,ty,w in act for k in range(w)}
+    def moved(ln):
+        t=ln.split(' ')
+        if t[0].split('.')[0]!='LDV': return ln
+        m=re.match(r'(\d+)(.*)$', t[2]); t[2]=f'{new[int(m.group(1))]}{m.group(2)}'
+        return ' '.join(t)
+    return [moved(ln) for ln in code], {n:(loc[n],ty) for n,i,ty,w in act}
+
+def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True, noops=0, attrs=None):
     exts=set()
     src=preprocess(src, stage, exts, strict)     # #define / #ifdef / #if ... + comment stripping
     toks=lex(src, exts); parser=Parser(toks, strict); ast=parser.parse()
@@ -4460,7 +4488,9 @@ def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True
         if k is None: return f'{base+r}{m.group(2) or ""}'
         return f'{base+r}.' + 'xyzw'[k]*(len(m.group(2))-1 if m.group(2) else 4)
     out=[re.sub(r'@(\d+)(\.[xyzw]+)?', at, ln) for ln in code]
-    return {'sasm':'\n'.join(out), 'attribs':c.attribs, 'uniforms':c.uniforms, 'samplers':c.samplers, 'sampler_sizes':c.sampler_sizes,
+    attribs=c.attribs
+    if stage=='vs': out, attribs = place_attribs(out, c.attribs, attrs)
+    return {'sasm':'\n'.join(out), 'attribs':attribs, 'uniforms':c.uniforms, 'samplers':c.samplers, 'sampler_sizes':c.sampler_sizes,
             'varyings':c.varyings, 'const_base':base, 'const_pool':pool, 'isa64':isa64, 'vs_tex':c.vs_tex}
 
 if __name__=='__main__':

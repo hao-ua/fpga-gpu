@@ -21,6 +21,8 @@
 typedef struct ShChunk { struct ShChunk *next; size_t cap, used; } ShChunk;
 typedef struct ShMark { ShChunk *chunk; size_t used, total; } ShMark;
 
+typedef struct ShBind { const char *name; int loc; } ShBind;     /* g2sc_bind */
+
 typedef struct Shc {
     jmp_buf jb;
     char err[512];
@@ -30,6 +32,7 @@ typedef struct Shc {
     int strict;                 /* g2sc_compile_strict: every error the language requires; survives sh_init too */
     const int *umap, *vmap;     /* g2sc_compile_packed: slot -> row * 4 + lane; survive sh_init too */
     uint32_t depth_units;       /* bit per sampler: a depth texture is bound, a read gives (z, z, z, 1) */
+    const ShBind *binds; int nbinds;   /* glslc attrs (g2sc_compile_bound): a link's attribute bindings, the last of a name counts; survive sh_init too */
     uint32_t xops;              /* glslc xops (g2sc_set_target), a fragment stage only: 1 SQRT / RCPM / RSQM, 2 CLAMP; survives sh_init too */
     uint32_t noops;             /* glslc noops (g2sc_set_absent), this stage's core: 1 no integer divider, 2 no SIN / COS; survives sh_init too */
     int nohoist;                /* glslc hoist=False: the register-spill retries compile without licm */

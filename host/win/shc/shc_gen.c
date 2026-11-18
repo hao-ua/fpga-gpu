@@ -3747,6 +3747,88 @@ static ShSym *sym_table(Cg *c, const Dict *d, int *n)
     return t;
 }
 
+/* the index an LDV line reads ("LDV r3 16", "LDV.xy r3 16", "LDV r3.y 16.x"): 1 and *at = where its digits start */
+static int ldv_index(const char *s, const char *e, const char **at, long long *idx)
+{
+    const char *p;
+    long long v = 0;
+    if (e - s < 4 || strncmp(s, "LDV", 3) || (s[3] != ' ' && s[3] != '.')) return 0;
+    p = memchr(s, ' ', (size_t)(e - s));
+    if (p) p = memchr(p + 1, ' ', (size_t)(e - p - 1));
+    if (!p || p + 1 >= e || p[1] < '0' || p[1] > '9') return 0;
+    *at = ++p;
+    while (p < e && *p >= '0' && *p <= '9' && v < 0x7FFFFFFF) v = v * 10 + (*p++ - '0');
+    *idx = v;
+    return 1;
+}
+
+/* glslc place_attribs: an attribute the program reads is active and takes a location (§2.10.4), a matrix one a column, in a run;
+ * a bound one (h->binds) where the link binds it, also two on one, the rest in declaration order the lowest run no active one holds.
+ * The code reads them there; the table keeps the active ones, in declaration order */
+static void place_attribs(Cg *c, ShOutput *out)
+{
+    Shc *h = c->h;
+    int n = c->attribs.n, nread = c->next_attr + 1, cap = 1, i, j, k, m = 0;
+    unsigned char *read = (unsigned char *)sh_zalloc(h, (size_t)nread), *held;
+    int *w = (int *)sh_alloc(h, (size_t)(n + 1) * sizeof(int) * 3), *loc = w + n + 1, *act = loc + n + 1;
+    int *moved = (int *)sh_alloc(h, (size_t)nread * sizeof(int));
+    const char *s, *e, *at;
+    long long idx;
+    ShSym *t = (ShSym *)sh_alloc(h, (size_t)(n + 1) * sizeof(ShSym));
+    SB b;
+    for (s = out->sasm; *s; s = *e ? e + 1 : e) {
+        e = strchr(s, '\n');
+        if (!e) e = s + strlen(s);
+        if (ldv_index(s, e, &at, &idx) && idx < nread) read[idx] = 1;
+    }
+    for (i = 0; i < n; i++) {
+        const Sym *y = (const Sym *)c->attribs.ent[i].p;
+        w[i] = mat_n(y->ty) ? ncomp2(c, y->ty) : 1;
+        act[i] = 0; loc[i] = -1;
+        for (k = 0; k < w[i]; k++) if (y->slot + k < nread && read[y->slot + k]) act[i] = 1;
+        if (!act[i]) continue;
+        cap += w[i];
+        for (j = h->nbinds - 1; j >= 0; j--) if (!strcmp(h->binds[j].name, c->attribs.ent[i].key)) { loc[i] = h->binds[j].loc; cap += loc[i] + w[i]; break; }
+    }
+    held = (unsigned char *)sh_zalloc(h, (size_t)cap);
+    for (i = 0; i < n; i++) if (act[i] && loc[i] >= 0) for (k = 0; k < w[i]; k++) held[loc[i] + k] = 1;
+    for (i = 0; i < n; i++) {
+        int x = 0;
+        if (!act[i] || loc[i] >= 0) continue;
+        for (;;) {
+            for (k = 0; k < w[i] && !(x + k < cap && held[x + k]); k++) ;
+            if (k == w[i]) break;
+            x++;
+        }
+        loc[i] = x;
+        for (k = 0; k < w[i]; k++) held[x + k] = 1;
+    }
+    for (i = 0; i < nread; i++) moved[i] = -1;
+    for (i = 0; i < n; i++) {
+        const Sym *y = (const Sym *)c->attribs.ent[i].p;
+        if (!act[i]) continue;
+        for (k = 0; k < w[i]; k++) moved[y->slot + k] = loc[i] + k;
+        t[m].name = c->attribs.ent[i].key; t[m].loc = loc[i]; t[m].ty = y->ty; t[m].has_array = 0; t[m].array = 0;
+        m++;
+    }
+    sb_init(&b, h, strlen(out->sasm) + 16);
+    for (s = out->sasm; *s; s = *e ? e + 1 : e) {
+        e = strchr(s, '\n');
+        if (!e) e = s + strlen(s);
+        if (ldv_index(s, e, &at, &idx)) {
+            const char *d = at;
+            if (idx >= nread || moved[idx] < 0) sh_py_error(h, "KeyError: %L", idx);
+            while (d < e && *d >= '0' && *d <= '9') d++;
+            sb_putn(&b, s, (size_t)(at - s));
+            sb_putll(&b, moved[idx]);
+            sb_putn(&b, d, (size_t)(e - d));
+        } else sb_putn(&b, s, (size_t)(e - s));
+        if (*e) sb_putc(&b, '\n');
+    }
+    out->sasm = sb_str(&b);
+    out->attribs = t; out->nattribs = m;
+}
+
 static void mark_struct(Cg *c, Dict *used, const char *ty)
 {
     DictEnt *e = dict_find(&c->structs, ty);
@@ -3911,7 +3993,8 @@ void sh_compile(Shc *h, const char *src, int fs, int remat, ShOutput *out)
     sv_room(c, c->vcount + 1);          /* the table covers every register, scalar or not */
     out->const_base = h->umap ? h->urows : c->next_uniform;
     out->sasm = sh_optimize(h, &c->code, c->vcount, c->sv, remat, out->const_base, c->fs, c->pool, &c->npool);
-    out->attribs = sym_table(c, &c->attribs, &out->nattribs);
+    if (c->fs) out->attribs = sym_table(c, &c->attribs, &out->nattribs);
+    else place_attribs(c, out);
     out->uniforms = sym_table(c, &c->uniforms, &out->nuniforms);
     out->samplers = sym_table(c, &c->samplers, &out->nsamplers);
     out->varyings = sym_table(c, &c->varyings, &out->nvaryings);

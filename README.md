@@ -4,7 +4,8 @@ An OpenGL ES 2.0 / OpenGL 2.0 / Direct3D 9 (shader model 2.0) class GPU built fr
 sends commands over gigabit Ethernet to **board A**, which runs the vertex shaders, clips, sets up and bins the
 primitives. Board A streams them over a ribbon-cable link to **board B**, which runs the fragment shaders, textures,
 blends and shows the picture on HDMI. Drop-in Windows libraries (`ddraw.dll`, `opengl32.dll`, `libGLESv2` / `libEGL`,
-`d3d9.dll`, `d3d8.dll`) let unmodified games render on it.
+`d3d9.dll`, `d3d8.dll`) let unmodified games render on it. On Linux, a DRM / KMS kernel driver and a Mesa Gallium
+driver give OpenGL ES 2.0, OpenGL 2.0, EGL, GLX and GBM ([LINUX.md](LINUX.md)).
 
 **Two-board design:** this branch (`master`), the two boards described above, each with its own XC7A200T and DDR3,
 joined by ribbon cables:
@@ -15,6 +16,20 @@ joined by ribbon cables:
 
 OpenArena's timedemo runs at 31.4 fps at 640×480 and 23.9 at 800×600; with board A's coarse depth and lazy TRI items
 off, 29.2 and 21.6 ([PERF_TESTS.md](PERF_TESTS.md)). How to build and run it: the rest of this file.
+
+**dEQP-GLES2** (Khronos VK-GL-CTS 3.2.14.1: the info, capability, functional and accuracy groups, 17 775 cases, on
+boards A 165 / A 166 with B 162):
+
+| driver | pass | fail | not supported | crash |
+|---|---|---|---|---|
+| Windows `libGLESv2` / `libEGL` | 17 196 (4 of them with a quality or compatibility warning) | 0 | 579 | 0 |
+| Linux Mesa Gallium driver | 17 275 | 8 | 492 | 0 |
+
+The Linux 8 are the projected-mipmap cases: board B's texture unit takes one level of detail per 2×2 quad, so a pixel
+or two at a level boundary are a level off; they are left as they are. "Not supported" is what ES 2.0 lets an
+implementation leave out: texture reads in vertex shaders, half-float textures, multisampling, separate 16-bit depth
+and 8-bit stencil buffers, and (Windows) the loop and indexing forms beyond GLSL ES Appendix A's minimum. These are
+dEQP runs, not a Khronos conformance submission.
 
 <img src="images/two-boards.jpg" alt="The two PA200T-StarLite boards stacked on standoffs: board A on top with the Ethernet cable, board B below with the HDMI cable" width="600">
 
@@ -36,7 +51,7 @@ only they know the one-board memory map.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | how the two boards, the link and the host protocol work |
 | [FEATURES.md](FEATURES.md) | what the hardware and each library support, and what they refuse |
 | [PERF_TESTS.md](PERF_TESTS.md) | the performance tests, how to run them, the latest results |
-| [LINUX.md](LINUX.md) | this branch (`linux-driver`): the Linux DRM / KMS kernel driver and the Mesa Gallium driver, design and status |
+| [LINUX.md](LINUX.md) | the Linux DRM / KMS kernel driver and the Mesa Gallium driver (`host/linux`), design and status |
 
 ## Repository layout
 

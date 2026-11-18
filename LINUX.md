@@ -2,8 +2,9 @@
 
 The GPU under Linux: a DRM kernel driver that talks to the boards over Ethernet and shows the board's HDMI output as a
 KMS display, and a Mesa Gallium driver that gives OpenGL ES 2.0, OpenGL, EGL, GLX and GBM through Mesa's front ends.
-This branch (`linux-driver`) is cut from master, so it drives the **two-board** design. Nothing here is built yet; this
-document is the plan.
+It drives the **two-board** design. The code is in `host/linux` (`kernel/`, `mesa/`, `x11/`, `tools/`), built and run
+in a Debian 13 Hyper-V VM on the PC; this document is its design, and section 7 its status. On boards A 166 / B 162
+dEQP-GLES2 passes 17 275 of its 17 775 cases, with 8 failures (section 6, the dEQP runs).
 
 ## 1. Decisions
 
@@ -265,8 +266,8 @@ counters and the last STATUS.
   - Band skipping (2026-11-17, boards A 160 / B 161 loaded by the band-skip session): Mesa sets FLUSH flag bit 10 when
     both boards report it (A STATUS layout >= 13, B flags bit 13), so the bands no draw and no clear reaches are not
     walked, loaded or stored. On a 800 x 600 target with depth (whole-target passes) a pass of an 8 x 8 quad costs 0.36
-    ms instead of 6.86 (`fg_egl_gl` test 16; `FPGAGPU_NOSKIP=1` for the old way). The flashed pair (A 154 / B 142)
-    ignores the flag.
+    ms instead of 6.86 (`fg_egl_gl` test 16; `FPGAGPU_NOSKIP=1` for the old way). Older boards (A 154 / B 142)
+    ignore the flag.
   - Copy extensions (2026-11-17, B 162 = B 161 + COPY_IMAGE's alpha 255, swizzle, tile, list and a burst path for 1:1
     copies; loaded with A 160, then flashed): Mesa uses them where B's flags have bit 14 (`host/linux/mesa/README.md`,
     Copy extensions): the alpha of an X image set in the copy, a draw's rectangles at one offset in one command, a
@@ -291,6 +292,12 @@ counters and the last STATUS.
     GLSL frontend). Not supported: half-float textures, samplers in vertex programs (board A has no TMU), separate
     16-bit depth and 8-bit stencil renderbuffers. The OpenGL 2.0 texture state the TMU has not got (LOD bias,
     MIN_LOD / MAX_LOD, the border colour, GL_CLAMP) is done in the fragment program (`fg_egl_gl` tests 19, 20).
+  - dEQP-GLES2 again (2026-11-18, boards A 166 / B 162, Mesa built from master in the VM's build directory): 17 775
+    cases, 17 275 pass, 492 not supported, 8 fail, no crash. The 115 clipping cases pass since board A clips with a
+    32-bit significand (A 163 and later), the 2 scoping cases since `apply.sh`'s patch of Mesa's GLSL frontend (in
+    `#version 100` a local may hide a function parameter). The 8 projected mipmap cases stay: the TMU takes one level
+    of detail per 2x2 quad. The shader back end shared with the Windows compiler (`host/win/shc`: no MAD that reads its
+    destination swizzled, constants four to a parameter row) changed no result. `fg_egl_draw` passes.
   - The boards restarted while the VM was paused (the PC asleep; 2026-11-17, board A's uptime 26 min): every
     sequenced command then timed out (BO_CREATE: ETIMEDOUT after 10 s; X drew nothing) while STATUS still answered,
     because the module's session (sequence numbers) was the old one. Reloading the module (a new HELLO) fixed it.

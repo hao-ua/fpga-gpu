@@ -148,12 +148,15 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
   - OES: rgb8_rgba8, depth24, packed_depth_stencil, element_index_uint, texture_npot, standard_derivatives,
     fragment_precision_high, vertex_array_object, mapbuffer, depth_texture, fbo_render_mipmap, texture_3D only when
     board B has 3D (not today);
-  - EXT: shader_texture_lod, frag_depth, discard_framebuffer, blend_minmax, BGRA8888 / read_format_bgra,
-    texture_storage, robustness;
-  - compressed formats DXT1/3/5 and ETC1 (decoded to RGB565);
+  - EXT: shader_texture_lod, frag_depth, discard_framebuffer, blend_minmax, BGRA8888 (textures and renderbuffers) /
+    read_format_bgra, texture_storage, robustness;
+  - compressed formats DXT1/3/5 and ETC1 (decoded to RGBA8 on the PC);
   - ANGLE instanced arrays, framebuffer blit and translated shader source;
   - NV_fence, get_program_binary.
 - **Refused:** OpenGL ES 3.0, which needs 32-bit float and integer, MRT and MSAA. `#version 300 es` is rejected.
+- **dEQP-GLES2** (info, capability, functional, accuracy: 17 775 cases; A 165 / B 162): 17 192 pass, 0 fail, 579 not
+  supported, 3 quality and 1 compatibility warnings. Points are kept to the viewport (board A clips them by near and
+  far only), and `eglSwapBuffers` on a pbuffer changes nothing.
 
 ### `d3d9.dll` — Direct3D 9, shader model 2.0 with the 2_x extras (x86, x64)
 - **Shaders:**
@@ -187,8 +190,15 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 
 ### Shader compiler (`host/win/shc`)
 - A word-for-word C port of `tools/glslc.py`, which is its specification.
-- Functions are inlined, and early return works per lane.
-- Varyings are packed as GLSL ES Appendix A.7 says.
+- GLSL ES 1.00's preprocessor in full (macros with arguments, `#if` expressions, `#line`, `#extension`); for an
+  application's program, every error the language's chapters 3–7 require.
+- Functions are inlined, early return works per lane, and `out` / `inout` arguments are copied in and out.
+- Varyings are packed as GLSL ES Appendix A.7 says; so are uniforms past the parameter rows, where only the uniforms a
+  stage reads take a row.
+- Attributes: only the active ones take a location; a link puts those named by `glBindAttribLocation` at their
+  location, two names on one location too (aliasing).
+- Constants share parameter rows: a scalar takes one lane of a row, a constant vector or matrix column one row.
+- Samplers in uniform structs take texture units of their own.
 - Hardware loops are used.
 - Uninitialised variables start at 0.
 - It emits SQRT / RCPM / RSQM only on a board B that reports them.
@@ -199,6 +209,14 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
   - `sin` / `cos`: 17 instructions, a three-part reduction and a polynomial. sin(0) = 0 and cos(0) = 1 exactly, and
     |result| ≤ 1. Up to |x| = 10⁴ the error is at most 4e-5 (sin) / 7e-5 (cos); the unit's is 4e-6.
   - `python3 tools/lower_check.py` checks both on the ISA simulator.
+
+### Linux: Mesa Gallium driver + DRM / KMS kernel driver (`host/linux`)
+- OpenGL ES 2.0 and OpenGL 2.0 (GLSL 1.10) through Mesa 26.3's front ends, with EGL, GLX and GBM; X runs on it with
+  glamor, and KMS shows board-B images on HDMI without a copy.
+- Shaders go from NIR into the Windows compiler's back end (`host/win/shc`: optimizer, register allocator, assembler).
+- dEQP-GLES2 (17 775 cases; A 166 / B 162): 17 275 pass, 8 fail (the projected mipmap cases: board B's texture unit
+  takes one level of detail per 2×2 quad), 492 not supported, no crash.
+- Design, status and how to build: [LINUX.md](LINUX.md) and `host/linux/mesa/README.md`.
 
 ## 3. Games and applications
 

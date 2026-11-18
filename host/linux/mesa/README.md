@@ -34,12 +34,13 @@ keeps in R8 textures read through `GL_TEXTURE_SWIZZLE_A = GL_RED`), texture swiz
 view's swizzle after the TEX; `apply.sh` lets GLES 2.0 contexts set it), and dma-buf import for DRI3 (BO_INFO). Every render pass holds the boards' render state for its process (the kernel's PASS ioctl), so X and a
 game can share the boards.
 
-dEQP-GLES2 (VK-GL-CTS, the x11_egl target: pbuffers through X's fpgagpu device): of the 17 775 cases of info,
-capability, functional and accuracy, 17 158 pass, 492 are not supported (half-float textures, samplers in vertex
-programs: board A has no TMU, separate 16-bit depth and 8-bit stencil renderbuffers: board B keeps them in one D24S8
-word) and 125 fail, none of them crashes: 115 clipping cases (huge coordinates, clipped in board A's FP24), 8 projected
-mipmap cases (the TMU's level of a projected coordinate, a pixel or two off) and 2 scoping cases (Mesa's GLSL
-frontend). See LINUX.md for the run.
+dEQP-GLES2 (VK-GL-CTS, the x11_egl target: pbuffers through X's fpgagpu device; boards A 166 / B 162): of the 17 775
+cases of info, capability, functional and accuracy, 17 275 pass, 492 are not supported (half-float textures, samplers
+in vertex programs: board A has no TMU, separate 16-bit depth and 8-bit stencil renderbuffers: board B keeps them in
+one D24S8 word) and 8 fail, none of them crashes: the projected mipmap cases (the TMU takes one level of detail per 2x2
+quad, so a pixel or two at a level boundary are a level off; left as they are). The clipping cases pass on board A 163
+and later, which clips with a 32-bit significand (115 of them failed on A 160's FP24 clipper), and the two scoping
+cases with `apply.sh`'s patch of Mesa's GLSL frontend. See LINUX.md for the runs.
 
 OpenGL 2.0 with GLSL 1.10, the version the hardware supports (as the Windows `opengl32`): `apply.sh` keeps a
 2.0 context's GLSL at the driver's 1.10 (Mesa would raise it to 1.20, which is compiler work beyond the hardware) and

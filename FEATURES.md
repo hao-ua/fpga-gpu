@@ -154,9 +154,13 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
   - ANGLE instanced arrays, framebuffer blit and translated shader source;
   - NV_fence, get_program_binary.
 - **Refused:** OpenGL ES 3.0, which needs 32-bit float and integer, MRT and MSAA. `#version 300 es` is rejected.
-- **dEQP-GLES2** (info, capability, functional, accuracy: 17 775 cases; A 165 / B 162): 17 192 pass, 0 fail, 579 not
-  supported, 3 quality and 1 compatibility warnings. Points are kept to the viewport (board A clips them by near and
-  far only), and `eglSwapBuffers` on a pbuffer changes nothing.
+- **dEQP-GLES2** (info, capability, functional, accuracy: 17 775 cases; A 166 / B 162):
+  - 17 190 pass, 579 not supported, 3 quality and 1 compatibility warnings;
+  - 2 fail: `texture2DLod` / `textureCubeLod` in a fragment shader compile, which the cases expect refused (Known open
+    issues).
+
+  Points are kept to the viewport (board A clips them by near and far only), and `eglSwapBuffers` on a pbuffer changes
+  nothing.
 
 ### `d3d9.dll` — Direct3D 9, shader model 2.0 with the 2_x extras (x86, x64)
 - **Shaders:**
@@ -200,6 +204,16 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 - Constants share parameter rows: a scalar takes one lane of a row, a constant vector or matrix column one row.
 - Samplers in uniform structs take texture units of their own.
 - Hardware loops are used.
+- What the fragment core does is there even where GLSL ES 1.00 asks for more:
+  - the derivatives, the `*LodEXT` / `*GradEXT` reads, `gl_FragDepthEXT` and `sampler3D` compile without their
+    `#extension` lines;
+  - `texture2DLod` / `textureCubeLod` compile in fragment shaders.
+- Program size: a vertex program may have up to 4 096 instructions, a fragment program 4 095 (board B's draw state
+  gives the length in 12 bits). A longer one does not compile.
+- Running out of registers, a program is compiled again, each step costing more instructions:
+  - without the loop-invariant hoist;
+  - then with the vectors of known components built a lane at a time;
+  - then with every constant loaded where it is used.
 - Uninitialised variables start at 0.
 - It emits SQRT / RCPM / RSQM only on a board B that reports them.
 - A core built without the integer divider or without SIN / COS reports it in STATUS (flags bits 30 / 31; both boards'
@@ -222,7 +236,7 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 
 | title | API | status |
 |---|---|---|
-| OpenArena | OpenGL | plays; timedemo at the game's default settings 31.4 fps at 640×480, 23.9 at 800×600 (A 154 / B 142) |
+| OpenArena | OpenGL | plays; timedemo at the game's default settings 30.5 fps at 640×480, 23.8 at 800×600 (A 166 / B 162) |
 | Need for Speed: Hot Pursuit 2 | Direct3D 8 | races run, 22–36 fps at 800×600 (A 147 / B 142); far-depth flicker fixed |
 | Half-Life | OpenGL 1.x | about 60 fps at 640×480; the hang on the first mission's tram ride is fixed in the RTL and in the flashed board A (A 149 and later), not yet replayed in the game |
 | Heroes Chronicles (Heroes III engine) | DirectDraw | menus and play at 800×600×16 |
@@ -230,16 +244,38 @@ All five are user-mode drop-in DLLs on one core library (`host/win/core`).
 
 ## 4. Known open issues
 
-- **Far depth in OpenGL / OpenGL ES:** reversed depth is done only in Direct3D, so far geometry keeps about 1 % depth
-  resolution at Quake scale.
-- **Board B's command-processor error count** rises by one per run of each library test program. Not investigated.
-- **Board link:** the CRC and parity counters creep slowly. No long soak test has been run.
-- **Lost event:** board A once lost a present event after about 71 minutes of uptime. Not reproduced or investigated
-  since.
-- **Board B hang** in an NFS HP2 race with 128×128 render targets: cause unknown. A similar OpenArena hang was fixed.
+- **Far depth in OpenGL / OpenGL ES:** reversed depth is done only in Direct3D. In OpenGL, OpenGL ES and the Linux
+  driver, far geometry keeps about 1 % depth resolution at Quake scale.
+  - There, window depth sits just under 1.0, where board A's FP24 resolves about 2⁻¹⁷.
+  - Board A's wider clipper (A 163 and later) does not change this: it rounds every vertex back to FP24.
+- **GLES contexts share every object:** the Windows `libGLESv2` keeps one set of named objects for all contexts,
+  whatever `eglCreateContext`'s share context says. Two unshared contexts that use one name without `glGen*` get one
+  object instead of two.
+- **Board B's command-error count** rises by one when a library first looks for 3D textures (once per run of each
+  library test program). The library probes with a one-texel CREATE_VOLUME, which board B (no volume textures)
+  refuses. Count it out when reading B's errors.
+- **Board link:** the A→B link resends what fails its CRC, so nothing is lost. The error rate depends on how the link
+  trained:
+  - some link-ups showed about 5×10⁻⁸ errors per word;
+  - others none in 0.7 G words.
+
+  Board B's receiver may centre on a soft edge of the eye. Not resolved. No soak longer than 25 minutes has been run.
+- **Lost event:** board A once lost a present event after about 71 minutes of uptime (A 130). A run at 4.3 hours of
+  uptime lost none, and it has not been reproduced.
+- **Board B hang:** seen once, in an NFS HP2 race that drew to 128×128 render targets, on a board B older than B 69.
+  - B 69 fixed a similar OpenArena deadlock, which may cover it.
+  - The cause is unknown, and it has not been seen again.
 - **Shader compiler limits:**
-  - no spilling past 32 registers;
-  - a uniform array copied whole inside a struct assignment is refused;
-  - `texture2DLod` is accepted in fragment shaders without the extension;
-  - `for(; i++ < N;)` is not treated as a counted loop.
-- **Timing margin:** board B meets timing by only +0.016 ns at 95.7 % of its slices.
+  - no spilling: a program that needs more than the 32 registers a lane has is refused;
+  - `for (; i++ < N;)` runs as a general loop (LOOP with a per-lane BREAK), not as a counted one. The result is right
+    but slower.
+- **Accepted conformance failures:**
+  - **Linux, dEQP-GLES2:** the 8 projected mipmap cases fail. The TMU takes one level of detail per 2×2 quad, so a
+    pixel or two at a level boundary come out a level off.
+  - **Windows, dEQP-EGL:** the 6 RGB565-window cases of `native_color_mapping` fail in the official run. dEQP reads a
+    16-bit window back from a 32-bit desktop and compares the raw 5- and 6-bit values with 8-bit ones.
+  - **Windows, dEQP-GLES2:** `texture_functions.invalid.texture2dlod_in_fragment` and `texturecubelod_in_fragment`
+    expect a compile error. The fragment core reads a given level, so these programs compile.
+- **Timing margin:**
+  - board B 162 meets timing with 0.000 ns to spare, at 97.3 % of its slices;
+  - board A 166 meets it with +0.008 ns, at 93.1 %.

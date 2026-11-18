@@ -14,19 +14,22 @@ joined by ribbon cables:
 - render targets up to 1280 pixels wide, video modes up to 1280×800;
 - board A culls quads that coarse depth proves hidden before they reach board B.
 
-OpenArena's timedemo runs at 31.4 fps at 640×480 and 23.9 at 800×600; with board A's coarse depth and lazy TRI items
-off, 29.2 and 21.6 ([PERF_TESTS.md](PERF_TESTS.md)). How to build and run it: the rest of this file.
+OpenArena's timedemo runs at 30.5 fps at 640×480 and 23.8 at 800×600 (boards A 166 / B 162). With board A's coarse depth
+and lazy TRI items off it ran at 29.2 and 21.6, measured on A 153 / B 142 ([PERF_TESTS.md](PERF_TESTS.md)). How to build
+and run it: the rest of this file.
 
 **dEQP-GLES2** (Khronos VK-GL-CTS 3.2.14.1: the info, capability, functional and accuracy groups, 17 775 cases, on
 boards A 165 / A 166 with B 162):
 
 | driver | pass | fail | not supported | crash |
 |---|---|---|---|---|
-| Windows `libGLESv2` / `libEGL` | 17 196 (4 of them with a quality or compatibility warning) | 0 | 579 | 0 |
+| Windows `libGLESv2` / `libEGL` | 17 194 (4 of them with a quality or compatibility warning) | 2 | 579 | 0 |
 | Linux Mesa Gallium driver | 17 275 | 8 | 492 | 0 |
 
-The Linux 8 are the projected-mipmap cases: board B's texture unit takes one level of detail per 2×2 quad, so a pixel
-or two at a level boundary are a level off; they are left as they are. "Not supported" is what ES 2.0 lets an
+The Windows 2 expect `texture2DLod` and `textureCubeLod` in a fragment shader to be refused. The fragment core reads a
+given level, and the compiler does not refuse what the hardware does. The Linux 8 are the projected-mipmap cases: board
+B's texture unit takes one level of detail per 2×2 quad, so a pixel or two at a level boundary are a level off; they are
+left as they are. "Not supported" is what ES 2.0 lets an
 implementation leave out: texture reads in vertex shaders, half-float textures, multisampling, separate 16-bit depth
 and 8-bit stencil buffers, and (Windows) the loop and indexing forms beyond GLSL ES Appendix A's minimum. These are
 dEQP runs, not a Khronos conformance submission.

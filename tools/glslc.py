@@ -4314,6 +4314,8 @@ def _mad_fuse(lines, isa64):
                 an,bn=_regnum(a),_regnum(b)
                 if any((not lines[k].endswith(':')) and _dst(lines[k].split()) in (an,bn) for k in range(j+1,i)):
                     continue
+                dn=_regnum(d)                                   # the MAD reads a and b as it writes d: a swizzled d would see what
+                if (an==dn and _hasswz(a)) or (bn==dn and _hasswz(b)): continue   # an earlier micro-op wrote (isa64.check_overlap)
                 dead=True                                       # tmp must be dead after the combine
                 for k in range(i+1,len(lines)):
                     if lines[k].endswith(':'): continue

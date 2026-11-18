@@ -591,6 +591,7 @@ static void mad_fuse(Shc *h, Lines *L)
                     if (lk->dst == an || lk->dst == bn) { ok = 0; break; }
                 }
                 if (!ok) continue;
+                if ((an == ln->dst && a.swz[0]) || (bn == ln->dst && b.swz[0])) continue;   /* the MAD reads a and b as it writes d: a swizzled d sees what an earlier micro-op wrote */
                 dead = 1;
                 for (k = i + 1; k < L->n; k++) {
                     Line *lk = L->v[k];

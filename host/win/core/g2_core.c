@@ -721,6 +721,12 @@ g2_board *g2_open(const char *ip, int port, const g2_options *opt)
     }
     b->timer_period = timeBeginPeriod(1) == TIMERR_NOERROR;
     b->running = 1;
+    {
+        /* The threads below run this module's code until the process ends. The module stays loaded from here on: a FreeLibrary of the library (dEQP unloads libEGL
+           after each session) would leave them running in unmapped code. They cannot be stopped from DllMain, which holds the loader lock they need to end */
+        HMODULE self;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(void *)rx_loop, &self);
+    }
     b->rx_thread = CreateThread(NULL, 0, rx_loop, b, 0, NULL);
     b->mt_thread = CreateThread(NULL, 0, maint_loop, b, 0, NULL);
     SetThreadPriority(b->rx_thread, THREAD_PRIORITY_ABOVE_NORMAL);

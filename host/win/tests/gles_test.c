@@ -1210,6 +1210,7 @@ static void test_scaled(void)
     ok(eglSwapBuffers(g_dpy, s), "scaled window: swap");
     ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the small window");
     glViewport(0, 0, W, H);
+    eglDestroySurface(g_dpy, s);
     DestroyWindow(big);
     clear_to(1, 0, 1, 1);
     px(W - 1, H - 1, "back in the small window", 255, 0, 255, 255);
@@ -1252,6 +1253,7 @@ static void test_configs(void)
         ok(eglSwapBuffers(g_dpy, s), "565 window: swap");
         ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the RGBA8 window");
         glViewport(0, 0, W, H);
+        eglDestroySurface(g_dpy, s);
         DestroyWindow(w);
         clear_to(1, 0, 1, 1);
         px(W - 1, H - 1, "back in the RGBA8 window", 255, 0, 255, 255);
@@ -3307,6 +3309,40 @@ static void test_threads(void)
     err(GL_NO_ERROR, "threads");
 }
 
+/* the PC's own pixel of a window, as 0xRRGGBB */
+static int window_pixel(HWND w, int x, int y)
+{
+    HDC dc = GetDC(w);
+    COLORREF c = dc ? GetPixel(dc, x, y) : CLR_INVALID;
+    if (dc) ReleaseDC(w, dc);
+    return c == CLR_INVALID ? -1 : (int)(GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c));
+}
+
+/* a window of at most 256 x 256 (GPU2_WIN_COPY) also gets each frame drawn into it on the PC, read back through GDI as dEQP's native-window cases do */
+static void test_window_copy(void)
+{
+    HWND w = CreateWindowA("gles_test", "small", WS_POPUP, 0, 0, 64, 64, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    EGLSurface s;
+    ShowWindow(w, SW_SHOWNOACTIVATE);
+    s = eglCreateWindowSurface(g_dpy, g_cfg, w, NULL);
+    ok(s && eglMakeCurrent(g_dpy, s, s, g_ctx), "a 64 x 64 window current");
+    if (!s) { DestroyWindow(w); return; }
+    glViewport(0, 0, 64, 64);
+    clear_to(0, 0, 1, 1);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 32, 32);
+    clear_to(1, 0, 0, 1);
+    glDisable(GL_SCISSOR_TEST);
+    ok(eglSwapBuffers(g_dpy, s), "small window: swap");
+    ieq(window_pixel(w, 8, 55), 0xFF0000, "small window on the PC: GL's bottom left, red");
+    ieq(window_pixel(w, 55, 8), 0x0000FF, "small window on the PC: GL's top right, blue");
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the main window");
+    glViewport(0, 0, W, H);
+    eglDestroySurface(g_dpy, s);
+    DestroyWindow(w);
+    err(GL_NO_ERROR, "window copy");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -3402,6 +3438,7 @@ int main(void)
     test_pbuffer_swap();
     test_egl_api();
     test_threads();
+    test_window_copy();
     test_swap();
     printf("%d checks, %d failed\n", g_checks, g_bad);
     if (!g_bad) printf("OK gles_test\n");

@@ -387,6 +387,40 @@ static void dump_frame(uint16_t image)
     free(px);
 }
 
+static int read_rgba8(const es_tg *g, int x, int y, int w, int h, uint8_t *out);
+
+/* Board B shows a frame on HDMI only; the window on the PC's screen stays as Windows drew it. A small window (both sides at most GPU2_WIN_COPY pixels, 256 when
+   unset, 0: none) also gets each frame drawn into it, for programs that read their own window back through GDI (dEQP's native-window cases: windows of 64 to 256).
+   It costs a wait for the frame and its pixels over the link, which a game's window, larger, does not pay */
+static void copy_to_window(uint16_t image)
+{
+    static int max = -1;
+    es_tg g;
+    BITMAPINFO bi;
+    uint8_t *px;
+    HDC dc;
+    int i, n = SF->fb_w * SF->fb_h;
+    if (max < 0) max = g2e_get_int("GPU2_WIN_COPY", 256);
+    if (!SF->hwnd || SF->vw > max || SF->vh > max || n <= 0) return;
+    px = (uint8_t *)malloc((size_t)n * 4);
+    if (!px) return;
+    memset(&g, 0, sizeof g);
+    g.t.color = image; g.t.width = (uint32_t)SF->fb_w; g.t.height = (uint32_t)SF->fb_h;
+    g.fmt = SF->color_fmt; g.kx = g.ky = 1.0;
+    g2r_finish(S.r);
+    if (read_rgba8(&g, 0, 0, SF->fb_w, SF->fb_h, px) >= 0) {
+        for (i = 0; i < n; i++) { uint8_t t = px[4 * i]; px[4 * i] = px[4 * i + 2]; px[4 * i + 2] = t; }     /* GDI's 32-bit DIB: B, G, R, unused */
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = SF->fb_w; bi.bmiHeader.biHeight = SF->fb_h;      /* bottom-up, as GL's rows */
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        if ((dc = GetDC(SF->hwnd)) != NULL) {
+            StretchDIBits(dc, 0, 0, SF->vw, SF->vh, 0, 0, SF->fb_w, SF->fb_h, px, &bi, DIB_RGB_COLORS, SRCCOPY);
+            ReleaseDC(SF->hwnd, dc);
+        }
+    }
+    free(px);
+}
+
 static void swap_buffers(void)
 {
     uint16_t image = SF->color[SF->back];
@@ -412,6 +446,7 @@ static void swap_buffers(void)
     S.frame++;
     g2r_stats_tick(S.r);
     dump_frame(image);
+    copy_to_window(image);
     SF->front = SF->back;
     SF->back = (SF->back + 1) % 3;
     /* EGL_BUFFER_DESTROYED: the colour buffer is undefined after a swap, which spares the next frame a band load */

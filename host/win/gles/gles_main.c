@@ -149,6 +149,10 @@ typedef struct es_uni {
     int vc, fc;                                 /* the lane it starts at in each stage, when a link packed it */
 } es_uni;
 
+/* an active attribute: loc is its location, the generic attribute it reads, and the vertex core's input the program reads it from; n: locations, a matrix one a column */
+typedef struct es_attr { char name[64]; int loc, n; GLenum type; } es_attr;
+typedef struct es_bind { char name[64]; GLuint loc; } es_bind;
+
 typedef struct es_prog {
     struct es_prog *next;
     GLuint name;
@@ -159,13 +163,15 @@ typedef struct es_prog {
     g2r_prog *p;
     es_uni *uni; int nuni;
     uint32_t *uval;                             /* every uniform's value as the application gave it, 32 bits a component: float bits, or an int (int, bool, sampler); glGetUniform reads these */
-    struct { char name[64]; int loc, idx, n; GLenum type; } attr[MAX_ATTR];    /* n: locations, a matrix takes one per column */
+    es_attr *attr;                              /* the active attributes; two may share a location (§2.10.4 aliasing), so there can be more than locations */
     int nattr;
     struct { uint32_t mask; g2r_prog *p; } dv[8];  /* the program with these samplers reading depth textures */
     int ndv, dv_next;
     uint32_t dnow;                              /* the samplers that do at this draw */
-    struct { char name[64]; GLuint loc; } bind[32];
+    es_bind bind[32];                           /* glBindAttribLocation's */
     int nbind;
+    es_bind lbind[32];                          /* the bindings the last link used: a link again for depth sampling takes these, later ones wait for glLinkProgram */
+    int nlbind;
     int samp_unit[MAX_UNITS], nsamp;
     int dr_vs, dr_fs;            /* gl_DepthRange's first slot in each stage, -1 if the stage does not read it */
     int ts[MAX_UNITS];           /* the slot of the texture size a unit's texture*GradEXT reads, -1 for none */
@@ -1746,7 +1752,7 @@ static void prog_free(es_prog *p)
     GLuint n = p->name;
     if (p->vs) { es_shader *s = sh_of(p->vs); if (s && !--s->refs && s->del) shader_free(p->vs); }
     if (p->fs) { es_shader *s = sh_of(p->fs); if (s && !--s->refs && s->del) shader_free(p->fs); }
-    DEL(progs, n, es_prog, { free(x_->uni); free(x_->uval); free(x_->bin_vs); free(x_->bin_fs); });
+    DEL(progs, n, es_prog, { free(x_->uni); free(x_->uval); free(x_->attr); free(x_->bin_vs); free(x_->bin_fs); });
 }
 void ES_APIENTRY glDeleteProgram(GLuint n)
 {
@@ -1878,9 +1884,11 @@ void ES_APIENTRY glLinkProgram(GLuint pn)
     g2sc_linked l;
     uint32_t fsmask = 0, *uval;
     int *umv = NULL, *umf = NULL;
-    int i, k, used[MAX_ATTR], next, units = 0, nval, old_nuni;
+    int i, units = 0, nval, old_nuni;
     g2r_prog *hw;
     es_uni *old;
+    es_attr *na = NULL;
+    g2sc_bind gb[sizeof p->bind / sizeof p->bind[0]];
     char err[sizeof p->log];
     if (!p) return;
     p->linked = 0; p->validated = 0; err[0] = 0;
@@ -1890,41 +1898,22 @@ void ES_APIENTRY glLinkProgram(GLuint pn)
     if (!vs || !fs) { snprintf(p->log, sizeof p->log, "a program needs a vertex and a fragment shader"); return; }
     if (!vs->compiled || !fs->compiled || !vs->compiled_src || !fs->compiled_src) { snprintf(p->log, sizeof p->log, "a shader did not compile"); return; }
     if (!S.r) { snprintf(p->log, sizeof p->log, "no current context"); return; }
-    if (g2sc_link(vs->compiled_src, fs->compiled_src, &l) < 0) { snprintf(err, sizeof err, "%s", l.error); goto done; }
+    /* §2.10.4: the compiler places the active attributes, a bound one at its location (two may share one), the rest at the lowest free locations; a location is the vertex core's input */
+    for (i = 0; i < p->nbind; i++) { gb[i].name = p->bind[i].name; gb[i].loc = (int)p->bind[i].loc; }
+    if (g2sc_link_bound(vs->compiled_src, fs->compiled_src, gb, p->nbind, 0, &l) < 0) { snprintf(err, sizeof err, "%s", l.error); goto done; }
     rv = l.vs; rf = l.fs; umv = l.umap_vs; umf = l.umap_fs; fsmask = l.fsmask;
     if (rv.vs_tex) { snprintf(err, sizeof err, "the vertex stage has no texture units (MAX_VERTEX_TEXTURE_IMAGE_UNITS is 0)"); goto done; }    /* declared and unused is legal: Cocos2d declares them in every shader */
     for (i = 0, units = 0; i < rf.nsamplers; i++) units += rf.samplers[i].has_array ? rf.samplers[i].array : 1;
     if (units > MAX_UNITS) { snprintf(err, sizeof err, "%d samplers, the hardware has %d", units, MAX_UNITS); goto done; }
-    /* attribute locations: bound names first, the rest take free slots (a matrix: consecutive) */
-    memset(used, 0, sizeof used);
-    if (rv.nattribs > MAX_ATTR) { snprintf(err, sizeof err, "too many attributes"); goto done; }
+    na = (es_attr *)calloc((size_t)(rv.nattribs ? rv.nattribs : 1), sizeof *na);
+    if (!na) { snprintf(err, sizeof err, "out of memory"); goto done; }
     for (i = 0; i < rv.nattribs; i++) {
-        const char *n = sym_name(&rv.attribs[i]);
         int c;
-        snprintf(p->attr[i].name, sizeof p->attr[i].name, "%s", n);
-        p->attr[i].idx = rv.attribs[i].loc;
-        p->attr[i].type = type_enum(sym_type(&rv.attribs[i]));
-        type_shape(p->attr[i].type, &p->attr[i].n, &c);
-        p->attr[i].loc = -1;
-        for (k = 0; k < p->nbind; k++) {
-            if (!strcmp(p->bind[k].name, n)) {
-                p->attr[i].loc = (int)p->bind[k].loc;
-                if (p->attr[i].loc + p->attr[i].n > MAX_ATTR) { snprintf(err, sizeof err, "attribute %s does not fit at its location", n); goto done; }
-                for (c = 0; c < p->attr[i].n; c++) used[p->attr[i].loc + c] = 1;
-            }
-        }
+        snprintf(na[i].name, sizeof na[i].name, "%s", sym_name(&rv.attribs[i]));
+        na[i].type = type_enum(sym_type(&rv.attribs[i]));
+        type_shape(na[i].type, &na[i].n, &c);
+        na[i].loc = rv.attribs[i].loc;
     }
-    for (i = 0; i < rv.nattribs; i++) {
-        if (p->attr[i].loc >= 0) continue;
-        for (next = 0; next + p->attr[i].n <= MAX_ATTR; next++) {
-            for (k = 0; k < p->attr[i].n; k++) if (used[next + k]) break;
-            if (k == p->attr[i].n) break;
-        }
-        if (next + p->attr[i].n > MAX_ATTR) { snprintf(err, sizeof err, "too many attributes"); goto done; }
-        p->attr[i].loc = next;
-        for (k = 0; k < p->attr[i].n; k++) used[next + k] = 1;
-    }
-    p->nattr = rv.nattribs;
     old = p->uni; old_nuni = p->nuni;
     p->uni = (es_uni *)calloc(MAX_UNI, sizeof *p->uni);
     if (!p->uni) { snprintf(err, sizeof err, "out of memory"); p->uni = old; goto done; }
@@ -1960,6 +1949,11 @@ void ES_APIENTRY glLinkProgram(GLuint pn)
     free(old);
     free(p->uval);
     p->uval = uval;
+    free(p->attr);
+    p->attr = na; na = NULL;
+    p->nattr = rv.nattribs;
+    memcpy(p->lbind, p->bind, sizeof p->lbind);
+    p->nlbind = p->nbind;
     p->p = hw;
     p->nsamp = units;
     memset(p->samp_unit, 0, sizeof p->samp_unit);
@@ -1968,6 +1962,7 @@ void ES_APIENTRY glLinkProgram(GLuint pn)
     free(p->bin_vs); free(p->bin_fs);
     p->bin_vs = _strdup(vs->compiled_src); p->bin_fs = _strdup(fs->compiled_src);
 done:
+    free(na);
     free(umv); free(umf);
     g2sc_free(&rv); g2sc_free(&rf);
     snprintf(p->log, sizeof p->log, "%s", err);
@@ -2620,11 +2615,13 @@ static int at_type(GLenum t, int *bytes)
 static g2r_prog *depth_variant(es_prog *p)
 {
     g2sc_linked l;
+    g2sc_bind gb[sizeof p->lbind / sizeof p->lbind[0]];
     g2r_prog *hw;
     int i;
     if (!p->dnow) return p->p;
     for (i = 0; i < p->ndv; i++) if (p->dv[i].mask == p->dnow) return p->dv[i].p;
-    if (g2sc_link_depth(p->bin_vs, p->bin_fs, p->dnow, &l) < 0) { g2e_log("gles: depth sampling: %s", l.error); return p->p; }
+    for (i = 0; i < p->nlbind; i++) { gb[i].name = p->lbind[i].name; gb[i].loc = (int)p->lbind[i].loc; }     /* the link's attribute locations, not today's bindings */
+    if (g2sc_link_bound(p->bin_vs, p->bin_fs, gb, p->nlbind, p->dnow, &l) < 0) { g2e_log("gles: depth sampling: %s", l.error); return p->p; }
     hw = g2r_prog_create(S.r, l.vs.words, (uint32_t)l.vs.nwords, (const double (*)[4])l.vs.const_pool, (uint32_t)l.vs.nconst, (uint32_t)l.vs.const_base, l.fs.words, (uint32_t)l.fs.nwords,
                          (const double (*)[4])l.fs.const_pool, (uint32_t)l.fs.nconst, (uint32_t)l.fs.const_base, l.fsmask);
     g2sc_link_free(&l);
@@ -2665,9 +2662,9 @@ static void do_draw(GLenum mode, const uint32_t *idx, uint32_t n, uint32_t first
     memset(tmp, 0, sizeof tmp);
     memset(from, 0, sizeof from);
     for (a = 0; a < p->nattr; a++) {
-        for (c = 0; c < p->attr[a].n; c++) {                    /* a matrix: one generic attribute per column */
-            es_va *va = &S.va[p->attr[a].loc + c];
-            int k = p->attr[a].idx + c, b, cc;
+        for (c = 0; c < p->attr[a].n; c++) {                    /* a matrix: one generic attribute per column; a location is also the vertex core's input */
+            int k = p->attr[a].loc + c, b, cc;
+            es_va *va = &S.va[k];
             g2r_attr *d = &s.attr[k];
             if (!va->enabled) {
                 for (cc = 0; cc < 4; cc++) d->constant[cc] = g2_fp24(va->cur[cc]);

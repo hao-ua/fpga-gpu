@@ -216,6 +216,39 @@ static void test_attributes(void)
     glBindAttribLocation(p, 1, "gl_Vertex");
     err(GL_INVALID_OPERATION, "glBindAttribLocation gl_");
     glDeleteProgram(p);
+    /* §2.10.4: two attributes bound to one location (no path reads both) link, an attribute nothing reads is not active, and a binding made after a link waits for the next one */
+    {
+        static const char vs_alias[] = "attribute vec2 a_pos; attribute vec4 a_x; attribute vec4 a_y; attribute vec4 a_unused; uniform bool u; varying vec4 v;\n"
+                                       "void main() { if (u) v = a_x; else v = a_y; gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+        GLint n = 0;
+        p = glCreateProgram();
+        glBindAttribLocation(p, 3, "a_x");
+        glBindAttribLocation(p, 3, "a_y");
+        glBindAttribLocation(p, 0, "a_pos");
+        link_prog(p, shader(GL_VERTEX_SHADER, vs_alias), shader(GL_FRAGMENT_SHADER, "precision mediump float; varying vec4 v; void main() { gl_FragColor = v; }\n"));
+        ieq(glGetAttribLocation(p, "a_x"), 3, "aliased attribute a_x");
+        ieq(glGetAttribLocation(p, "a_y"), 3, "aliased attribute a_y");
+        ieq(glGetAttribLocation(p, "a_unused"), -1, "an attribute nothing reads has no location");
+        glGetProgramiv(p, GL_ACTIVE_ATTRIBUTES, &n);
+        ieq(n, 3, "active attributes: a_pos, a_x, a_y");
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "u"), 1);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, q);
+        glEnableVertexAttribArray(0);
+        glVertexAttrib4f(3, 1.0f, 0.5f, 0.0f, 1.0f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        px(100, 100, "aliased attributes, the path of a_x", 255, 128, 0, 255);
+        glUniform1i(glGetUniformLocation(p, "u"), 0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        px(100, 100, "aliased attributes, the path of a_y", 255, 128, 0, 255);
+        glBindAttribLocation(p, 7, "a_x");
+        ieq(glGetAttribLocation(p, "a_x"), 3, "a binding after the link waits for the next link");
+        glLinkProgram(p);
+        ieq(glGetAttribLocation(p, "a_x"), 7, "the next link takes the binding");
+        glDisableVertexAttribArray(0);
+        glDeleteProgram(p);
+        err(GL_NO_ERROR, "attribute locations");
+    }
 }
 
 static void test_uniforms(void)

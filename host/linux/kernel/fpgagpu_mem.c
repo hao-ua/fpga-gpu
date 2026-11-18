@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu_mem: the boards' host heaps and handle tables, shared by every process.
  *

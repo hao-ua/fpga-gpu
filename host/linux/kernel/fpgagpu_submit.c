@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu_submit: SUBMIT, WAIT and READ.
  *

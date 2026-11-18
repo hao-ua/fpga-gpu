@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu_net: the board protocol's transport inside the kernel. A port of fbproto.Board (host/fb/fbproto.py) and its
  * C port g2_core.c, with the same rules:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0 OR MIT
+# Copyright (c) 2026 Dmytro Ivanysh
 obj-m += fpgagpu.o
 fpgagpu-y := fpgagpu_drv.o fpgagpu_net.o fpgagpu_kms.o fpgagpu_mem.o fpgagpu_gem.o fpgagpu_submit.o
 # our UAPI header, and the kernel's own uapi/drm for the "drm.h" it includes

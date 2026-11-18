@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu_gem: buffer objects in the boards' memory. A board BO is a range in a board heap plus a board handle; the
  * CPU cannot map it. BO_CREATE sends CREATE_BUFFER / CREATE_IMAGE; the last reference going away queues the object, and

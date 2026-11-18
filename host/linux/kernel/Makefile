@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0 OR MIT
+# Copyright (c) 2026 Dmytro Ivanysh
 # make                     build fpgagpu.ko against the running kernel (KDIR=... for another tree)
 # make clean
 KDIR ?= /lib/modules/$(shell uname -r)/build

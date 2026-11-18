@@ -14,7 +14,7 @@ dEQP-GLES2 passes 17 275 of its 17 775 cases, with 8 failures (section 6, the dE
 | kernel driver | a DRM driver, `fpgagpu`, with the board protocol's UDP transport inside the kernel; packaged for DKMS |
 | OpenGL | a Mesa Gallium driver, `fpgagpu`, with a new shader-compiler back end from NIR to the board's ISA |
 | the board's HDMI | a KMS connector: the Linux console, X and Wayland desktops and page flips show on the board's monitor |
-| licence | the kernel module's files are `GPL-2.0 OR MIT` (`MODULE_LICENSE("Dual MIT/GPL")`), so it can use DRM's GPL-only helpers. Its uapi header is `(GPL-2.0 WITH Linux-syscall-note) OR MIT`, and the Mesa driver's copy of it is identical. The Mesa driver is MIT, like the rest of the repository. Each of its files starts with the SPDX identifier and the copyright line, as Mesa's sources do. So do the compiler files `apply.sh` copies into it (`host/linux/mesa/README.md`, Licence). |
+| licence | the kernel module's files are `GPL-2.0 OR MIT` (`MODULE_LICENSE("Dual MIT/GPL")`), so it can use DRM's GPL-only helpers. Each of its source files has the SPDX identifier on line 1 (the kernel's rule) and the copyright line after it. Its uapi header is `(GPL-2.0 WITH Linux-syscall-note) OR MIT`, and the Mesa driver's copy of it is identical. The Mesa driver is MIT, like the rest of the repository. Each of its files starts with the SPDX identifier and the copyright line, as Mesa's sources do. So do the compiler files `apply.sh` copies into it (`host/linux/mesa/README.md`, Licence). |
 
 ## 2. Layers
 

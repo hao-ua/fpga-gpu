@@ -245,7 +245,8 @@ Run them from `host/fb`; Python 3, standard library only (see `host/fb/README.md
 ## Licence
 
 MIT ([LICENSE](LICENSE)), with these additions:
-- **Linux kernel module** (`host/linux/kernel`): `GPL-2.0 OR MIT`, so that it can use DRM's GPL-only helpers.
+- **Linux kernel module** (`host/linux/kernel`): `GPL-2.0 OR MIT`, so that it can use DRM's GPL-only helpers. Each
+  source file starts with that SPDX identifier and the copyright line.
 - **Its userspace header** `fpgagpu_drm.h`: `(GPL-2.0 WITH Linux-syscall-note) OR MIT`, like Linux's uapi headers.
   The Mesa driver carries an identical copy.
 - **Mesa driver** (`host/linux/mesa`): MIT, like Mesa's drivers. Its files, and the five compiler files `apply.sh`

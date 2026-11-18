@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu: the DRM driver of the FPGA GPU, two FPGA boards that a PC drives over Ethernet.
  *

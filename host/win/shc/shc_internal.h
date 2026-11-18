@@ -38,6 +38,7 @@ typedef struct Shc {
     uint32_t xops;              /* glslc xops (g2sc_set_target), a fragment stage only: 1 SQRT / RCPM / RSQM, 2 CLAMP; survives sh_init too */
     uint32_t noops;             /* glslc noops (g2sc_set_absent), this stage's core: 1 no integer divider, 2 no SIN / COS; survives sh_init too */
     int nohoist;                /* glslc hoist=False: the register-spill retries compile without licm */
+    int nofold;                 /* glslc fold_cvec=False: the register-spill retries build a vector of known components a lane at a time (no kvec) */
     int urows, nvmap;
     int depth;
     ShChunk *chunk;

@@ -1,2 +1,3 @@
 precision mediump float; uniform vec4 u; uniform float f; uniform int ii; varying vec2 w;
-void main() { gl_FragDepthEXT = 1.0; }
+uniform sampler2D s;
+void main() { gl_FragColor = texture2DLodEXT(s, w, f); }

@@ -105,8 +105,8 @@ static int has_fn(const char *src, const char *name)
     return 0;
 }
 
-/* what a source leaves out, put in front of it (the header comment): a float precision, the Shadertoy inputs it names and does not declare, tanh / sinh / cosh it calls and does not
- * define, and main() around mainImage. NULL if nothing was missing: the source then goes to the library as it is */
+/* what a source leaves out, put in front of it (the header comment): the derivatives extension Shadertoy's page enables, a float precision, the Shadertoy inputs it names and
+ * does not declare, tanh / sinh / cosh it calls and does not define, and main() around mainImage. NULL if nothing was missing: the source then goes to the library as it is */
 static char *complete_source(const char *src)
 {
     static const char *const fn[3][2] = {
@@ -118,10 +118,16 @@ static char *complete_source(const char *src)
     size_t cap = strlen(src) + 4096;
     char *o, said[512];
     int i, t, toy = has_fn(src, "mainImage") && !has_fn(src, "main");
+    int deriv = (word_in(src, NULL, "dFdx") || word_in(src, NULL, "dFdy") || word_in(src, NULL, "fwidth")) && !word_in(src, NULL, "GL_OES_standard_derivatives");
     o = (char *)malloc(cap);
-    said[0] = 0;
-    /* always the first line of what is added: the added lines use floats, and the source's own statement would come after them. A second statement in the source is legal and wins from there on */
-    strcpy(o, "precision mediump float;\n");
+    said[0] = o[0] = 0;
+    /* GLSL ES 1.00 has dFdx / dFdy / fwidth only with the extension, which Shadertoy's page enables; the directive goes before every other line */
+    if (deriv) {
+        strcpy(o, "#extension GL_OES_standard_derivatives : enable\n");
+        strcat(said, ", #extension GL_OES_standard_derivatives : enable");
+    }
+    /* always added: the added lines use floats, and the source's own statement would come after them. A second statement in the source is legal and wins from there on */
+    strcat(o, "precision mediump float;\n");
     if (!stated(src, "precision", "float")) strcat(said, ", precision mediump float");
     for (i = 0; i < 5; i++)
         if (word_in(src, NULL, in[i][0]) && !stated(src, "uniform", in[i][0])) {

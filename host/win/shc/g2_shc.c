@@ -261,8 +261,9 @@ static int compile_opts(const char *src, int stage, const char *const *varying_o
     sh_init(h);
 retry:
     if (setjmp(h->jb)) {
-        /* compile_stage: a CompileError mentioning 'register spill' retries without the loop-invariant hoist (attempt 1), then with remat_consts=True and no hoist (2) */
-        if (attempt < 2 && h->compile_error && strstr(h->err, "register spill")) {
+        /* compile_stage: a CompileError mentioning 'register spill' retries without the loop-invariant hoist (attempt 1), then with the vectors of known components
+         * built a lane at a time (fold_cvec=False), with the hoist (2) and without (3), then with remat_consts=True and no hoist (4) */
+        if (attempt < 4 && h->compile_error && strstr(h->err, "register spill")) {
             attempt++;
             sh_done(h);
             sh_init(h);
@@ -275,10 +276,21 @@ retry:
         return -1;
     }
     memset(&o, 0, sizeof o);
-    h->nohoist = attempt >= 1;
-    sh_compile(h, src, stage == G2SC_FS, attempt == 2, &o);
+    h->nohoist = attempt == 1 || attempt >= 3;
+    h->nofold = attempt == 2 || attempt == 3;
+    sh_compile(h, src, stage == G2SC_FS, attempt == 4, &o);
     over = may_pack && (o.const_base + o.npool > (stage == G2SC_VS ? 256 : 64) || (!h->vmap && vary_rows(&o) > 8) || attr_end(&o) > G2SC_MAX_ATTRIBS);
     if (!over) words = sh_assemble(h, o.sasm, stage == G2SC_VS, IF_DEPTH_DEFAULT, LOOP_DEPTH_DEFAULT, &nwords);
+    /* glslc PROG_MAX: the cores' program memories hold 4096 instructions; board A takes a vertex program of up to 4096, board B's draw state gives a fragment
+     * program's length in 12 bits, so 4095 at most */
+    if (words && nwords > (stage == G2SC_VS ? 4096 : 4095)) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "the program has %d instructions: the %s core runs at most %d", nwords, stage == G2SC_VS ? "vertex" : "fragment", stage == G2SC_VS ? 4096 : 4095);
+        set_error(out, msg);
+        sh_done(h);
+        free(h);
+        return -1;
+    }
     rc = result_out(&o, words, nwords, out);
     if (rc) {
         char msg[sizeof out->error];
@@ -289,7 +301,7 @@ retry:
         free(h);
         return -1;
     }
-    out->remat = attempt == 2;
+    out->remat = attempt == 4;
     out->oversize = over;
     sh_done(h);
     free(h);

@@ -120,7 +120,7 @@ static Tk *lex(Shc *h, const char *src, int exts, int *ntok)
             j = i + 1;
             while (j < n && sh_is_word((unsigned char)src[j])) j++;
             w = sh_strndup(h, src + i, j - i);
-            t[nt].k = is_keyword(w) || ((exts & SH_EXT_3D) && !strcmp(w, "sampler3D")) ? TK_KW : TK_ID; t[nt].v = w; t[nt].num = 0; nt++;
+            t[nt].k = is_keyword(w) || !strcmp(w, "sampler3D") ? TK_KW : TK_ID; t[nt].v = w; t[nt].num = 0; nt++;   /* 3D textures with or without GL_OES_texture_3D */
             i = j;
             continue;
         }

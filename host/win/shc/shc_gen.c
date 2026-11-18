@@ -550,7 +550,7 @@ static Val *construct_mat(Cg *c, const char *ty, Val **args0, int na)
     if (na == 1 && is_mat(args[0])) {                   /* from a matrix: its components where they exist, the identity elsewhere */
         Val *m = args[0], **cols = new_vals(c, n);
         int k = ncomp2(c, m->ty), nk;
-        const double *kn = known(c, m, &nk);
+        const double *kn = c->h->nofold ? NULL : known(c, m, &nk);
         if (kn) {                                       /* known: a constant row a column */
             for (j = 0; j < n; j++) {
                 double v[4];
@@ -573,7 +573,7 @@ static Val *construct_mat(Cg *c, const char *ty, Val **args0, int na)
     }
     if (na == 1 && is_scalar(TY(c, args[0]))) {
         Val *f = args[0], *z, **cols = new_vals(c, n);
-        if (f->u.r.has_const) {
+        if (f->u.r.has_const && !c->h->nofold) {
             for (j = 0; j < n; j++) {
                 double v[4];
                 for (i = 0; i < n; i++) v[i] = i == j ? f->u.r.cval : 0.0;
@@ -595,7 +595,7 @@ static Val *construct_mat(Cg *c, const char *ty, Val **args0, int na)
         for (i = 0; i < na; i++) if (!(is_reg(args[i]) && vec_n(args[i]->ty) && ncomp(args[i]->ty) == n)) { all = 0; break; }
         if (all) return mk_mat(c, args, n, ty);
     }
-    {
+    if (!c->h->nofold) {
         double *kn = (double *)sh_alloc(c->h, ((size_t)na * 16 + 1) * sizeof(double));
         int nk = 0, ok = 1, m, q;
         for (i = 0; i < na && ok; i++) {
@@ -733,7 +733,7 @@ static Val *construct(Cg *c, const char *ty, Val **args0, int na0)
     }
     for (i = 0; i < na; i++) args[i] = asf(c, orig[i]);
     {
-        const double *cv = cvec_of(c, ty, args, na);
+        const double *cv = c->h->nofold ? NULL : cvec_of(c, ty, args, na);
         if (cv) return kvec(c, ty, cv, ncomp(ty));               /* every component known: one constant row */
     }
     n = ncomp(ty);
@@ -2482,8 +2482,8 @@ static Val *eval_(Cg *c, Node *e)
             return mk_mat(c, cols, a->u.m.ncols, a->ty);
         }
         if (e->s[0] == '-') {
-            if (is_reg(a) && !strcmp(a->ty, "float") && a->u.r.has_const && a->u.r.cval != 0.0) return kf(c, sh_pf(c->h, -a->u.r.cval));   /* known: a constant (not 0: -0.0 is a value of its own) */
-            if (is_reg(a) && (!strcmp(a->ty, "vec2") || !strcmp(a->ty, "vec3") || !strcmp(a->ty, "vec4")) && a->u.r.cvec) {
+            if (!c->h->nofold && is_reg(a) && !strcmp(a->ty, "float") && a->u.r.has_const && a->u.r.cval != 0.0) return kf(c, sh_pf(c->h, -a->u.r.cval));   /* known: a constant (not 0: -0.0 is a value of its own) */
+            if (!c->h->nofold && is_reg(a) && (!strcmp(a->ty, "vec2") || !strcmp(a->ty, "vec3") || !strcmp(a->ty, "vec4")) && a->u.r.cvec) {
                 double *v = (double *)sh_alloc(c->h, ((size_t)a->u.r.ncvec + 1) * sizeof(double));
                 int i, nz = 1;
                 for (i = 0; i < a->u.r.ncvec; i++) if (a->u.r.cvec[i] == 0.0) nz = 0;

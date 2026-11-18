@@ -387,7 +387,7 @@ def lex(src, exts=()):
         k = m.lastgroup
         if k in ('ws','comment'): continue
         v = m.group()
-        if k=='ident' and (v in KEYWORDS or (v=='sampler3D' and 'GL_OES_texture_3D' in exts)): toks.append(('kw', v))
+        if k=='ident' and (v in KEYWORDS or v=='sampler3D'): toks.append(('kw', v))    # 3D textures with or without GL_OES_texture_3D
         elif k=='ident': toks.append(('id', v))
         elif k=='float': toks.append(('num', float(v)))
         elif k=='hex': toks.append(('num', IntLit(int(v,16))))
@@ -793,7 +793,7 @@ class Sema:
         else:
             g.update({'gl_FragCoord':Sym(('vec4',None),'ro'),'gl_FrontFacing':Sym(('bool',None),'ro'),'gl_PointCoord':Sym(('vec2',None),'ro'),
                       'gl_FragColor':Sym(('vec4',None)),'gl_FragData':Sym(('vec4',1))})
-            if not strict or 'GL_EXT_frag_depth' in exts: g['gl_FragDepthEXT']=Sym(('float',None))
+            g['gl_FragDepthEXT']=Sym(('float',None))     # the core writes depth, with or without GL_EXT_frag_depth
             if not strict: g['gl_FragDepth']=Sym(('float',None))
         for k,v in GL_MAX.items(): g[k]=Sym(('int',None),'const',IntLit(v))
         g['gl_DepthRange']=Sym(('gl_DepthRangeParameters',None),'uniform')
@@ -1194,10 +1194,11 @@ class Sema:
         return (n,None)
     def ty_builtin(self, e, n, ts):
         fs=self.stage=='fs'
+        # What the fragment core does is there whether or not ES 1.00 asks for it: the derivatives and the *LodEXT / *GradEXT reads
+        # without their #extension lines, the *Lod reads in a fragment shader. The vertex core has no quads and no texture unit
         if self.strict:
-            if n in _DERIV and not (fs and 'GL_OES_standard_derivatives' in self.exts): return self.err(f"{n} needs GL_OES_standard_derivatives")
-            if n.endswith('EXT') and not (fs and 'GL_EXT_shader_texture_lod' in self.exts): return self.err(f"{n} needs GL_EXT_shader_texture_lod")
-            if n in ('texture2DLod','texture2DProjLod','textureCubeLod','texture3DLod','texture3DProjLod') and fs: return self.err(f"{n} is for vertex shaders")
+            if n in _DERIV and not fs: return self.err(f"{n} is for fragment shaders")
+            if n.endswith('EXT') and not fs: return self.err(f"{n} is for fragment shaders")
             if n in ('texture2D','texture2DProj','textureCube','texture3D','texture3DProj') and len(ts)==3 and not fs: return self.err(f"{n} with a bias is for fragment shaders")
         known=False
         for sg in SIGS:
@@ -1263,6 +1264,7 @@ class Codegen:
         self.creg={}             # tuple(4 floats) -> pinned Reg (loaded once, reused)
         self.cvreg={}            # (type, 4 floats) -> pinned Reg of a constant vector (kvec)
         self.remat_consts=False  # True -> rematerialize constants (fresh LDP per use) to cut register pressure
+        self.fold_cvec=True      # False -> a vector of known components built a lane at a time from the scalar constants (no kvec)
         self.uniforms={}         # name -> (slot, type)  (user uniforms)
         self.samplers={}         # name -> texture unit (sampler2D/samplerCube/sampler3D)
         self.sampler_sizes={}    # name -> size, for an array of samplers (units base .. base + size - 1)
@@ -1457,7 +1459,7 @@ class Codegen:
         n=ncomp2(ty)
         if len(args)==1 and isinstance(args[0],MatVal):   # from a matrix: its components where they exist, the identity elsewhere
             m=args[0]; k=ncomp2(m.ty); cols=[]
-            kn=self._known(m)
+            kn=self._known(m) if self.fold_cvec else None
             if kn is not None:                            # known: a constant row a column
                 return MatVal([self.kvec(f'vec{n}', [kn[j*k+i] if j<k and i<k else (1.0 if i==j else 0.0) for i in range(n)]) for j in range(n)], ty)
             for j in range(n):
@@ -1469,7 +1471,7 @@ class Codegen:
             return MatVal(cols, ty)
         if len(args)==1 and is_scalar(args[0].ty):        # matN(f) = f on the diagonal, 0 elsewhere
             f=args[0]
-            if f.const is not None: return MatVal([self.kvec(f'vec{n}', [f.const if i==j else 0.0 for i in range(n)]) for j in range(n)], ty)
+            if f.const is not None and self.fold_cvec: return MatVal([self.kvec(f'vec{n}', [f.const if i==j else 0.0 for i in range(n)]) for j in range(n)], ty)
             z=self.zeroreg(); cols=[]
             for j in range(n):
                 col=self.alloc(f'vec{n}'); self.emit('MOV', f'r{col.n}', f'r{z.n}')
@@ -1477,8 +1479,8 @@ class Codegen:
             return MatVal(cols, ty)
         if len(args)==n and all(isinstance(a,Reg) and is_vec(a.ty) and ncomp(a.ty)==n for a in args):   # n column vectors
             return MatVal(list(args), ty)
-        kn=[]
-        for a in args:
+        kn=[] if self.fold_cvec else None
+        for a in args if self.fold_cvec else ():
             k=self._known(a)
             if k is None: kn=None; break
             kn+=k
@@ -1513,7 +1515,7 @@ class Codegen:
         flat=[]
         for a in args: flat+=a.cols if isinstance(a,MatVal) else [a]     # a matrix goes in column by column
         orig=flat; args=[self._asf(a) for a in flat]                     # int components -> float
-        cv=self._cvec(ty, args)
+        cv=self._cvec(ty, args) if self.fold_cvec else None
         if cv is not None: return self.kvec(ty, cv)                       # every component known: one constant row
         n=ncomp(ty); r=self.alloc(ty); lane=0
         # single scalar -> broadcast to all N
@@ -1893,8 +1895,8 @@ class Compiler(Codegen):
                 for c in a.cols: r=self.alloc(c.ty); self.emit('MOV', f'r{r.n}', f'-r{c.n}'); cols.append(r)
                 return MatVal(cols, a.ty)
             if op=='-':                                    # negate = MOV sign-flip (is_simp, lat 1) — much
-                if isinstance(a,Reg) and a.ty=='float' and a.const is not None and a.const!=0.0: return self.kf(-a.const)   # known: a constant (not 0: -0.0 is a value of its own)
-                if isinstance(a,Reg) and a.ty in ('vec2','vec3','vec4') and a.cvec is not None and all(x!=0.0 for x in a.cvec): return self.kvec(a.ty, [-x for x in a.cvec])
+                if self.fold_cvec and isinstance(a,Reg) and a.ty=='float' and a.const is not None and a.const!=0.0: return self.kf(-a.const)   # known: a constant (not 0: -0.0 is a value of its own)
+                if self.fold_cvec and isinstance(a,Reg) and a.ty in ('vec2','vec3','vec4') and a.cvec is not None and all(x!=0.0 for x in a.cvec): return self.kvec(a.ty, [-x for x in a.cvec])
                 if isinstance(a,Reg) and a.ty=='int':      # int negate: 0 - a (sign-flip is a float trick)
                     r=self.alloc('int'); self.emit('ISUB', f'r{r.n}', f'r{self._asi_lit(0).n}', f'r{a.n}'); self.freer(a); return r
                 r=self.alloc(a.ty); self.emit('MOV', f'r{r.n}', f'-r{a.n}'); self.freer(a); return r  # cheaper than SUB via madd
@@ -4373,6 +4375,10 @@ def _mad_fuse(lines, isa64):
     return lines
 
 # --------------- top-level program build ---------------
+# The cores' program memories hold 4096 instructions; board A takes a vertex program of up to 4096 (VS_PROGRAM refuses more), board
+# B's draw state gives a fragment program's length in 12 bits, so 4095 at most
+PROG_MAX={'vs':4096, 'fs':4095}
+
 def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, noops=0, attrs=None):
     # Auto-fallback: if a shader exceeds the 31-register file with the default (constant-pinning) allocation,
     # retry with constant rematerialization (fresh LDP per use) — trades a few more instructions for far lower
@@ -4389,12 +4395,14 @@ def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True,
     # B's b_flags for the fragment stage): 1 the integer divider (int / becomes _idiv_lowered), 2 SIN / COS (_sincos_lowered); isa64.
     # attrs: a vertex stage's attribute bindings at a link, name -> location (place_attribs).
     # A spill retries first without the loop-invariant hoist (licm: what it takes out of a loop stays live across all of it, so a long
-    # program can need more registers with it than without), then with the constants rematerialized, without the hoist either: never a
-    # refusal that the code before the hoist did not have.
+    # program can need more registers with it than without), then with the vectors of known components built a lane at a time
+    # (fold_cvec=False: a folded one holds a register of its own to its last use, the lanes of the scalars it is built from are shared),
+    # with and without the hoist, then with every constant rematerialized, without the hoist either: never a refusal that the code
+    # before the hoist or the folding did not have.
     if not remat_consts:
-        for hoist in (True, False):
+        for fold, hoist in ((True, True), (True, False), (False, True), (False, False)):
             try:
-                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist, noops=noops, attrs=attrs)
+                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist, noops=noops, attrs=attrs, fold_cvec=fold)
             except CompileError as e:
                 if 'register spill' not in str(e): raise
     return _compile_stage(src, stage, optimize, remat_consts=True, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=False, noops=noops, attrs=attrs)
@@ -4426,12 +4434,12 @@ def place_attribs(code, attribs, attrs):
         return ' '.join(t)
     return [moved(ln) for ln in code], {n:(loc[n],ty) for n,i,ty,w in act}
 
-def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True, noops=0, attrs=None):
+def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True, noops=0, attrs=None, fold_cvec=True):
     exts=set()
     src=preprocess(src, stage, exts, strict)     # #define / #ifdef / #if ... + comment stripping
     toks=lex(src, exts); parser=Parser(toks, strict); ast=parser.parse()
     sem=Sema(stage, parser, exts, strict); sem.run(ast)
-    c=Compiler(stage); c.remat_consts=remat_consts; c.hw_sincos=hw_sincos; c.isa64=isa64; c.callmap=sem.callmap; c.ints=sem.ints
+    c=Compiler(stage); c.remat_consts=remat_consts; c.fold_cvec=fold_cvec; c.hw_sincos=hw_sincos; c.isa64=isa64; c.callmap=sem.callmap; c.ints=sem.ints
     c.xops=xops&3 if isa64 and stage=='fs' else 0
     if isa64 and noops&1: c.hw_idiv=False
     if isa64 and noops&2: c.hw_sincos=False
@@ -4532,6 +4540,9 @@ def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True
     out=[re.sub(r'@(\d+)(\.[xyzw]+)?', at, ln) for ln in code]
     attribs=c.attribs
     if stage=='vs': out, attribs = place_attribs(out, c.attribs, attrs)
+    n=sum(1 for ln in out if ln.split('//')[0].split(';')[0].strip() and not ln.strip().endswith(':'))
+    if isa64 and n>PROG_MAX[stage]:
+        raise CompileError(f"the program has {n} instructions: the {'vertex' if stage=='vs' else 'fragment'} core runs at most {PROG_MAX[stage]}")
     return {'sasm':'\n'.join(out), 'attribs':attribs, 'uniforms':c.uniforms, 'samplers':c.samplers, 'sampler_sizes':c.sampler_sizes,
             'varyings':c.varyings, 'const_base':base, 'const_pool':pool, 'isa64':isa64, 'vs_tex':c.vs_tex}
 

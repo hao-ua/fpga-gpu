@@ -138,6 +138,18 @@ W = [
 # (name, stage, source): each must not compile
 B = 'precision mediump float; uniform vec4 u; uniform float f; uniform int ii; varying vec2 w;\n'
 X3 = '#extension GL_OES_texture_3D : enable\n'
+# (name, stage, source): beyond GLSL ES 1.00, what the fragment core does is there without the #extension line ES asks for; each must compile
+YES = [
+    ('dFdx, dFdy, fwidth with no extension', 'fs', B + 'void main() { gl_FragColor = vec4(dFdx(w), dFdy(w.x), fwidth(w.y)); }\n'),
+    ('texture2DLod in a fragment shader', 'fs', B + 'uniform sampler2D s;\nvoid main() { gl_FragColor = texture2DLod(s, w, f); }\n'),
+    ('textureCubeLod in a fragment shader', 'fs', B + 'uniform samplerCube s;\nvoid main() { gl_FragColor = textureCubeLod(s, vec3(w, 1.0), f); }\n'),
+    ('texture2DLodEXT with no extension', 'fs', B + 'uniform sampler2D s;\nvoid main() { gl_FragColor = texture2DLodEXT(s, w, f); }\n'),
+    ('texture2DGradEXT with no extension', 'fs', B + 'uniform sampler2D s;\nvoid main() { gl_FragColor = texture2DGradEXT(s, w, dFdx(w), dFdy(w)); }\n'),
+    ('gl_FragDepthEXT with no extension', 'fs', B + 'void main() { gl_FragDepthEXT = f; gl_FragColor = u; }\n'),
+    ('sampler3D and texture3D with no extension', 'fs', B + 'uniform sampler3D s;\nvoid main() { gl_FragColor = texture3D(s, vec3(w, f)); }\n'),
+    ('texture3DLod in a fragment shader', 'fs', X3 + B + 'uniform sampler3D s;\nvoid main() { gl_FragColor = texture3DLod(s, vec3(w, 0.0), f); }\n'),
+    ('texture3DProjLod in a fragment shader', 'fs', X3 + B + 'uniform sampler3D s;\nvoid main() { gl_FragColor = texture3DProjLod(s, vec4(w, 0.0, 1.0), f); }\n'),
+]
 NO = [
     ('#version 300 es', 'fs', '#version 300 es\nvoid main() { }\n'),
     ('#version after code', 'fs', 'precision mediump float;\n#version 100\nvoid main() { }\n'),
@@ -281,20 +293,14 @@ NO = [
     ('== of arrays', 'fs', B + 'void main() { float a[2]; float b[2]; bool c = a == b; }\n'),
     ('== of a struct with an array', 'fs', B + 'struct S { float a[2]; };\nvoid main() { S x; S y; bool c = x == y; }\n'),
     ('array assignment with a sampler in a struct', 'fs', B + 'struct S { sampler2D s; };\nuniform S a; uniform S b;\nvoid main() { S c; }\n'),
-    ('dFdx with no extension', 'fs', B + 'void main() { vec2 a = dFdx(w); }\n'),
-    ('texture2DLod in a fragment shader', 'fs', B + 'uniform sampler2D s;\nvoid main() { vec4 c = texture2DLod(s, w, 0.0); }\n'),
-    ('texture2DLodEXT with no extension', 'fs', B + 'uniform sampler2D s;\nvoid main() { vec4 c = texture2DLodEXT(s, w, 0.0); }\n'),
-    ('gl_FragDepthEXT with no extension', 'fs', B + 'void main() { gl_FragDepthEXT = 1.0; }\n'),
+    ('dFdx in a vertex shader', 'vs', 'attribute vec4 a;\nvoid main() { gl_Position = a + vec4(dFdx(a.x)); }\n'),
+    ('texture2DLodEXT in a vertex shader', 'vs', 'attribute vec4 a; uniform sampler2D s;\nvoid main() { gl_Position = texture2DLodEXT(s, a.xy, 0.0); }\n'),
     ('a bias in a vertex shader', 'vs', 'uniform sampler2D s; attribute vec2 a;\nvoid main() { gl_Position = texture2D(s, a, 1.0); }\n'),
-    ('sampler3D with no extension', 'fs', B + 'uniform sampler3D s;\nvoid main() { }\n'),
-    ('sampler3D after disable', 'fs', '#extension GL_OES_texture_3D : enable\n#extension GL_OES_texture_3D : disable\n' + B + 'uniform sampler3D s;\nvoid main() { }\n'),
-    ('texture3D with no extension', 'fs', B + 'uniform sampler2D s;\nvoid main() { vec4 c = texture3D(s, vec3(w, 0.0)); }\n'),
+    ('sampler3D as a variable name', 'fs', B + 'void main() { float sampler3D = 1.0; }\n'),
     ('texture3D of a sampler2D', 'fs', X3 + B + 'uniform sampler2D s;\nvoid main() { vec4 c = texture3D(s, vec3(w, 0.0)); }\n'),
     ('texture3D of a vec2', 'fs', X3 + B + 'uniform sampler3D s;\nvoid main() { vec4 c = texture3D(s, w); }\n'),
     ('texture3DProj of a vec3', 'fs', X3 + B + 'uniform sampler3D s;\nvoid main() { vec4 c = texture3DProj(s, vec3(w, 1.0)); }\n'),
     ('texture2D of a sampler3D', 'fs', X3 + B + 'uniform sampler3D s;\nvoid main() { vec4 c = texture2D(s, w); }\n'),
-    ('texture3DLod in a fragment shader', 'fs', X3 + B + 'uniform sampler3D s;\nvoid main() { vec4 c = texture3DLod(s, vec3(w, 0.0), 0.0); }\n'),
-    ('texture3DProjLod in a fragment shader', 'fs', X3 + B + 'uniform sampler3D s;\nvoid main() { vec4 c = texture3DProjLod(s, vec4(w, 0.0, 1.0), 0.0); }\n'),
     ('a bias on texture3D in a vertex shader', 'vs', X3 + 'uniform sampler3D s; attribute vec3 a;\nvoid main() { gl_Position = texture3D(s, a, 1.0); }\n'),
     ('a local sampler3D', 'fs', X3 + B + 'void main() { sampler3D s; }\n'),
     ('an out sampler3D', 'fs', X3 + B + 'void f(out sampler3D s) { }\nvoid main() { }\n'),
@@ -351,6 +357,8 @@ def dump(d):
         open('%s/w%03d_%s.frag' % (d, i, name(c[0])), 'w', newline='').write(FS + c[1])
     for i, (nm, st, src) in enumerate(NO):
         open('%s/no%03d_%s.%s' % (d, i, name(nm), 'vert' if st == 'vs' else 'frag'), 'w', newline='').write(src)
+    for i, (nm, st, src) in enumerate(YES):
+        open('%s/yes%03d_%s.%s' % (d, i, name(nm), 'vert' if st == 'vs' else 'frag'), 'w', newline='').write(src)
 
 
 def main():
@@ -391,8 +399,15 @@ def main():
         except Exception as e:
             print('FAIL %s: not a compile error: %s %s' % (name, type(e).__name__, str(e)[:100]))
             no += 1
-    print('%d programs, %d failures; %d refused, %d not' % (len(C) + len(W) + len(vs), bad, len(NO), no))
-    return 1 if bad or no else 0
+    yes = 0
+    for name, stage, src in YES:
+        try:
+            glslc.compile_stage(src, stage, isa64=True, forward=True, strict=True)
+        except Exception as e:
+            print('FAIL refused: %s: %s' % (name, str(e)[:100]))
+            yes += 1
+    print('%d programs, %d failures; %d refused, %d not; %d beyond ES 1.00 compiled, %d not' % (len(C) + len(W) + len(vs), bad, len(NO), no, len(YES) - yes, yes))
+    return 1 if bad or no or yes else 0
 
 
 sys.exit(main())

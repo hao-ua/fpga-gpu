@@ -840,10 +840,11 @@ static ShT ty_builtin(S *s, const char *n, ShT *ts, int na)
 {
     int fs = s->fs, known = 0, i;
     size_t ln = strlen(n);
+    /* what the fragment core does is there whether or not ES 1.00 asks for it: the derivatives and the *LodEXT / *GradEXT reads without their #extension lines,
+     * the *Lod reads in a fragment shader. The vertex core has no quads and no texture unit */
     if (s->strict) {
-        if (is_deriv(n) && !(fs && (s->exts & SH_EXT_DERIV))) return serr(s, "%s needs GL_OES_standard_derivatives", n);
-        if (ln > 3 && !strcmp(n + ln - 3, "EXT") && !(fs && (s->exts & SH_EXT_LOD))) return serr(s, "%s needs GL_EXT_shader_texture_lod", n);
-        if ((!strcmp(n, "texture2DLod") || !strcmp(n, "texture2DProjLod") || !strcmp(n, "textureCubeLod") || !strcmp(n, "texture3DLod") || !strcmp(n, "texture3DProjLod")) && fs) return serr(s, "%s is for vertex shaders", n);
+        if (is_deriv(n) && !fs) return serr(s, "%s is for fragment shaders", n);
+        if (ln > 3 && !strcmp(n + ln - 3, "EXT") && !fs) return serr(s, "%s is for fragment shaders", n);
         if ((!strcmp(n, "texture2D") || !strcmp(n, "texture2DProj") || !strcmp(n, "textureCube") || !strcmp(n, "texture3D") || !strcmp(n, "texture3DProj")) && na == 3 && !fs) return serr(s, "%s with a bias is for fragment shaders", n);
     }
     for (i = 0; SIGS[i]; i++) {
@@ -1037,7 +1038,7 @@ void sh_sema(Shc *h, Decl *ast, int nd, int fs, int exts, int *depthrange)
         put(s, g, "gl_FragColor", tn("vec4"), "", 0, 0, 0);
         fd.b = "vec4"; fd.arr = 1;
         put(s, g, "gl_FragData", fd, "", 0, 0, 0);
-        if (!s->strict || (exts & SH_EXT_FRAGDEPTH)) put(s, g, "gl_FragDepthEXT", tn("float"), "", 0, 0, 0);
+        put(s, g, "gl_FragDepthEXT", tn("float"), "", 0, 0, 0);     /* the core writes depth, with or without GL_EXT_frag_depth */
         if (!s->strict) put(s, g, "gl_FragDepth", tn("float"), "", 0, 0, 0);
     }
     for (i = 0; i < SH_NMAX; i++) put(s, g, SH_GL_MAX[i].name, tn("int"), "const", 1, SH_GL_MAX[i].v, 1);

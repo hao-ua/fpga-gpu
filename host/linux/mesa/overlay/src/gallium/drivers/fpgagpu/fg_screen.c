@@ -313,7 +313,7 @@ fg_init_shader_caps(struct fg_screen *screen)
    struct pipe_shader_caps *vs = (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_VERTEX];
    struct pipe_shader_caps *fs = (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_FRAGMENT];
 
-   vs->max_instructions = vs->max_alu_instructions = 4096;
+   vs->max_instructions = vs->max_alu_instructions = FG_VS_WORDS;
    vs->max_control_flow_depth = 16;
    vs->max_inputs = 16;
    vs->max_outputs = 16;
@@ -323,7 +323,7 @@ fg_init_shader_caps(struct fg_screen *screen)
    vs->indirect_const_addr = true;
    vs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
 
-   fs->max_instructions = fs->max_alu_instructions = fs->max_tex_instructions = fs->max_tex_indirections = 4096;
+   fs->max_instructions = fs->max_alu_instructions = fs->max_tex_instructions = fs->max_tex_indirections = FG_FS_WORDS;
    fs->max_control_flow_depth = 16;
    fs->max_inputs = 8;
    fs->max_outputs = 1;

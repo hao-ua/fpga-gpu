@@ -14,6 +14,8 @@
 
 #define FG_VS_PARAMS 256 /* parameter vectors of the vertex core: the uniforms, then the constants */
 #define FG_FS_PARAMS 64  /* of the fragment core */
+#define FG_VS_WORDS  4096 /* instructions of a vertex program: board A refuses VS_PROGRAM past it */
+#define FG_FS_WORDS  4095 /* of a fragment program: board B's draw state gives the length in 12 bits */
 #define FG_VARYINGS  8   /* varying vectors from the vertex to the fragment stage */
 
 /* a 2D unit's border (the TMU clamps to the edge; the program mixes the border colour in) */

@@ -1794,6 +1794,12 @@ retry:
       fail(c, "more uniforms and constants than the core's parameter vectors", n);
    }
    words = sh_assemble(h, sasm, !fs, IF_DEPTH, LOOP_DEPTH, &nwords);
+   if (nwords > (fs ? FG_FS_WORDS : FG_VS_WORDS)) {
+      char n[64];
+
+      snprintf(n, sizeof(n), "%d instructions, %d room", nwords, fs ? FG_FS_WORDS : FG_VS_WORDS);
+      fail(c, "more instructions than the core's program memory", n);
+   }
 
    out->words = (uint64_t *)malloc((size_t)(nwords ? nwords : 1) * sizeof(uint64_t));
    out->consts = (uint32_t *)malloc((size_t)(c->npool ? c->npool : 1) * 4 * sizeof(uint32_t));

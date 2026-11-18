@@ -139,6 +139,7 @@ void g2r_finish(g2r *r);                             /* + wait for the board */
 
 /* presentation: ends the pass, PRESENTs, keeps at most two frames in flight */
 void g2r_present(g2r *r, uint16_t image, int hold);
+void g2r_present_idle(g2r *r);                       /* ends the pass and waits until no PRESENT is in flight: before a SET_MODE */
 
 /* diagnostics */
 typedef struct g2r_stats { uint64_t draws, draw_states, passes, frames, stream_bytes, keep_bytes, kept_binds, kept_unseen; uint32_t kept_now, kept_mb; uint64_t renames; } g2r_stats;

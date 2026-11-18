@@ -3343,6 +3343,48 @@ static void test_window_copy(void)
     err(GL_NO_ERROR, "window copy");
 }
 
+/* images board B shows or has queued are kept until later frames have replaced them: a window of the mode's size (its frames shown as they are) resized just
+   after a swap, and another destroyed just after its swap. Drawing and swapping go on as before */
+static void test_shown_images(void)
+{
+    HWND w = CreateWindowA("gles_test", "shown", WS_POPUP, 0, 0, W, H, NULL, NULL, GetModuleHandleA(NULL), NULL), w2;
+    EGLSurface s = eglCreateWindowSurface(g_dpy, g_cfg, w, NULL), s2;
+    EGLint v = 0;
+    int i;
+    ok(s && eglMakeCurrent(g_dpy, s, s, g_ctx), "a window of the mode's size current");
+    if (!s) { DestroyWindow(w); return; }
+    glViewport(0, 0, W, H);
+    clear_to(1, 0, 0, 1);
+    ok(eglSwapBuffers(g_dpy, s), "shown images: a swap");
+    SetWindowPos(w, NULL, 0, 0, 400, 300, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ok(eglSwapBuffers(g_dpy, s), "shown images: the swap that finds the window resized");
+    eglQuerySurface(g_dpy, s, 0x3057, &v);
+    ieq(v, 400, "shown images: the surface's new width");
+    glViewport(0, 0, 400, 300);
+    for (i = 0; i < 4; i++) {
+        clear_to(0, (float)(i & 1), 1, 1);
+        px(399, 299, "shown images: the resized framebuffer", 0, (i & 1) * 255, 255, 255);
+        ok(eglSwapBuffers(g_dpy, s), "shown images: swaps after the resize");
+    }
+    w2 = CreateWindowA("gles_test", "shown 2", WS_POPUP, 0, 0, W, H, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    s2 = eglCreateWindowSurface(g_dpy, g_cfg, w2, NULL);
+    ok(s2 && eglMakeCurrent(g_dpy, s2, s2, g_ctx), "a second window of the mode's size current");
+    glViewport(0, 0, W, H);
+    clear_to(1, 1, 0, 1);
+    ok(eglSwapBuffers(g_dpy, s2), "shown images: the second window's swap");
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the main window");
+    ok(eglDestroySurface(g_dpy, s2) && eglDestroySurface(g_dpy, s), "both window surfaces destroyed, one just after its swap");
+    DestroyWindow(w2);
+    DestroyWindow(w);
+    glViewport(0, 0, W, H);
+    for (i = 0; i < 4; i++) {
+        clear_to((float)(i & 1), 1, 0, 1);
+        px(W - 1, H - 1, "shown images: the main window after the others went", (i & 1) * 255, 255, 0, 255);
+        ok(eglSwapBuffers(g_dpy, g_surf), "shown images: the main window's swaps");
+    }
+    err(GL_NO_ERROR, "shown images");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -3439,6 +3481,7 @@ int main(void)
     test_egl_api();
     test_threads();
     test_window_copy();
+    test_shown_images();
     test_swap();
     printf("%d checks, %d failed\n", g_checks, g_bad);
     if (!g_bad) printf("OK gles_test\n");

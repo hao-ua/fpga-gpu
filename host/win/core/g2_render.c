@@ -276,6 +276,7 @@ int g2r_volume_alias(g2r *r, uint16_t *handle, uint32_t base, uint32_t w, uint32
 
 void g2r_image_destroy(g2r *r, uint16_t handle, uint32_t base)
 {
+    if (r->discard_image == handle) r->discard_image = 0;      /* the handle may come back as another image, whose contents count */
     g2_destroy(r->bd, handle);
     g2_handle_free(&r->h_img, handle);
     g2_heap_free(r->heap_b, base);
@@ -910,6 +911,12 @@ void g2r_present(g2r *r, uint16_t image, int hold)
     r->frame_pending[r->npending] = r->frame + 1;
     r->pending[r->npending++] = g2_present(r->bd, image, ++r->frame, 0, hold);
     r->st.frames++;
+}
+
+void g2r_present_idle(g2r *r)
+{
+    g2r_end_pass(r);
+    while (r->npending) wait_one(r);
 }
 
 void g2r_get_stats(g2r *r, g2r_stats *s) { *s = r->st; }

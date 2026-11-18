@@ -212,6 +212,9 @@ static struct {
     uint16_t scan[3];                           /* mode-sized images a smaller framebuffer is copied into to be shown */
     uint32_t scan_base[3];
     int scan_w, scan_h;
+    uint16_t shown[3];                          /* the last three images presented: one on the screen, up to two queued (g2r_present keeps two in flight) */
+    uint16_t late[3];                           /* images to destroy once they are none of shown[] */
+    uint32_t late_base[3];
     es_sfc *sfp;
     /* objects: shared by all contexts, names never repeat */
     es_buf *bufs[HASH];
@@ -292,13 +295,37 @@ static int dev_up(void)
 static const struct { int color, depth, stencil; } CFG[] = { { 32, 24, 8 }, { 32, 0, 0 }, { 32, 16, 0 }, { 16, 24, 8 }, { 16, 16, 0 }, { 16, 0, 0 } };
 #define NCFG ((int)(sizeof CFG / sizeof CFG[0]))
 
+/* An image board B may be showing or have queued (one of S.shown) is not destroyed yet: board B would go on scanning out memory given to another image, or
+   PRESENT a handle that is gone. It waits in S.late until three later PRESENTs have taken its place (late_sweep). Every late one is one of shown[], so three
+   places are enough */
+static void img_drop(uint16_t h, uint32_t base)
+{
+    int i;
+    if (!h) return;
+    for (i = 0; i < 3 && S.shown[i] != h; i++) ;
+    if (i == 3) { g2r_image_destroy(S.r, h, base); return; }
+    for (i = 0; i < 3; i++) if (!S.late[i]) { S.late[i] = h; S.late_base[i] = base; return; }
+    g2e_log("gles: image %u kept: no room to wait until it is off the screen", h);
+}
+
+/* after a PRESENT: the late images no longer among shown[] go */
+static void late_sweep(void)
+{
+    int i, k;
+    for (i = 0; i < 3; i++) {
+        if (!S.late[i]) continue;
+        for (k = 0; k < 3 && S.shown[k] != S.late[i]; k++) ;
+        if (k == 3) { g2r_image_destroy(S.r, S.late[i], S.late_base[i]); S.late[i] = 0; }
+    }
+}
+
 /* a surface's images back to board B */
 static void sfc_free(es_sfc *f)
 {
     int i;
     if (!S.r) return;
     g2r_end_pass(S.r);
-    for (i = 0; i < 3; i++) { if (f->color[i]) g2r_image_destroy(S.r, f->color[i], f->color_base[i]); f->color[i] = 0; }
+    for (i = 0; i < 3; i++) { img_drop(f->color[i], f->color_base[i]); f->color[i] = 0; }
     if (f->ds) g2r_image_destroy(S.r, f->ds, f->ds_base);
     f->ds = 0;
 }
@@ -323,7 +350,8 @@ static void default_fb(int vw, int vh, int cfg, int window)
         if (h > maxh) h = maxh;
     }
     sfc_free(SF);
-    if (window) {                               /* the smallest mode that holds the window */
+    if (window) {                               /* the smallest mode that holds the window; board B takes no SET_MODE while a PRESENT is in flight */
+        g2r_present_idle(S.r);
         if (g2_mode_select(S.bd, w, h, &S.mode) < 0) g2e_log("gles: SET_MODE for %d x %d: %s", w, h, g2_error_text(S.bd));
         S.mode_w = G2_MODE_W[S.mode]; S.mode_h = G2_MODE_H[S.mode];
     }
@@ -346,7 +374,7 @@ static void scan_fit(void)
     if (S.scan[0] && S.scan_w == S.mode_w && S.scan_h == S.mode_h) return;
     g2r_end_pass(S.r);
     for (i = 0; i < 3; i++) {
-        if (S.scan[i]) g2r_image_destroy(S.r, S.scan[i], S.scan_base[i]);
+        img_drop(S.scan[i], S.scan_base[i]);
         S.scan[i] = 0;
         g2r_image_create(S.r, &S.scan[i], &S.scan_base[i], (uint32_t)S.mode_w, (uint32_t)S.mode_h, G2_FMT_RGBA8, 1, 1, 1, G2_USE_SCANOUT | G2_USE_TRANSFER);
         g2_fill_image(S.bd, S.scan[i], G2_TF_RAW, 0x000000FFu, 0, 0, (uint32_t)S.mode_w, (uint32_t)S.mode_h, 0xF, 0, 0);
@@ -423,7 +451,7 @@ static void copy_to_window(uint16_t image)
 
 static void swap_buffers(void)
 {
-    uint16_t image = SF->color[SF->back];
+    uint16_t image = SF->color[SF->back], out = image;
     int hold = S.hold && SF->swap_interval, w, h;
     g2r_end_pass(S.r);
     if (SF->fb_w == S.mode_w && SF->fb_h == S.mode_h) {
@@ -441,8 +469,11 @@ static void swap_buffers(void)
         scan_fit();
         S.scan_idx = (S.scan_idx + 1) % 3;
         g2_copy_image(S.bd, image, S.scan[S.scan_idx], 0, 0, (uint32_t)SF->fb_w, (uint32_t)SF->fb_h, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        g2r_present(S.r, S.scan[S.scan_idx], hold);
+        out = S.scan[S.scan_idx];
+        g2r_present(S.r, out, hold);
     }
+    S.shown[S.frame % 3] = out;
+    late_sweep();
     S.frame++;
     g2r_stats_tick(S.r);
     dump_frame(image);

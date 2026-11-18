@@ -40,6 +40,8 @@ typedef struct GConst { const char *ty; Node *init; } GConst;
 
 /* consts + creg: tuple(4 floats) -> pool slot, pinned Reg */
 typedef struct CEnt { double k[4]; int slot; Val *reg; int used; } CEnt;
+/* cvreg: (type, 4 floats) -> pinned Reg of a constant vector (kvec) */
+typedef struct CVEnt { const char *ty; double k[4]; Val *reg; } CVEnt;
 
 typedef struct Cg {
     Shc *h;
@@ -48,6 +50,7 @@ typedef struct Cg {
     int vcount;
     unsigned char *sv; int svcap;
     CEnt *ct; int ctcap, ctn;
+    CVEnt *cvr; int ncvr, cvrcap;
     double *pool; int npool, poolcap;
     Dict uniforms, samplers, attribs, varyings, const_env, funcs, inlining, structs, global_consts;     /* const_env: global scalar consts; a local's is in its scope, entry with p NULL */
     Dict shadow, vary_used;      /* the varyings and special outputs kept in a local until the end of main */
@@ -339,6 +342,34 @@ static Val *kf(Cg *c, double f)
     return r;
 }
 
+/* glslc kvec: a float vector of known components in one constant row, the lanes past ty's the last component, loaded once (remat: at every use) into a register of
+ * its own (a kf scalar's register is one lane of a packed one) */
+static Val *kvec(Cg *c, const char *ty, const double *vals, int n)
+{
+    double k[4], *cv;
+    int i, slot;
+    Val *r;
+    for (i = 0; i < 4; i++) k[i] = vals[i < n ? i : n - 1];
+    if (!c->remat) for (i = 0; i < c->ncvr; i++) if (!strcmp(c->cvr[i].ty, ty) && key_same(c->cvr[i].k, k)) return c->cvr[i].reg;
+    r = alloc(c, ty);
+    slot = const_slot(c, k);
+    emit(c, "LDP r%d @%d", r->u.r.n, slot);
+    cv = (double *)sh_alloc(c->h, (size_t)n * sizeof(double));
+    memcpy(cv, vals, (size_t)n * sizeof(double));
+    r->u.r.cvec = cv; r->u.r.ncvec = n;
+    if (!c->remat) {
+        if (c->ncvr == c->cvrcap) {
+            int cap = c->cvrcap ? c->cvrcap * 2 : 16;
+            CVEnt *nt = (CVEnt *)sh_alloc(c->h, (size_t)cap * sizeof(CVEnt));
+            if (c->ncvr) memcpy(nt, c->cvr, (size_t)c->ncvr * sizeof(CVEnt));
+            c->cvr = nt; c->cvrcap = cap;
+        }
+        c->cvr[c->ncvr].ty = ty; memcpy(c->cvr[c->ncvr].k, k, sizeof k); c->cvr[c->ncvr].reg = r;
+        c->ncvr++;
+    }
+    return r;
+}
+
 static Val *zeroreg(Cg *c)
 {
     if (!c->zero) c->zero = kf(c, 0.0);
@@ -508,6 +539,8 @@ static void masked_write(Cg *c, Val *lhs, const char *mask, Val *rhs)
 }
 
 /* ---------------- constructors ---------------- */
+static const double *known(Cg *c, Val *a, int *n);
+
 static Val *construct_mat(Cg *c, const char *ty, Val **args0, int na)
 {
     Val **args = new_vals(c, na);
@@ -516,7 +549,16 @@ static Val *construct_mat(Cg *c, const char *ty, Val **args0, int na)
     n = ncomp2(c, ty);
     if (na == 1 && is_mat(args[0])) {                   /* from a matrix: its components where they exist, the identity elsewhere */
         Val *m = args[0], **cols = new_vals(c, n);
-        int k = ncomp2(c, m->ty);
+        int k = ncomp2(c, m->ty), nk;
+        const double *kn = known(c, m, &nk);
+        if (kn) {                                       /* known: a constant row a column */
+            for (j = 0; j < n; j++) {
+                double v[4];
+                for (i = 0; i < n; i++) v[i] = j < k && i < k ? kn[j * k + i] : (i == j ? 1.0 : 0.0);
+                cols[j] = kvec(c, vecn(c, n), v, n);
+            }
+            return mk_mat(c, cols, n, ty);
+        }
         for (j = 0; j < n; j++) {
             Val *cl = alloc(c, vecn(c, n));
             for (i = 0; i < n; i++) {
@@ -530,7 +572,16 @@ static Val *construct_mat(Cg *c, const char *ty, Val **args0, int na)
         return mk_mat(c, cols, n, ty);
     }
     if (na == 1 && is_scalar(TY(c, args[0]))) {
-        Val *f = args[0], *z = zeroreg(c), **cols = new_vals(c, n);
+        Val *f = args[0], *z, **cols = new_vals(c, n);
+        if (f->u.r.has_const) {
+            for (j = 0; j < n; j++) {
+                double v[4];
+                for (i = 0; i < n; i++) v[i] = i == j ? f->u.r.cval : 0.0;
+                cols[j] = kvec(c, vecn(c, n), v, n);
+            }
+            return mk_mat(c, cols, n, ty);
+        }
+        z = zeroreg(c);
         for (j = 0; j < n; j++) {
             Val *cl = alloc(c, vecn(c, n));
             emit(c, "MOV r%d r%d", cl->u.r.n, N(c, z));
@@ -543,6 +594,20 @@ static Val *construct_mat(Cg *c, const char *ty, Val **args0, int na)
         int all = 1;
         for (i = 0; i < na; i++) if (!(is_reg(args[i]) && vec_n(args[i]->ty) && ncomp(args[i]->ty) == n)) { all = 0; break; }
         if (all) return mk_mat(c, args, n, ty);
+    }
+    {
+        double *kn = (double *)sh_alloc(c->h, ((size_t)na * 16 + 1) * sizeof(double));
+        int nk = 0, ok = 1, m, q;
+        for (i = 0; i < na && ok; i++) {
+            const double *v = known(c, args[i], &m);
+            if (!v) ok = 0;
+            else for (q = 0; q < m; q++) kn[nk++] = v[q];
+        }
+        if (ok && nk >= n * n) {                        /* every component known: a constant row a column */
+            Val **cols = new_vals(c, n);
+            for (j = 0; j < n; j++) cols[j] = kvec(c, vecn(c, n), kn + j * n, n);
+            return mk_mat(c, cols, n, ty);
+        }
     }
     {                                                   /* anything else: the components in order, column-major */
         const char **srcs = (const char **)sh_alloc(c->h, 64 * sizeof(char *) + (size_t)na * 16 * sizeof(char *));
@@ -600,26 +665,59 @@ static Val *convert(Cg *c, Val *r, const char *ty, Val **args, int na)
     return r;
 }
 
-/* glslc._cvec: the components of a float vector built from known values (constants, or vectors of them) */
-static void set_cvec(Cg *c, Val *r, const char *ty, Val **args, int na)
+/* glslc._cvec: the components of a float vector built from known values (constants, or vectors of them), NULL else */
+static const double *cvec_of(Cg *c, const char *ty, Val **args, int na)
 {
     double *vals;
     int n = ncomp(ty), k = 0, i, j;
-    if (strcmp(ty, "vec2") && strcmp(ty, "vec3") && strcmp(ty, "vec4")) return;
+    if (strcmp(ty, "vec2") && strcmp(ty, "vec3") && strcmp(ty, "vec4")) return NULL;
     vals = (double *)sh_alloc(c->h, (size_t)(na * 4 + n + 1) * sizeof(double));
     for (i = 0; i < na; i++) {
         Val *a = args[i];
-        if (!is_reg(a)) return;
+        if (!is_reg(a)) return NULL;
         if (is_scalar(a->ty)) {
-            if (!a->u.r.has_const) return;
+            if (!a->u.r.has_const) return NULL;
             vals[k++] = a->u.r.cval;
         }
         else if (a->u.r.cvec) { int an = ncomp(a->ty); for (j = 0; j < an && j < a->u.r.ncvec; j++) vals[k++] = a->u.r.cvec[j]; }
-        else return;
+        else return NULL;
     }
     if (na == 1 && is_scalar(args[0]->ty)) for (k = 1; k < n; k++) vals[k] = vals[0];
-    if (k < n) return;
-    r->u.r.cvec = vals; r->u.r.ncvec = n;
+    if (k < n) return NULL;
+    return vals;
+}
+static void set_cvec(Cg *c, Val *r, const char *ty, Val **args, int na)
+{
+    const double *v = cvec_of(c, ty, args, na);
+    if (v) { r->u.r.cvec = v; r->u.r.ncvec = ncomp(ty); }
+}
+
+/* glslc._known: a value's components known at compile time (a matrix column by column), as _cvec takes them; NULL else, *n their count */
+static const double *known(Cg *c, Val *a, int *n)
+{
+    double *out;
+    int k = 0, j, q;
+    if (is_mat(a)) {
+        out = (double *)sh_alloc(c->h, ((size_t)a->u.m.ncols * 4 + 1) * sizeof(double));
+        for (j = 0; j < a->u.m.ncols; j++) {
+            int m;
+            const double *v = known(c, a->u.m.cols[j], &m);
+            if (!v) return NULL;
+            for (q = 0; q < m; q++) out[k++] = v[q];
+        }
+        *n = k;
+        return out;
+    }
+    if (!is_reg(a)) return NULL;
+    if (is_scalar(a->ty)) {
+        if (!a->u.r.has_const) return NULL;
+        out = (double *)sh_alloc(c->h, sizeof(double));
+        out[0] = a->u.r.cval; *n = 1;
+        return out;
+    }
+    if (!a->u.r.cvec) return NULL;
+    *n = ncomp(a->ty) < a->u.r.ncvec ? ncomp(a->ty) : a->u.r.ncvec;
+    return a->u.r.cvec;
 }
 
 static Val *construct(Cg *c, const char *ty, Val **args0, int na0)
@@ -634,6 +732,10 @@ static Val *construct(Cg *c, const char *ty, Val **args0, int na0)
         else orig[na++] = args0[i];
     }
     for (i = 0; i < na; i++) args[i] = asf(c, orig[i]);
+    {
+        const double *cv = cvec_of(c, ty, args, na);
+        if (cv) return kvec(c, ty, cv, ncomp(ty));               /* every component known: one constant row */
+    }
     n = ncomp(ty);
     r = alloc(c, ty);
     if (na == 1 && is_scalar(TY(c, args[0]))) {
@@ -2380,6 +2482,16 @@ static Val *eval_(Cg *c, Node *e)
             return mk_mat(c, cols, a->u.m.ncols, a->ty);
         }
         if (e->s[0] == '-') {
+            if (is_reg(a) && !strcmp(a->ty, "float") && a->u.r.has_const && a->u.r.cval != 0.0) return kf(c, sh_pf(c->h, -a->u.r.cval));   /* known: a constant (not 0: -0.0 is a value of its own) */
+            if (is_reg(a) && (!strcmp(a->ty, "vec2") || !strcmp(a->ty, "vec3") || !strcmp(a->ty, "vec4")) && a->u.r.cvec) {
+                double *v = (double *)sh_alloc(c->h, ((size_t)a->u.r.ncvec + 1) * sizeof(double));
+                int i, nz = 1;
+                for (i = 0; i < a->u.r.ncvec; i++) if (a->u.r.cvec[i] == 0.0) nz = 0;
+                if (nz) {
+                    for (i = 0; i < a->u.r.ncvec; i++) v[i] = sh_pf(c->h, -a->u.r.cvec[i]);
+                    return kvec(c, a->ty, v, a->u.r.ncvec);
+                }
+            }
             if (is_reg(a) && !strcmp(a->ty, "int")) {
                 Val *z;
                 r = alloc(c, "int");

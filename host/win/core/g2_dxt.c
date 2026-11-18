@@ -85,16 +85,16 @@ void g2_dxt_decode(int kind, const uint8_t *src, int w, int h, uint8_t *rgba)
 }
 
 /* ---------------------------------------------------------------- ETC1 (OES_compressed_ETC1_RGB8_texture): 64 bits a 4 x 4 block, big-endian, a base colour and a table for each half of the block. A texel's two bits, spread over
-   two 16-bit words, pick one of its table's four offsets, added to all three channels. B stores the nearest RGB565 of the result */
+   two 16-bit words, pick one of its table's four offsets, added to all three channels and clamped to 0 .. 255 */
 static const int ETC1_MOD[8][4] = { { 2, 8, -2, -8 }, { 5, 17, -5, -17 }, { 9, 29, -9, -29 }, { 13, 42, -13, -42 }, { 18, 60, -18, -60 }, { 24, 80, -24, -80 }, { 33, 106, -33, -106 }, { 47, 183, -47, -183 } };
 
 static int etc1_clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
-static int etc1_5to8(int v) { return v << 3 | v >> 2; }
+static int etc1_5to8(int v) { return (v << 3 | v >> 2) & 255; }
 static int etc1_delta(int v) { return v >= 4 ? v - 8 : v; }     /* 3 bits, two's complement */
 
 uint32_t g2_etc1_bytes(int w, int h) { return (uint32_t)((w + 3) / 4) * (uint32_t)((h + 3) / 4) * 8; }
 
-void g2_etc1_decode(const uint8_t *src, int w, int h, uint16_t *rgb565)
+void g2_etc1_decode(const uint8_t *src, int w, int h, uint8_t *rgba)
 {
     int bx, by, x, y;
     for (by = 0; by < h; by += 4) {
@@ -103,9 +103,9 @@ void g2_etc1_decode(const uint8_t *src, int w, int h, uint16_t *rgb565)
             unsigned msb = (unsigned)src[4] << 8 | src[5], lsb = (unsigned)src[6] << 8 | src[7];
             tab[0] = src[3] >> 5; tab[1] = src[3] >> 2 & 7;
             for (c = 0; c < 3; c++) {
-                if (diff) {
+                if (diff) {             /* a base + delta outside 0 .. 31 is no valid block; its 8 bits extend as the reference decoder's do */
                     int a = src[c] >> 3;
-                    base[0][c] = etc1_5to8(a); base[1][c] = etc1_5to8((a + etc1_delta(src[c] & 7)) & 31);
+                    base[0][c] = etc1_5to8(a); base[1][c] = etc1_5to8((a + etc1_delta(src[c] & 7)) & 255);
                 } else {
                     base[0][c] = (src[c] >> 4) * 17; base[1][c] = (src[c] & 15) * 17;
                 }
@@ -113,8 +113,8 @@ void g2_etc1_decode(const uint8_t *src, int w, int h, uint16_t *rgb565)
             for (y = 0; y < 4 && by + y < h; y++) {
                 for (x = 0; x < 4 && bx + x < w; x++) {
                     int k = x * 4 + y, half = flip ? y >= 2 : x >= 2, m = ETC1_MOD[tab[half]][(lsb >> k & 1) | (msb >> k & 1) << 1];
-                    int r = etc1_clamp(base[half][0] + m), g = etc1_clamp(base[half][1] + m), b = etc1_clamp(base[half][2] + m);
-                    rgb565[(by + y) * w + bx + x] = (uint16_t)(((r * 31 + 127) / 255) << 11 | ((g * 63 + 127) / 255) << 5 | ((b * 31 + 127) / 255));
+                    uint8_t *o = rgba + ((size_t)(by + y) * w + bx + x) * 4;
+                    o[0] = (uint8_t)etc1_clamp(base[half][0] + m); o[1] = (uint8_t)etc1_clamp(base[half][1] + m); o[2] = (uint8_t)etc1_clamp(base[half][2] + m); o[3] = 255;
                 }
             }
         }

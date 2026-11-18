@@ -2078,7 +2078,8 @@ static int uni_base(GLenum t)
 static int is_sampler_type(GLenum t) { return t == GL_SAMPLER_2D || t == GL_SAMPLER_CUBE || t == GL_SAMPLER_3D_OES; }
 
 /* §2.10.4. kind: 'f', 'i', 'm' (a matrix of comps columns). Int uniforms are stored as floats: the compiler keeps them that way, FTOI on load. uval keeps what was given.
-   A sampler is set by Uniform1i{v} alone; one inside a struct has no unit of the compiler's (u->sampler < 0), so its value is kept and read back, and no draw sees it */
+   A sampler is set by Uniform1i{v} alone. One the compiler listed (a struct's member too, under its full name) has its units in samp_unit; one it did not (u->sampler < 0)
+   keeps its value for glGetUniform, and no draw reads it */
 static void uni_set(GLint loc, GLsizei n, int kind, int comps, const float *v, const int *iv)
 {
     es_prog *p = S.cur;

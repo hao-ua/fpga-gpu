@@ -27,6 +27,10 @@ int EGLAPI eglChooseConfig(EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLi
 EGLSurface EGLAPI eglCreateWindowSurface(EGLDisplay, EGLConfig, HWND, const EGLint *);
 EGLSurface EGLAPI eglCreatePbufferSurface(EGLDisplay, EGLConfig, const EGLint *);
 int EGLAPI eglDestroySurface(EGLDisplay, EGLSurface);
+int EGLAPI eglDestroyContext(EGLDisplay, EGLContext);
+int EGLAPI eglSurfaceAttrib(EGLDisplay, EGLSurface, EGLint, EGLint);
+EGLSurface EGLAPI eglGetCurrentSurface(EGLint);
+int EGLAPI eglGetConfigs(EGLDisplay, EGLConfig *, EGLint, EGLint *);
 EGLContext EGLAPI eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
 int EGLAPI eglMakeCurrent(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
 int EGLAPI eglSwapBuffers(EGLDisplay, EGLSurface);
@@ -3150,6 +3154,39 @@ static void test_pbuffer_swap(void)
     err(GL_NO_ERROR, "pbuffer swap");
 }
 
+/* EGL 1.4's handles and errors: a handle that names no surface or context, attributes, a surface destroyed while current */
+static void test_egl_api(void)
+{
+    static const EGLint twice[] = { 0x3031, 1, 0x3031, 0, 0x3038 }, bad_name[] = { 0, 0x3038 }, neg[] = { 0x3057, -1, 0x3056, 4, 0x3038 }, pa[] = { 0x3057, 16, 0x3056, 16, 0x3038 };
+    EGLConfig c[8];
+    EGLint n = -5, v;
+    EGLSurface pb;
+    ok(!eglDestroySurface(g_dpy, (EGLSurface)(intptr_t)-1) && eglGetError() == 0x300D, "eglDestroySurface of no surface: EGL_BAD_SURFACE");
+    ok(!eglDestroyContext(g_dpy, (EGLContext)(intptr_t)-1) && eglGetError() == 0x3006, "eglDestroyContext of no context: EGL_BAD_CONTEXT");
+    ok(!eglMakeCurrent(g_dpy, (EGLSurface)(intptr_t)-1, (EGLSurface)(intptr_t)-1, g_ctx) && eglGetError() == 0x300D, "eglMakeCurrent of no surface: EGL_BAD_SURFACE");
+    ok(!eglMakeCurrent(g_dpy, g_surf, g_surf, NULL) && eglGetError() == 0x3009, "eglMakeCurrent, a surface and no context: EGL_BAD_MATCH");
+    ok(eglGetCurrentSurface(0x3038) == NULL && eglGetError() == 0x300C, "eglGetCurrentSurface(EGL_NONE): EGL_BAD_PARAMETER");
+    v = -42;
+    ok(eglQuerySurface(g_dpy, g_surf, 0x3080, &v) && v == -42, "EGL_TEXTURE_FORMAT of a window: success, value untouched");
+    ok(!eglQuerySurface(g_dpy, g_surf, 0, &v) && eglGetError() == 0x3004 && v == -42, "eglQuerySurface of attribute 0: EGL_BAD_ATTRIBUTE, value untouched");
+    ok(eglQuerySurface(g_dpy, g_surf, 0x3099, &v) && v == 0x309A, "EGL_MULTISAMPLE_RESOLVE starts at EGL_MULTISAMPLE_RESOLVE_DEFAULT");
+    ok(!eglSurfaceAttrib(g_dpy, g_surf, 0x3093, 0x3094) && eglGetError() == 0x3009, "EGL_BUFFER_PRESERVED without the config bit: EGL_BAD_MATCH");
+    ok(eglChooseConfig(g_dpy, twice, c, 8, &n) && n == 6, "eglChooseConfig: an attribute given twice counts at its last value");
+    ok(!eglChooseConfig(g_dpy, bad_name, c, 8, &n) && eglGetError() == 0x3004, "eglChooseConfig of attribute 0: EGL_BAD_ATTRIBUTE");
+    ok(eglGetConfigs(g_dpy, c, -1, &n) && n == 0, "eglGetConfigs of room -1 returns none");
+    ok(eglCreatePbufferSurface(g_dpy, g_cfg, neg) == NULL && eglGetError() == 0x300C, "a pbuffer of width -1: EGL_BAD_PARAMETER");
+    /* a surface destroyed while current: its handle is gone at once, the surface while it is current */
+    pb = eglCreatePbufferSurface(g_dpy, g_cfg, pa);
+    ok(pb && eglMakeCurrent(g_dpy, pb, pb, g_ctx), "a pbuffer current");
+    ok(eglDestroySurface(g_dpy, pb), "eglDestroySurface of the current surface");
+    ok(!eglQuerySurface(g_dpy, pb, 0x3057, &v) && eglGetError() == 0x300D, "its handle is no longer valid");
+    clear_to(0, 1, 0, 1);
+    px(1, 1, "a destroyed surface renders while it is current", 0, 255, 0, 255);
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the window");
+    glViewport(0, 0, W, H);
+    err(GL_NO_ERROR, "EGL handles and errors");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -3243,6 +3280,7 @@ int main(void)
     test_scaled();
     test_configs();
     test_pbuffer_swap();
+    test_egl_api();
     test_swap();
     printf("%d checks, %d failed\n", g_checks, g_bad);
     if (!g_bad) printf("OK gles_test\n");

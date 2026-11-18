@@ -90,7 +90,8 @@ int g2sc_compile_bound(const char *src, const g2sc_bind *binds, int nbinds, g2sc
  * Returns the rows in use, counted to the last one, or -1: it does not fit in max_rows */
 int g2sc_pack_vars(const int *rank, const int *rows, int n, int max_rows, int *out);
 /* a program of two stages, as a library links one: the fragment stage in the vertex stage's varying numbering, what it never reads not computed, Appendix A.7 when one row a variable does not fit.
- * vs and fs are what was compiled. 0 ok; umap_* (malloc'd, NULL = as declared) say where each uniform slot went, row * 4 + lane. < 0: error says why, nothing to free */
+ * vs and fs are what was compiled. 0 ok; umap_* (malloc'd, NULL = as declared) say where each uniform slot went, row * 4 + lane, -1 for a slot the stage never reads (not an
+ * active uniform there: it takes no row, a library stores it nowhere). < 0: error says why, nothing to free */
 typedef struct g2sc_linked {
     g2sc_result vs, fs;
     uint32_t fsmask;

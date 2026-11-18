@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /* shc_util.c — arena, error exit, strings, ordered dict, big integers, exact decimal -> double. */
 #include <stdlib.h>
 #include <string.h>

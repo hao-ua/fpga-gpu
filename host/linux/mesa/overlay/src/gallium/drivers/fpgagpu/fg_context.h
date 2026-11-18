@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu context: state, render passes and the command stream.
  *

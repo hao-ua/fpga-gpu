@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu resources and transfers.
  *

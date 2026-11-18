@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fg_compiler: NIR to the programs of the fpgagpu cores (board A's vertex core, board B's fragment core).
  */

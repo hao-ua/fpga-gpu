@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Dmytro Ivanysh
 #
 # apply.sh <mesa-tree>: copy the fpgagpu Gallium driver (overlay/) into a Mesa source tree and register it with the
 # build, the DRI target and the pipe loader. Safe to run again: a registration already present is left alone. Stops

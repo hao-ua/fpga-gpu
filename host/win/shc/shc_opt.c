@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /* shc_opt.c — glslc's passes on the emitted lines: strip_dead_bra, dce, copy_prop, cse, hoist_consts, hoist_tex, _mad_fuse,
  * allocate_registers (with the scalar packing) and _rewrite_packed. Lines are pre-tokenized (Python re-parses the text on
  * every look); each pass makes the same decisions in the same order, so the output text is the same. */

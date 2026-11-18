@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /* shc_asm.c — the assembler half of tools/isa64.py: enc_swz, encode, _reg, parse_src, parse_dst, parse_idx, parse_fp,
  * assemble (vs= rules, max_if / max_loop) and check_overlap, with the constants of shader_ref.py they use. The word
  * format is in isa64.py's header. Every AsmError (and every ValueError / IndexError / KeyError the Python raises on a

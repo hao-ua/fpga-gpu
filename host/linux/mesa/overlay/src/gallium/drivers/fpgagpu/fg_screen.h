@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu: the Gallium screen of the FPGA GPU, two boards on Ethernet driven through the fpgagpu DRM driver
  * (include/drm-uapi/fpgagpu_drm.h). Board A runs the vertex stage, board B the fragment stage and holds the images.

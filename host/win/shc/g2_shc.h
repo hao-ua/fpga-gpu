@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /* g2_shc.h — the gpu2 GLSL ES 1.00 compiler in C: a bit-exact port of tools/glslc.py (the isa64 production path:
  * compile_stage(src, stage, isa64=True), optimizer on, hw sin/cos, MAD fusion, the register-spill fallback to
  * rematerialized constants) and of the assembler half of tools/isa64.py. Python stays the oracle: host/win/shc/test/.

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu resources: textures, render targets and depth-stencil buffers are images in board B's memory (BO_CREATE
  * of an FPGAGPU_BO_B_IMAGE); PIPE_BUFFER resources live in host memory.

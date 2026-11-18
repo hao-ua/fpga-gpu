@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: (GPL-2.0 WITH Linux-syscall-note) OR MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu: the userspace interface of the FPGA GPU's DRM driver. The GPU is two FPGA boards on Ethernet; the driver
  * talks to board A over UDP (the protocol of host/fb/fbproto.py), and board A forwards board B's share.

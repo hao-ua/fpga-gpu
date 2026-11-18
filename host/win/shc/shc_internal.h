@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /* shc_internal.h — shared by the host/win/shc/ sources; nothing here is part of the API (g2_shc.h is). */
 #ifndef SHC_INTERNAL_H
 #define SHC_INTERNAL_H

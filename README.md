@@ -64,6 +64,7 @@ only they know the one-board memory map.
 | `sim/` | simulation benches and models |
 | `tests/` | shader test programs: assembly (`.sasm`) and GLSL |
 | `host/win/` | the Windows libraries, the shader compiler (`shc`), test programs and game launchers |
+| `host/linux/` | the Linux drivers: the DRM / KMS kernel module (`kernel/`), the Mesa Gallium driver (`mesa/`), X on the boards (`x11/`), test programs (`tools/`) |
 | `host/fb/` | Python host tools: the protocol library, board status, acceptance tests, benchmarks |
 | `images/` | photos used in this file |
 
@@ -240,3 +241,12 @@ Run them from `host/fb`; Python 3, standard library only (see `host/fb/README.md
 - `fb_3d_test.py`, `fb_cube.py --check` and `fb_bench.py` run the 3D path (see [PERF_TESTS.md](PERF_TESTS.md)).
 - `fb_mode.py`, `fb_image.py`, `fb_video.py` and `fb_2d.py` exercise the display and the 2D path.
 - `eth_rx_sweep.py` and `phy_opt.py` tune the Ethernet receive timing.
+
+## Licence
+
+MIT ([LICENSE](LICENSE)), with these additions:
+- **Linux kernel module** (`host/linux/kernel`): `GPL-2.0 OR MIT`, so that it can use DRM's GPL-only helpers.
+- **Its userspace header** `fpgagpu_drm.h`: `(GPL-2.0 WITH Linux-syscall-note) OR MIT`, like Linux's uapi headers.
+  The Mesa driver carries an identical copy.
+- **Mesa driver** (`host/linux/mesa`): MIT, like Mesa's drivers. Its files, and the five compiler files `apply.sh`
+  copies into it from `host/win/shc`, start with `SPDX-License-Identifier: MIT` and the copyright line.

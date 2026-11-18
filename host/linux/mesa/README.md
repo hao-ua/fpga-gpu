@@ -240,3 +240,15 @@ board-B images, shown without a copy.
 `FPGAGPU_DEBUG=1` prints the boards' flags when the screen is created, every image created to be shown, any image
 refused, what a framebuffer without a colour buffer holds and, for each read map, the time spent on the submission,
 the wait and the `READ`. `FPGAGPU_SHADERS=1` prints each compiled program's assembler text.
+
+## Licence
+
+The driver is MIT, like Mesa's drivers.
+- Every file of `overlay/`, and `apply.sh`, starts with `SPDX-License-Identifier: MIT` and the copyright line of the
+  repository's `LICENSE`.
+- So do the five files of the Windows libraries' compiler that `apply.sh` copies into the driver's `shc/` directory:
+  `shc_internal.h`, `g2_shc.h`, `shc_opt.c`, `shc_asm.c` and `shc_util.c`.
+- `overlay/include/drm-uapi/fpgagpu_drm.h` is `(GPL-2.0 WITH Linux-syscall-note) OR MIT`, like the kernel driver's
+  copy (`../kernel/include/uapi/drm/fpgagpu_drm.h`), which it matches byte for byte.
+- The lines `apply.sh` adds to Mesa's own files (the registrations and patches above) are changes to those files.
+  Each comes under its file's licence.

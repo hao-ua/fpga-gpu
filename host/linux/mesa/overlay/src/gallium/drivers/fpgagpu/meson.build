@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Dmytro Ivanysh
 
 files_fpgagpu = files(
   'fg_compiler.c',

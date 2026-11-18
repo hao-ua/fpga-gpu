@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Dmytro Ivanysh */
 /*
  * fpgagpu draws: state objects, shaders, and a draw's messages (host/win/core/g2_render.c g2r_draw):
  *   [WRITE_BUFFER the vertices and indices into the ring]

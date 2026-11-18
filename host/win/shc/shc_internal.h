@@ -21,6 +21,8 @@
 typedef struct ShChunk { struct ShChunk *next; size_t cap, used; } ShChunk;
 typedef struct ShMark { ShChunk *chunk; size_t used, total; } ShMark;
 
+typedef struct ShBind { const char *name; int loc; } ShBind;     /* g2sc_bind */
+
 typedef struct Shc {
     jmp_buf jb;
     char err[512];
@@ -30,6 +32,7 @@ typedef struct Shc {
     int strict;                 /* g2sc_compile_strict: every error the language requires; survives sh_init too */
     const int *umap, *vmap;     /* g2sc_compile_packed: slot -> row * 4 + lane; survive sh_init too */
     uint32_t depth_units;       /* bit per sampler: a depth texture is bound, a read gives (z, z, z, 1) */
+    const ShBind *binds; int nbinds;   /* glslc attrs (g2sc_compile_bound): a link's attribute bindings, the last of a name counts; survive sh_init too */
     uint32_t xops;              /* glslc xops (g2sc_set_target), a fragment stage only: 1 SQRT / RCPM / RSQM, 2 CLAMP; survives sh_init too */
     uint32_t noops;             /* glslc noops (g2sc_set_absent), this stage's core: 1 no integer divider, 2 no SIN / COS; survives sh_init too */
     int nohoist;                /* glslc hoist=False: the register-spill retries compile without licm */
@@ -109,10 +112,9 @@ double sh_str2d(Shc *h, const char *s, size_t n);          /* float(str) of digi
 double sh_fmod(double x, double y);                        /* exact, the C99 fmod */
 double sh_pymod(double x, double y);                       /* Python float %, y != 0 */
 
-/* ---------------- preprocessor, the Python expression evaluator of #if ---------------- */
+/* ---------------- preprocessor ---------------- */
 enum { SH_EXT_DERIV = 1, SH_EXT_LOD = 2, SH_EXT_FRAGDEPTH = 4, SH_EXT_3D = 8 };   /* glslc.EXTENSIONS; *exts = the ones #extension enabled */
 char *sh_preprocess(Shc *h, const char *src, int fs, int *exts);
-int   sh_pyeval_truth(Shc *h, const char *expr);           /* `1 if eval(expr) else 0`, every exception = 0 */
 
 /* ---------------- lexer, AST ---------------- */
 enum { TK_KW, TK_ID, TK_NUM, TK_OP, TK_EOF };
@@ -138,6 +140,7 @@ typedef struct Node {
     int isc;                     /* S_LDECL const */
     int cond;                    /* S_LDECL: written under runtime control flow, so a real masked register */
     int hwloop;                  /* S_FOR: the pass count of a long constant-bounded loop that is a hardware loop, else 0 (glslc.hw_for; shc_gen.c long_for) */
+    int fragdata;                /* N_VAR gl_FragColor that was gl_FragData[0] (Parser.fragdata) */
     struct Node *a, *b, *c, *d;  /* children: see sh_parse (the field order of the Python tuples) */
     struct Node **list; int nlist;
     struct Val *reg;             /* N_REG: a pre-materialized value in a synthetic AST */
@@ -145,7 +148,8 @@ typedef struct Node {
     struct Member *mem; int nmem;   /* S_LSTRUCT */
 } Node;
 
-typedef struct Member { const char *ty, *name; Node *arr; const char *prec; } Member;
+typedef struct Member { const char *ty, *name; Node *arr; const char *prec;
+                        const char *rprec; } Member;       /* rprec (Sema): its precision, its own or the default where the struct is defined; NULL for bool and struct types */
 typedef struct Param { const char *q, *ty, *name, *prec; Node *arr; int isconst; } Param;
 
 typedef enum { D_STRUCT, D_GDECL, D_FUNC, D_PROTO, D_PREC } DeclKind;
@@ -213,7 +217,7 @@ char *sh_optimize(Shc *h, Lines *code, int vcount, const unsigned char *svregs, 
 
 /* ---------------- code generator ---------------- */
 typedef struct ShSym { const char *name; long long loc; const char *ty; int has_array; long long array; } ShSym;
-typedef struct ShMember { const char *name, *ty; long long offset, nslots, array; int has_array; } ShMember;
+typedef struct ShMember { const char *name, *ty; long long offset, nslots, array; int has_array; const char *prec; } ShMember;
 typedef struct ShStruct { const char *name; long long nslots; ShMember *members; int nmembers; } ShStruct;
 
 typedef struct ShOutput {

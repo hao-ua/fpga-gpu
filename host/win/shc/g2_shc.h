@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 
-/* one symbol. attribs: name -> (index, type). uniforms: name -> (slot, type[, count]). samplers: name -> unit.
- * varyings: name -> (index, type). The order is glslc's dict order (first insertion). */
+/* one symbol. attribs: name -> (index, type), the active ones alone (an attribute the program reads, §2.10.4; see g2sc_compile_bound).
+ * uniforms: name -> (slot, type[, count]). samplers: name -> unit. varyings: name -> (index, type). The order is glslc's dict order (first insertion). */
 typedef struct g2sc_sym {
     char name[64];              /* truncated to 63 characters: lname is the whole name */
     int  loc;
@@ -37,6 +37,7 @@ typedef struct g2sc_member {
     int nslots;                 /* slots of the whole member (array count included) */
     int array;                  /* element count, 0 = not an array */
     int has_array;
+    const char *prec;           /* "lowp" / "mediump" / "highp": its own or the default where the struct is defined; NULL for bool and struct types (static, not freed) */
 } g2sc_member;
 
 typedef struct g2sc_struct {
@@ -78,6 +79,13 @@ int g2sc_compile_vs(const char *src, uint32_t unread_varyings, g2sc_result *out)
  * varying slot, -1 = not passed on, nvmap entries. Either may be NULL: as declared. unread as g2sc_compile_vs, without vmap. Tables stay those of g2sc_compile. */
 typedef struct g2sc_pack { const int *umap; int urows; const int *vmap; int nvmap; uint32_t unread; uint32_t depth_units; } g2sc_pack;   /* depth_units: bit per sampler, it reads a depth texture: (z, z, z, 1) from the D24S8 word */
 int g2sc_compile_packed(const char *src, int stage, const char *const *varying_order, int n_order, const g2sc_pack *pack, g2sc_result *out);
+/* glBindAttribLocation's table at a link: name -> location, 0 to 15; of a name bound twice the last counts */
+typedef struct g2sc_bind { const char *name; int loc; } g2sc_bind;
+#define G2SC_MAX_ATTRIBS 16                     /* the vertex core's inputs, GL_MAX_VERTEX_ATTRIBS */
+/* a vertex stage with a link's attribute bindings. Every compile places the active attributes, a matrix one location a column, in a run: a bound one at its location
+ * (two may share one: §2.10.4 aliasing, no path reads both), the rest in declaration order at the lowest free run; without bindings from 0. attribs[i].loc is that
+ * location, the input of the vertex core the program reads. Past 16 locations a compile has no words (oversize) and a link refuses the program. */
+int g2sc_compile_bound(const char *src, const g2sc_bind *binds, int nbinds, g2sc_result *out);
 /* the placement of Appendix A.7. rank: 0 mat4, 1 mat2, 2 vec4, 3 mat3, 4 vec3, 5 vec2, 6 float; rows[i]: its vectors, array included. out[i] = row * 4 + lane of its first vector, the rest follow a row each.
  * Returns the rows in use, counted to the last one, or -1: it does not fit in max_rows */
 int g2sc_pack_vars(const int *rank, const int *rows, int n, int max_rows, int *out);
@@ -92,6 +100,9 @@ typedef struct g2sc_linked {
 } g2sc_linked;
 int g2sc_link(const char *vs, const char *fs, g2sc_linked *out);
 int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_linked *out);     /* the same, g2sc_pack's depth_units in the fragment stage */
+/* the same with the program's attribute bindings (g2sc_compile_bound): vs.attribs[i].loc is the attribute's location and the vertex core's input. A library links again
+ * (depth_units) with the bindings of the first link: the bindings of glBindAttribLocation calls since then wait for the next glLinkProgram */
+int g2sc_link_bound(const char *vs, const char *fs, const g2sc_bind *binds, int nbinds, uint32_t depth_units, g2sc_linked *out);
 void g2sc_link_free(g2sc_linked *l);
 void g2sc_free(g2sc_result *r);
 

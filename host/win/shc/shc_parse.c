@@ -12,7 +12,7 @@ static const char *const KEYWORDS[] = {
     "vec2","vec3","vec4","bvec2","bvec3","bvec4","ivec2","ivec3","ivec4",
     "mat2","mat3","mat4","sampler2D","samplerCube",
     "if","else","for","return","discard","true","false","in","out","inout","precision",
-    "highp","mediump","lowp","struct","while","do","continue","break", NULL
+    "highp","mediump","lowp","struct","while","do","continue","break","invariant", NULL
 };
 
 static int is_keyword(const char *s)
@@ -204,6 +204,15 @@ static int accept_(P *p, const char *v)
     return 0;
 }
 
+/* the name a declaration gives: an identifier (§3.7); a program from an application that names a keyword or a number fails */
+static const char *ident(P *p)
+{
+    Tk *k = next(p);
+    if (k->k == TK_NUM) sh_compile_error(p->h, "expected a name, got <number>");
+    if (p->h->strict && k->k != TK_ID) sh_compile_error(p->h, "expected a name, got '%s'", k->v);
+    return k->v;
+}
+
 static Node *node(P *p, NodeKind k)
 {
     Node *n = (Node *)sh_zalloc(p->h, sizeof(Node));
@@ -302,7 +311,7 @@ static Node *postfix(P *p)
             next(p);
             n->a = e; n->b = expr(p);
             eat(p, "]");
-            if (e->kind == N_VAR && !strcmp(e->s, "gl_FragData") && n->b->kind == N_NUM && n->b->num == 0.0) e->s = "gl_FragColor";   /* MAX_DRAW_BUFFERS is 1 */
+            if (e->kind == N_VAR && !strcmp(e->s, "gl_FragData") && n->b->kind == N_NUM && n->b->num == 0.0) { e->s = "gl_FragColor"; e->fragdata = 1; }   /* MAX_DRAW_BUFFERS is 1 */
             else e = n;
         }
         else if (!strcmp(v, "(") && e->kind == N_VAR) {
@@ -452,6 +461,17 @@ static int starts_decl(P *p, const char *v)
 static Decl *dv_new(P *p, DV *l, DeclKind k);
 static const char *parse_struct(P *p, Member **pm, int *pn);
 
+/* §6.2: the statement of an if or an else is a scope of its own: a declaration there goes in a block */
+static Node *scoped(P *p, Node *s)
+{
+    Node *b;
+    if (s->kind != S_LDECL && s->kind != S_MULTI && s->kind != S_LSTRUCT) return s;
+    b = node(p, S_BLOCK);
+    b->list = (Node **)sh_alloc(p->h, sizeof(Node *));
+    b->list[0] = s; b->nlist = 1;
+    return b;
+}
+
 /* the local declarators after a type: name[size] = init, ... ; */
 static Node *ldecl_names(P *p, int isc, const char *ty, const char *prec, Node *first)
 {
@@ -462,7 +482,7 @@ static Node *ldecl_names(P *p, int isc, const char *ty, const char *prec, Node *
     for (;;) {
         Node *d = node(p, S_LDECL);
         d->isc = isc; d->ty = ty; d->prec = prec;
-        d->s = next(p)->v;
+        d->s = ident(p);
         if (accept_(p, "[")) { d->b = assign(p); eat(p, "]"); }
         if (accept_(p, "=")) d->a = assign(p);
         nv_push(p, &l, d);
@@ -504,8 +524,8 @@ static Node *stmt(P *p)
         n = node(p, S_IF);
         n->a = expr(p);
         eat(p, ")");
-        n->b = stmt(p);
-        if (accept_(p, "else")) n->c = stmt(p);
+        n->b = scoped(p, stmt(p));
+        if (accept_(p, "else")) n->c = scoped(p, stmt(p));
     }
     else if (!strcmp(v, "for")) {
         next(p); eat(p, "(");
@@ -589,14 +609,14 @@ static const char *parse_struct(P *p, Member **pm, int *pn)
     Dict *top;
     next(p);
     p->nstruct++;
-    if (!at(p, "{")) name = next(p)->v;
+    if (!at(p, "{")) name = ident(p);
     eat(p, "{");
     while (!at(p, "}")) {
         const char *mty, *pr;
         pr = skip_precision(p);
         mty = type_name(p);
         for (;;) {
-            const char *mname = next(p)->v;
+            const char *mname = ident(p);
             Node *marr = NULL;
             if (accept_(p, "[")) { marr = assign(p); eat(p, "]"); }
             if (nm == cap) {
@@ -621,7 +641,7 @@ static const char *parse_struct(P *p, Member **pm, int *pn)
 static void gdecl_names(P *p, DV *l, const char *qual, const char *ty, const char *prec)
 {
     for (;;) {
-        const char *name = next(p)->v;
+        const char *name = ident(p);
         Node *arr = NULL, *init = NULL;
         Decl *d;
         if (accept_(p, "[")) { arr = assign(p); eat(p, "]"); }
@@ -643,18 +663,22 @@ static void parse_params(P *p, Decl *d)
         for (;;) {
             const char *q = "in", *ty, *nm = "", *pr = NULL;
             Node *arr = NULL;
-            int isc = 0;
+            int isc = 0, last = -1;
             for (;;) {
                 const char *v = peek(p)->v;
+                int o;
                 if (strcmp(v, "in") && strcmp(v, "out") && strcmp(v, "inout") && strcmp(v, "const") &&
                     strcmp(v, "highp") && strcmp(v, "mediump") && strcmp(v, "lowp")) break;
                 next(p);
+                o = !strcmp(v, "const") ? 0 : !strcmp(v, "in") || !strcmp(v, "out") || !strcmp(v, "inout") ? 1 : 2;   /* §4.6.4: const, then in / out / inout, then a precision */
+                if (p->h->strict && o <= last) sh_compile_error(p->h, "parameter qualifier '%s' out of order", v);
+                last = o;
                 if (!strcmp(v, "in") || !strcmp(v, "out") || !strcmp(v, "inout")) q = v;
                 else if (!strcmp(v, "const")) isc = 1;
                 else pr = v;
             }
             ty = type_name(p);
-            if (!at(p, ",") && !at(p, ")") && !at(p, "[")) nm = next(p)->v;      /* a prototype may leave the name out */
+            if (!at(p, ",") && !at(p, ")") && !at(p, "[")) nm = ident(p);       /* a prototype may leave the name out */
             if (accept_(p, "[")) { arr = assign(p); eat(p, "]"); }
             if (np == cap) {
                 Param *nn = (Param *)sh_alloc(p->h, (size_t)cap * 2 * sizeof(Param));
@@ -690,8 +714,11 @@ static void top_decl(P *p, DV *l)
     }
     if (!strcmp(v, "invariant")) {           /* every program here is computed one way: nothing to do */
         next(p);
-        if (!at(p, "varying")) {
-            while (!accept_(p, ";")) next(p);
+        if (!at(p, "varying")) {             /* invariant gl_Position, v; : names declared before */
+            while (!accept_(p, ";")) {
+                Tk *k = next(p);
+                if (p->h->strict && k->k != TK_ID && strcmp(k->v, ",")) sh_compile_error(p->h, "invariant qualifies varyings and the outputs gl_Position and gl_PointSize");
+            }
             return;
         }
         v = peek(p)->v;
@@ -712,7 +739,7 @@ static void top_decl(P *p, DV *l)
     }
     {
         const char *pr = skip_precision(p);
-        const char *ty = type_name(p), *name = next(p)->v;
+        const char *ty = type_name(p), *name = ident(p);
         if (at(p, "(")) {
             Decl tmp, *d;
             Node *body = NULL;
@@ -733,7 +760,7 @@ static void top_decl(P *p, DV *l)
             d = dv_new(p, l, D_GDECL);
             d->qual = "var"; d->ty = ty; d->name = name; d->arr = arr; d->init = init; d->prec = pr;
             if (!accept_(p, ",")) break;
-            name = next(p)->v;
+            name = ident(p);
         }
         eat(p, ";");
     }

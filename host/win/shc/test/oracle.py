@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """oracle — the same canonical text as shc_dump.c, from the Python compiler (tools/glslc.py + tools/isa64.py). Python is the specification; the C port must match it word for word.
-    python3 host/win/shc/test/oracle.py [--xops n] [--noops n] [--order a,b,c] [--unread mask] [--strict] file.vert file.frag ...      (run from the repository root)
---order renames nothing: it reorders the varying declarations of the source first, which is what g2sc_compile_ex must be equivalent to. --unread is g2sc_compile_vs, on the vertex shaders."""
+    python3 host/win/shc/test/oracle.py [--xops n] [--noops n] [--order a,b,c] [--unread mask] [--bind a=1,b=1] [--strict] file.vert file.frag ...      (run from the repository root)
+--order renames nothing: it reorders the varying declarations of the source first, which is what g2sc_compile_ex must be equivalent to. --unread is g2sc_compile_vs, on the vertex shaders.
+--bind is g2sc_compile_bound (not strict) on the vertex shaders without a .pack, --order or --unread."""
 import os, re, signal, struct, sys
 sys.path.insert(0, 'tools')
 import glslc, isa64
@@ -69,6 +70,10 @@ def main():
     if args and args[0] == '--unread':
         unread = int(args[1], 0)
         args = args[2:]
+    attrs = None
+    if args and args[0] == '--bind':                # g2sc_compile_bound, on the vertex shaders: name=location,...
+        attrs = {n: int(v, 0) for n, v in (b.split('=') for b in args[1].split(','))}
+        args = args[2:]
     strict = bool(args) and args[0] == '--strict'
     if strict:
         args = args[1:]
@@ -82,7 +87,9 @@ def main():
             if order:
                 src = reorder(src, order)
             pack = read_pack(path)
-            r = glslc.compile_stage(src, stage, isa64=True, forward=True, unread=unread if stage == 'vs' else 0, strict=strict and not pack, pack=pack, xops=xops, noops=noops)
+            bound = attrs is not None and stage == 'vs' and not pack and not order and not unread
+            r = glslc.compile_stage(src, stage, isa64=True, forward=True, unread=unread if stage == 'vs' else 0, strict=strict and not pack and not bound, pack=pack, xops=xops, noops=noops,
+                                    attrs=attrs if bound else None)
             words, _ = isa64.assemble(r['sasm'].splitlines(), vs=stage == 'vs')
         except Exception as e:
             print('ERROR', str(e).replace('\n', ' '))

@@ -57,6 +57,7 @@ typedef struct Cg {
     CurRet *cur_ret;
     long long next_uniform;
     int next_sampler, next_attr, next_vary;
+    Dict sampler_slot;           /* the uniform slot of a sampler in a uniform struct (as text) -> its unit in .i (struct_samplers) */
     Val *zero;
     int nozero;                  /* a declaration without a value is not zeroed (zero_val): the outputs' shadows */
     int label_n;
@@ -830,6 +831,11 @@ static long long type_nslots(Cg *c, const char *ty, long long asz)
 static Val *load_uniform_member(Cg *c, long long slot, const char *ty, long long asz)
 {
     Val *reg;
+    if (!strcmp(ty, "sampler2D") || !strcmp(ty, "samplerCube") || !strcmp(ty, "sampler3D")) {   /* a sampler in a uniform struct: its unit */
+        DictEnt *e = dict_find(&c->sampler_slot, sh_fmt(c->h, "%L", slot));
+        if (!e) sh_py_error(c->h, "KeyError: a sampler slot");
+        return mk_sampler(c, (int)e->i, "sampler2D", asz == NONE_SZ ? -1 : asz);
+    }
     if (asz != NONE_SZ) return mk_array(c, ty, asz, 0, slot, NULL);
     if (dict_find(&c->structs, ty)) return load_uniform_struct(c, slot, ty);
     if (mat_n(ty)) return load_cols(c, ty, slot);
@@ -1593,7 +1599,14 @@ static Val *atan64(Cg *c, Val **a, int na)
     static const double CF[4] = { -0.0851330, 0.1801410, -0.3302995, 0.9998660 };
     Val *y, *x, *ay, *ax, *mn, *mx, *inv, *r, *s, *p, *at, *z, *c1, *t1, *a1, *a2, *c3, *t3, *res, *kk;
     int i;
-    if (na == 1) { y = a[0]; x = kf(c, 1.0); }
+    if (na == 1) {
+        y = a[0]; x = kf(c, 1.0);
+        if (strcmp(TY(c, y), "float")) {        /* a 1 of y's shape: what is worked out from x takes its type (min, max, SET) */
+            Val *one = alloc(c, TY(c, y));
+            emit(c, "MOV r%d r%d", one->u.r.n, x->u.r.n);
+            x = one;
+        }
+    }
     else {
         if (na != 2) sh_py_error(c->h, "ValueError: wrong number of arguments to atan");
         y = a[0]; x = a[1];
@@ -1923,6 +1936,46 @@ static int no_alias(Cg *c, Node *e)
     return e->kind == N_SWIZZLE && !is_struct(eval_lvalue(c, e->a));
 }
 
+static const char *local_type(Cg *c, const char *name);
+
+/* the variable an lvalue writes: v of v.xy, a[i], s.m */
+static const char *lv_base(Node *e)
+{
+    while (e->kind == N_SWIZZLE || e->kind == N_INDEX) e = e->a;
+    return e->kind == N_VAR ? e->s : NULL;
+}
+
+/* does a function body read or write `name`, also through the functions it calls (a local of the name counts too);
+ * own: the function has a parameter of the name, so only the functions it calls can see the caller's */
+static int sees(Cg *c, Node *e, const char *name, Dict *seen, int own)
+{
+    int r = 0, i;
+    if (!e || e->kind == N_REG) return 0;
+    SH_ENTER(c->h, 2);
+    if (e->kind == N_VAR) r = !own && !strcmp(e->s, name);
+    else {
+        if (e->kind == N_CALL) {
+            const char *fn = e->fn ? e->fn->name : e->s;
+            DictEnt *fe = dict_find(&c->funcs, fn);
+            if (fe && !dict_find(seen, fn)) {
+                dict_put(c->h, seen, fn);
+                r = sees(c, ((Func *)fe->p)->body, name, seen, 0);
+            }
+        }
+        if (!r) r = sees(c, e->a, name, seen, own) || sees(c, e->b, name, seen, own) || sees(c, e->c, name, seen, own) || sees(c, e->d, name, seen, own);
+        for (i = 0; i < e->nlist && !r; i++) r = sees(c, e->list[i], name, seen, own);
+    }
+    SH_LEAVE(c->h, 2);
+    return r;
+}
+
+/* a local whose register holds its value in the other representation than the parameter's: a promoted int is a float */
+static int repr_differs(Cg *c, Node *e, const char *pty)
+{
+    const char *lt = e->kind == N_VAR ? local_type(c, e->s) : NULL;
+    return lt && !strcmp(lt, "int") != !strcmp(pty, "int");
+}
+
 /* a return under an if or in a loop (under: any return at all) */
 static int early_return(Cg *c, Node *s, int under)
 {
@@ -2005,7 +2058,36 @@ static Val *inline_call(Cg *c, const char *name, Node **argexprs, int nargs)
         Param *p = &f->params[i];
         Node *ae = argexprs[i];
         if (!strcmp(p->q, "out") || !strcmp(p->q, "inout")) {
-            if (no_alias(c, ae)) {              /* no register to alias: a copy, written back at the end */
+            const char *b;
+            int shared = 0, k;
+            Val *agg = NULL;
+            if (ae->kind == N_VAR && const_home(c, ae->s)) promote(c, ae->s);         /* a register to write */
+            b = lv_base(ae);                    /* §6.1.1 copies in and out: an alias would show when another argument or the function sees it */
+            if (b) {
+                int same = 0, own = 0;
+                for (k = 0; k < nargs; k++) {
+                    const char *q = f->params[k].q, *o;
+                    if ((!strcmp(q, "out") || !strcmp(q, "inout")) && (o = lv_base(argexprs[k])) != NULL && !strcmp(o, b)) same++;
+                }
+                for (k = 0; k < f->nparams; k++) if (!strcmp(f->params[k].name, b)) own = 1;
+                if (same > 1) shared = 1;
+                else {
+                    Dict *seen = new_dict(c);
+                    dict_put(c->h, seen, name);
+                    shared = sees(c, f->body, b, seen, own);
+                }
+            }
+            if (shared && !no_alias(c, ae)) {
+                Val *lv = get_lvalue_reg(c, ae);
+                if (lv && (lv->kind == V_MAT || lv->kind == V_ARRAY || lv->kind == V_STRUCT)) agg = lv;
+            }
+            if (agg) {                          /* an array, struct or matrix of its own, written back at the end */
+                Val *pr = !strcmp(p->q, "inout") ? clone_val(c, agg) : like(c, agg);
+                local_set(c, binds, p->name, pr, p->ty);
+                copy[i] = pr;
+                if (!strcmp(p->q, "out")) outs[i] = pr;
+            }
+            else if (no_alias(c, ae) || repr_differs(c, ae, p->ty) || shared) {    /* no register to alias: a copy, written back at the end */
                 Val *pr = alloc(c, p->ty);
                 if (!strcmp(p->q, "inout")) {
                     Val *av = eval(c, ae);
@@ -2695,7 +2777,7 @@ static void store(Cg *c, Node *lhs, Val *rv)
             }
             return;
         }
-        masked_write(c, target, mask, rv);
+        masked_write(c, target, mask, asf(c, rv));      /* a vector holds its ints as floats: i.x += 1 is an IADD */
         return;
     }
     if (lhs->kind == N_INDEX) {
@@ -2740,6 +2822,57 @@ static void store(Cg *c, Node *lhs, Val *rv)
     sh_compile_error(c->h, "unsupported assignment target");
 }
 
+/* registers for an aggregate member of a local struct, at its first write: 0, as the struct's other members */
+static Val *member_new(Cg *c, const char *sname, const char *mname)
+{
+    StructDef *s = (StructDef *)dict_find(&c->structs, sname)->p;
+    int i;
+    for (i = 0; i < s->n; i++) {
+        Member *m = &s->m[i];
+        Val *v;
+        if (strcmp(m->name, mname)) continue;
+        if (m->arr) {
+            long long n = arrsize(c, m->arr), j;
+            Val **elems = new_vals(c, n);
+            for (j = 0; j < n; j++) elems[j] = fresh(c, m->ty);
+            v = mk_array(c, m->ty, n, 1, 0, elems);
+        }
+        else v = fresh(c, m->ty);
+        zero_val(c, v);
+        return v;
+    }
+    return NULL;
+}
+
+/* the value of a local the lvalue e names, an aggregate member of a local struct made on the way (NULL: no such local) */
+static Val *lv_struct(Cg *c, Node *e)
+{
+    Val *r = NULL;
+    SH_ENTER(c->h, 1);
+    if (e->kind == N_VAR) {
+        Local *l = local_find(c, e->s);
+        r = l ? l->v : NULL;
+    }
+    else if (e->kind == N_SWIZZLE) {
+        Val *st = lv_struct(c, e->a);
+        DictEnt *m = is_struct(st) ? dict_find(st->u.st.members, e->s) : NULL;
+        if (m) {
+            if (!m->p) m->p = member_new(c, st->u.st.sname, e->s);
+            r = (Val *)m->p;
+        }
+    }
+    else if (e->kind == N_INDEX) {
+        Val *a = lv_struct(c, e->a);
+        double ci;
+        if (is_array(a) && a->u.a.local == 1 && fold_const(c, e->b, &ci)) {
+            long long i = py_int(c, ci);
+            if (i >= 0 && i < a->u.a.size) r = a->u.a.elems[i];
+        }
+    }
+    SH_LEAVE(c->h, 1);
+    return r;
+}
+
 static Val *eval_lvalue_(Cg *c, Node *e)
 {
     e = fd(c, e);
@@ -2752,6 +2885,7 @@ static Val *eval_lvalue_(Cg *c, Node *e)
         Val *arr;
         long long i;
         if (!fold_const(c, e->b, &ci)) sh_compile_error(c->h, "array index must be a constant expression");
+        lv_struct(c, e->a);                     /* s.b[0] = x: s.b gets its registers at its first write */
         arr = eval(c, e->a);
         i = py_int(c, ci);
         if (is_array(arr) && arr->u.a.local != 1 && e->a->kind == N_SWIZZLE) {
@@ -2996,7 +3130,7 @@ static void scan_cond_assigns(Cg *c, Node *s, int incond)
         scan_cond_assigns(c, s->c, 1);
         break;
     case S_FOR: {
-        int rt = refs_runtime(c, s->b);
+        int rt = refs_runtime(c, s->b) || refs_runtime(c, s->c);      /* runtime bound or step -> real (non-unrolled) loop */
         memset(&in, 0, sizeof in);
         in.up = c->scan; c->scan = &in;
         if (!rt && (s->hwloop = long_for(c, s)) != 0) rt = 1;      /* a long constant loop: the hardware loop too (hwloop = its pass count) */
@@ -3090,7 +3224,9 @@ static void shadow_varyings(Cg *c, Node *body)
             dict_put(c->h, &c->shadow, name);
             d->ty = v->ty; d->s = name;
             if (v->has3) d->b = nnum(c, (double)v->n);
+            c->nozero = !(v->has3 || mat_n(v->ty));    /* an array or a matrix starts at 0: a write at a run-time index reads every element */
             run_stmt(c, d);
+            c->nozero = 1;
         }
     }
     for (i = 0; i < 3; i++) {
@@ -3571,6 +3707,32 @@ static Sym *sym_put(Cg *c, Dict *d, const char *name, long long slot, const char
     return s;
 }
 
+/* a sampler in a uniform struct: a texture unit of its own, under the name a front end gives it (s.tex, a[1].tex), and the uniform
+ * slot it takes, which a load of the struct turns into that unit */
+static void struct_samplers(Cg *c, const char *path, const char *ty, long long asz, long long slot)
+{
+    StructDef *s = (StructDef *)dict_find(&c->structs, ty)->p;
+    long long e, ne = asz != NONE_SZ ? asz : 1;
+    int i;
+    SH_ENTER(c->h, 1);
+    for (e = 0; e < ne; e++) {
+        const char *p = asz != NONE_SZ ? sh_fmt(c->h, "%s[%L]", path, e) : path;
+        for (i = 0; i < s->n; i++) {
+            Member *m = &s->m[i];
+            long long n = arrsize(c, m->arr);
+            const char *q = sh_fmt(c->h, "%s.%s", p, m->name);
+            if (!strcmp(m->ty, "sampler2D") || !strcmp(m->ty, "samplerCube") || !strcmp(m->ty, "sampler3D")) {
+                sym_put(c, &c->samplers, q, c->next_sampler, m->ty, n != NONE_SZ, n != NONE_SZ ? n : 1);
+                dict_put(c->h, &c->sampler_slot, sh_fmt(c->h, "%L", slot))->i = c->next_sampler;
+                c->next_sampler = (int)c_range(c, c->next_sampler + (n != NONE_SZ ? n : 1));
+            }
+            else if (dict_find(&c->structs, m->ty)) struct_samplers(c, q, m->ty, n, slot);
+            slot += type_nslots(c, m->ty, n);
+        }
+    }
+    SH_LEAVE(c->h, 1);
+}
+
 static ShSym *sym_table(Cg *c, const Dict *d, int *n)
 {
     ShSym *t = (ShSym *)sh_alloc(c->h, (size_t)(d->n + 1) * sizeof(ShSym));
@@ -3583,6 +3745,88 @@ static ShSym *sym_table(Cg *c, const Dict *d, int *n)
     }
     *n = k;
     return t;
+}
+
+/* the index an LDV line reads ("LDV r3 16", "LDV.xy r3 16", "LDV r3.y 16.x"): 1 and *at = where its digits start */
+static int ldv_index(const char *s, const char *e, const char **at, long long *idx)
+{
+    const char *p;
+    long long v = 0;
+    if (e - s < 4 || strncmp(s, "LDV", 3) || (s[3] != ' ' && s[3] != '.')) return 0;
+    p = memchr(s, ' ', (size_t)(e - s));
+    if (p) p = memchr(p + 1, ' ', (size_t)(e - p - 1));
+    if (!p || p + 1 >= e || p[1] < '0' || p[1] > '9') return 0;
+    *at = ++p;
+    while (p < e && *p >= '0' && *p <= '9' && v < 0x7FFFFFFF) v = v * 10 + (*p++ - '0');
+    *idx = v;
+    return 1;
+}
+
+/* glslc place_attribs: an attribute the program reads is active and takes a location (§2.10.4), a matrix one a column, in a run;
+ * a bound one (h->binds) where the link binds it, also two on one, the rest in declaration order the lowest run no active one holds.
+ * The code reads them there; the table keeps the active ones, in declaration order */
+static void place_attribs(Cg *c, ShOutput *out)
+{
+    Shc *h = c->h;
+    int n = c->attribs.n, nread = c->next_attr + 1, cap = 1, i, j, k, m = 0;
+    unsigned char *read = (unsigned char *)sh_zalloc(h, (size_t)nread), *held;
+    int *w = (int *)sh_alloc(h, (size_t)(n + 1) * sizeof(int) * 3), *loc = w + n + 1, *act = loc + n + 1;
+    int *moved = (int *)sh_alloc(h, (size_t)nread * sizeof(int));
+    const char *s, *e, *at;
+    long long idx;
+    ShSym *t = (ShSym *)sh_alloc(h, (size_t)(n + 1) * sizeof(ShSym));
+    SB b;
+    for (s = out->sasm; *s; s = *e ? e + 1 : e) {
+        e = strchr(s, '\n');
+        if (!e) e = s + strlen(s);
+        if (ldv_index(s, e, &at, &idx) && idx < nread) read[idx] = 1;
+    }
+    for (i = 0; i < n; i++) {
+        const Sym *y = (const Sym *)c->attribs.ent[i].p;
+        w[i] = mat_n(y->ty) ? ncomp2(c, y->ty) : 1;
+        act[i] = 0; loc[i] = -1;
+        for (k = 0; k < w[i]; k++) if (y->slot + k < nread && read[y->slot + k]) act[i] = 1;
+        if (!act[i]) continue;
+        cap += w[i];
+        for (j = h->nbinds - 1; j >= 0; j--) if (!strcmp(h->binds[j].name, c->attribs.ent[i].key)) { loc[i] = h->binds[j].loc; cap += loc[i] + w[i]; break; }
+    }
+    held = (unsigned char *)sh_zalloc(h, (size_t)cap);
+    for (i = 0; i < n; i++) if (act[i] && loc[i] >= 0) for (k = 0; k < w[i]; k++) held[loc[i] + k] = 1;
+    for (i = 0; i < n; i++) {
+        int x = 0;
+        if (!act[i] || loc[i] >= 0) continue;
+        for (;;) {
+            for (k = 0; k < w[i] && !(x + k < cap && held[x + k]); k++) ;
+            if (k == w[i]) break;
+            x++;
+        }
+        loc[i] = x;
+        for (k = 0; k < w[i]; k++) held[x + k] = 1;
+    }
+    for (i = 0; i < nread; i++) moved[i] = -1;
+    for (i = 0; i < n; i++) {
+        const Sym *y = (const Sym *)c->attribs.ent[i].p;
+        if (!act[i]) continue;
+        for (k = 0; k < w[i]; k++) moved[y->slot + k] = loc[i] + k;
+        t[m].name = c->attribs.ent[i].key; t[m].loc = loc[i]; t[m].ty = y->ty; t[m].has_array = 0; t[m].array = 0;
+        m++;
+    }
+    sb_init(&b, h, strlen(out->sasm) + 16);
+    for (s = out->sasm; *s; s = *e ? e + 1 : e) {
+        e = strchr(s, '\n');
+        if (!e) e = s + strlen(s);
+        if (ldv_index(s, e, &at, &idx)) {
+            const char *d = at;
+            if (idx >= nread || moved[idx] < 0) sh_py_error(h, "KeyError: %L", idx);
+            while (d < e && *d >= '0' && *d <= '9') d++;
+            sb_putn(&b, s, (size_t)(at - s));
+            sb_putll(&b, moved[idx]);
+            sb_putn(&b, d, (size_t)(e - d));
+        } else sb_putn(&b, s, (size_t)(e - s));
+        if (*e) sb_putc(&b, '\n');
+    }
+    out->sasm = sb_str(&b);
+    out->attribs = t; out->nattribs = m;
 }
 
 static void mark_struct(Cg *c, Dict *used, const char *ty)
@@ -3618,7 +3862,7 @@ static void struct_table(Cg *c, ShOutput *out)
             long long asz = arrsize(c, s->m[m].arr), nsl = type_nslots(c, s->m[m].ty, asz);
             ShMember *om = &o->members[m];
             om->name = s->m[m].name; om->ty = s->m[m].ty; om->offset = off; om->nslots = nsl;
-            om->has_array = asz != NONE_SZ; om->array = asz != NONE_SZ ? asz : 0;
+            om->has_array = asz != NONE_SZ; om->array = asz != NONE_SZ ? asz : 0; om->prec = s->m[m].rprec;
             off += nsl;
         }
         o->nslots = off;
@@ -3668,6 +3912,7 @@ void sh_compile(Shc *h, const char *src, int fs, int remat, ShOutput *out)
                 long long asz = arrsize(c, d->arr), n = type_nslots(c, d->ty, asz);
                 if (asz != NONE_SZ) sym_put(c, &c->uniforms, d->name, c->next_uniform, d->ty, 1, asz);
                 else sym_put(c, &c->uniforms, d->name, c->next_uniform, d->ty, 0, 0);
+                struct_samplers(c, d->name, d->ty, asz, c->next_uniform);
                 c->next_uniform = c_range(c, c->next_uniform + n);
             }
             else {
@@ -3748,7 +3993,8 @@ void sh_compile(Shc *h, const char *src, int fs, int remat, ShOutput *out)
     sv_room(c, c->vcount + 1);          /* the table covers every register, scalar or not */
     out->const_base = h->umap ? h->urows : c->next_uniform;
     out->sasm = sh_optimize(h, &c->code, c->vcount, c->sv, remat, out->const_base, c->fs, c->pool, &c->npool);
-    out->attribs = sym_table(c, &c->attribs, &out->nattribs);
+    if (c->fs) out->attribs = sym_table(c, &c->attribs, &out->nattribs);
+    else place_attribs(c, out);
     out->uniforms = sym_table(c, &c->uniforms, &out->nuniforms);
     out->samplers = sym_table(c, &c->samplers, &out->nsamplers);
     out->varyings = sym_table(c, &c->varyings, &out->nvaryings);

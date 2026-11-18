@@ -1,5 +1,6 @@
 /* shc_dump — every result of the C compiler as canonical text, one block per file. oracle.py prints the same text from tools/glslc.py + tools/isa64.py; compare.ps1 compares them line by line.
- *   shc_dump [--xops n] [--noops n] [--order a,b,c] [--unread mask] [--strict] file.vert|file.frag ...      (.vert / .vs = vertex stage, anything else = fragment; --xops: g2sc_set_target)
+ *   shc_dump [--xops n] [--noops n] [--order a,b,c] [--unread mask] [--bind a=1,b=1] [--strict] file.vert|file.frag ...      (.vert / .vs = vertex stage, anything else = fragment; --xops: g2sc_set_target;
+ *   --bind: g2sc_compile_bound on the vertex shaders)
  * A file X.pack beside a shader is its Appendix A.7 layout (pack_check.py): a line "U urows slot..." and a line "V slot...", and a line "D bits": the samplers that read depth textures. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,7 +79,8 @@ int main(int argc, char **argv)
     const char *order[32];
     char *list = NULL;
     uint32_t unread = 0;
-    int a = 1, i, nord = 0, strict = 0;
+    g2sc_bind bind[64];
+    int a = 1, i, nord = 0, strict = 0, nbind = 0;
     if (a + 1 < argc && !strcmp(argv[a], "--xops")) { g2sc_set_target((uint32_t)strtoul(argv[a + 1], NULL, 0)); a += 2; }     /* oracle.py --xops */
     if (a + 1 < argc && !strcmp(argv[a], "--noops")) {                                                                        /* oracle.py --noops: both stages */
         uint32_t n = (uint32_t)strtoul(argv[a + 1], NULL, 0);
@@ -91,6 +93,16 @@ int main(int argc, char **argv)
         for (t = strtok(list, ","); t && nord < 32; t = strtok(NULL, ",")) order[nord++] = t;
     }
     if (a + 1 < argc && !strcmp(argv[a], "--unread")) { unread = (uint32_t)strtoul(argv[a + 1], NULL, 0); a += 2; }
+    if (a + 1 < argc && !strcmp(argv[a], "--bind")) {                                                                         /* oracle.py --bind name=location,... */
+        char *t;
+        for (t = strtok(argv[a + 1], ","); t && nbind < 64; t = strtok(NULL, ",")) {
+            char *eq = strchr(t, '=');
+            if (!eq) continue;
+            *eq = 0;
+            bind[nbind].name = t; bind[nbind].loc = (int)strtol(eq + 1, NULL, 0); nbind++;
+        }
+        a += 2;
+    }
     if (a < argc && !strcmp(argv[a], "--strict")) { strict = 1; a++; }
     for (; a < argc; a++) {
         g2sc_result r;
@@ -102,7 +114,8 @@ int main(int argc, char **argv)
         if (!src) { printf("ERROR unreadable\nEND\n"); continue; }
         memset(&r, 0, sizeof r);
         if (read_pack(argv[a], &pk, um, vm)) rc = g2sc_compile_packed(src, stage, NULL, 0, &pk, &r);
-        else rc = nord ? g2sc_compile_ex(src, stage, order, nord, &r) : unread && stage == G2SC_VS ? g2sc_compile_vs(src, unread, &r) : strict ? g2sc_compile_strict(src, stage, &r) : g2sc_compile(src, stage, &r);
+        else rc = nord ? g2sc_compile_ex(src, stage, order, nord, &r) : unread && stage == G2SC_VS ? g2sc_compile_vs(src, unread, &r) : nbind && stage == G2SC_VS ? g2sc_compile_bound(src, bind, nbind, &r)
+                : strict ? g2sc_compile_strict(src, stage, &r) : g2sc_compile(src, stage, &r);
         free(src);
         if (rc < 0) { printf("ERROR %s\nEND\n", r.error); g2sc_free(&r); continue; }
         if (r.oversize) {                                       /* a library packs it at the link; Python's assembler is what the oracle ran */

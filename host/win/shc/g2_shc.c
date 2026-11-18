@@ -93,7 +93,7 @@ static int result_out(const ShOutput *o, const uint64_t *words, int nwords, g2sc
                     dm->type = dup_str(sm->ty);
                     if (!dm->name || !dm->type) return -1;
                     dm->offset = (int)sm->offset; dm->nslots = (int)sm->nslots;
-                    dm->array = (int)sm->array; dm->has_array = sm->has_array;
+                    dm->array = (int)sm->array; dm->has_array = sm->has_array; dm->prec = sm->prec;
                 }
             }
         }
@@ -129,7 +129,8 @@ static void set_error(g2sc_result *r, const char *msg)
     copy_trunc(r->error, sizeof r->error, msg);
 }
 
-static int compile_opts(const char *src, int stage, const char *const *varying_order, int n_order, uint32_t unread, int strict, int may_pack, const g2sc_pack *pack, g2sc_result *out);
+static int compile_opts(const char *src, int stage, const char *const *varying_order, int n_order, uint32_t unread, int strict, int may_pack, const g2sc_pack *pack, const g2sc_bind *binds, int nbinds, g2sc_result *out);
+typedef char bind_layout[sizeof(g2sc_bind) == sizeof(ShBind) && offsetof(g2sc_bind, loc) == offsetof(ShBind, loc) ? 1 : -1];     /* the compiler reads a g2sc_bind table as ShBind */
 
 /* the one setting outside a compile (g2_shc.h): what board B's fragment core can run, glslc.compile_stage's xops */
 static volatile long g_xops;
@@ -140,11 +141,25 @@ static volatile long g_noops_vs, g_noops_fs;
 void g2sc_set_absent(uint32_t vs, uint32_t fs) { g_noops_vs = (long)(vs & 3u); g_noops_fs = (long)(fs & 3u); }
 uint32_t g2sc_absent(int stage) { return (uint32_t)(stage == G2SC_FS ? g_noops_fs : g_noops_vs); }
 
-int g2sc_compile(const char *src, int stage, g2sc_result *out) { return compile_opts(src, stage, NULL, 0, 0, 0, 0, NULL, out); }
-int g2sc_compile_strict(const char *src, int stage, g2sc_result *out) { return compile_opts(src, stage, NULL, 0, 0, 1, 1, NULL, out); }
-int g2sc_compile_ex(const char *src, int stage, const char *const *varying_order, int n_order, g2sc_result *out) { return compile_opts(src, stage, varying_order, n_order, 0, 0, 1, NULL, out); }
-int g2sc_compile_vs(const char *src, uint32_t unread_varyings, g2sc_result *out) { return compile_opts(src, G2SC_VS, NULL, 0, unread_varyings, 0, 0, NULL, out); }
-int g2sc_compile_packed(const char *src, int stage, const char *const *varying_order, int n_order, const g2sc_pack *pack, g2sc_result *out) { return compile_opts(src, stage, varying_order, n_order, pack ? pack->unread : 0, 0, 1, pack, out); }
+int g2sc_compile(const char *src, int stage, g2sc_result *out) { return compile_opts(src, stage, NULL, 0, 0, 0, 0, NULL, NULL, 0, out); }
+int g2sc_compile_strict(const char *src, int stage, g2sc_result *out) { return compile_opts(src, stage, NULL, 0, 0, 1, 1, NULL, NULL, 0, out); }
+int g2sc_compile_ex(const char *src, int stage, const char *const *varying_order, int n_order, g2sc_result *out) { return compile_opts(src, stage, varying_order, n_order, 0, 0, 1, NULL, NULL, 0, out); }
+int g2sc_compile_vs(const char *src, uint32_t unread_varyings, g2sc_result *out) { return compile_opts(src, G2SC_VS, NULL, 0, unread_varyings, 0, 0, NULL, NULL, 0, out); }
+int g2sc_compile_packed(const char *src, int stage, const char *const *varying_order, int n_order, const g2sc_pack *pack, g2sc_result *out) { return compile_opts(src, stage, varying_order, n_order, pack ? pack->unread : 0, 0, 1, pack, NULL, 0, out); }
+int g2sc_compile_bound(const char *src, const g2sc_bind *binds, int nbinds, g2sc_result *out) { return compile_opts(src, G2SC_VS, NULL, 0, 0, 0, 1, NULL, binds, nbinds, out); }
+
+/* the locations the active attributes take, to the last one */
+static long long attr_end(const ShOutput *o)
+{
+    long long end = 0;
+    int i;
+    for (i = 0; i < o->nattribs; i++) {
+        const ShSym *a = &o->attribs[i];
+        long long e = a->loc + (!strncmp(a->ty, "mat", 3) ? a->ty[3] - '0' : 1);
+        if (e > end) end = e;
+    }
+    return end;
+}
 
 /* the varying vectors as declared, up to the last one */
 static int vary_rows(const ShOutput *o)
@@ -219,19 +234,22 @@ done:
     return rc;
 }
 
-static int compile_opts(const char *src, int stage, const char *const *varying_order, int n_order, uint32_t unread, int strict, int may_pack, const g2sc_pack *pack, g2sc_result *out)
+static int compile_opts(const char *src, int stage, const char *const *varying_order, int n_order, uint32_t unread, int strict, int may_pack, const g2sc_pack *pack, const g2sc_bind *binds, int nbinds, g2sc_result *out)
 {
     Shc *h;
     ShOutput o;
     uint64_t *words = NULL;
-    int nwords = 0, rc, over;
+    int nwords = 0, rc, over, i;
     volatile int attempt = 0;
     if (!out) return -1;
     memset(out, 0, sizeof *out);
     if (!src) { set_error(out, "no source"); return -1; }
     if (stage != G2SC_VS && stage != G2SC_FS) { set_error(out, "bad stage"); return -1; }
+    if (!binds || stage != G2SC_VS) nbinds = 0;
+    for (i = 0; i < nbinds; i++) if (!binds[i].name || binds[i].loc < 0 || binds[i].loc >= G2SC_MAX_ATTRIBS) { set_error(out, "attribute location out of range"); return -1; }
     h = (Shc *)malloc(sizeof(Shc));
     if (!h) { set_error(out, "out of memory"); return -1; }
+    h->binds = (const ShBind *)binds; h->nbinds = nbinds;
     h->vary_order = varying_order; h->nvary_order = varying_order ? n_order : 0;
     h->unread = unread;
     h->strict = strict;
@@ -259,7 +277,7 @@ retry:
     memset(&o, 0, sizeof o);
     h->nohoist = attempt >= 1;
     sh_compile(h, src, stage == G2SC_FS, attempt == 2, &o);
-    over = may_pack && (o.const_base + o.npool > (stage == G2SC_VS ? 256 : 64) || (!h->vmap && vary_rows(&o) > 8));
+    over = may_pack && (o.const_base + o.npool > (stage == G2SC_VS ? 256 : 64) || (!h->vmap && vary_rows(&o) > 8) || attr_end(&o) > G2SC_MAX_ATTRIBS);
     if (!over) words = sh_assemble(h, o.sasm, stage == G2SC_VS, IF_DEPTH_DEFAULT, LOOP_DEPTH_DEFAULT, &nwords);
     rc = result_out(&o, words, nwords, out);
     if (rc) {
@@ -373,10 +391,37 @@ void g2sc_link_free(g2sc_linked *l)
     l->umap_vs = l->umap_fs = NULL;
 }
 
-#define LINK_ERR(...) do { snprintf(o->error, sizeof o->error, __VA_ARGS__); goto fail; } while (0)
-int g2sc_link(const char *vs, const char *fs, g2sc_linked *o) { return g2sc_link_depth(vs, fs, 0, o); }
+static const g2sc_struct *find_struct(const g2sc_result *r, const char *name)
+{
+    int i;
+    for (i = 0; i < r->nstructs; i++) if (!strcmp(r->structs[i].name, name)) return &r->structs[i];
+    return NULL;
+}
 
-int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_linked *o)
+/* the name a struct was declared with: the compiler names one a scope hides "S@3" */
+static size_t base_len(const char *n) { const char *at = strchr(n, '@'); return at ? (size_t)(at - n) : strlen(n); }
+
+/* the same struct type in both stages: its name, then its members in order, each of one name, type, array size and precision */
+static int same_struct(const g2sc_result *a, const char *ta, const g2sc_result *b, const char *tb, int depth)
+{
+    const g2sc_struct *sa = find_struct(a, ta), *sb = find_struct(b, tb);
+    int m;
+    if (!sa || !sb) return !sa && !sb && !strcmp(ta, tb);
+    if (depth > 32 || base_len(ta) != base_len(tb) || strncmp(ta, tb, base_len(ta)) || sa->nmembers != sb->nmembers) return 0;
+    for (m = 0; m < sa->nmembers; m++) {
+        const g2sc_member *x = &sa->members[m], *y = &sb->members[m];
+        if (strcmp(x->name, y->name) || x->has_array != y->has_array || x->array != y->array) return 0;
+        if (!x->prec != !y->prec || (x->prec && strcmp(x->prec, y->prec))) return 0;
+        if (!same_struct(a, x->type, b, y->type, depth + 1)) return 0;
+    }
+    return 1;
+}
+
+#define LINK_ERR(...) do { snprintf(o->error, sizeof o->error, __VA_ARGS__); goto fail; } while (0)
+int g2sc_link(const char *vs, const char *fs, g2sc_linked *o) { return g2sc_link_bound(vs, fs, NULL, 0, 0, o); }
+int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_linked *o) { return g2sc_link_bound(vs, fs, NULL, 0, depth_units, o); }
+
+int g2sc_link_bound(const char *vs, const char *fs, const g2sc_bind *binds, int nbinds, uint32_t depth_units, g2sc_linked *o)
 {
     g2sc_pack first;
     const char *order[MAX_VARY_SLOTS];
@@ -385,7 +430,15 @@ int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_l
     uint32_t unread = 0, declared = 0;
     g2sc_result *rv = &o->vs, *rf = &o->fs;
     memset(o, 0, sizeof *o);
-    if (g2sc_compile_ex(vs, G2SC_VS, NULL, 0, rv) < 0) LINK_ERR("vertex shader: %s", rv->error);
+    if (!binds) nbinds = 0;
+    if (compile_opts(vs, G2SC_VS, NULL, 0, 0, 0, 1, NULL, binds, nbinds, rv) < 0) LINK_ERR("vertex shader: %s", rv->error);
+    for (i = 0; i < rv->nattribs; i++) {                    /* §2.10.4: the active attributes need a location each, a matrix one a column */
+        const g2sc_sym *a = &rv->attribs[i];
+        if (a->loc + mat_rows(sym_type(a)) <= G2SC_MAX_ATTRIBS) continue;
+        for (k = nbinds - 1; k >= 0 && strcmp(binds[k].name, sym_name(a)); k--) ;
+        if (k >= 0) LINK_ERR("attribute %s does not fit at location %d", sym_name(a), a->loc);
+        LINK_ERR("too many attributes: the vertex stage has %d locations", G2SC_MAX_ATTRIBS);
+    }
     memset(order, 0, sizeof order);
     for (i = 0; i < rv->nvaryings; i++) {
         int last = rv->varyings[i].loc + vary_slots(&rv->varyings[i]);
@@ -397,6 +450,13 @@ int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_l
     memset(&first, 0, sizeof first);
     first.depth_units = depth_units;
     if (g2sc_compile_packed(fs, G2SC_FS, order, nslots, &first, rf) < 0) LINK_ERR("fragment shader: %s", rf->error);
+    for (i = 0; i < rv->nuniforms; i++) {                   /* a uniform of struct type in both stages: one struct (§4.2.6, §4.5.3) */
+        const g2sc_sym *u = &rv->uniforms[i];
+        for (k = 0; k < rf->nuniforms; k++) if (!strcmp(sym_name(u), sym_name(&rf->uniforms[k]))) break;
+        if (k == rf->nuniforms || (!find_struct(rv, sym_type(u)) && !find_struct(rf, sym_type(&rf->uniforms[k])))) continue;
+        if (u->array != rf->uniforms[k].array || !same_struct(rv, sym_type(u), rf, sym_type(&rf->uniforms[k]), 0))
+            LINK_ERR("uniform %s has another struct in the fragment shader", sym_name(u));
+    }
     pack_uv = rv->const_base + rv->nconst > 256; pack_uf = rf->const_base + rf->nconst > 64;
     pack_v = nslots > 8 || (rf->oversize && !pack_uf) || (rv->oversize && !pack_uv);
     for (i = 0; i < rf->nvaryings; i++) {
@@ -430,7 +490,7 @@ int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_l
         if (pack_uf && !(o->umap_fs = pk_uniforms(rf, 64 - rf->nconst, &urf))) LINK_ERR("fragment stage: the uniforms do not pack into %d vectors", 64 - rf->nconst);
         pk.umap = o->umap_vs; pk.urows = urv; pk.unread = unread;
         memset(&r2, 0, sizeof r2);
-        if (g2sc_compile_packed(vs, G2SC_VS, NULL, 0, &pk, &r2) < 0) { snprintf(o->error, sizeof o->error, "vertex shader: %s", r2.error); g2sc_free(&r2); goto fail; }
+        if (compile_opts(vs, G2SC_VS, NULL, 0, pk.unread, 0, 1, &pk, binds, nbinds, &r2) < 0) { snprintf(o->error, sizeof o->error, "vertex shader: %s", r2.error); g2sc_free(&r2); goto fail; }
         g2sc_free(rv); *rv = r2;
         pk.umap = o->umap_fs; pk.urows = urf; pk.unread = 0; pk.depth_units = depth_units;
         memset(&r2, 0, sizeof r2);
@@ -439,7 +499,7 @@ int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_l
     } else if (unread) {
         g2sc_result r2;
         memset(&r2, 0, sizeof r2);
-        if (g2sc_compile_vs(vs, unread, &r2) == 0) { g2sc_free(rv); *rv = r2; }
+        if (compile_opts(vs, G2SC_VS, NULL, 0, unread, 0, 0, NULL, binds, nbinds, &r2) == 0) { g2sc_free(rv); *rv = r2; }
         else g2sc_free(&r2);
     }
     if (rv->const_base + rv->nconst > 256) LINK_ERR("vertex stage: %d uniform and constant vectors, the hardware has 256", rv->const_base + rv->nconst);

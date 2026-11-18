@@ -55,148 +55,299 @@ def is_scalar(t): return t in SCALAR
 def _cidx(c): return 'xyzw'.index(c) if c in 'xyzw' else 'rgba'.index(c) if c in 'rgba' else 'stpq'.index(c)
 
 # ---------------- preprocessor ----------------
-_PP_IDENT = re.compile(r'[A-Za-z_]\w*')
-def _pp_split_args(text, i):
-    """text[i]=='(' -> parse comma-separated args respecting nested parens. Returns (args, index_after_)."""
-    assert text[i]=='('; i+=1; args=[]; depth=1; cur=''
-    while i<len(text) and depth>0:
-        c=text[i]
-        if c=='(' : depth+=1; cur+=c
-        elif c==')':
-            depth-=1
-            if depth==0: break
-            cur+=c
-        elif c==',' and depth==1: args.append(cur.strip()); cur=''
-        else: cur+=c
-        i+=1
-    if cur.strip() or args: args.append(cur.strip())
-    return args, i+1
+# GLSL ES 1.00 §3.4, which is C++'s: preprocessing tokens, macros replaced token by token (a token remembers the macros it came out
+# of, so none expands inside itself), #if expressions of ints with C's precedence. A token is [kind, text, line, ws, hide]: kind
+# 'id' 'num' 'op' 'other', line its physical line, ws white space (or a comment) before it, hide the macros it came out of.
+_PP_TOK = re.compile(r"""
+   (?P<id>[A-Za-z_]\w*)
+ | (?P<num>\.?\d(?:[eE][+-]|[\w.])*)
+ | (?P<op><<=|>>=|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||\^\^|\+=|-=|\*=|/=|%=|&=|\^=|\|=|\#\#|[-+*/%<>=!&|^~?:.,;(){}\[\]\#])
+ | (?P<other>.)
+""", re.VERBOSE | re.S)
+_PP_WS = ' \t\r\f\v'
+
+def _pp_lines(src):
+    """the source as logical lines (first physical line, tokens) and its physical line count: a comment is white space, so one
+    that runs over lines joins them"""
+    lines=[]; cur=[]; i=0; n=len(src); line=1; start=1; ws=False
+    while i<n:
+        c=src[i]
+        if c=='\n':
+            lines.append((start,cur)); cur=[]; line+=1; start=line; ws=False; i+=1; continue
+        if c in _PP_WS: ws=True; i+=1; continue
+        if src.startswith('//',i):
+            while i<n and src[i]!='\n': i+=1
+            ws=True; continue
+        if src.startswith('/*',i):
+            j=src.find('*/',i+2)
+            if j<0: raise CompileError("a comment does not end")
+            line+=src.count('\n',i,j); i=j+2; ws=True; continue
+        m=_PP_TOK.match(src,i)
+        cur.append([m.lastgroup, m.group(), line, ws, frozenset()]); ws=False; i=m.end()
+    lines.append((start,cur))
+    return lines, line
+
+def _pp_text(toks):
+    return ''.join((' ' if k else '')+t[1] for k,t in enumerate(toks))
+
+def _pp_int(v):
+    """an integer literal of a #if, None if the token is none"""
+    if re.fullmatch(r'0[xX][0-9a-fA-F]+', v): return int(v,16)
+    if re.fullmatch(r'0[0-7]*', v): return int(v,8)
+    if re.fullmatch(r'[1-9]\d*', v): return int(v)
+    return None
+
+def _pp_w32(x): return ((x+0x80000000) & 0xFFFFFFFF) - 0x80000000     # the ints of a #if: 32 bits, two's complement
 
 EXTENSIONS=('GL_OES_standard_derivatives','GL_EXT_shader_texture_lod','GL_EXT_frag_depth','GL_OES_texture_3D')   # fragment language; the library advertises the same list
 EXT_ANY=('GL_OES_texture_3D',)   # the vertex language has these too: a sampler there compiles, and the link refuses it
+_PP_LEVELS=(('||',),('&&',),('|',),('^',),('&',),('==','!='),('<','>','<=','>='),('<<','>>'),('+','-'),('*','/','%'))
 
 def preprocess(src, stage='vs', exts=None, strict=False):
-    """A GLSL-ES preprocessor: object- and function-like #define, #undef, #ifdef/#ifndef/#if/#elif/#else/
-    #endif (with defined() + integer const-expr), #version (100 only, first), #extension (exts collects the ones
-    enabled), #line, and skips #pragma. Comments are stripped first so directives and macro bodies aren't confused by them."""
-    # strip comments (block then line), preserving newlines for line structure
-    src=re.sub(r'/\*.*?\*/', lambda m:'\n'*m.group(0).count('\n'), src, flags=re.S)
-    src=re.sub(r'//[^\n]*', '', src)
-    defines={'GL_ES':(None,'1'), '__VERSION__':(None,'100'), '__FILE__':(None,'0')}       # name -> (params|None, body)
+    """GLSL ES 1.00's preprocessor: object- and function-like #define, #undef, #if / #ifdef / #ifndef / #elif / #else / #endif,
+    #error, #pragma, #extension (exts collects the ones enabled), #version (100, first), #line, __LINE__ __FILE__ __VERSION__
+    GL_ES. strict (a program from an application): every error §3.4 names; otherwise what cannot be read is let pass."""
+    def err(msg):
+        raise CompileError(msg)
+    lines,nlines=_pp_lines(src)
+    defines={}                                         # name -> (params | None, replacement tokens)
+    def const(name, v): defines[name]=(None,[['num',v,0,False,frozenset()]])
+    const('GL_ES','1'); const('__VERSION__','100')
     if stage=='fs':
-        defines['GL_FRAGMENT_PRECISION_HIGH']=(None,'1')   # highp exists in this fragment language: FP24 meets it
-        for x in EXTENSIONS: defines[x]=(None,'1')
-    for x in EXT_ANY: defines[x]=(None,'1')
-    def expand(text, hide=frozenset()):
-        out=[]; i=0; n=len(text)
-        while i<n:
-            m=_PP_IDENT.match(text,i)
-            if not m: out.append(text[i]); i+=1; continue
-            name=m.group(0); j=m.end()
-            if name in defines and name not in hide:
-                params,body=defines[name]
-                if params is None:
-                    out.append(expand(body, hide|{name})); i=j
+        const('GL_FRAGMENT_PRECISION_HIGH','1')      # highp exists in this fragment language: FP24 meets it
+        for x in EXTENSIONS: const(x,'1')
+    for x in EXT_ANY: const(x,'1')
+    fixed=('__LINE__','__FILE__','__VERSION__','GL_ES')      # predefined: no #define or #undef takes them
+    st={'lineoff':0, 'file':0}
+
+    def call_end(toks, i):
+        """toks[i] names a function-like macro: the index of its '(' and of the ')' that closes it; None when no '(' follows,
+        'open' when the call does not end in toks"""
+        j=i+1
+        if j>=len(toks): return 'open'
+        if toks[j][1]!='(': return None
+        depth=0
+        for k in range(j,len(toks)):
+            if toks[k][1]=='(': depth+=1
+            elif toks[k][1]==')':
+                depth-=1
+                if depth==0: return j,k
+        return 'open'
+
+    def expand(toks, ifexpr=False):
+        """macro replacement of a token list; ifexpr: `defined X` and `defined ( X )` become 1 or 0, also where a
+        replacement brings them"""
+        toks=[list(t) for t in toks]; out=[]; i=0
+        while i<len(toks):
+            t=toks[i]; k,v=t[0],t[1]
+            if ifexpr and k=='id' and v=='defined':
+                j=i+1; paren=j<len(toks) and toks[j][1]=='('
+                if paren: j+=1
+                if j>=len(toks) or toks[j][0]!='id': err("defined needs a macro name")
+                nm=toks[j][1]; j+=1
+                if paren:
+                    if j>=len(toks) or toks[j][1]!=')': err("defined( needs a )")
+                    j+=1
+                out.append(['num','1' if nm in defines or nm in ('__LINE__','__FILE__') else '0',t[2],t[3],frozenset()]); i=j; continue
+            if k!='id' or v in t[4]:
+                out.append(t); i+=1; continue
+            if v=='__LINE__':
+                out.append(['num',str(t[2]+st['lineoff']),t[2],t[3],frozenset()]); i+=1; continue
+            if v=='__FILE__':
+                out.append(['num',str(st['file']),t[2],t[3],frozenset()]); i+=1; continue
+            if v not in defines:
+                out.append(t); i+=1; continue
+            params,body=defines[v]
+            if params is None:
+                rep=[[b[0],b[1],t[2],(t[3] if n==0 else b[3]),t[4]|{v}] for n,b in enumerate(body)]
+                toks[i:i+1]=rep; continue
+            ce=call_end(toks,i)
+            if not isinstance(ce,tuple):
+                out.append(t); i+=1; continue
+            lp,rp=ce
+            args=[[]]; depth=0
+            for a in toks[lp+1:rp]:
+                if a[1]=='(': depth+=1
+                elif a[1]==')': depth-=1
+                if a[1]==',' and depth==0: args.append([]); continue
+                args[-1].append(a)
+            if args==[[]] and not params: args=[]
+            if len(args)!=len(params):
+                if strict: err(f"macro {v} takes {len(params)} arguments, not {len(args)}")
+                args=(args+[[] for _ in params])[:len(params)]
+            args=[expand(a) for a in args]
+            hide=t[4]|{v}; line=toks[rp][2]; rep=[]
+            for n,b in enumerate(body):
+                ws=t[3] if n==0 else b[3]
+                if b[0]=='id' and b[1] in params:
+                    a=args[params.index(b[1])]
+                    rep.extend([x[0],x[1],x[2],(ws if m==0 else x[3]),x[4]|hide] for m,x in enumerate(a))
+                else: rep.append([b[0],b[1],line,ws,hide])
+            toks[i:rp+1]=rep
+        return out
+
+    def eval_if(toks):
+        """a #if / #elif expression: 1 or 0"""
+        x=expand(toks, True); pos=[0]
+        if not x: err("#if needs an expression")
+        def peek(): return x[pos[0]][1] if pos[0]<len(x) else None
+        def unary(ev):
+            if pos[0]>=len(x): err("#if: the expression ends early")
+            k,v=x[pos[0]][0],x[pos[0]][1]; pos[0]+=1
+            if v in ('+','-','~','!'):
+                a=unary(ev)
+                return a if v=='+' else _pp_w32(-a) if v=='-' else _pp_w32(~a) if v=='~' else int(not a)
+            if v=='(':
+                a=binary(0,ev)
+                if peek()!=')': err("#if: ) expected")
+                pos[0]+=1; return a
+            if k=='num':
+                a=_pp_int(v)
+                if a is None: err(f"#if: {v} is no integer")
+                return _pp_w32(a)
+            if k=='id':
+                if ev: err(f"#if: {v!r} is not defined")
+                return 0
+            err(f"#if: unexpected {v!r}")
+        def binary(lvl, ev):
+            if lvl==len(_PP_LEVELS): return unary(ev)
+            a=binary(lvl+1,ev)
+            while peek() in _PP_LEVELS[lvl]:
+                op=peek(); pos[0]+=1
+                if op=='||': b=binary(lvl+1, ev and not a); a=int(bool(a) or bool(b)); continue
+                if op=='&&': b=binary(lvl+1, ev and bool(a)); a=int(bool(a) and bool(b)); continue
+                b=binary(lvl+1,ev)
+                if op in ('/','%'):
+                    if b==0:
+                        if ev: err("#if: division by zero")
+                        a=0; continue
+                    q=abs(a)//abs(b)
+                    if (a<0)!=(b<0): q=-q
+                    a=_pp_w32(q) if op=='/' else _pp_w32(a-b*q); continue
+                if op in ('<<','>>'): a=_pp_w32(a<<(b&31)) if op=='<<' else a>>(b&31); continue
+                a={'==':int(a==b),'!=':int(a!=b),'<':int(a<b),'>':int(a>b),'<=':int(a<=b),'>=':int(a>=b),
+                   '|':a|b,'^':a^b,'&':a&b,'+':_pp_w32(a+b),'-':_pp_w32(a-b),'*':_pp_w32(a*b)}[op]
+            return a
+        r=binary(0,True)
+        if pos[0]!=len(x): err(f"#if: unexpected {x[pos[0]][1]!r} after the expression")
+        return int(bool(r))
+    def if_value(toks):
+        try: return eval_if(toks)
+        except CompileError:
+            if strict: raise
+            return 0
+
+    def name_of(toks, what):
+        """the one name a directive takes"""
+        if strict and (len(toks)!=1 or toks[0][0]!='id'): err(f"#{what} takes one macro name")
+        return toks[0][1] if toks else ''
+    def no_more(toks, what):
+        if strict and toks: err(f"#{what}: unexpected {toks[0][1]!r}")
+    def same_body(a, b):
+        return [(x[0],x[1],x[3] if n else False) for n,x in enumerate(a)]==[(x[0],x[1],x[3] if n else False) for n,x in enumerate(b)]
+
+    def define(toks):
+        if not toks or toks[0][0]!='id': err("#define needs a macro name")
+        nm=toks[0][1]; params=None; i=1
+        if i<len(toks) and toks[i][1]=='(' and not toks[i][3]:          # a function-like macro: '(' right after the name
+            params=[]; i+=1
+            if i<len(toks) and toks[i][1]==')': i+=1
+            else:
+                while True:
+                    if i>=len(toks) or toks[i][0]!='id':
+                        if strict: err(f"#define {nm}: a parameter must be a name")
+                        while i<len(toks) and toks[i][1]!=')': i+=1
+                        i+=1; break
+                    if strict and toks[i][1] in params: err(f"#define {nm}: the parameter {toks[i][1]} twice")
+                    params.append(toks[i][1]); i+=1
+                    if i<len(toks) and toks[i][1]==',': i+=1; continue
+                    if i<len(toks) and toks[i][1]==')': i+=1; break
+                    if strict: err(f"#define {nm}: ) expected")
+                    break
+        body=toks[i:]
+        if strict and (nm.startswith('GL_') or nm in fixed): err(f"macro name {nm!r} is reserved")
+        if strict and nm in defines and (defines[nm][0]!=params or not same_body(defines[nm][1],body)): err(f"macro {nm} is defined again otherwise")
+        defines[nm]=(params,[list(b) for b in body])
+
+    out=['']*nlines; stack=[]                          # (parent active, this group taken, a group of the chain taken, #else met)
+    begun=False                                        # a directive or code went before: #version comes first
+    code=False                                         # code went before: #extension comes first
+    li=0
+    while li<len(lines):
+        start,toks=lines[li]; li+=1
+        active=all(s[1] for s in stack)
+        if toks and toks[0][1]=='#':
+            d=toks[1:]
+            key=d[0][1] if d and d[0][0]=='id' else ''
+            rest=d[1:]
+            if d and not key and strict and active: err(f"bad directive #{d[0][1]}")
+            if key in ('if','ifdef','ifndef'):
+                if not active: t=False
+                elif key=='if': t=bool(if_value(rest))
                 else:
-                    k=j
-                    while k<n and text[k] in ' \t\n': k+=1
-                    if k<n and text[k]=='(':
-                        args,k=_pp_split_args(text,k); args=[expand(a,hide) for a in args]
-                        rep=body
-                        for p,a in zip(params,args):
-                            rep=re.sub(r'\b'+re.escape(p)+r'\b', lambda _m,a=a: a, rep)
-                        out.append(expand(rep, hide|{name})); i=k
-                    else: out.append(name); i=j
-            else: out.append(name); i=j
-        return ''.join(out)
-    def eval_if(expr):
-        expr=re.sub(r'defined\s*\(\s*(\w+)\s*\)', lambda m:'1' if m.group(1) in defines else '0', expr)
-        expr=re.sub(r'defined\s+(\w+)', lambda m:'1' if m.group(1) in defines else '0', expr)
-        expr=expand(expr)
-        expr=re.sub(r'\b[A-Za-z_]\w*\b', '0', expr)   # remaining identifiers -> 0 (undefined)
-        expr=expr.replace('||',' or ').replace('&&',' and ').replace('!','not ')
-        expr=re.sub(r'\bnot=', '!=', expr)            # undo "not =" from !=
-        try: return 1 if eval(expr, {'__builtins__':{}}, {}) else 0
-        except Exception: return 0
-    def open_call(text):
-        """text ends inside a call of a function-like macro: the arguments go on over the next line, as in C++"""
-        i=0; n=len(text)
-        while i<n:
-            m=_PP_IDENT.match(text,i)
-            if not m: i+=1; continue
-            i=m.end()
-            d=defines.get(m.group(0))
-            if d is None or d[0] is None: continue
-            k=i
-            while k<n and text[k] in ' \t\n': k+=1
-            if k==n: return True                      # the '(' may be on the next line
-            if text[k]!='(': continue
-            depth=0
-            while k<n:
-                if text[k]=='(': depth+=1
-                elif text[k]==')':
-                    depth-=1
-                    if depth==0: break
-                k+=1
-            if k==n: return True
-            i=k+1
-        return False
-    out=[]; stack=[]   # stack of (parent_active, this_branch_taken, any_taken)
-    active=lambda: all(s[1] for s in stack)
-    lines=src.split('\n'); skip=0; lineoff=0; begun=False   # lineoff: what #line added; begun: something other than white space went before
-    for lineno,line in enumerate(lines,1):
-        if skip: skip-=1; out.append(''); continue    # joined to a macro call above
-        defines['__LINE__']=(None,str(lineno+lineoff))
-        st=line.strip()
-        if st.startswith('#'):
-            d=st[1:].strip(); parts=d.split(None,1); key=parts[0] if parts else ''; rest=parts[1] if len(parts)>1 else ''
-            if key=='version':
-                if active() and (begun or rest.strip()!='100'):
-                    raise CompileError('#version must come first' if rest.strip()=='100' else f'#version {rest.strip()} is not supported: GLSL ES 1.00 only')
-            if key: begun=True
-            if key=='define' and active():
-                m=re.match(r'(\w+)(\(([^)]*)\))?\s*(.*)', rest, re.S)   # func-like needs '(' with NO space
-                nm=m.group(1); params=[p.strip() for p in m.group(3).split(',')] if m.group(2) else None
-                if params==['']: params=[]
-                if strict and nm.startswith('GL_'): raise CompileError(f"macro name {nm!r} is reserved")
-                defines[nm]=(params, m.group(4).strip())
-            elif key=='undef' and active(): defines.pop(rest.strip(), None)
-            elif key=='error' and active(): raise CompileError('#error '+rest)
-            elif key=='ifdef':  stack.append((active(), active() and rest.strip() in defines, active() and rest.strip() in defines))
-            elif key=='ifndef': stack.append((active(), active() and rest.strip() not in defines, active() and rest.strip() not in defines))
-            elif key=='if':
-                pa=active(); t=pa and bool(eval_if(rest)); stack.append((pa, t, t))
+                    nm=name_of(rest, key); t=(nm in defines or nm in ('__LINE__','__FILE__'))==(key=='ifdef')
+                stack.append((active, t, t, False))
             elif key=='elif':
-                pa,cur,any_=stack[-1]; t=pa and (not any_) and bool(eval_if(rest)); stack[-1]=(pa, t, any_ or t)
+                if not stack: err("#elif without #if")
+                pa,_,any_,el=stack[-1]
+                if el and strict: err("#elif after #else")
+                t=pa and not any_ and bool(if_value(rest))
+                stack[-1]=(pa, t, any_ or t, el)
             elif key=='else':
-                pa,cur,any_=stack[-1]; stack[-1]=(pa, pa and not any_, True)
-            elif key=='endif': stack.pop()
-            elif key=='extension' and active():
-                m=re.match(r'(\w+)\s*:\s*(\w+)\s*$', rest)
-                if not m or m.group(2) not in ('require','enable','warn','disable'): raise CompileError(f"bad #extension: {rest}")
-                nm,beh=m.group(1),m.group(2)
-                if nm=='all':
-                    if beh in ('require','enable'): raise CompileError(f"#extension all : {beh}")
-                    if exts is not None:
-                        if beh=='disable': exts.clear()
-                        else: exts.update(EXTENSIONS if stage=='fs' else EXT_ANY)
-                elif not (nm in EXT_ANY or (stage=='fs' and nm in EXTENSIONS)):
-                    if beh=='require': raise CompileError(f"extension {nm} is not supported")
-                elif exts is not None:
-                    if beh=='disable': exts.discard(nm)
-                    else: exts.add(nm)
-            elif key=='line' and active():
-                m=re.match(r'(\d+)(\s+\d+)?\s*$', expand(rest))
-                if not m: raise CompileError(f"bad #line: {rest}")
-                lineoff=int(m.group(1))-lineno                          # ES 1.00: the next line counts as line + 1
-            out.append('')            # directive -> blank line (keep line numbers)
-        elif active():
-            if st: begun=True
-            while lineno+skip<len(lines) and open_call(line) and not lines[lineno+skip].strip().startswith('#'):
-                line+=' '+lines[lineno+skip]; skip+=1
-            out.append(expand(line))
-        else: out.append('')
-    if stack: raise CompileError("#if without #endif")
+                if not stack: err("#else without #if")
+                pa,_,any_,el=stack[-1]
+                if el and strict: err("#else after #else")
+                no_more(rest, 'else')
+                stack[-1]=(pa, pa and not any_, True, True)
+            elif key=='endif':
+                if not stack: err("#endif without #if")
+                no_more(rest, 'endif')
+                stack.pop()
+            elif active:
+                if key=='version':
+                    v=_pp_text(rest)
+                    if begun or v!='100': err('#version must come first' if v=='100' else f'#version {v} is not supported: GLSL ES 1.00 only')
+                elif key=='define': define(rest)
+                elif key=='undef':
+                    nm=name_of(rest, 'undef')
+                    if strict and (nm.startswith('GL_') or nm in fixed): err(f"macro name {nm!r} is reserved")
+                    defines.pop(nm, None)
+                elif key=='error': err('#error '+_pp_text(rest))
+                elif key=='extension':
+                    m=re.fullmatch(r'(\w+) : (\w+)', _pp_text(rest))
+                    if not m or m.group(2) not in ('require','enable','warn','disable'): err(f"bad #extension: {_pp_text(rest)}")
+                    if strict and code: err("#extension comes before the code")
+                    nm,beh=m.group(1),m.group(2)
+                    if nm=='all':
+                        if beh in ('require','enable'): err(f"#extension all : {beh}")
+                        if exts is not None:
+                            if beh=='disable': exts.clear()
+                            else: exts.update(EXTENSIONS if stage=='fs' else EXT_ANY)
+                    elif not (nm in EXT_ANY or (stage=='fs' and nm in EXTENSIONS)):
+                        if beh=='require': err(f"extension {nm} is not supported")
+                    elif exts is not None:
+                        if beh=='disable': exts.discard(nm)
+                        else: exts.add(nm)
+                elif key=='line':
+                    x=expand(rest); vals=[min(int(t[1]),0x7FFFFFFF) if t[0]=='num' and re.fullmatch(r'\d+', t[1]) else None for t in x]
+                    if not 1<=len(vals)<=2 or None in vals: err(f"bad #line: {_pp_text(rest)}")
+                    nxt=lines[li][0] if li<len(lines) else nlines+1
+                    st['lineoff']=vals[0]-nxt                                 # the next line is line vals[0]
+                    if len(vals)==2: st['file']=vals[1]
+                elif key=='pragma' or not d: pass
+                elif strict: err(f"unknown directive #{key}")
+            if key: begun=True
+            continue
+        if not active: continue
+        if toks: begun=True; code=True
+        while li<len(lines) and not (lines[li][1] and lines[li][1][0][1]=='#'):    # a call of a function-like macro may go on over lines
+            ids=[n for n,t in enumerate(toks) if t[0]=='id' and t[1] in defines and defines[t[1]][0] is not None]
+            if not any(call_end(toks,n)=='open' for n in ids): break
+            nxt=[list(t) for t in lines[li][1]]
+            if nxt: nxt[0][3]=True
+            toks=toks+nxt; li+=1
+        out[start-1]=_pp_text(expand(toks))
+    if stack: err("#if without #endif")
     return '\n'.join(out)
 
 # ---------------- lexer ----------------
@@ -204,7 +355,7 @@ KEYWORDS = {'attribute','uniform','varying','const','void','float','int','bool',
             'vec2','vec3','vec4','bvec2','bvec3','bvec4','ivec2','ivec3','ivec4',
             'mat2','mat3','mat4','sampler2D','samplerCube',
             'if','else','for','return','discard','true','false','in','out','inout','precision',
-            'highp','mediump','lowp','struct','while','do','continue','break'}
+            'highp','mediump','lowp','struct','while','do','continue','break','invariant'}
 RESERVED = {'asm','class','union','enum','typedef','template','this','packed','goto','switch','default','inline','noinline',
             'volatile','public','static','extern','external','interface','flat','long','short','double','half','fixed',
             'unsigned','superp','input','output','hvec2','hvec3','hvec4','dvec2','dvec3','dvec4','fvec2','fvec3','fvec4',
@@ -258,6 +409,7 @@ class Parser:
         self.hoisted=[]                            # struct definitions met inside functions: every struct is global to the code generator
         self.prec={}                               # id(declaration) -> its precision qualifier (Sema: the fragment language has no default for float)
         self.parr={}                               # id(parameter) -> its array size expression
+        self.fragdata=set()                        # id of the gl_FragColor nodes that were gl_FragData[0] (Sema: a shader writes one of the two)
     def peek(self): return self.t[self.i]
     def next(self): tok=self.t[self.i]; self.i+=1; return tok
     def at(self, v): k,val=self.peek(); return val==v
@@ -268,6 +420,11 @@ class Parser:
     def accept(self, v):
         if self.at(v): self.i+=1; return True
         return False
+    def ident(self):
+        """the name a declaration gives: an identifier (§3.7); a program from an application that names a keyword or a number fails"""
+        k,v=self.next()
+        if k=='num' or (self.strict and k!='id'): raise CompileError("expected a name, got " + ('<number>' if k=='num' else repr(v)))
+        return v
 
     # ---- top level ----
     def parse(self):
@@ -288,13 +445,13 @@ class Parser:
     def parse_struct(self):
         self.next()                              # 'struct'
         self.nstruct+=1; name=None
-        if not self.at('{'): name=self.next()[1]
+        if not self.at('{'): name=self.ident()
         self.eat('{'); members=[]
         while not self.at('}'):
             p=self.skip_precision()
             mty=self.type_name()
             while True:                          # comma-separated members of the same type
-                mname=self.next()[1]; marr=None
+                mname=self.ident(); marr=None
                 if self.accept('['): marr=self.assign(); self.eat(']')
                 m=(mty, mname, marr); self.prec[id(m)]=p; members.append(m)
                 if not self.accept(','): break
@@ -308,7 +465,7 @@ class Parser:
         """the declarators after a type: name[size] = init, ... ; make(name, size, init) builds each"""
         out=[]
         while True:
-            name=self.next()[1]; arr=None; init=None
+            name=self.ident(); arr=None; init=None
             if self.accept('['): arr=self.assign(); self.eat(']')   # assign(): a comma separates declarators
             if self.accept('='): init=self.assign()
             out.append(make(name, arr, init))
@@ -325,8 +482,10 @@ class Parser:
             return out+self.decl_names(lambda n,a,i: ('gdecl','var',sname,n,a,i))    # struct S{..} a, b;
         if v=='invariant':                       # every program here is computed one way: nothing to do
             self.next()
-            if not self.at('varying'):
-                while not self.accept(';'): self.next()
+            if not self.at('varying'):           # invariant gl_Position, v; : names declared before
+                while not self.accept(';'):
+                    k,w=self.next()
+                    if self.strict and k!='id' and w!=',': raise CompileError("invariant qualifies varyings and the outputs gl_Position and gl_PointSize")
                 return []
             k,v=self.peek()
         if v in ('attribute','uniform','varying','const'):
@@ -340,7 +499,7 @@ class Parser:
             return out+self.decl_names(make)
         # function def or global: <type> name ( ... ) { ... }  OR <type> name;
         p=self.skip_precision()
-        ty=self.type_name(); name=self.next()[1]
+        ty=self.type_name(); name=self.ident()
         if self.at('('):
             params=self.params()
             if self.accept(';'): d=('proto', ty, name, params)
@@ -354,7 +513,7 @@ class Parser:
             if self.accept('='): init=self.assign()
             d=('gdecl', 'var', ty, name, arr, init); self.prec[id(d)]=p; out.append(d)
             if not self.accept(','): break
-            name=self.next()[1]
+            name=self.ident()
         self.eat(';'); return out
     def skip_precision(self):
         q=None
@@ -366,14 +525,17 @@ class Parser:
         if self.at('void') and self.t[self.i+1][1]==')': self.next()   # f(void)
         if not self.at(')'):
             while True:
-                q='in'; c=False; pr=None
+                q='in'; c=False; pr=None; last=-1
                 while self.peek()[1] in ('in','out','inout','const','highp','mediump','lowp'):
                     t=self.next()[1]
+                    o=0 if t=='const' else 1 if t in ('in','out','inout') else 2      # §4.6.4: const, then in / out / inout, then a precision
+                    if self.strict and o<=last: raise CompileError(f"parameter qualifier {t!r} out of order")
+                    last=o
                     if t in ('in','out','inout'): q=t
                     elif t=='const': c=True
                     else: pr=t
                 ty=self.type_name(); nm=''
-                if not self.at(',') and not self.at(')') and not self.at('['): nm=self.next()[1]   # a prototype may leave the name out
+                if not self.at(',') and not self.at(')') and not self.at('['): nm=self.ident()   # a prototype may leave the name out
                 arr=None
                 if self.accept('['): arr=self.assign(); self.eat(']')
                 p=(q,ty,nm); self.prec[id(p)]=pr; self.parr[id(p)]=(arr,c); ps.append(p)
@@ -381,6 +543,9 @@ class Parser:
         self.eat(')')
         return ps
     # ---- statements ----
+    def scoped(self, s):
+        """§6.2: the statement of an if or an else is a scope of its own: a declaration there goes in a block"""
+        return ('block', [s]) if s[0] in ('ldecl','multi','lstruct') else s
     def block(self):
         self.eat('{'); stmts=[]; self.sscope.append({})
         while not self.at('}'): stmts.append(self.stmt())
@@ -398,8 +563,8 @@ class Parser:
             return ('multi', [d]+self.decl_names(lambda n,a,i: ('ldecl', False, sname, n, i, a)))
         if v=='if':
             self.next(); self.eat('('); c=self.expr(); self.eat(')')
-            th=self.stmt(); el=None
-            if self.accept('else'): el=self.stmt()
+            th=self.scoped(self.stmt()); el=None
+            if self.accept('else'): el=self.scoped(self.stmt())
             return ('if', c, th, el)
         if v=='for':
             self.next(); self.eat('(')
@@ -481,7 +646,9 @@ class Parser:
                 self.next(); field=self.next()[1]; e=('swizzle', e, field)
             elif v=='[':
                 self.next(); idx=self.expr(); self.eat(']')
-                e=('var','gl_FragColor') if e==('var','gl_FragData') and idx==('num',0.0) else ('index', e, idx)   # MAX_DRAW_BUFFERS is 1
+                if e==('var','gl_FragData') and idx==('num',0.0):           # MAX_DRAW_BUFFERS is 1
+                    e=tuple(['var','gl_FragColor']); self.fragdata.add(id(e))
+                else: e=('index', e, idx)
             elif v=='(' and e[0]=='var':          # function/constructor call
                 args=self.arglist(); e=('call', self.sname(e[1]) or e[1], args)
             elif v in ('++','--'):
@@ -619,6 +786,8 @@ class Sema:
         self.fnames={}           # id(function node) -> the name the code generator knows it by
         self.depthrange=False    # the program reads gl_DepthRange
         self.cur=None; self.loops=0
+        self.gnames={}           # a global name -> 'function', 'variable' or 'struct': §4.2.7, they share one name space
+        self.fragout=set()       # gl_FragColor / gl_FragData, the ones the program writes
         g=self.scopes[0]
         if stage=='vs': g.update({'gl_Position':Sym(('vec4',None)),'gl_PointSize':Sym(('float',None))})
         else:
@@ -672,15 +841,33 @@ class Sema:
         for mt,mn,ma in self.structs.get(b,()):
             if ma is not None or self.has_opaque(mt): return True
         return False
+    def has_array(self, b):
+        """a struct type with an array among its members, at any depth"""
+        return any(ma is not None or self.has_array(mt) for mt,mn,ma in self.structs.get(b,()))
+    def gname(self, name, kind):
+        was=self.gnames.setdefault(name, kind)
+        if was!=kind: self.err(f"{name!r} is already declared as a {was}")
+    def builtin_takes(self, name, sig):
+        """a built-in function of this name takes exactly these parameters"""
+        if not any(sg[1]==name for sg in SIGS): return False
+        s=self.strict; self.strict=False
+        try: return self.ty_builtin(None, name, list(sig))!=ERR
+        finally: self.strict=s
+    def wrote(self, e):
+        """a write to e: §7.2, a shader writes gl_FragColor or gl_FragData, not both"""
+        while e[0] in ('swizzle','index'): e=e[1]
+        if e[0]=='var' and e[1] in ('gl_FragColor','gl_FragData'):
+            self.fragout.add('gl_FragData' if e[1]=='gl_FragData' or id(e) in self.p.fragdata else 'gl_FragColor')
     # ---- top level ----
     def run(self, ast):
         order=[]
         for d in ast:
             k=d[0]
             if k=='precision': self.prec_stmt(d)
-            elif k=='struct': self.struct(d)
-            elif k=='gdecl': self.gdecl(d)
-            elif k in ('proto','func'): order.append(self.func(d))
+            elif k=='struct': self.struct(d); self.gname(d[1], 'struct')
+            elif k=='gdecl': self.gdecl(d); self.gname(d[3], 'variable')
+            elif k in ('proto','func'): order.append(self.func(d)); self.gname(d[2], 'function')
+        if len(self.fragout)>1: self.err("a shader writes gl_FragColor or gl_FragData, not both")
         main=self.funcs.get('main')
         if main is None or not any(f.defined for f in main):
             if self.strict: raise CompileError("no main()")
@@ -758,10 +945,17 @@ class Sema:
             sig.append((p[1],self.size(a)))
         sig=tuple(sig)
         if name.startswith('gl_'): self.err(f"{name!r}: the gl_ prefix is reserved")
+        if ret!='void' and self.has_array(ret): self.err(f"{name}: a function cannot return a struct with an array")
+        if self.strict and self.builtin_takes(name, sig): self.err(f"{name}: a built-in function cannot be declared again")
         fs=self.funcs.setdefault(name,[])
         fn=next((f for f in fs if f.sig==sig),None)
         if fn is None: fn=Fn(name,ret,params,sig); fs.append(fn)
-        elif fn.ret!=ret: self.err(f"{name}: two return types")
+        else:
+            if fn.ret!=ret: self.err(f"{name}: two return types")
+            if not isdef: self.err(f"{name} is already declared")
+            for p,q in zip(params, fn.params):
+                if p[0]!=q[0] or self.p.parr.get(id(p),(None,False))[1]!=self.p.parr.get(id(q),(None,False))[1]:
+                    self.err(f"{name}: a parameter's qualifiers differ from its declaration")
         if isdef:
             if fn.defined: self.err(f"{name} is already defined")
             fn.defined=True; fn.node=d; fn.params=params
@@ -803,7 +997,13 @@ class Sema:
         elif k=='for':
             self.scopes.append({}); self.stmt(s[1]); self.cond(s[2])
             if s[3] is not None: self.ty(s[3])
-            self.loops+=1; self.stmt(s[4]); self.loops-=1; self.scopes.pop()
+            self.loops+=1
+            if self.strict and s[4][0]=='block':                   # §6.3: the body shares the scope of the for statement
+                self.defprec.append({})
+                for x in s[4][1]: self.stmt(x)
+                self.defprec.pop()
+            else: self.stmt(s[4])
+            self.loops-=1; self.scopes.pop()
         elif k=='while':
             self.cond(s[1]); self.loops+=1; self.stmt(s[2]); self.loops-=1
         elif k=='dowhile':
@@ -868,7 +1068,7 @@ class Sema:
         if k=='index': return self.ty_index(e)
         if k=='call': return self.ty_call(e)
         if k=='postop':
-            t=self.ty(e[1])
+            t=self.ty(e[1]); self.wrote(e[1])
             if t[0]=='?': return t
             if not self.is_lvalue(e[1]): self.err(f"{e[2]} needs a variable it can write")
             if _fam(t[0])[0] not in ('int','float') or t[1] is not None: self.err(f"{e[2]} of a {t[0]}")
@@ -888,7 +1088,7 @@ class Sema:
             if a[1] is not None: self.err("?: of arrays")
             return a if a[0]!='?' else b
         if k=='assign':
-            t=self.ty(e[2]); r=self.ty(e[3])
+            t=self.ty(e[2]); r=self.ty(e[3]); self.wrote(e[2])
             if t[0]!='?' and not self.is_lvalue(e[2]): self.err("assignment to something that cannot be written")
             if e[1]=='=':
                 if not self.same(t,r): self.err(f"cannot assign a {r[0]} to a {t[0]}")
@@ -972,7 +1172,9 @@ class Sema:
                     self.callmap[id(e)]=f
                     if self.cur is not None: self.cur.calls.append(f)
                     for p,a in zip(f.params,args):
-                        if p[0] in ('out','inout') and not self.is_lvalue(a): self.err(f"{n}: an {p[0]} argument must be a variable")
+                        if p[0] in ('out','inout'):
+                            self.wrote(a)
+                            if not self.is_lvalue(a): self.err(f"{n}: an {p[0]} argument must be a variable")
                     return (f.ret,None)
             return self.err(f"no function {n}({', '.join(t[0] for t in ts)})")
         return self.ty_builtin(e,n,ts)
@@ -1064,6 +1266,7 @@ class Codegen:
         self.samplers={}         # name -> texture unit (sampler2D/samplerCube/sampler3D)
         self.sampler_sizes={}    # name -> size, for an array of samplers (units base .. base + size - 1)
         self.next_sampler=0
+        self.sampler_slot={}     # the uniform slot of a sampler in a uniform struct -> its unit (_struct_samplers)
         self.attribs={}          # name -> (index, type)
         self.varyings={}         # name -> (index, type)
         self.locals=[]           # scope stack of {name: (Reg|MatVal, type)}
@@ -1397,7 +1600,21 @@ class Compiler(Codegen):
         else:
             n = ncomp2(ty) if is_mat(ty) else 1
         return n * (asz or 1)
+    def _struct_samplers(self, path, ty, asz, slot):
+        """a sampler in a uniform struct: a texture unit of its own, under the name a front end gives it (s.tex, a[1].tex),
+        and the uniform slot it takes, which a load of the struct turns into that unit"""
+        for e in (range(asz) if asz is not None else [None]):
+            p=path if e is None else f'{path}[{e}]'
+            for mt,mn,ma in self.structs[ty]:
+                n=self._arrsize(ma); q=f'{p}.{mn}'
+                if mt in SAMPLERS:
+                    self.samplers[q]=self.next_sampler; self.sampler_slot[slot]=self.next_sampler
+                    if n is not None: self.sampler_sizes[q]=n
+                    self.next_sampler+=n if n is not None else 1
+                elif mt in self.structs: self._struct_samplers(q, mt, n, slot)
+                slot+=self._type_nslots(mt, n)
     def _load_uniform_member(self, slot, ty, asz):
+        if ty in SAMPLERS: return Sampler(self.sampler_slot[slot], 'sampler2D', asz)      # a sampler in a uniform struct: its unit
         if asz is not None: return ArrayVal(ty, asz, 'uniform', base=slot)        # array member
         if ty in self.structs: return self._load_uniform_struct(slot, ty)         # nested struct
         if is_mat(ty):
@@ -1834,8 +2051,21 @@ class Compiler(Codegen):
         if len(params)!=len(argexprs): raise CompileError(f"{name}(): expected {len(params)} args, got {len(argexprs)}")
         binds=Scope(); copyout=[]; outs=[]                           # bind args in the CALLER's scope first
         wrt=self._written([body], {})                                # a parameter the body never writes keeps a known value (const, cvec)
+        bases=[self._base(ae) for (pq,_,_),ae in zip(params,argexprs) if pq in ('out','inout')]
         for (pq,pty,pname),ae in zip(params, argexprs):              # (arg eval may nest same-name calls: not recursion)
-            if pq in ('out','inout') and self._no_alias(ae):         # no register to alias: a copy, written back at the end
+            agg=None; shared=False
+            if pq in ('out','inout'):
+                if ae[0]=='var' and self._const_home(ae[1]) is not None: self._promote(ae[1])      # a register to write
+                b=self._base(ae)                                     # §6.1.1 copies in and out: an alias would show when another
+                shared=b is not None and (bases.count(b)>1 or self._sees(body, b, {name}, b in {p[2] for p in params}))   # argument or the function sees it
+                if shared and not self._no_alias(ae):
+                    lv=self.get_lvalue_reg(ae)
+                    if isinstance(lv,(MatVal,ArrayVal,StructVal)): agg=lv
+            if agg is not None:                                      # an array, struct or matrix of its own, written back at the end
+                pr=self._clone(agg) if pq=='inout' else self._like(agg)
+                binds[pname]=(pr,pty); copyout.append((ae,pr))
+                if pq=='out': outs.append(pr)
+            elif pq in ('out','inout') and (self._no_alias(ae) or self._repr_differs(ae, pty) or shared):   # no register to alias: a copy, written back at the end
                 pr=self.alloc(pty); pr.tmp=False
                 if pq=='inout':
                     av=self.eval(ae); av=self._asi(av) if pty=='int' else self._asf(av)
@@ -1867,6 +2097,26 @@ class Compiler(Codegen):
         self.cur_ret=saved
         for ae,pr in copyout: self.store(ae, pr)
         return holder[0] if holder[0] is not None else retreg
+    def _base(self, e):
+        """the variable an lvalue writes: v of v.xy, a[i], s.m"""
+        while e[0] in ('swizzle','index'): e=e[1]
+        return e[1] if e[0]=='var' else None
+    def _sees(self, e, name, seen, own=False):
+        """does a function body read or write `name`, also through the functions it calls (a local of the name counts too);
+        own: the function has a parameter of the name, so only the functions it calls can see the caller's"""
+        if isinstance(e,list): return any(self._sees(x, name, seen, own) for x in e)
+        if not isinstance(e,tuple) or not e: return False
+        if e[0]=='var': return e[1]==name and not own
+        if e[0]=='call':
+            fn=self.callmap[id(e)].name if id(e) in self.callmap else e[1]
+            if fn in self.funcs and fn not in seen:
+                seen.add(fn)
+                if self._sees(self.funcs[fn][2], name, seen): return True
+        return any(self._sees(x, name, seen, own) for x in e[1:])
+    def _repr_differs(self, e, pty):
+        """a local whose register holds its value in the other representation than the parameter's: a promoted int is a float"""
+        lt=self._local_type(e[1]) if e[0]=='var' else None
+        return lt is not None and (lt=='int')!=(pty=='int')
     def _no_alias(self, e):
         """an out / inout argument without a register of its own: part of a vector"""
         if e[0]=='index': return isinstance(self.eval_lvalue(e[1]), Reg)
@@ -2260,7 +2510,10 @@ class Compiler(Codegen):
         line), the octant form instead — r = min(|x|, |y|) / max(|x|, |y|) in [0, 1], atan(r) by the degree-9
         minimax polynomial as MADs, then the three exact SELs: |y| > |x| -> pi/2 - at, x < 0 -> pi - at, y < 0 -> -at.
         21 instructions; atan(0, 0) is NaN (undefined in GLSL ES)."""
-        if len(a)==1: y, x = a[0], self.kf(1.0)
+        if len(a)==1:
+            y, x = a[0], self.kf(1.0)
+            if y.ty!='float':                            # a 1 of y's shape: what is worked out from x takes its type (min, max, SET)
+                one=self.alloc(y.ty); self.emit('MOV', f'r{one.n}', f'r{x.n}'); x=one
         else: y, x = a
         ay=self.bi_abs(y); ax=self.bi_abs(x)
         mn=self.bi_min(ax, ay); mx=self.bi_max(ax, ay)
@@ -2429,7 +2682,7 @@ class Compiler(Codegen):
                     self._copy_val(cur, rv)
                 else: target.members[mask]=rv                # aggregate member (mat/array/nested) re-bind
                 return
-            self.masked_write(target, mask, rv); return
+            self.masked_write(target, mask, self._asf(rv)); return     # a vector holds its ints as floats: i.x += 1 is an IADD
         if lhs[0]=='index':                                  # a[i] = rv   (local array / matrix column / vector component)
             ci=self.fold_const(lhs[2])
             if lhs[1][0]=='swizzle' and not isinstance(self.eval_lvalue(lhs[1][1]),StructVal):       # v.zy[1] = rv
@@ -2479,7 +2732,9 @@ class Compiler(Codegen):
         for name,v in self.varyings.items():
             if self.stage=='vs' and (len(v)==3 or is_mat(v[1]) or name in used or self.vmap is not None):
                 self.shadow.append(name)
+                self.nozero=not (len(v)==3 or is_mat(v[1]))     # an array or a matrix starts at 0: a write at a run-time index reads every element
                 self.run_stmt(('ldecl', False, v[1], name, None, ('num',float(v[2])) if len(v)==3 else None))
+                self.nozero=True
         if self.isa64:
             for name,ty in _SPECIAL[self.stage].items():
                 if name in used:
@@ -2527,6 +2782,29 @@ class Compiler(Codegen):
         val=h.pop(name)
         r=self.alloc('float'); r.tmp=False; home[name]=(r,'float')
         self.emit('MOV', f'r{r.n}', f'r{self.kf(float(val)).n}'); return r
+    def _lv_struct(self, e):
+        """the value of a local the lvalue e names, an aggregate member of a local struct made on the way (None: no such local)"""
+        if e[0]=='var':
+            for sc in reversed(self.locals):
+                if e[1] in sc: return sc[e[1]][0]
+            return None
+        if e[0]=='swizzle':
+            st=self._lv_struct(e[1])
+            if not isinstance(st,StructVal) or e[2] not in st.members: return None
+            if st.members[e[2]] is None: st.members[e[2]]=self._member_new(st.sname, e[2])
+            return st.members[e[2]]
+        if e[0]=='index':
+            a=self._lv_struct(e[1]); ci=self.fold_const(e[2])
+            if isinstance(a,ArrayVal) and a.kind=='local' and ci is not None and 0<=int(ci)<len(a.elems): return a.elems[int(ci)]
+        return None
+    def _member_new(self, sname, mname):
+        """registers for an aggregate member of a local struct, at its first write: 0, as the struct's other members"""
+        for mt,mn,ma in self.structs[sname]:
+            if mn==mname:
+                n=self._arrsize(ma)
+                v=ArrayVal(mt, n, 'local', elems=[self._fresh(mt) for _ in range(n)]) if ma is not None else self._fresh(mt)
+                self._zero(v); return v
+        return None
     def eval_lvalue(self, e):
         e=self._fd(e)
         if e[0]=='var':
@@ -2536,6 +2814,7 @@ class Compiler(Codegen):
         if e[0]=='index':                                    # a[const] -> the element's Reg (local arr / mat col)
             ci=self.fold_const(e[2])
             if ci is None: raise CompileError("array index must be a constant expression")
+            self._lv_struct(e[1])                            # s.b[0] = x: s.b gets its registers at its first write
             arr=self.eval(e[1]); i=int(ci)
             if isinstance(arr,ArrayVal) and arr.kind!='local' and e[1][0]=='swizzle':
                 # a struct copied from a uniform shares its read-only array until the first write, which would otherwise
@@ -2590,7 +2869,7 @@ class Compiler(Codegen):
             self.scan_cond_assigns(stmt[2], True); self.scan_cond_assigns(stmt[3], True)
         elif k=='for':
             self._scan.append({})
-            runtime=self._refs_runtime(stmt[2])                       # runtime bound -> real (non-unrolled) loop
+            runtime=self._refs_runtime(stmt[2]) or self._refs_runtime(stmt[3])     # runtime bound or step -> real (non-unrolled) loop
             if not runtime and (self.stage=='fs' or self.isa64) and self._long_for(stmt):
                 self.hw_for[id(stmt)]=self._for_trips(stmt[1], stmt[2], stmt[3]); runtime=True     # a long constant loop: the hardware loop too (_long_for)
             self.scan_cond_assigns(stmt[1], incond)
@@ -4035,6 +4314,8 @@ def _mad_fuse(lines, isa64):
                 an,bn=_regnum(a),_regnum(b)
                 if any((not lines[k].endswith(':')) and _dst(lines[k].split()) in (an,bn) for k in range(j+1,i)):
                     continue
+                dn=_regnum(d)                                   # the MAD reads a and b as it writes d: a swizzled d would see what
+                if (an==dn and _hasswz(a)) or (bn==dn and _hasswz(b)): continue   # an earlier micro-op wrote (isa64.check_overlap)
                 dead=True                                       # tmp must be dead after the combine
                 for k in range(i+1,len(lines)):
                     if lines[k].endswith(':'): continue
@@ -4052,7 +4333,7 @@ def _mad_fuse(lines, isa64):
     return lines
 
 # --------------- top-level program build ---------------
-def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, noops=0):
+def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, noops=0, attrs=None):
     # Auto-fallback: if a shader exceeds the 31-register file with the default (constant-pinning) allocation,
     # retry with constant rematerialization (fresh LDP per use) — trades a few more instructions for far lower
     # register pressure, letting heavy shaders (e.g. the Seascape) compile transparently through g.program().
@@ -4066,18 +4347,46 @@ def compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True,
     # RSQRT feeding one scalar MUL), 2 CLAMP. Bit for bit the code they replace; a fragment program only (the vertex core has none), isa64 only.
     # noops: the units this stage's core lacks, as its STATUS flags bits 30 / 31 say (>> 30; board A's for the vertex stage, board
     # B's b_flags for the fragment stage): 1 the integer divider (int / becomes _idiv_lowered), 2 SIN / COS (_sincos_lowered); isa64.
+    # attrs: a vertex stage's attribute bindings at a link, name -> location (place_attribs).
     # A spill retries first without the loop-invariant hoist (licm: what it takes out of a loop stays live across all of it, so a long
     # program can need more registers with it than without), then with the constants rematerialized, without the hoist either: never a
     # refusal that the code before the hoist did not have.
     if not remat_consts:
         for hoist in (True, False):
             try:
-                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist, noops=noops)
+                return _compile_stage(src, stage, optimize, remat_consts=False, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=hoist, noops=noops, attrs=attrs)
             except CompileError as e:
                 if 'register spill' not in str(e): raise
-    return _compile_stage(src, stage, optimize, remat_consts=True, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=False, noops=noops)
+    return _compile_stage(src, stage, optimize, remat_consts=True, hw_sincos=hw_sincos, fuse=fuse, isa64=isa64, forward=forward, unread=unread, strict=strict, pack=pack, xops=xops, hoist=False, noops=noops, attrs=attrs)
 
-def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True, noops=0):
+# Attribute locations (§2.10.4): an attribute the program reads is active and takes a location, a matrix one a column, in a run; the
+# others leave the table. attrs (a link's glBindAttribLocation table, name -> location) puts a bound one at its location, two of them
+# also at one (aliasing: no path reads both); the rest, in declaration order, take the lowest run no active one holds. The code reads
+# them there; the table keeps the active ones in declaration order. Past 16 locations the assembler refuses the LDV, a link the program.
+def place_attribs(code, attribs, attrs):
+    read=set()
+    for ln in code:
+        t=ln.split(' ')
+        if t[0].split('.')[0]=='LDV': read.add(int(t[2].split('.')[0]))
+    act=[(n,i,ty,ncomp2(ty) if is_mat(ty) else 1) for n,(i,ty) in attribs.items()]
+    act=[a for a in act if any(a[1]+k in read for k in range(a[3]))]
+    loc={}; held=set()
+    for n,i,ty,w in act:
+        if attrs and n in attrs: loc[n]=attrs[n]; held.update(range(attrs[n], attrs[n]+w))
+    for n,i,ty,w in act:
+        if n in loc: continue
+        at=0
+        while any(at+k in held for k in range(w)): at+=1
+        loc[n]=at; held.update(range(at, at+w))
+    new={i+k:loc[n]+k for n,i,ty,w in act for k in range(w)}
+    def moved(ln):
+        t=ln.split(' ')
+        if t[0].split('.')[0]!='LDV': return ln
+        m=re.match(r'(\d+)(.*)$', t[2]); t[2]=f'{new[int(m.group(1))]}{m.group(2)}'
+        return ' '.join(t)
+    return [moved(ln) for ln in code], {n:(loc[n],ty) for n,i,ty,w in act}
+
+def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True, fuse=True, isa64=False, forward=False, unread=0, strict=False, pack=None, xops=0, hoist=True, noops=0, attrs=None):
     exts=set()
     src=preprocess(src, stage, exts, strict)     # #define / #ifdef / #if ... + comment stripping
     toks=lex(src, exts); parser=Parser(toks, strict); ast=parser.parse()
@@ -4104,6 +4413,7 @@ def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True
                 elif ty in c.structs:                                         # uniform struct (+ array of structs)
                     asz=c._arrsize(arr); n=c._type_nslots(ty, asz)
                     c.uniforms[name]=(c.next_uniform,ty,asz) if asz is not None else (c.next_uniform,ty)
+                    c._struct_samplers(name, ty, asz, c.next_uniform)
                     c.next_uniform+=n
                 else:
                     per=ncomp2(ty) if is_mat(ty) else 1
@@ -4165,10 +4475,24 @@ def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True
     # the optimizer removed, or an unrolled loop's index nobody reads, would otherwise stay in the pool (a 60-pass loop would
     # keep 60 vectors for one load — of the fragment core's 64, the uniforms included)
     used=sorted({int(n) for ln in code for n in re.findall(r'@(\d+)', ln)})
-    slot={o:i for i,o in enumerate(used)}
-    out=[re.sub(r'@(\d+)', lambda m: str(base+slot[int(m.group(1))]), ln) for ln in code]
-    pool=[list(c.const_order[o]) for o in used]
-    return {'sasm':'\n'.join(out), 'attribs':c.attribs, 'uniforms':c.uniforms, 'samplers':c.samplers, 'sampler_sizes':c.sampler_sizes,
+    # A constant whose four lanes are one value, loaded by LDP only, takes one lane of a row it shares with three others: LDP's
+    # swizzle picks it (a scalar reads .x of its slot, a vector its splat). The rows left over go to the uniforms
+    other={int(n) for ln in code if not ln.startswith('LDP ') for n in re.findall(r'@(\d+)', ln)}
+    lane=[o for o in used if o not in other and c.const_order[o][0]==c.const_order[o][1]==c.const_order[o][2]==c.const_order[o][3]]
+    whole=[o for o in used if o not in set(lane)]
+    pool=[list(c.const_order[o]) for o in whole]
+    slot={o:(i,None) for i,o in enumerate(whole)}
+    for i,o in enumerate(lane):
+        if i%4==0: pool.append([0.0]*4)
+        pool[-1][i%4]=c.const_order[o][0]; slot[o]=(len(pool)-1, i%4)
+    def at(m):
+        r,k=slot[int(m.group(1))]
+        if k is None: return f'{base+r}{m.group(2) or ""}'
+        return f'{base+r}.' + 'xyzw'[k]*(len(m.group(2))-1 if m.group(2) else 4)
+    out=[re.sub(r'@(\d+)(\.[xyzw]+)?', at, ln) for ln in code]
+    attribs=c.attribs
+    if stage=='vs': out, attribs = place_attribs(out, c.attribs, attrs)
+    return {'sasm':'\n'.join(out), 'attribs':attribs, 'uniforms':c.uniforms, 'samplers':c.samplers, 'sampler_sizes':c.sampler_sizes,
             'varyings':c.varyings, 'const_base':base, 'const_pool':pool, 'isa64':isa64, 'vs_tex':c.vs_tex}
 
 if __name__=='__main__':

@@ -591,6 +591,7 @@ static void mad_fuse(Shc *h, Lines *L)
                     if (lk->dst == an || lk->dst == bn) { ok = 0; break; }
                 }
                 if (!ok) continue;
+                if ((an == ln->dst && a.swz[0]) || (bn == ln->dst && b.swz[0])) continue;   /* the MAD reads a and b as it writes d: a swizzled d sees what an earlier micro-op wrote */
                 dead = 1;
                 for (k = i + 1; k < L->n; k++) {
                     Line *lk = L->v[k];
@@ -643,7 +644,8 @@ static SHC_NORETURN void spill(Shc *h, int s, int live)
                         "\xE2\x80\x94 shader exceeds 31 live registers (split it or reduce temporaries)", s, live);
 }
 
-/* one line of the output: Python's new[] joined with ' ', @N resolved */
+/* one line of the output: Python's new[] joined with ' ', @N resolved; @N#c (compact_pool: a constant in lane c of row N) reads
+ * that lane in every lane its swizzle names */
 static void put_tok_text(SB *o, const char *s, long long base)
 {
     if (s[0] == '@') {
@@ -651,7 +653,13 @@ static void put_tok_text(SB *o, const char *s, long long base)
         long long n = 0;
         while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
         sb_putll(o, base + n);
-        sb_puts(o, p);
+        if (*p == '#') {
+            char c = p[1];
+            size_t k, len = p[2] == '.' ? strlen(p + 3) : 4;
+            sb_putc(o, '.');
+            for (k = 0; k < len; k++) sb_putc(o, c);
+        }
+        else sb_puts(o, p);
     }
     else sb_puts(o, s);
 }
@@ -764,8 +772,9 @@ static char *allocate_registers(Shc *h, Lines *L, int nv, const unsigned char *s
                     sb_putc(&o, 'r'); sb_putll(&o, p); sb_putc(&o, '.'); sb_putc(&o, "xyzw"[comp[v]]);
                 }
             } else {
-                put_tok_text(&o, x->s, base);
-                if (t == 2 && dst_packed && (l->op == OP_LDP || l->op == OP_LDV || l->op == OP_LDPX) && !l->has_dot && !strchr(x->s, '.')) sb_puts(&o, ".x");
+                if (t == 2 && dst_packed && (l->op == OP_LDP || l->op == OP_LDV || l->op == OP_LDPX) && !l->has_dot && !strchr(x->s, '.'))
+                    put_tok_text(&o, sh_fmt(h, "%s.x", x->s), base);
+                else put_tok_text(&o, x->s, base);
             }
         }
     }
@@ -1404,19 +1413,49 @@ static void compact_pool(Shc *h, Lines *L, double *pool, int *npool)
             if (s && s[0] == '@' && s[1] >= '0' && s[1] <= '9') { long v = strtol(s + 1, NULL, 10); if (v >= 0 && v < n) slot[v] = 0; }
         }
     }
-    for (i = 0; i < n; i++) if (slot[i] == 0) {
-        if (k != i) memcpy(pool + (size_t)k * 4, pool + (size_t)i * 4, 4 * sizeof(double));
-        slot[i] = k++;
-    }
-    if (k != n) for (i = 0; i < L->n; i++) {
-        Line *l = L->v[i];
-        if (l->label) continue;
-        for (t = 1; t < l->ntok; t++) {
-            const char *s = l->tok[t].s;
-            if (s && s[0] == '@' && s[1] >= '0' && s[1] <= '9') {
-                char *e;
-                long v = strtol(s + 1, &e, 10);
-                if (v >= 0 && v < n && slot[v] != v) l->tok[t].s = sh_fmt(h, "@%d%s", slot[v], e);
+    /* A constant whose four lanes are one value, loaded by LDP only, takes one lane of a row it shares with three others: LDP's
+     * swizzle picks it (a scalar reads .x of its slot, a vector its splat). The rows left over go to the uniforms. The constants
+     * of whole rows come first, in their order, then the shared rows: slot[i] = the row, lane[i] its lane or -1 */
+    {
+        signed char *lane = (signed char *)sh_alloc(h, (size_t)n + 1);
+        unsigned char *other = (unsigned char *)sh_zalloc(h, (size_t)n + 1);
+        double *np = (double *)sh_zalloc(h, ((size_t)n + 4) * 4 * sizeof(double));
+        int nl = 0;
+        for (i = 0; i < L->n; i++) {
+            Line *l = L->v[i];
+            if (l->label || l->op == OP_LDP) continue;
+            for (t = 1; t < l->ntok; t++) {
+                const char *s = l->tok[t].s;
+                if (s && s[0] == '@' && s[1] >= '0' && s[1] <= '9') { long v = strtol(s + 1, NULL, 10); if (v >= 0 && v < n) other[v] = 1; }
+            }
+        }
+        for (i = 0; i < n; i++) {
+            const double *q = pool + (size_t)i * 4;
+            lane[i] = -1;
+            if (slot[i] == 0 && !other[i] && q[0] == q[1] && q[1] == q[2] && q[2] == q[3]) lane[i] = 0;
+        }
+        for (i = 0; i < n; i++) if (slot[i] == 0 && lane[i] < 0) {
+            memcpy(np + (size_t)k * 4, pool + (size_t)i * 4, 4 * sizeof(double));
+            slot[i] = k++;
+        }
+        for (i = 0; i < n; i++) if (slot[i] == 0 && lane[i] == 0) {
+            if (nl % 4 == 0) k++;
+            np[(size_t)(k - 1) * 4 + nl % 4] = pool[(size_t)i * 4];
+            lane[i] = (signed char)(nl % 4); slot[i] = k - 1; nl++;
+        }
+        memcpy(pool, np, (size_t)k * 4 * sizeof(double));
+        for (i = 0; i < L->n; i++) {
+            Line *l = L->v[i];
+            if (l->label) continue;
+            for (t = 1; t < l->ntok; t++) {
+                const char *s = l->tok[t].s;
+                if (s && s[0] == '@' && s[1] >= '0' && s[1] <= '9') {
+                    char *e;
+                    long v = strtol(s + 1, &e, 10);
+                    if (v < 0 || v >= n) continue;
+                    if (lane[v] >= 0) l->tok[t].s = sh_fmt(h, "@%d#%c%s", slot[v], "xyzw"[lane[v]], e);
+                    else if (slot[v] != v) l->tok[t].s = sh_fmt(h, "@%d%s", slot[v], e);
+                }
             }
         }
     }

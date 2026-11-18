@@ -903,10 +903,10 @@ static void test_primitives(void)
         g_checks++;
         if (c[0] < 150 || c[0] > 210 || c[1] > 90) { g_bad++; printf("FAIL point sprite: %d %d %d, gl_PointCoord right of centre, t grows downward\n", c[0], c[1], c[2]); }
     }
-    /* §2.13: a point goes by near and far only, whatever the viewport */
+    /* a point is kept to the viewport (test_point_viewport): of a wide point centred past its edge, the part inside is drawn, nothing beside it */
     {
         static const GLfloat past[2] = { 1.2f, 0 };
-        uint8_t c[4];
+        uint8_t c[4], d[4];
         clear_to(0, 0, 0, 1);
         glViewport(100, 100, 50, 50);
         glUseProgram(p);
@@ -915,9 +915,11 @@ static void test_primitives(void)
         glDrawArrays(GL_POINTS, 0, 1);
         glDisableVertexAttribArray((GLuint)a2);
         glViewport(0, 0, W, H);
-        glReadPixels(150, 125, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
-        g_checks++;
-        if (c[1] < 60) { g_bad++; printf("FAIL a point is not clipped by x and y: %d %d %d\n", c[0], c[1], c[2]); }
+        glReadPixels(148, 125, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+        glReadPixels(150, 125, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, d);
+        g_checks += 2;
+        if (c[1] < 60) { g_bad++; printf("FAIL a wide point centred past the viewport, inside it: %d %d %d\n", c[0], c[1], c[2]); }
+        if (d[0] > 8 || d[1] > 8) { g_bad++; printf("FAIL a wide point centred past the viewport, beside it: %d %d %d\n", d[0], d[1], d[2]); }
     }
     glDeleteProgram(p);
     color(0, 1, 0, 1);

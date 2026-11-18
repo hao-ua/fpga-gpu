@@ -37,6 +37,7 @@ typedef struct g2sc_member {
     int nslots;                 /* slots of the whole member (array count included) */
     int array;                  /* element count, 0 = not an array */
     int has_array;
+    const char *prec;           /* "lowp" / "mediump" / "highp": its own or the default where the struct is defined; NULL for bool and struct types (static, not freed) */
 } g2sc_member;
 
 typedef struct g2sc_struct {

@@ -174,7 +174,8 @@ typedef struct S {
     Shc *h;
     int fs, strict, exts;
     Dict **scopes; int nscope, capscope;
-    unsigned char *fprec; int nprec, capprec;    /* defprec: this scope has a default precision for float */
+    unsigned char *fprec; int nprec, capprec;    /* defprec: this scope's default precision for float, 0 none, 1 lowp, 2 mediump, 3 highp */
+    unsigned char *iprec;                        /* the same for int */
     Dict funcs, structs;
     ShFn *cur;
     int loops, depthrange;
@@ -252,12 +253,12 @@ static void scope_push(S *s)
     if (s->nscope == s->capscope) {
         int cap = s->capscope ? s->capscope * 2 : 16;
         Dict **n = (Dict **)sh_alloc(s->h, (size_t)cap * sizeof(Dict *));
-        unsigned char *f = (unsigned char *)sh_alloc(s->h, (size_t)cap);
-        if (s->nscope) { memcpy(n, s->scopes, (size_t)s->nscope * sizeof(Dict *)); memcpy(f, s->fprec, (size_t)s->nscope); }
-        s->scopes = n; s->fprec = f; s->capscope = cap;
+        unsigned char *f = (unsigned char *)sh_alloc(s->h, (size_t)cap), *ip = (unsigned char *)sh_alloc(s->h, (size_t)cap);
+        if (s->nscope) { memcpy(n, s->scopes, (size_t)s->nscope * sizeof(Dict *)); memcpy(f, s->fprec, (size_t)s->nscope); memcpy(ip, s->iprec, (size_t)s->nscope); }
+        s->scopes = n; s->fprec = f; s->iprec = ip; s->capscope = cap;
     }
     s->scopes[s->nscope] = (Dict *)sh_zalloc(s->h, sizeof(Dict));
-    s->fprec[s->nscope] = 0;
+    s->fprec[s->nscope] = 0; s->iprec[s->nscope] = 0;
     s->nscope++;
 }
 
@@ -359,6 +360,23 @@ static void wrote(S *s, Node *e)
     SH_LEAVE(s->h, 1);
 }
 
+/* the precision a declaration of base type b has here: its own, else the default in effect; NULL for bool and struct types.
+ * A static string: it outlives the compile (g2sc_member.prec) */
+static const char *prec_of(S *s, const char *b, const char *own)
+{
+    static const char *const NAME[4] = { NULL, "lowp", "mediump", "highp" };
+    int n, i;
+    const char *f = fam(b, &n);
+    unsigned char *tab;
+    if (own) own = !strcmp(own, "lowp") ? NAME[1] : !strcmp(own, "mediump") ? NAME[2] : NAME[3];
+    if (is_sampler(b)) return own ? own : NAME[1];
+    if (!f || !strcmp(f, "bool")) return NULL;
+    if (own) return own;
+    tab = !strcmp(f, "float") ? s->fprec : s->iprec;
+    for (i = s->nscope - 1; i >= 0; i--) if (tab[i]) return NAME[tab[i]];
+    return NULL;
+}
+
 static void do_struct(S *s, const char *name, Member *m, int n)
 {
     StructInfo *i = (StructInfo *)sh_alloc(s->h, sizeof(StructInfo));
@@ -368,6 +386,7 @@ static void do_struct(S *s, const char *name, Member *m, int n)
         if (!base_ok(s, m[k].ty) || !strcmp(m[k].ty, "void")) serr(s, "struct %s: bad member type %s", name, m[k].ty);
         need_prec(s, m[k].ty, m[k].prec);
         if (m[k].arr) size_of(s, m[k].arr);
+        m[k].rprec = prec_of(s, m[k].ty, m[k].prec);
     }
     i->m = m; i->n = n;
     dict_put(s->h, &s->structs, name)->p = i;
@@ -377,7 +396,11 @@ static void prec_stmt(S *s, const char *q, const char *t)
 {
     if (strcmp(q, "highp") && strcmp(q, "mediump") && strcmp(q, "lowp")) serr(s, "bad precision statement");
     if (strcmp(t, "float") && strcmp(t, "int") && !is_sampler(t)) serr(s, "no default precision for %s", t);
-    if (!strcmp(t, "float")) s->fprec[s->nscope - 1] = 1;
+    {
+        unsigned char lvl = !strcmp(q, "lowp") ? 1 : !strcmp(q, "mediump") ? 2 : 3;
+        if (!strcmp(t, "float")) s->fprec[s->nscope - 1] = lvl;
+        if (!strcmp(t, "int")) s->iprec[s->nscope - 1] = lvl;
+    }
 }
 
 static int is_const(S *s, Node *e);
@@ -1024,7 +1047,7 @@ void sh_sema(Shc *h, Decl *ast, int nd, int fs, int exts, int *depthrange)
         si->m = SH_DEPTHRANGE; si->n = 3;
         dict_put(h, &s->structs, "gl_DepthRangeParameters")->p = si;
     }
-    s->fprec[0] = !fs;
+    s->fprec[0] = fs ? 0 : 3; s->iprec[0] = fs ? 2 : 3;          /* §4.5.3: the vertex language highp, the fragment language int mediump */
     for (i = 0; i < nd; i++) {
         Decl *d = &ast[i];
         switch (d->kind) {

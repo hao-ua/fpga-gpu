@@ -131,7 +131,8 @@ W = [
     ('one array as two inout arguments', 'void neg(inout float a[2]) { a[0] = -a[0]; a[1] = -a[1]; }\nfloat f(inout float a[2], inout float b[2]) { neg(a); return a[0] == b[0] ? 1.0 : -1.0; }\nvoid main() { float r[2]; r[0] = 3.0; r[1] = 4.0; float m = f(r, r); gl_FragColor = vec4(m, 0.0, 0.0, 0.0); }\n', (-1, 0, 0, 0)),
     ('arrays in a local struct written element by element', 'struct T { float a; vec2 b[2]; };\nstruct S { float a; float b[3]; T t[2]; };\nvoid main() { S s; s.a = 1.0; s.b[1] = 4.0; s.t[1].b[0] = vec2(5.0, 6.0); gl_FragColor = vec4(s.a, s.b[1], s.b[0], s.t[1].b[0].y); }\n', (1, 4, 0, 6)),
     ('a loop whose step reads a uniform', 'float f() { for (int i = 1; i < 10; i += int(n) - 4) return 2.0; return 3.0; }\nvoid main() { gl_FragColor = vec4(f()); }\n', (2, 2, 2, 2)),
-    ('71 scalar constants', 'void main() { float a = v0.x; ' + ''.join('a = a * 0.5 + %d.0; ' % k for k in range(70)) + 'gl_FragColor = vec4(a); }\n', (A71[0],) * 4, (A71[1],) * 4),
+    ('atan of a vector, a lane each', 'void main() { vec4 x = vec4(-3.9, -0.6, 1.7, 3.95); vec3 y = atan(x.wzy); gl_FragColor = atan(x) + vec4(0.0, 0.0, 0.0, y.x - atan(3.95)); }\n', (-1.31979, -0.54042, 1.03907, 1.32264)),
+    ('71 scalar constants','void main() { float a = v0.x; ' + ''.join('a = a * 0.5 + %d.0; ' % k for k in range(70)) + 'gl_FragColor = vec4(a); }\n', (A71[0],) * 4, (A71[1],) * 4),
     ('invariant on varyings and gl_Position', 'invariant varying vec4 q;\nvoid main() { gl_FragColor = vec4(2.0); }\n', (2, 2, 2, 2)),
 ]
 # (name, stage, source): each must not compile
@@ -373,6 +374,7 @@ def main():
         ('VS: uniform matrix at a run-time index', VS + 'uniform mat4 m;\nvoid main() { gl_Position = m[int(a0.x * 4.0)] + 1.0; }\n', (1, 1, 1, 1)),
         ('VS: a local vector at a run-time index', VS + 'void main() { vec4 q = vec4(1.0, 2.0, 3.0, 4.0); gl_Position = vec4(q[int(a0.x * 4.0)]); }\n', (4, 4, 4, 4), (2, 2, 2, 2)),
         ('VS: a sampler compiles, the link refuses', VS + 'uniform sampler2D s;\nvoid main() { gl_Position = texture2DLod(s, a0.xy, 0.0) + 1.0; }\n', (1, 1, 1, 1)),
+        ('VS: a float varying array written in a run-time loop', VS + 'varying float va[4];\nvoid main() { float c = a0.x; for (int i = 0; i < int(n); i++) { va[i] = c; c = c * 0.5; } gl_Position = vec4(va[0], va[1], va[2], va[3]); }\n', (.75, .375, .1875, .09375), (.25, .125, .0625, .03125)),
     ]
     for c in vs:
         bad += check(c[0], c[1], 'vs', c[2], c[3] if len(c) > 3 else c[2])

@@ -57,6 +57,7 @@ typedef struct Cg {
     CurRet *cur_ret;
     long long next_uniform;
     int next_sampler, next_attr, next_vary;
+    Dict sampler_slot;           /* the uniform slot of a sampler in a uniform struct (as text) -> its unit in .i (struct_samplers) */
     Val *zero;
     int nozero;                  /* a declaration without a value is not zeroed (zero_val): the outputs' shadows */
     int label_n;
@@ -830,6 +831,11 @@ static long long type_nslots(Cg *c, const char *ty, long long asz)
 static Val *load_uniform_member(Cg *c, long long slot, const char *ty, long long asz)
 {
     Val *reg;
+    if (!strcmp(ty, "sampler2D") || !strcmp(ty, "samplerCube") || !strcmp(ty, "sampler3D")) {   /* a sampler in a uniform struct: its unit */
+        DictEnt *e = dict_find(&c->sampler_slot, sh_fmt(c->h, "%L", slot));
+        if (!e) sh_py_error(c->h, "KeyError: a sampler slot");
+        return mk_sampler(c, (int)e->i, "sampler2D", asz == NONE_SZ ? -1 : asz);
+    }
     if (asz != NONE_SZ) return mk_array(c, ty, asz, 0, slot, NULL);
     if (dict_find(&c->structs, ty)) return load_uniform_struct(c, slot, ty);
     if (mat_n(ty)) return load_cols(c, ty, slot);
@@ -1593,7 +1599,14 @@ static Val *atan64(Cg *c, Val **a, int na)
     static const double CF[4] = { -0.0851330, 0.1801410, -0.3302995, 0.9998660 };
     Val *y, *x, *ay, *ax, *mn, *mx, *inv, *r, *s, *p, *at, *z, *c1, *t1, *a1, *a2, *c3, *t3, *res, *kk;
     int i;
-    if (na == 1) { y = a[0]; x = kf(c, 1.0); }
+    if (na == 1) {
+        y = a[0]; x = kf(c, 1.0);
+        if (strcmp(TY(c, y), "float")) {        /* a 1 of y's shape: what is worked out from x takes its type (min, max, SET) */
+            Val *one = alloc(c, TY(c, y));
+            emit(c, "MOV r%d r%d", one->u.r.n, x->u.r.n);
+            x = one;
+        }
+    }
     else {
         if (na != 2) sh_py_error(c->h, "ValueError: wrong number of arguments to atan");
         y = a[0]; x = a[1];
@@ -3211,7 +3224,9 @@ static void shadow_varyings(Cg *c, Node *body)
             dict_put(c->h, &c->shadow, name);
             d->ty = v->ty; d->s = name;
             if (v->has3) d->b = nnum(c, (double)v->n);
+            c->nozero = !(v->has3 || mat_n(v->ty));    /* an array or a matrix starts at 0: a write at a run-time index reads every element */
             run_stmt(c, d);
+            c->nozero = 1;
         }
     }
     for (i = 0; i < 3; i++) {
@@ -3692,6 +3707,32 @@ static Sym *sym_put(Cg *c, Dict *d, const char *name, long long slot, const char
     return s;
 }
 
+/* a sampler in a uniform struct: a texture unit of its own, under the name a front end gives it (s.tex, a[1].tex), and the uniform
+ * slot it takes, which a load of the struct turns into that unit */
+static void struct_samplers(Cg *c, const char *path, const char *ty, long long asz, long long slot)
+{
+    StructDef *s = (StructDef *)dict_find(&c->structs, ty)->p;
+    long long e, ne = asz != NONE_SZ ? asz : 1;
+    int i;
+    SH_ENTER(c->h, 1);
+    for (e = 0; e < ne; e++) {
+        const char *p = asz != NONE_SZ ? sh_fmt(c->h, "%s[%L]", path, e) : path;
+        for (i = 0; i < s->n; i++) {
+            Member *m = &s->m[i];
+            long long n = arrsize(c, m->arr);
+            const char *q = sh_fmt(c->h, "%s.%s", p, m->name);
+            if (!strcmp(m->ty, "sampler2D") || !strcmp(m->ty, "samplerCube") || !strcmp(m->ty, "sampler3D")) {
+                sym_put(c, &c->samplers, q, c->next_sampler, m->ty, n != NONE_SZ, n != NONE_SZ ? n : 1);
+                dict_put(c->h, &c->sampler_slot, sh_fmt(c->h, "%L", slot))->i = c->next_sampler;
+                c->next_sampler = (int)c_range(c, c->next_sampler + (n != NONE_SZ ? n : 1));
+            }
+            else if (dict_find(&c->structs, m->ty)) struct_samplers(c, q, m->ty, n, slot);
+            slot += type_nslots(c, m->ty, n);
+        }
+    }
+    SH_LEAVE(c->h, 1);
+}
+
 static ShSym *sym_table(Cg *c, const Dict *d, int *n)
 {
     ShSym *t = (ShSym *)sh_alloc(c->h, (size_t)(d->n + 1) * sizeof(ShSym));
@@ -3739,7 +3780,7 @@ static void struct_table(Cg *c, ShOutput *out)
             long long asz = arrsize(c, s->m[m].arr), nsl = type_nslots(c, s->m[m].ty, asz);
             ShMember *om = &o->members[m];
             om->name = s->m[m].name; om->ty = s->m[m].ty; om->offset = off; om->nslots = nsl;
-            om->has_array = asz != NONE_SZ; om->array = asz != NONE_SZ ? asz : 0;
+            om->has_array = asz != NONE_SZ; om->array = asz != NONE_SZ ? asz : 0; om->prec = s->m[m].rprec;
             off += nsl;
         }
         o->nslots = off;
@@ -3789,6 +3830,7 @@ void sh_compile(Shc *h, const char *src, int fs, int remat, ShOutput *out)
                 long long asz = arrsize(c, d->arr), n = type_nslots(c, d->ty, asz);
                 if (asz != NONE_SZ) sym_put(c, &c->uniforms, d->name, c->next_uniform, d->ty, 1, asz);
                 else sym_put(c, &c->uniforms, d->name, c->next_uniform, d->ty, 0, 0);
+                struct_samplers(c, d->name, d->ty, asz, c->next_uniform);
                 c->next_uniform = c_range(c, c->next_uniform + n);
             }
             else {

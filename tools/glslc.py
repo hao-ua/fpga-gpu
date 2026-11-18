@@ -1266,6 +1266,7 @@ class Codegen:
         self.samplers={}         # name -> texture unit (sampler2D/samplerCube/sampler3D)
         self.sampler_sizes={}    # name -> size, for an array of samplers (units base .. base + size - 1)
         self.next_sampler=0
+        self.sampler_slot={}     # the uniform slot of a sampler in a uniform struct -> its unit (_struct_samplers)
         self.attribs={}          # name -> (index, type)
         self.varyings={}         # name -> (index, type)
         self.locals=[]           # scope stack of {name: (Reg|MatVal, type)}
@@ -1599,7 +1600,21 @@ class Compiler(Codegen):
         else:
             n = ncomp2(ty) if is_mat(ty) else 1
         return n * (asz or 1)
+    def _struct_samplers(self, path, ty, asz, slot):
+        """a sampler in a uniform struct: a texture unit of its own, under the name a front end gives it (s.tex, a[1].tex),
+        and the uniform slot it takes, which a load of the struct turns into that unit"""
+        for e in (range(asz) if asz is not None else [None]):
+            p=path if e is None else f'{path}[{e}]'
+            for mt,mn,ma in self.structs[ty]:
+                n=self._arrsize(ma); q=f'{p}.{mn}'
+                if mt in SAMPLERS:
+                    self.samplers[q]=self.next_sampler; self.sampler_slot[slot]=self.next_sampler
+                    if n is not None: self.sampler_sizes[q]=n
+                    self.next_sampler+=n if n is not None else 1
+                elif mt in self.structs: self._struct_samplers(q, mt, n, slot)
+                slot+=self._type_nslots(mt, n)
     def _load_uniform_member(self, slot, ty, asz):
+        if ty in SAMPLERS: return Sampler(self.sampler_slot[slot], 'sampler2D', asz)      # a sampler in a uniform struct: its unit
         if asz is not None: return ArrayVal(ty, asz, 'uniform', base=slot)        # array member
         if ty in self.structs: return self._load_uniform_struct(slot, ty)         # nested struct
         if is_mat(ty):
@@ -2495,7 +2510,10 @@ class Compiler(Codegen):
         line), the octant form instead — r = min(|x|, |y|) / max(|x|, |y|) in [0, 1], atan(r) by the degree-9
         minimax polynomial as MADs, then the three exact SELs: |y| > |x| -> pi/2 - at, x < 0 -> pi - at, y < 0 -> -at.
         21 instructions; atan(0, 0) is NaN (undefined in GLSL ES)."""
-        if len(a)==1: y, x = a[0], self.kf(1.0)
+        if len(a)==1:
+            y, x = a[0], self.kf(1.0)
+            if y.ty!='float':                            # a 1 of y's shape: what is worked out from x takes its type (min, max, SET)
+                one=self.alloc(y.ty); self.emit('MOV', f'r{one.n}', f'r{x.n}'); x=one
         else: y, x = a
         ay=self.bi_abs(y); ax=self.bi_abs(x)
         mn=self.bi_min(ax, ay); mx=self.bi_max(ax, ay)
@@ -2714,7 +2732,9 @@ class Compiler(Codegen):
         for name,v in self.varyings.items():
             if self.stage=='vs' and (len(v)==3 or is_mat(v[1]) or name in used or self.vmap is not None):
                 self.shadow.append(name)
+                self.nozero=not (len(v)==3 or is_mat(v[1]))     # an array or a matrix starts at 0: a write at a run-time index reads every element
                 self.run_stmt(('ldecl', False, v[1], name, None, ('num',float(v[2])) if len(v)==3 else None))
+                self.nozero=True
         if self.isa64:
             for name,ty in _SPECIAL[self.stage].items():
                 if name in used:
@@ -4363,6 +4383,7 @@ def _compile_stage(src, stage, optimize=True, remat_consts=False, hw_sincos=True
                 elif ty in c.structs:                                         # uniform struct (+ array of structs)
                     asz=c._arrsize(arr); n=c._type_nslots(ty, asz)
                     c.uniforms[name]=(c.next_uniform,ty,asz) if asz is not None else (c.next_uniform,ty)
+                    c._struct_samplers(name, ty, asz, c.next_uniform)
                     c.next_uniform+=n
                 else:
                     per=ncomp2(ty) if is_mat(ty) else 1

@@ -93,7 +93,7 @@ static int result_out(const ShOutput *o, const uint64_t *words, int nwords, g2sc
                     dm->type = dup_str(sm->ty);
                     if (!dm->name || !dm->type) return -1;
                     dm->offset = (int)sm->offset; dm->nslots = (int)sm->nslots;
-                    dm->array = (int)sm->array; dm->has_array = sm->has_array;
+                    dm->array = (int)sm->array; dm->has_array = sm->has_array; dm->prec = sm->prec;
                 }
             }
         }
@@ -373,6 +373,32 @@ void g2sc_link_free(g2sc_linked *l)
     l->umap_vs = l->umap_fs = NULL;
 }
 
+static const g2sc_struct *find_struct(const g2sc_result *r, const char *name)
+{
+    int i;
+    for (i = 0; i < r->nstructs; i++) if (!strcmp(r->structs[i].name, name)) return &r->structs[i];
+    return NULL;
+}
+
+/* the name a struct was declared with: the compiler names one a scope hides "S@3" */
+static size_t base_len(const char *n) { const char *at = strchr(n, '@'); return at ? (size_t)(at - n) : strlen(n); }
+
+/* the same struct type in both stages: its name, then its members in order, each of one name, type, array size and precision */
+static int same_struct(const g2sc_result *a, const char *ta, const g2sc_result *b, const char *tb, int depth)
+{
+    const g2sc_struct *sa = find_struct(a, ta), *sb = find_struct(b, tb);
+    int m;
+    if (!sa || !sb) return !sa && !sb && !strcmp(ta, tb);
+    if (depth > 32 || base_len(ta) != base_len(tb) || strncmp(ta, tb, base_len(ta)) || sa->nmembers != sb->nmembers) return 0;
+    for (m = 0; m < sa->nmembers; m++) {
+        const g2sc_member *x = &sa->members[m], *y = &sb->members[m];
+        if (strcmp(x->name, y->name) || x->has_array != y->has_array || x->array != y->array) return 0;
+        if (!x->prec != !y->prec || (x->prec && strcmp(x->prec, y->prec))) return 0;
+        if (!same_struct(a, x->type, b, y->type, depth + 1)) return 0;
+    }
+    return 1;
+}
+
 #define LINK_ERR(...) do { snprintf(o->error, sizeof o->error, __VA_ARGS__); goto fail; } while (0)
 int g2sc_link(const char *vs, const char *fs, g2sc_linked *o) { return g2sc_link_depth(vs, fs, 0, o); }
 
@@ -397,6 +423,13 @@ int g2sc_link_depth(const char *vs, const char *fs, uint32_t depth_units, g2sc_l
     memset(&first, 0, sizeof first);
     first.depth_units = depth_units;
     if (g2sc_compile_packed(fs, G2SC_FS, order, nslots, &first, rf) < 0) LINK_ERR("fragment shader: %s", rf->error);
+    for (i = 0; i < rv->nuniforms; i++) {                   /* a uniform of struct type in both stages: one struct (§4.2.6, §4.5.3) */
+        const g2sc_sym *u = &rv->uniforms[i];
+        for (k = 0; k < rf->nuniforms; k++) if (!strcmp(sym_name(u), sym_name(&rf->uniforms[k]))) break;
+        if (k == rf->nuniforms || (!find_struct(rv, sym_type(u)) && !find_struct(rf, sym_type(&rf->uniforms[k])))) continue;
+        if (u->array != rf->uniforms[k].array || !same_struct(rv, sym_type(u), rf, sym_type(&rf->uniforms[k]), 0))
+            LINK_ERR("uniform %s has another struct in the fragment shader", sym_name(u));
+    }
     pack_uv = rv->const_base + rv->nconst > 256; pack_uf = rf->const_base + rf->nconst > 64;
     pack_v = nslots > 8 || (rf->oversize && !pack_uf) || (rv->oversize && !pack_uv);
     for (i = 0; i < rf->nvaryings; i++) {

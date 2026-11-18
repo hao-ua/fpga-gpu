@@ -145,7 +145,8 @@ typedef struct Node {
     struct Member *mem; int nmem;   /* S_LSTRUCT */
 } Node;
 
-typedef struct Member { const char *ty, *name; Node *arr; const char *prec; } Member;
+typedef struct Member { const char *ty, *name; Node *arr; const char *prec;
+                        const char *rprec; } Member;       /* rprec (Sema): its precision, its own or the default where the struct is defined; NULL for bool and struct types */
 typedef struct Param { const char *q, *ty, *name, *prec; Node *arr; int isconst; } Param;
 
 typedef enum { D_STRUCT, D_GDECL, D_FUNC, D_PROTO, D_PREC } DeclKind;
@@ -213,7 +214,7 @@ char *sh_optimize(Shc *h, Lines *code, int vcount, const unsigned char *svregs, 
 
 /* ---------------- code generator ---------------- */
 typedef struct ShSym { const char *name; long long loc; const char *ty; int has_array; long long array; } ShSym;
-typedef struct ShMember { const char *name, *ty; long long offset, nslots, array; int has_array; } ShMember;
+typedef struct ShMember { const char *name, *ty; long long offset, nslots, array; int has_array; const char *prec; } ShMember;
 typedef struct ShStruct { const char *name; long long nslots; ShMember *members; int nmembers; } ShStruct;
 
 typedef struct ShOutput {

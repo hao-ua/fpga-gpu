@@ -27,6 +27,10 @@ int EGLAPI eglChooseConfig(EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLi
 EGLSurface EGLAPI eglCreateWindowSurface(EGLDisplay, EGLConfig, HWND, const EGLint *);
 EGLSurface EGLAPI eglCreatePbufferSurface(EGLDisplay, EGLConfig, const EGLint *);
 int EGLAPI eglDestroySurface(EGLDisplay, EGLSurface);
+int EGLAPI eglDestroyContext(EGLDisplay, EGLContext);
+int EGLAPI eglSurfaceAttrib(EGLDisplay, EGLSurface, EGLint, EGLint);
+EGLSurface EGLAPI eglGetCurrentSurface(EGLint);
+int EGLAPI eglGetConfigs(EGLDisplay, EGLConfig *, EGLint, EGLint *);
 EGLContext EGLAPI eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
 int EGLAPI eglMakeCurrent(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
 int EGLAPI eglSwapBuffers(EGLDisplay, EGLSurface);
@@ -35,6 +39,7 @@ int EGLAPI eglQuerySurface(EGLDisplay, EGLSurface, EGLint, EGLint *);
 int EGLAPI eglGetConfigAttrib(EGLDisplay, EGLConfig, EGLint, EGLint *);
 EGLint EGLAPI eglGetError(void);
 void *EGLAPI eglGetProcAddress(const char *);
+EGLContext EGLAPI eglGetCurrentContext(void);
 
 #define W 640
 #define H 480
@@ -1205,6 +1210,7 @@ static void test_scaled(void)
     ok(eglSwapBuffers(g_dpy, s), "scaled window: swap");
     ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the small window");
     glViewport(0, 0, W, H);
+    eglDestroySurface(g_dpy, s);
     DestroyWindow(big);
     clear_to(1, 0, 1, 1);
     px(W - 1, H - 1, "back in the small window", 255, 0, 255, 255);
@@ -1247,6 +1253,7 @@ static void test_configs(void)
         ok(eglSwapBuffers(g_dpy, s), "565 window: swap");
         ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the RGBA8 window");
         glViewport(0, 0, W, H);
+        eglDestroySurface(g_dpy, s);
         DestroyWindow(w);
         clear_to(1, 0, 1, 1);
         px(W - 1, H - 1, "back in the RGBA8 window", 255, 0, 255, 255);
@@ -3150,6 +3157,234 @@ static void test_pbuffer_swap(void)
     err(GL_NO_ERROR, "pbuffer swap");
 }
 
+/* EGL 1.4's handles and errors: a handle that names no surface or context, attributes, a surface destroyed while current */
+static void test_egl_api(void)
+{
+    static const EGLint twice[] = { 0x3031, 1, 0x3031, 0, 0x3038 }, bad_name[] = { 0, 0x3038 }, neg[] = { 0x3057, -1, 0x3056, 4, 0x3038 }, pa[] = { 0x3057, 16, 0x3056, 16, 0x3038 };
+    EGLConfig c[8];
+    EGLint n = -5, v;
+    EGLSurface pb;
+    ok(!eglDestroySurface(g_dpy, (EGLSurface)(intptr_t)-1) && eglGetError() == 0x300D, "eglDestroySurface of no surface: EGL_BAD_SURFACE");
+    ok(!eglDestroyContext(g_dpy, (EGLContext)(intptr_t)-1) && eglGetError() == 0x3006, "eglDestroyContext of no context: EGL_BAD_CONTEXT");
+    ok(!eglMakeCurrent(g_dpy, (EGLSurface)(intptr_t)-1, (EGLSurface)(intptr_t)-1, g_ctx) && eglGetError() == 0x300D, "eglMakeCurrent of no surface: EGL_BAD_SURFACE");
+    ok(!eglMakeCurrent(g_dpy, g_surf, g_surf, NULL) && eglGetError() == 0x3009, "eglMakeCurrent, a surface and no context: EGL_BAD_MATCH");
+    ok(eglGetCurrentSurface(0x3038) == NULL && eglGetError() == 0x300C, "eglGetCurrentSurface(EGL_NONE): EGL_BAD_PARAMETER");
+    v = -42;
+    ok(eglQuerySurface(g_dpy, g_surf, 0x3080, &v) && v == -42, "EGL_TEXTURE_FORMAT of a window: success, value untouched");
+    ok(!eglQuerySurface(g_dpy, g_surf, 0, &v) && eglGetError() == 0x3004 && v == -42, "eglQuerySurface of attribute 0: EGL_BAD_ATTRIBUTE, value untouched");
+    ok(eglQuerySurface(g_dpy, g_surf, 0x3099, &v) && v == 0x309A, "EGL_MULTISAMPLE_RESOLVE starts at EGL_MULTISAMPLE_RESOLVE_DEFAULT");
+    ok(!eglSurfaceAttrib(g_dpy, g_surf, 0x3093, 0x3094) && eglGetError() == 0x3009, "EGL_BUFFER_PRESERVED without the config bit: EGL_BAD_MATCH");
+    ok(eglChooseConfig(g_dpy, twice, c, 8, &n) && n == 6, "eglChooseConfig: an attribute given twice counts at its last value");
+    ok(!eglChooseConfig(g_dpy, bad_name, c, 8, &n) && eglGetError() == 0x3004, "eglChooseConfig of attribute 0: EGL_BAD_ATTRIBUTE");
+    ok(eglGetConfigs(g_dpy, c, -1, &n) && n == 0, "eglGetConfigs of room -1 returns none");
+    ok(eglCreatePbufferSurface(g_dpy, g_cfg, neg) == NULL && eglGetError() == 0x300C, "a pbuffer of width -1: EGL_BAD_PARAMETER");
+    /* a surface destroyed while current: its handle is gone at once, the surface while it is current */
+    pb = eglCreatePbufferSurface(g_dpy, g_cfg, pa);
+    ok(pb && eglMakeCurrent(g_dpy, pb, pb, g_ctx), "a pbuffer current");
+    ok(eglDestroySurface(g_dpy, pb), "eglDestroySurface of the current surface");
+    ok(!eglQuerySurface(g_dpy, pb, 0x3057, &v) && eglGetError() == 0x300D, "its handle is no longer valid");
+    clear_to(0, 1, 0, 1);
+    px(1, 1, "a destroyed surface renders while it is current", 0, 255, 0, 255);
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the window");
+    glViewport(0, 0, W, H);
+    err(GL_NO_ERROR, "EGL handles and errors");
+}
+
+/* one pixel as 0xRRGGBBAA */
+static uint32_t pixel_at(int x, int y)
+{
+    uint8_t c[4];
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+    return (uint32_t)c[0] << 24 | (uint32_t)c[1] << 16 | (uint32_t)c[2] << 8 | c[3];
+}
+
+/* what a second thread does, and what it saw: its checks are counted by the main thread after it ended */
+typedef struct thr_job {
+    int what;                                   /* 0: try what another thread holds; 1: render in its own context; 2: end with a context current; 3: clears in a loop */
+    EGLSurface surf, busy_surf;
+    EGLContext ctx;
+    float rgb[3];
+    uint32_t want;
+    int bad_surf, access_ctx, access_surf, made, own_ctx, err_after, cleared, rounds, wrong;
+} thr_job;
+
+static DWORD WINAPI thr_main(void *p)
+{
+    thr_job *j = (thr_job *)p;
+    int i;
+    if (j->what == 0) {
+        j->bad_surf = !eglMakeCurrent(g_dpy, (EGLSurface)(intptr_t)-1, (EGLSurface)(intptr_t)-1, j->ctx) ? eglGetError() : 0;
+        j->access_ctx = !eglMakeCurrent(g_dpy, j->surf, j->surf, g_ctx) ? eglGetError() : 0;
+        j->access_surf = !eglMakeCurrent(g_dpy, j->busy_surf, j->busy_surf, j->ctx) ? eglGetError() : 0;
+        j->own_ctx = eglGetCurrentContext() == NULL;
+        return 0;
+    }
+    j->made = eglMakeCurrent(g_dpy, j->surf, j->surf, j->ctx);
+    j->own_ctx = eglGetCurrentContext() == j->ctx;
+    if (!j->made) return 0;
+    glViewport(0, 0, 16, 16);
+    for (i = 0; i < (j->what == 3 ? j->rounds : 1); i++) {
+        glClearColor(j->rgb[0], j->rgb[1], j->rgb[2], 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (pixel_at(3, 3) != j->want) j->wrong++;
+        else j->cleared++;
+    }
+    j->err_after = (int)glGetError();
+    if (j->what != 2) eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+    return 0;
+}
+
+static void thr_run(thr_job *j, int n)
+{
+    HANDLE h[4];
+    int i;
+    for (i = 0; i < n; i++) h[i] = CreateThread(NULL, 0, thr_main, &j[i], 0, NULL);
+    WaitForMultipleObjects((DWORD)n, h, TRUE, 30000);
+    for (i = 0; i < n; i++) CloseHandle(h[i]);
+}
+
+/* EGL §3.7.3, §3.1: a current context and surface per thread, its own error per thread; a context or surface current in another thread is EGL_BAD_ACCESS. Each surface keeps its own
+   colour buffer: two pbuffers of one size, one after the other in one context */
+static void test_threads(void)
+{
+    static const EGLint ca[] = { 0x3098, 2, 0x3038 }, pa[] = { 0x3057, 16, 0x3056, 16, 0x3038 };
+    EGLSurface a = eglCreatePbufferSurface(g_dpy, g_cfg, pa), b = eglCreatePbufferSurface(g_dpy, g_cfg, pa);
+    EGLContext c2 = eglCreateContext(g_dpy, g_cfg, NULL, ca), c3 = eglCreateContext(g_dpy, g_cfg, NULL, ca);
+    thr_job j[2];
+    float cc[4];
+    ok(a && b && c2 && c3, "two pbuffers and two more contexts");
+    if (!a || !b || !c2 || !c3) return;
+    /* two surfaces of one size keep two colour buffers */
+    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current");
+    glViewport(0, 0, 16, 16);
+    clear_to(1, 0, 0, 1);
+    ok(eglMakeCurrent(g_dpy, b, b, g_ctx), "pbuffer b current");
+    clear_to(0, 0, 1, 1);
+    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current again");
+    px(3, 3, "pbuffer a kept its own colour", 255, 0, 0, 255);
+    ok(eglMakeCurrent(g_dpy, b, b, g_ctx), "pbuffer b current again");
+    px(3, 3, "pbuffer b kept its own colour", 0, 0, 255, 255);
+    /* another thread cannot take this thread's context or surface; its error is its own */
+    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current for the thread tests");
+    glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
+    memset(j, 0, sizeof j);
+    j[0].what = 0; j[0].surf = b; j[0].busy_surf = a; j[0].ctx = c2;
+    thr_run(j, 1);
+    ieq(j[0].bad_surf, 0x300D, "another thread's eglMakeCurrent of no surface: EGL_BAD_SURFACE there");
+    ieq(j[0].access_ctx, 0x3002, "another thread makes this thread's context current: EGL_BAD_ACCESS");
+    ieq(j[0].access_surf, 0x3002, "another thread makes this thread's surface current: EGL_BAD_ACCESS");
+    ok(j[0].own_ctx, "the other thread still has no context");
+    ok(eglGetError() == 0x3000, "this thread's EGL error is not the other thread's");
+    ok(eglGetCurrentContext() == g_ctx, "this thread keeps its context");
+    /* another thread renders in its own context and surface; this thread's state stays as it was */
+    memset(j, 0, sizeof j);
+    j[0].what = 1; j[0].surf = b; j[0].ctx = c2; j[0].rgb[1] = 1.0f; j[0].want = 0x00FF00FFu;
+    thr_run(j, 1);
+    ok(j[0].made && j[0].own_ctx, "a second thread makes its own context and pbuffer b current");
+    ieq(j[0].cleared, 1, "the second thread reads what it cleared");
+    ieq(j[0].err_after, GL_NO_ERROR, "no GL error in the second thread");
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+    ok(cc[0] == 0.5f && cc[1] == 0.5f, "this thread's clear colour is its own");
+    ok(eglMakeCurrent(g_dpy, b, b, g_ctx), "pbuffer b, released by the other thread, current here");
+    px(3, 3, "pbuffer b holds what the other thread cleared", 0, 255, 0, 255);
+    /* a thread that ends with a context current lets it go */
+    memset(j, 0, sizeof j);
+    j[0].what = 2; j[0].surf = a; j[0].ctx = c2; j[0].rgb[0] = 1.0f; j[0].rgb[2] = 1.0f; j[0].want = 0xFF00FFFFu;
+    thr_run(j, 1);
+    ok(j[0].made && j[0].cleared == 1, "a thread clears pbuffer a and ends with it current");
+    ok(eglMakeCurrent(g_dpy, a, a, c2), "its context and pbuffer current here after it ended");
+    px(3, 3, "pbuffer a holds what the ended thread cleared", 255, 0, 255, 255);
+    /* two threads clear and read back at once, each in its own context and pbuffer */
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "this thread back on the window");
+    memset(j, 0, sizeof j);
+    j[0].what = 3; j[0].surf = a; j[0].ctx = c2; j[0].rgb[0] = 1.0f; j[0].want = 0xFF0000FFu; j[0].rounds = 40;
+    j[1].what = 3; j[1].surf = b; j[1].ctx = c3; j[1].rgb[2] = 1.0f; j[1].want = 0x0000FFFFu; j[1].rounds = 40;
+    thr_run(j, 2);
+    ok(j[0].made && j[1].made, "two threads with a context each");
+    ieq(j[0].wrong + j[1].wrong, 0, "two threads at once: reads of another thread's colour");
+    ieq(j[0].cleared + j[1].cleared, 80, "two threads at once: clears read back");
+    glViewport(0, 0, W, H);
+    eglDestroySurface(g_dpy, a); eglDestroySurface(g_dpy, b);
+    eglDestroyContext(g_dpy, c2); eglDestroyContext(g_dpy, c3);
+    err(GL_NO_ERROR, "threads");
+}
+
+/* the PC's own pixel of a window, as 0xRRGGBB */
+static int window_pixel(HWND w, int x, int y)
+{
+    HDC dc = GetDC(w);
+    COLORREF c = dc ? GetPixel(dc, x, y) : CLR_INVALID;
+    if (dc) ReleaseDC(w, dc);
+    return c == CLR_INVALID ? -1 : (int)(GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c));
+}
+
+/* a window of at most 256 x 256 (GPU2_WIN_COPY) also gets each frame drawn into it on the PC, read back through GDI as dEQP's native-window cases do */
+static void test_window_copy(void)
+{
+    HWND w = CreateWindowA("gles_test", "small", WS_POPUP, 0, 0, 64, 64, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    EGLSurface s;
+    ShowWindow(w, SW_SHOWNOACTIVATE);
+    s = eglCreateWindowSurface(g_dpy, g_cfg, w, NULL);
+    ok(s && eglMakeCurrent(g_dpy, s, s, g_ctx), "a 64 x 64 window current");
+    if (!s) { DestroyWindow(w); return; }
+    glViewport(0, 0, 64, 64);
+    clear_to(0, 0, 1, 1);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 32, 32);
+    clear_to(1, 0, 0, 1);
+    glDisable(GL_SCISSOR_TEST);
+    ok(eglSwapBuffers(g_dpy, s), "small window: swap");
+    ieq(window_pixel(w, 8, 55), 0xFF0000, "small window on the PC: GL's bottom left, red");
+    ieq(window_pixel(w, 55, 8), 0x0000FF, "small window on the PC: GL's top right, blue");
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the main window");
+    glViewport(0, 0, W, H);
+    eglDestroySurface(g_dpy, s);
+    DestroyWindow(w);
+    err(GL_NO_ERROR, "window copy");
+}
+
+/* images board B shows or has queued are kept until later frames have replaced them: a window of the mode's size (its frames shown as they are) resized just
+   after a swap, and another destroyed just after its swap. Drawing and swapping go on as before */
+static void test_shown_images(void)
+{
+    HWND w = CreateWindowA("gles_test", "shown", WS_POPUP, 0, 0, W, H, NULL, NULL, GetModuleHandleA(NULL), NULL), w2;
+    EGLSurface s = eglCreateWindowSurface(g_dpy, g_cfg, w, NULL), s2;
+    EGLint v = 0;
+    int i;
+    ok(s && eglMakeCurrent(g_dpy, s, s, g_ctx), "a window of the mode's size current");
+    if (!s) { DestroyWindow(w); return; }
+    glViewport(0, 0, W, H);
+    clear_to(1, 0, 0, 1);
+    ok(eglSwapBuffers(g_dpy, s), "shown images: a swap");
+    SetWindowPos(w, NULL, 0, 0, 400, 300, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ok(eglSwapBuffers(g_dpy, s), "shown images: the swap that finds the window resized");
+    eglQuerySurface(g_dpy, s, 0x3057, &v);
+    ieq(v, 400, "shown images: the surface's new width");
+    glViewport(0, 0, 400, 300);
+    for (i = 0; i < 4; i++) {
+        clear_to(0, (float)(i & 1), 1, 1);
+        px(399, 299, "shown images: the resized framebuffer", 0, (i & 1) * 255, 255, 255);
+        ok(eglSwapBuffers(g_dpy, s), "shown images: swaps after the resize");
+    }
+    w2 = CreateWindowA("gles_test", "shown 2", WS_POPUP, 0, 0, W, H, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    s2 = eglCreateWindowSurface(g_dpy, g_cfg, w2, NULL);
+    ok(s2 && eglMakeCurrent(g_dpy, s2, s2, g_ctx), "a second window of the mode's size current");
+    glViewport(0, 0, W, H);
+    clear_to(1, 1, 0, 1);
+    ok(eglSwapBuffers(g_dpy, s2), "shown images: the second window's swap");
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "back to the main window");
+    ok(eglDestroySurface(g_dpy, s2) && eglDestroySurface(g_dpy, s), "both window surfaces destroyed, one just after its swap");
+    DestroyWindow(w2);
+    DestroyWindow(w);
+    glViewport(0, 0, W, H);
+    for (i = 0; i < 4; i++) {
+        clear_to((float)(i & 1), 1, 0, 1);
+        px(W - 1, H - 1, "shown images: the main window after the others went", (i & 1) * 255, 255, 0, 255);
+        ok(eglSwapBuffers(g_dpy, g_surf), "shown images: the main window's swaps");
+    }
+    err(GL_NO_ERROR, "shown images");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -3243,6 +3478,10 @@ int main(void)
     test_scaled();
     test_configs();
     test_pbuffer_swap();
+    test_egl_api();
+    test_threads();
+    test_window_copy();
+    test_shown_images();
     test_swap();
     printf("%d checks, %d failed\n", g_checks, g_bad);
     if (!g_bad) printf("OK gles_test\n");

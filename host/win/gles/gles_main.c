@@ -192,17 +192,30 @@ typedef struct es_tg {
     double kx, ky;                              /* the target's pixels per application pixel: 1 except for a window larger than the hardware */
 } es_tg;
 
+/* an EGL surface's own framebuffer on board B: its colour buffers (three, presented in turn) and its depth-stencil buffer */
+typedef struct es_sfc {
+    HWND hwnd;                                  /* NULL: a pbuffer */
+    int vw, vh, fb_w, fb_h, back, front, swap_interval;     /* vw, vh: the window; fb_w, fb_h: what is rendered */
+    uint16_t color[3], ds;
+    uint32_t color_base[3], ds_base;
+    int cfg, depth16, stencil;                  /* the surface's EGL config: its depth has 16 bits, it has stencil */
+    uint32_t color_fmt;                         /* and its colour: RGBA8 or RGB565 */
+} es_sfc;
+#define SF (S.sfp)                              /* the surface of the calling thread's context */
+
 static struct {
     g2_board *bd;
     g2r *r;
-    /* window system */
-    HWND hwnd;
-    int vw, vh, fb_w, fb_h, mode, mode_w, mode_h, back, front, scan_idx, hold, stretch, swap_interval;      /* vw, vh: the window; fb_w, fb_h: what is rendered */
+    /* window system: board B's display, shared by every window surface */
+    int mode, mode_w, mode_h, scan_idx, hold, stretch;
     uint32_t frame;
-    uint16_t color[3], ds, scan[3];
-    uint32_t color_base[3], ds_base, scan_base[3];
-    int cfg, depth16, stencil;              /* the surface's EGL config: its depth has 16 bits, it has stencil */
-    uint32_t color_fmt;                     /* and its colour: RGBA8 or RGB565 */
+    uint16_t scan[3];                           /* mode-sized images a smaller framebuffer is copied into to be shown */
+    uint32_t scan_base[3];
+    int scan_w, scan_h;
+    uint16_t shown[3];                          /* the last three images presented: one on the screen, up to two queued (g2r_present keeps two in flight) */
+    uint16_t late[3];                           /* images to destroy once they are none of shown[] */
+    uint32_t late_base[3];
+    es_sfc *sfp;
     /* objects: shared by all contexts, names never repeat */
     es_buf *bufs[HASH];
     es_tex *texs[HASH], *tex_default[3];
@@ -211,7 +224,7 @@ static struct {
     es_shader *shaders[HASH];
     es_prog *progs[HASH];
     GLuint next_name;
-    char ctx_begin;                             /* from here to ctx_end: one context's state, swapped by eglMakeCurrent */
+    char ctx_begin;                             /* from here to ctx_end: one context's state, swapped when a thread with another context calls (thread_bind) */
     GLenum error;
     int vp_set, tex_storing;
     GLuint array_buf, elem_buf, fb, read_fb, rb;
@@ -282,15 +295,51 @@ static int dev_up(void)
 static const struct { int color, depth, stencil; } CFG[] = { { 32, 24, 8 }, { 32, 0, 0 }, { 32, 16, 0 }, { 16, 24, 8 }, { 16, 16, 0 }, { 16, 0, 0 } };
 #define NCFG ((int)(sizeof CFG / sizeof CFG[0]))
 
+/* An image board B may be showing or have queued (one of S.shown) is not destroyed yet: board B would go on scanning out memory given to another image, or
+   PRESENT a handle that is gone. It waits in S.late until three later PRESENTs have taken its place (late_sweep). Every late one is one of shown[], so three
+   places are enough */
+static void img_drop(uint16_t h, uint32_t base)
+{
+    int i;
+    if (!h) return;
+    for (i = 0; i < 3 && S.shown[i] != h; i++) ;
+    if (i == 3) { g2r_image_destroy(S.r, h, base); return; }
+    for (i = 0; i < 3; i++) if (!S.late[i]) { S.late[i] = h; S.late_base[i] = base; return; }
+    g2e_log("gles: image %u kept: no room to wait until it is off the screen", h);
+}
+
+/* after a PRESENT: the late images no longer among shown[] go */
+static void late_sweep(void)
+{
+    int i, k;
+    for (i = 0; i < 3; i++) {
+        if (!S.late[i]) continue;
+        for (k = 0; k < 3 && S.shown[k] != S.late[i]; k++) ;
+        if (k == 3) { g2r_image_destroy(S.r, S.late[i], S.late_base[i]); S.late[i] = 0; }
+    }
+}
+
+/* a surface's images back to board B */
+static void sfc_free(es_sfc *f)
+{
+    int i;
+    if (!S.r) return;
+    g2r_end_pass(S.r);
+    for (i = 0; i < 3; i++) { img_drop(f->color[i], f->color_base[i]); f->color[i] = 0; }
+    if (f->ds) g2r_image_destroy(S.r, f->ds, f->ds_base);
+    f->ds = 0;
+}
+
+/* the framebuffer of the calling thread's surface (SF), made or made again for vw x vh and config cfg */
 static void default_fb(int vw, int vh, int cfg, int window)
 {
     int i, w, h, maxh = window ? MAX_SCAN_H : MAX_TEX, maxw = g2e_get_int("GPU2_MAX_W", MAX_RT_W);    /* a lower GPU2_MAX_W trades resolution for speed: fill rate is what limits most games */
     int depth = CFG[cfg - 1].depth != 0;
     if (vw < 1) vw = 640;
     if (vh < 1) vh = 480;
-    if (vw == S.vw && vh == S.vh && S.color[0] && S.cfg == cfg) return;
-    S.cfg = cfg; S.depth16 = CFG[cfg - 1].depth == 16; S.stencil = CFG[cfg - 1].stencil != 0;
-    S.color_fmt = CFG[cfg - 1].color == 16 ? G2_FMT_RGB565 : G2_FMT_RGBA8;
+    if (vw == SF->vw && vh == SF->vh && SF->color[0] && SF->cfg == cfg) return;
+    SF->cfg = cfg; SF->depth16 = CFG[cfg - 1].depth == 16; SF->stencil = CFG[cfg - 1].stencil != 0;
+    SF->color_fmt = CFG[cfg - 1].color == 16 ? G2_FMT_RGB565 : G2_FMT_RGBA8;
     if (maxw > MAX_RT_W || maxw < 1) maxw = MAX_RT_W;
     w = vw; h = vh;
     if (w > maxw || h > maxh) {
@@ -300,34 +349,37 @@ static void default_fb(int vw, int vh, int cfg, int window)
         if (w > maxw) w = maxw;
         if (h > maxh) h = maxh;
     }
-    g2r_end_pass(S.r);
-    for (i = 0; i < 3; i++) {
-        if (S.color[i]) g2r_image_destroy(S.r, S.color[i], S.color_base[i]);
-        if (S.scan[i]) g2r_image_destroy(S.r, S.scan[i], S.scan_base[i]);
-        S.color[i] = S.scan[i] = 0;
-    }
-    if (S.ds) g2r_image_destroy(S.r, S.ds, S.ds_base);
-    S.ds = 0;
-    if (window) {                               /* the smallest mode that holds the window */
+    sfc_free(SF);
+    if (window) {                               /* the smallest mode that holds the window; board B takes no SET_MODE while a PRESENT is in flight */
+        g2r_present_idle(S.r);
         if (g2_mode_select(S.bd, w, h, &S.mode) < 0) g2e_log("gles: SET_MODE for %d x %d: %s", w, h, g2_error_text(S.bd));
         S.mode_w = G2_MODE_W[S.mode]; S.mode_h = G2_MODE_H[S.mode];
     }
     for (i = 0; i < 3; i++) {
-        if (g2r_image_create(S.r, &S.color[i], &S.color_base[i], (uint32_t)w, (uint32_t)h, S.color_fmt, 1, 1, 1, G2_USE_RT | G2_USE_SCANOUT | G2_USE_TRANSFER | G2_USE_SAMPLED) < 0)
+        if (g2r_image_create(S.r, &SF->color[i], &SF->color_base[i], (uint32_t)w, (uint32_t)h, SF->color_fmt, 1, 1, 1, G2_USE_RT | G2_USE_SCANOUT | G2_USE_TRANSFER | G2_USE_SAMPLED) < 0)
             g2e_log("gles: no room for the framebuffer");
     }
     if (depth) {
-        g2r_image_create(S.r, &S.ds, &S.ds_base, (uint32_t)w, (uint32_t)h, G2_FMT_D24S8, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER);
-        g2r_stencil_undefined(S.r, S.ds);
+        g2r_image_create(S.r, &SF->ds, &SF->ds_base, (uint32_t)w, (uint32_t)h, G2_FMT_D24S8, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER);
+        g2r_stencil_undefined(S.r, SF->ds);
     }
-    if (w != S.mode_w || h != S.mode_h) {
-        for (i = 0; i < 3; i++) {
-            g2r_image_create(S.r, &S.scan[i], &S.scan_base[i], (uint32_t)S.mode_w, (uint32_t)S.mode_h, G2_FMT_RGBA8, 1, 1, 1, G2_USE_SCANOUT | G2_USE_TRANSFER);
-            g2_fill_image(S.bd, S.scan[i], G2_TF_RAW, 0x000000FFu, 0, 0, (uint32_t)S.mode_w, (uint32_t)S.mode_h, 0xF, 0, 0);
-        }
-    }
-    S.vw = vw; S.vh = vh; S.fb_w = w; S.fb_h = h; S.back = S.front = 0;
+    SF->vw = vw; SF->vh = vh; SF->fb_w = w; SF->fb_h = h; SF->back = SF->front = 0;
     g2e_log("gles: window %d x %d, framebuffer %d x %d, colour %d depth %d stencil %d, HDMI mode %d", vw, vh, w, h, CFG[cfg - 1].color, CFG[cfg - 1].depth, CFG[cfg - 1].stencil, S.mode);
+}
+
+/* board B shows a framebuffer of the mode's size itself and a smaller one through a mode-sized copy: those copies, made when a swap needs them, again after the mode changed */
+static void scan_fit(void)
+{
+    int i;
+    if (S.scan[0] && S.scan_w == S.mode_w && S.scan_h == S.mode_h) return;
+    g2r_end_pass(S.r);
+    for (i = 0; i < 3; i++) {
+        img_drop(S.scan[i], S.scan_base[i]);
+        S.scan[i] = 0;
+        g2r_image_create(S.r, &S.scan[i], &S.scan_base[i], (uint32_t)S.mode_w, (uint32_t)S.mode_h, G2_FMT_RGBA8, 1, 1, 1, G2_USE_SCANOUT | G2_USE_TRANSFER);
+        g2_fill_image(S.bd, S.scan[i], G2_TF_RAW, 0x000000FFu, 0, 0, (uint32_t)S.mode_w, (uint32_t)S.mode_h, 0xF, 0, 0);
+    }
+    S.scan_w = S.mode_w; S.scan_h = S.mode_h;
 }
 
 static void win_size(HWND w, int *x, int *y)
@@ -347,53 +399,92 @@ static void dump_frame(uint16_t image)
     if (every < 0) every = g2e_get_int("GPU2_DUMP_EVERY", 120);
     if (S.frame % (uint32_t)every != 1) return;
     snprintf(path, sizeof path, "%s\\frame_%05u.bmp", g2e_get("GPU2_DUMP", ""), S.frame);
-    px = (uint8_t *)malloc((size_t)S.fb_w * S.fb_h * 4);
+    px = (uint8_t *)malloc((size_t)SF->fb_w * SF->fb_h * 4);
     f = fopen(path, "wb");
     if (px && f) {
         BITMAPFILEHEADER fh;
         BITMAPINFOHEADER ih;
         g2_fence(S.bd, 5.0);
-        g2_read_image(S.bd, image, G2_TF_BGRA8888, 0, 0, (uint32_t)S.fb_w, (uint32_t)S.fb_h, 0, 0, S.color_fmt, 0, 0, px);
+        g2_read_image(S.bd, image, G2_TF_BGRA8888, 0, 0, (uint32_t)SF->fb_w, (uint32_t)SF->fb_h, 0, 0, SF->color_fmt, 0, 0, px);
         memset(&fh, 0, sizeof fh); memset(&ih, 0, sizeof ih);
-        fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih; fh.bfSize = fh.bfOffBits + (DWORD)S.fb_w * S.fb_h * 4;
-        ih.biSize = sizeof ih; ih.biWidth = S.fb_w; ih.biHeight = S.fb_h; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;     /* bottom-up, as GL */
-        fwrite(&fh, sizeof fh, 1, f); fwrite(&ih, sizeof ih, 1, f); fwrite(px, 4, (size_t)S.fb_w * S.fb_h, f);
+        fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih; fh.bfSize = fh.bfOffBits + (DWORD)SF->fb_w * SF->fb_h * 4;
+        ih.biSize = sizeof ih; ih.biWidth = SF->fb_w; ih.biHeight = SF->fb_h; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;     /* bottom-up, as GL */
+        fwrite(&fh, sizeof fh, 1, f); fwrite(&ih, sizeof ih, 1, f); fwrite(px, 4, (size_t)SF->fb_w * SF->fb_h, f);
     }
     if (f) fclose(f);
     free(px);
 }
 
+static int read_rgba8(const es_tg *g, int x, int y, int w, int h, uint8_t *out);
+
+/* Board B shows a frame on HDMI only; the window on the PC's screen stays as Windows drew it. A small window (both sides at most GPU2_WIN_COPY pixels, 256 when
+   unset, 0: none) also gets each frame drawn into it, for programs that read their own window back through GDI (dEQP's native-window cases: windows of 64 to 256).
+   It costs a wait for the frame and its pixels over the link, which a game's window, larger, does not pay */
+static void copy_to_window(uint16_t image)
+{
+    static int max = -1;
+    es_tg g;
+    BITMAPINFO bi;
+    uint8_t *px;
+    HDC dc;
+    int i, n = SF->fb_w * SF->fb_h;
+    if (max < 0) max = g2e_get_int("GPU2_WIN_COPY", 256);
+    if (!SF->hwnd || SF->vw > max || SF->vh > max || n <= 0) return;
+    px = (uint8_t *)malloc((size_t)n * 4);
+    if (!px) return;
+    memset(&g, 0, sizeof g);
+    g.t.color = image; g.t.width = (uint32_t)SF->fb_w; g.t.height = (uint32_t)SF->fb_h;
+    g.fmt = SF->color_fmt; g.kx = g.ky = 1.0;
+    g2r_finish(S.r);
+    if (read_rgba8(&g, 0, 0, SF->fb_w, SF->fb_h, px) >= 0) {
+        for (i = 0; i < n; i++) { uint8_t t = px[4 * i]; px[4 * i] = px[4 * i + 2]; px[4 * i + 2] = t; }     /* GDI's 32-bit DIB: B, G, R, unused */
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = SF->fb_w; bi.bmiHeader.biHeight = SF->fb_h;      /* bottom-up, as GL's rows */
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        if ((dc = GetDC(SF->hwnd)) != NULL) {
+            StretchDIBits(dc, 0, 0, SF->vw, SF->vh, 0, 0, SF->fb_w, SF->fb_h, px, &bi, DIB_RGB_COLORS, SRCCOPY);
+            ReleaseDC(SF->hwnd, dc);
+        }
+    }
+    free(px);
+}
+
 static void swap_buffers(void)
 {
-    uint16_t image = S.color[S.back];
-    int hold = S.hold && S.swap_interval, w, h;
+    uint16_t image = SF->color[SF->back], out = image;
+    int hold = S.hold && SF->swap_interval, w, h;
     g2r_end_pass(S.r);
-    if (S.fb_w == S.mode_w && S.fb_h == S.mode_h) {
+    if (SF->fb_w == S.mode_w && SF->fb_h == S.mode_h) {
         g2r_present(S.r, image, hold);
     } else {
         int dw = S.mode_w, dh = S.mode_h, dx = 0, dy = 0;
         if (!S.stretch) {
-            int sx = S.mode_w / S.fb_w, sy = S.mode_h / S.fb_h, s = sx < sy ? sx : sy;
+            int sx = S.mode_w / SF->fb_w, sy = S.mode_h / SF->fb_h, s = sx < sy ? sx : sy;
             if (s < 1) s = 1;
-            dw = S.fb_w * s; dh = S.fb_h * s;
+            dw = SF->fb_w * s; dh = SF->fb_h * s;
             if (dw > S.mode_w) dw = S.mode_w;
             if (dh > S.mode_h) dh = S.mode_h;
             dx = (S.mode_w - dw) / 2; dy = (S.mode_h - dh) / 2;
         }
+        scan_fit();
         S.scan_idx = (S.scan_idx + 1) % 3;
-        g2_copy_image(S.bd, image, S.scan[S.scan_idx], 0, 0, (uint32_t)S.fb_w, (uint32_t)S.fb_h, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        g2r_present(S.r, S.scan[S.scan_idx], hold);
+        g2_copy_image(S.bd, image, S.scan[S.scan_idx], 0, 0, (uint32_t)SF->fb_w, (uint32_t)SF->fb_h, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        out = S.scan[S.scan_idx];
+        g2r_present(S.r, out, hold);
     }
+    S.shown[S.frame % 3] = out;
+    late_sweep();
     S.frame++;
     g2r_stats_tick(S.r);
     dump_frame(image);
-    S.front = S.back;
-    S.back = (S.back + 1) % 3;
+    copy_to_window(image);
+    SF->front = SF->back;
+    SF->back = (SF->back + 1) % 3;
     /* EGL_BUFFER_DESTROYED: the colour buffer is undefined after a swap, which spares the next frame a band load */
-    g2r_discard_color(S.r, S.color[S.back]);
-    if (S.hwnd) {
-        win_size(S.hwnd, &w, &h);
-        if (w != S.vw || h != S.vh) default_fb(w, h, S.cfg, 1);
+    g2r_discard_color(S.r, SF->color[SF->back]);
+    if (SF->hwnd) {
+        win_size(SF->hwnd, &w, &h);
+        if (w != SF->vw || h != SF->vh) default_fb(w, h, SF->cfg, 1);
     }
 }
 
@@ -418,14 +509,14 @@ static GLenum fb_target(es_tg *g)
     memset(g, 0, sizeof *g);
     g->fmt = G2_FMT_RGBA8;
     if (!f) {
-        g->fmt = S.color_fmt;
-        g->t.color = S.color[S.back]; g->t.ds = S.ds;
-        g->t.width = (uint32_t)S.fb_w; g->t.height = (uint32_t)S.fb_h;
+        g->fmt = SF->color_fmt;
+        g->t.color = SF->color[SF->back]; g->t.ds = SF->ds;
+        g->t.width = (uint32_t)SF->fb_w; g->t.height = (uint32_t)SF->fb_h;
         g->t.bits_r = rb_bits(g->fmt, 0); g->t.bits_g = rb_bits(g->fmt, 1); g->t.bits_b = rb_bits(g->fmt, 2); g->t.bits_a = rb_bits(g->fmt, 3);
-        g->t.depth16 = S.depth16;
-        g->has_d = S.ds != 0; g->has_s = S.ds != 0 && S.stencil;
-        g->vw = S.vw; g->vh = S.vh;
-        g->kx = (double)S.fb_w / S.vw; g->ky = (double)S.fb_h / S.vh;
+        g->t.depth16 = SF->depth16;
+        g->has_d = SF->ds != 0; g->has_s = SF->ds != 0 && SF->stencil;
+        g->vw = SF->vw; g->vh = SF->vh;
+        g->kx = (double)SF->fb_w / SF->vw; g->ky = (double)SF->fb_h / SF->vh;
         return GL_FRAMEBUFFER_COMPLETE;
     }
     c = &f->a[ATT_COLOR]; da = &f->a[ATT_DEPTH]; sa = &f->a[ATT_STENCIL];
@@ -3161,30 +3252,116 @@ enum { EGL_SUCCESS = 0x3000, EGL_NOT_INITIALIZED = 0x3001, EGL_BAD_ATTRIBUTE = 0
        EGL_MAX_SWAP_INTERVAL = 0x303C, EGL_LUMINANCE_SIZE = 0x303D, EGL_ALPHA_MASK_SIZE = 0x303E, EGL_COLOR_BUFFER_TYPE = 0x303F, EGL_RENDERABLE_TYPE = 0x3040, EGL_MATCH_NATIVE_PIXMAP = 0x3041, EGL_CONFORMANT = 0x3042, EGL_RGB_BUFFER = 0x308E,
        EGL_OPENGL_ES2_BIT = 4, EGL_WINDOW_BIT = 4, EGL_PBUFFER_BIT = 1, EGL_DONT_CARE = -1,
        EGL_VENDOR = 0x3053, EGL_VERSION = 0x3054, EGL_EXTENSIONS = 0x3055, EGL_CLIENT_APIS = 0x308D, EGL_WIDTH = 0x3057, EGL_HEIGHT = 0x3056, EGL_OPENGL_ES_API = 0x30A0, EGL_DRAW = 0x3059, EGL_READ = 0x305A,
-       EGL_RENDER_BUFFER = 0x3086, EGL_BACK_BUFFER = 0x3084, EGL_SWAP_BEHAVIOR = 0x3093, EGL_BUFFER_DESTROYED = 0x3095, EGL_CONTEXT_CLIENT_TYPE = 0x3097, EGL_CONTEXT_CLIENT_VERSION = 0x3098 };
+       EGL_RENDER_BUFFER = 0x3086, EGL_BACK_BUFFER = 0x3084, EGL_SWAP_BEHAVIOR = 0x3093, EGL_BUFFER_DESTROYED = 0x3095, EGL_CONTEXT_CLIENT_TYPE = 0x3097, EGL_CONTEXT_CLIENT_VERSION = 0x3098,
+       EGL_FALSE = 0, EGL_TRUE = 1, EGL_BAD_ACCESS = 0x3002, EGL_BAD_ALLOC = 0x3003, EGL_BAD_NATIVE_PIXMAP = 0x300A, EGL_BAD_NATIVE_WINDOW = 0x300B, EGL_OPENGL_ES_BIT = 1, EGL_UNKNOWN = -1,
+       EGL_SLOW_CONFIG = 0x3050, EGL_NON_CONFORMANT_CONFIG = 0x3051, EGL_TRANSPARENT_RGB = 0x3052, EGL_LUMINANCE_BUFFER = 0x308F, EGL_CORE_NATIVE_ENGINE = 0x305B, EGL_OPENVG_IMAGE = 0x3096,
+       EGL_LARGEST_PBUFFER = 0x3058, EGL_TEXTURE_FORMAT = 0x3080, EGL_TEXTURE_TARGET = 0x3081, EGL_MIPMAP_TEXTURE = 0x3082, EGL_MIPMAP_LEVEL = 0x3083, EGL_NO_TEXTURE = 0x305C, EGL_TEXTURE_RGB = 0x305D,
+       EGL_TEXTURE_RGBA = 0x305E, EGL_TEXTURE_2D = 0x305F, EGL_SINGLE_BUFFER = 0x3085, EGL_COLORSPACE = 0x3087, EGL_ALPHA_FORMAT = 0x3088, EGL_COLORSPACE_sRGB = 0x3089, EGL_COLORSPACE_LINEAR = 0x308A,
+       EGL_ALPHA_FORMAT_NONPRE = 0x308B, EGL_ALPHA_FORMAT_PRE = 0x308C, EGL_HORIZONTAL_RESOLUTION = 0x3090, EGL_VERTICAL_RESOLUTION = 0x3091, EGL_PIXEL_ASPECT_RATIO = 0x3092, EGL_BUFFER_PRESERVED = 0x3094,
+       EGL_MULTISAMPLE_RESOLVE = 0x3099, EGL_MULTISAMPLE_RESOLVE_DEFAULT = 0x309A, EGL_MULTISAMPLE_RESOLVE_BOX = 0x309B };
 
-typedef struct egl_surf { HWND hwnd; int w, h, cfg; } egl_surf;
-typedef struct egl_ctx { char *saved; int cfg; } egl_ctx;
-static EGLint g_egl_err = EGL_SUCCESS;
-static egl_surf *g_cur_surf;
-static egl_ctx *g_cur_ctx;
+/* A surface or context handle is the object's address, valid while the object is in its list. One destroyed while current is dead: its handle is no longer valid, and it goes when no
+   thread has it current (§3.5.5, §3.7.2). thread: the thread it is current in, 0 for none. The configs have no VG bits, no EGL_SWAP_BEHAVIOR_PRESERVED_BIT and no EGL_MULTISAMPLE_RESOLVE_BOX_BIT */
+typedef struct egl_surf {
+    struct egl_surf *next;
+    HWND hwnd;
+    int w, h, cfg, pbuffer, dead;
+    DWORD thread;
+    EGLint largest, tex_format, tex_target, mipmap_tex, mipmap_level, swap_behavior, ms_resolve, colorspace, alpha_format;
+    es_sfc sf;                                  /* its own framebuffer on board B */
+} egl_surf;
+typedef struct egl_ctx { struct egl_ctx *next; char *saved; int cfg, dead; DWORD thread; } egl_ctx;
+static egl_surf *g_surfs;
+static egl_ctx *g_ctxs;
 static int g_egl_init;
-#define E_OK() (g_egl_err = EGL_SUCCESS)
-#define DISPLAY ((EGLDisplay)1)
-#define CHECK_DPY(d, ret) do { if ((d) != DISPLAY) { g_egl_err = EGL_BAD_DISPLAY; return ret; } if (!g_egl_init) { g_egl_err = EGL_NOT_INITIALIZED; return ret; } } while (0)
 
-EGLint EGLAPI eglGetError(void) { EGLint e = g_egl_err; g_egl_err = EGL_SUCCESS; return e; }
+/* §3.1: each thread has its own current context and surface and its own error. GL and EGL calls are taken one at a time (g_lock, around every export): a GL call first puts its
+   thread's context in S and its surface in SF (thread_bind) */
+typedef struct egl_thread { egl_ctx *ctx; egl_surf *surf; EGLint err; } egl_thread;
+static CRITICAL_SECTION g_lock;
+static DWORD g_tls = TLS_OUT_OF_INDEXES;
+static egl_thread g_thr_spare;                  /* a thread whose own record could not be had */
+static egl_ctx *g_loaded;                       /* the context whose state is in S; NULL: S's context block is no context's */
+static es_sfc g_nosfc;                          /* SF of a thread with no surface */
+static egl_thread *thr(void)
+{
+    egl_thread *t = (egl_thread *)TlsGetValue(g_tls);
+    if (!t) {
+        t = (egl_thread *)calloc(1, sizeof *t);
+        if (!t) t = &g_thr_spare;
+        TlsSetValue(g_tls, t);
+    }
+    return t;
+}
+static void thread_bind(void)
+{
+    egl_thread *t = thr();
+    size_t n = (size_t)(&S.ctx_end - &S.ctx_begin);
+    if (t->ctx != g_loaded) {
+        if (S.r) g2r_end_pass(S.r);
+        if (g_loaded) memcpy(g_loaded->saved, &S.ctx_begin, n);
+        if (t->ctx) memcpy(&S.ctx_begin, t->ctx->saved, n);
+        g_loaded = t->ctx;
+    }
+    S.sfp = t->surf ? &t->surf->sf : &g_nosfc;
+    S.live = t->ctx && t->surf;
+}
+/* the generated exports (gles_entry_gen.h) call the implementations between these */
+static void gl_enter(void) { EnterCriticalSection(&g_lock); thread_bind(); }
+static void egl_enter(void) { EnterCriticalSection(&g_lock); }
+static void api_leave(void) { LeaveCriticalSection(&g_lock); }
+
+#define EGL_ERR (thr()->err)
+#define E_OK() (EGL_ERR = EGL_SUCCESS)
+#define DISPLAY ((EGLDisplay)1)
+#define CHECK_DPY(d, ret) do { if ((d) != DISPLAY) { EGL_ERR = EGL_BAD_DISPLAY; return ret; } if (!g_egl_init) { EGL_ERR = EGL_NOT_INITIALIZED; return ret; } } while (0)
+#define EGL_FAIL(e, ret) do { EGL_ERR = (e); return ret; } while (0)
+
+static egl_surf *surf_of(EGLSurface s) { egl_surf *x; for (x = g_surfs; x; x = x->next) if ((void *)x == s) return x->dead ? NULL : x; return NULL; }
+static egl_ctx *ctx_of(EGLContext c) { egl_ctx *x; for (x = g_ctxs; x; x = x->next) if ((void *)x == c) return x->dead ? NULL : x; return NULL; }
+static void surf_free(egl_surf *x)
+{
+    egl_surf **p = &g_surfs;
+    sfc_free(&x->sf);
+    if (S.sfp == &x->sf) S.sfp = &g_nosfc;
+    while (*p && *p != x) p = &(*p)->next;
+    if (*p) *p = x->next;
+    free(x);
+}
+static void ctx_free(egl_ctx *x)
+{
+    egl_ctx **p = &g_ctxs;
+    if (g_loaded == x) g_loaded = NULL;
+    while (*p && *p != x) p = &(*p)->next;
+    if (*p) *p = x->next;
+    free(x->saved);
+    free(x);
+}
+
+EGLint EGLAPI eglGetError(void) { EGLint e = EGL_ERR; EGL_ERR = EGL_SUCCESS; return e; }
 EGLDisplay EGLAPI eglGetDisplay(void *id) { (void)id; E_OK(); return DISPLAY; }
 EGLBoolean EGLAPI eglInitialize(EGLDisplay d, EGLint *maj, EGLint *min)
 {
-    if (d != DISPLAY) { g_egl_err = EGL_BAD_DISPLAY; return 0; }
+    if (d != DISPLAY) { EGL_ERR = EGL_BAD_DISPLAY; return 0; }
     g_egl_init = 1;
     if (maj) *maj = 1;
     if (min) *min = 4;
     E_OK();
     return 1;
 }
-EGLBoolean EGLAPI eglTerminate(EGLDisplay d) { if (d != DISPLAY) { g_egl_err = EGL_BAD_DISPLAY; return 0; } E_OK(); return 1; }
+/* §3.2: every surface and context of the display goes; one that is current lives on, with a handle no longer valid, until it is released. Also the dead ones whose thread
+   ended while they were current */
+EGLBoolean EGLAPI eglTerminate(EGLDisplay d)
+{
+    egl_surf *s, *sn;
+    egl_ctx *c, *cn;
+    if (d != DISPLAY) EGL_FAIL(EGL_BAD_DISPLAY, 0);
+    for (s = g_surfs; s; s = sn) { sn = s->next; if (s->thread) s->dead = 1; else surf_free(s); }
+    for (c = g_ctxs; c; c = cn) { cn = c->next; if (c->thread) c->dead = 1; else ctx_free(c); }
+    g_egl_init = 0;
+    E_OK();
+    return 1;
+}
 const char *EGLAPI eglQueryString(EGLDisplay d, EGLint n)
 {
     CHECK_DPY(d, NULL);
@@ -3194,7 +3371,7 @@ const char *EGLAPI eglQueryString(EGLDisplay d, EGLint n)
     case EGL_VERSION: return "1.4 gpu2";
     case EGL_EXTENSIONS: return "";
     case EGL_CLIENT_APIS: return "OpenGL_ES";
-    default: g_egl_err = EGL_BAD_PARAMETER; return NULL;
+    default: EGL_ERR = EGL_BAD_PARAMETER; return NULL;
     }
 }
 
@@ -3227,26 +3404,68 @@ static EGLint cfg_attr(int c, EGLint a)
     default: return -1;
     }
 }
-/* §3.4.1's selection: at least, exact or a mask, per attribute */
-static int cfg_match(int c, const EGLint *a)
+/* §3.4.1: eglChooseConfig's attribute list as one value per attribute, the last of a name given twice; table 3.4's defaults where the list is silent. The attributes run from
+   EGL_BUFFER_SIZE to EGL_CONFORMANT: CA(name) is a name's place, set[] says which the list gave */
+#define CA_FIRST EGL_BUFFER_SIZE
+#define CA_N (EGL_CONFORMANT - EGL_BUFFER_SIZE + 1)
+#define CA(name) ((name) - CA_FIRST)
+typedef struct cfg_want { EGLint v[CA_N]; char set[CA_N]; } cfg_want;
+
+static int choose_attr_ok(EGLint name, EGLint v)
 {
+    switch (name) {
+    case EGL_BIND_TO_TEXTURE_RGB: case EGL_BIND_TO_TEXTURE_RGBA: case EGL_NATIVE_RENDERABLE: return v == EGL_DONT_CARE || v == EGL_TRUE || v == EGL_FALSE;
+    case EGL_COLOR_BUFFER_TYPE: return v == EGL_DONT_CARE || v == EGL_RGB_BUFFER || v == EGL_LUMINANCE_BUFFER;
+    case EGL_TRANSPARENT_TYPE: return v == EGL_DONT_CARE || v == EGL_NONE || v == EGL_TRANSPARENT_RGB;
+    case EGL_CONFIG_CAVEAT: return v == EGL_DONT_CARE || v == EGL_NONE || v == EGL_SLOW_CONFIG || v == EGL_NON_CONFORMANT_CONFIG;
+    default: return 1;
+    }
+}
+
+/* 0, or EGL_BAD_ATTRIBUTE: a name that is no config attribute, or a value it does not take. EGL_MAX_PBUFFER_*, EGL_NATIVE_VISUAL_ID are ignored (§3.4.1) */
+static EGLint choose_parse(const EGLint *a, cfg_want *w)
+{
+    memset(w, 0, sizeof *w);
     for (; a && a[0] != EGL_NONE; a += 2) {
-        EGLint have = cfg_attr(c, a[0]), v = a[1];
-        if (v == EGL_DONT_CARE) continue;
-        switch (a[0]) {
+        if (a[0] < CA_FIRST || a[0] > EGL_CONFORMANT || a[0] == 0x3030 || !choose_attr_ok(a[0], a[1])) return EGL_BAD_ATTRIBUTE;    /* 0x3030: no attribute since EGL 1.3 */
+        w->v[CA(a[0])] = a[1]; w->set[CA(a[0])] = 1;
+    }
+    /* the defaults that select: an exact EGL_RGB_BUFFER, level 0 and no transparency, a window. EGL_RENDERABLE_TYPE's default of EGL_OPENGL_ES_BIT is not applied: no config
+       renders OpenGL ES 1.x, so a list that does not ask for EGL_OPENGL_ES2_BIT would find none */
+    if (!w->set[CA(EGL_COLOR_BUFFER_TYPE)]) w->v[CA(EGL_COLOR_BUFFER_TYPE)] = EGL_RGB_BUFFER;
+    if (!w->set[CA(EGL_TRANSPARENT_TYPE)]) w->v[CA(EGL_TRANSPARENT_TYPE)] = EGL_NONE;
+    if (!w->set[CA(EGL_SURFACE_TYPE)]) w->v[CA(EGL_SURFACE_TYPE)] = EGL_WINDOW_BIT;
+    w->set[CA(EGL_COLOR_BUFFER_TYPE)] = w->set[CA(EGL_TRANSPARENT_TYPE)] = w->set[CA(EGL_SURFACE_TYPE)] = w->set[CA(EGL_LEVEL)] = 1;
+    return 0;
+}
+
+/* §3.4.1's selection: at least, exact or a mask, per attribute; EGL_CONFIG_ID alone when it is given */
+static int cfg_match(int c, const cfg_want *w)
+{
+    int i;
+    if (w->set[CA(EGL_CONFIG_ID)] && w->v[CA(EGL_CONFIG_ID)] != EGL_DONT_CARE) return w->v[CA(EGL_CONFIG_ID)] == c;
+    for (i = 0; i < CA_N; i++) {
+        EGLint name = CA_FIRST + i, v = w->v[i], have;
+        if (!w->set[i] || v == EGL_DONT_CARE) continue;
+        have = cfg_attr(c, name);
+        switch (name) {
         case EGL_BUFFER_SIZE: case EGL_RED_SIZE: case EGL_GREEN_SIZE: case EGL_BLUE_SIZE: case EGL_ALPHA_SIZE: case EGL_DEPTH_SIZE: case EGL_STENCIL_SIZE: case EGL_SAMPLES: case EGL_SAMPLE_BUFFERS: case EGL_LUMINANCE_SIZE: case EGL_ALPHA_MASK_SIZE:
             if (have < v) return 0;
             break;
         case EGL_SURFACE_TYPE: case EGL_RENDERABLE_TYPE: case EGL_CONFORMANT:
             if ((have & v) != v) return 0;
             break;
-        case EGL_CONFIG_ID: case EGL_COLOR_BUFFER_TYPE: case EGL_LEVEL: case EGL_CONFIG_CAVEAT: case EGL_TRANSPARENT_TYPE:
+        case EGL_TRANSPARENT_RED_VALUE: case EGL_TRANSPARENT_GREEN_VALUE: case EGL_TRANSPARENT_BLUE_VALUE:
+            if (w->v[CA(EGL_TRANSPARENT_TYPE)] == EGL_TRANSPARENT_RGB && have != v) return 0;
+            break;
+        case EGL_MATCH_NATIVE_PIXMAP:
+            if (v != EGL_NONE) return 0;                        /* no config renders to a native pixmap */
+            break;
+        case EGL_MAX_PBUFFER_HEIGHT: case EGL_MAX_PBUFFER_PIXELS: case EGL_MAX_PBUFFER_WIDTH: case EGL_NATIVE_VISUAL_ID: case EGL_CONFIG_ID:
+            break;
+        default:                                                /* exact: caveat, colour buffer type, level, transparency, native renderable / visual type, texture binding, swap intervals */
             if (have != v) return 0;
             break;
-        case EGL_BIND_TO_TEXTURE_RGB: case EGL_BIND_TO_TEXTURE_RGBA:
-            if (v == 1) return 0;
-            break;
-        default: break;
         }
     }
     return 1;
@@ -3255,35 +3474,41 @@ EGLBoolean EGLAPI eglGetConfigs(EGLDisplay d, EGLConfig *c, EGLint n, EGLint *ou
 {
     int i;
     CHECK_DPY(d, 0);
-    if (!out) { g_egl_err = EGL_BAD_PARAMETER; return 0; }
+    if (!out) EGL_FAIL(EGL_BAD_PARAMETER, 0);
+    if (n < 0) n = 0;
     if (c) for (i = 0; i < n && i < NCFG; i++) c[i] = (EGLConfig)(intptr_t)(i + 1);
     *out = c ? (n < NCFG ? n : NCFG) : NCFG;
     E_OK();
     return 1;
 }
-/* §3.4.1.2's order: more of the colour bits asked for first, then the smaller buffer, depth, stencil and config id */
-static int cfg_before(int a, int b, const EGLint *attr)
+/* §3.4.1.2's order: more of the colour bits asked for first, then the smaller buffer, sample buffers, samples, depth, stencil, alpha mask and config id (caveat and colour buffer
+   type are the same for all) */
+static int cfg_before(int a, int b, const cfg_want *w)
 {
     static const EGLint COL[4] = { EGL_RED_SIZE, EGL_GREEN_SIZE, EGL_BLUE_SIZE, EGL_ALPHA_SIZE };
+    static const EGLint SMALLER[6] = { EGL_BUFFER_SIZE, EGL_SAMPLE_BUFFERS, EGL_SAMPLES, EGL_DEPTH_SIZE, EGL_STENCIL_SIZE, EGL_ALPHA_MASK_SIZE };
     EGLint ca = 0, cb = 0;
-    const EGLint *p;
     int i;
-    for (p = attr; p && p[0] != EGL_NONE; p += 2) for (i = 0; i < 4; i++) if (p[0] == COL[i] && p[1] != 0 && p[1] != EGL_DONT_CARE) { ca += cfg_attr(a, COL[i]); cb += cfg_attr(b, COL[i]); }
+    for (i = 0; i < 4; i++) {
+        EGLint v = w->v[CA(COL[i])];
+        if (w->set[CA(COL[i])] && v != 0 && v != EGL_DONT_CARE) { ca += cfg_attr(a, COL[i]); cb += cfg_attr(b, COL[i]); }
+    }
     if (ca != cb) return ca > cb;
-    if (CFG[a - 1].color != CFG[b - 1].color) return CFG[a - 1].color < CFG[b - 1].color;
-    if (CFG[a - 1].depth != CFG[b - 1].depth) return CFG[a - 1].depth < CFG[b - 1].depth;
-    if (CFG[a - 1].stencil != CFG[b - 1].stencil) return CFG[a - 1].stencil < CFG[b - 1].stencil;
+    for (i = 0; i < 6; i++) if (cfg_attr(a, SMALLER[i]) != cfg_attr(b, SMALLER[i])) return cfg_attr(a, SMALLER[i]) < cfg_attr(b, SMALLER[i]);
     return a < b;
 }
 
 EGLBoolean EGLAPI eglChooseConfig(EGLDisplay d, const EGLint *attr, EGLConfig *c, EGLint n, EGLint *out)
 {
     int k = 0, i, j, m[NCFG];
+    cfg_want w;
     CHECK_DPY(d, 0);
-    if (!out) { g_egl_err = EGL_BAD_PARAMETER; return 0; }
+    if (!out) EGL_FAIL(EGL_BAD_PARAMETER, 0);
+    if (choose_parse(attr, &w)) EGL_FAIL(EGL_BAD_ATTRIBUTE, 0);
+    if (n < 0) n = 0;
     for (i = 1; i <= NCFG; i++) {
-        if (!cfg_match(i, attr)) continue;
-        for (j = k; j > 0 && cfg_before(i, m[j - 1], attr); j--) m[j] = m[j - 1];
+        if (!cfg_match(i, &w)) continue;
+        for (j = k; j > 0 && cfg_before(i, m[j - 1], &w); j--) m[j] = m[j - 1];
         m[j] = i;
         k++;
     }
@@ -3296,160 +3521,303 @@ EGLBoolean EGLAPI eglGetConfigAttrib(EGLDisplay d, EGLConfig c, EGLint a, EGLint
 {
     int i = (int)(intptr_t)c;
     CHECK_DPY(d, 0);
-    if (!cfg_ok(c)) { g_egl_err = EGL_BAD_CONFIG; return 0; }
+    if (!cfg_ok(c)) { EGL_ERR = EGL_BAD_CONFIG; return 0; }
     *v = cfg_attr(i, a);
-    if (*v == -1) { g_egl_err = EGL_BAD_ATTRIBUTE; return 0; }
+    if (*v == -1) { EGL_ERR = EGL_BAD_ATTRIBUTE; return 0; }
     E_OK();
     return 1;
 }
+/* a new surface with §3.5's defaults, in the list; NULL: no memory (EGL_BAD_ALLOC set) */
+static egl_surf *surf_new(const egl_surf *t)
+{
+    egl_surf *s = (egl_surf *)malloc(sizeof *s);
+    if (!s) { EGL_ERR = EGL_BAD_ALLOC; return NULL; }
+    *s = *t;
+    s->next = g_surfs; g_surfs = s;
+    return s;
+}
+static void surf_defaults(egl_surf *t, EGLConfig c, int pbuffer)
+{
+    memset(t, 0, sizeof *t);
+    t->cfg = (int)(intptr_t)c; t->pbuffer = pbuffer;
+    t->tex_format = t->tex_target = EGL_NO_TEXTURE;
+    t->swap_behavior = EGL_BUFFER_DESTROYED; t->ms_resolve = EGL_MULTISAMPLE_RESOLVE_DEFAULT;
+    t->colorspace = EGL_COLORSPACE_sRGB; t->alpha_format = EGL_ALPHA_FORMAT_NONPRE;
+    t->sf.swap_interval = 1;                    /* §3.9.3 */
+}
+/* the OpenVG attributes any surface takes: 0, or the error */
+static EGLint surf_vg_attr(egl_surf *t, EGLint name, EGLint v)
+{
+    if (name == EGL_COLORSPACE) { if (v != EGL_COLORSPACE_sRGB && v != EGL_COLORSPACE_LINEAR) return EGL_BAD_ATTRIBUTE; t->colorspace = v; return 0; }
+    if (v != EGL_ALPHA_FORMAT_NONPRE && v != EGL_ALPHA_FORMAT_PRE) return EGL_BAD_ATTRIBUTE;
+    t->alpha_format = v;
+    return 0;
+}
+
 EGLSurface EGLAPI eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType w, const EGLint *a)
 {
-    egl_surf *s;
-    (void)a;
+    egl_surf t, *s;
+    EGLint e;
     CHECK_DPY(d, NULL);
-    if (!cfg_ok(c)) { g_egl_err = EGL_BAD_CONFIG; return NULL; }
-    s = (egl_surf *)calloc(1, sizeof *s);
-    if (!s) return NULL;
-    s->hwnd = w; s->cfg = (int)(intptr_t)c;
-    win_size(w, &s->w, &s->h);
+    if (!cfg_ok(c)) EGL_FAIL(EGL_BAD_CONFIG, NULL);
+    surf_defaults(&t, c, 0);
+    for (; a && a[0] != EGL_NONE; a += 2) {
+        switch (a[0]) {
+        case EGL_RENDER_BUFFER: if (a[1] != EGL_BACK_BUFFER && a[1] != EGL_SINGLE_BUFFER) EGL_FAIL(EGL_BAD_ATTRIBUTE, NULL); break;    /* a request: rendering goes to the back buffer */
+        case EGL_COLORSPACE: case EGL_ALPHA_FORMAT: if ((e = surf_vg_attr(&t, a[0], a[1]))) EGL_FAIL(e, NULL); break;
+        default: EGL_FAIL(EGL_BAD_ATTRIBUTE, NULL);
+        }
+    }
+    if (t.colorspace == EGL_COLORSPACE_LINEAR || t.alpha_format == EGL_ALPHA_FORMAT_PRE) EGL_FAIL(EGL_BAD_MATCH, NULL);
+    if (!w || !IsWindow(w)) EGL_FAIL(EGL_BAD_NATIVE_WINDOW, NULL);
+    for (s = g_surfs; s; s = s->next) if (!s->dead && s->hwnd == w) EGL_FAIL(EGL_BAD_ALLOC, NULL);     /* §3.5.1: one surface a window */
+    t.hwnd = t.sf.hwnd = w;
+    win_size(w, &t.w, &t.h);
+    if (!(s = surf_new(&t))) return NULL;
     E_OK();
     return s;
 }
 EGLSurface EGLAPI eglCreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint *a)
 {
-    egl_surf *s;
+    egl_surf t, *s;
+    EGLint e;
     CHECK_DPY(d, NULL);
-    if (!cfg_ok(c)) { g_egl_err = EGL_BAD_CONFIG; return NULL; }
-    s = (egl_surf *)calloc(1, sizeof *s);
-    if (!s) return NULL;
-    s->cfg = (int)(intptr_t)c; s->w = s->h = 1;
-    for (; a && a[0] != EGL_NONE; a += 2) { if (a[0] == EGL_WIDTH) s->w = a[1]; if (a[0] == EGL_HEIGHT) s->h = a[1]; }
+    if (!cfg_ok(c)) EGL_FAIL(EGL_BAD_CONFIG, NULL);
+    surf_defaults(&t, c, 1);
+    for (; a && a[0] != EGL_NONE; a += 2) {
+        switch (a[0]) {
+        case EGL_WIDTH: t.w = a[1]; break;
+        case EGL_HEIGHT: t.h = a[1]; break;
+        case EGL_LARGEST_PBUFFER: t.largest = a[1] != EGL_FALSE; break;
+        case EGL_TEXTURE_FORMAT: if (a[1] != EGL_NO_TEXTURE && a[1] != EGL_TEXTURE_RGB && a[1] != EGL_TEXTURE_RGBA) EGL_FAIL(EGL_BAD_ATTRIBUTE, NULL); t.tex_format = a[1]; break;
+        case EGL_TEXTURE_TARGET: if (a[1] != EGL_NO_TEXTURE && a[1] != EGL_TEXTURE_2D) EGL_FAIL(EGL_BAD_ATTRIBUTE, NULL); t.tex_target = a[1]; break;
+        case EGL_MIPMAP_TEXTURE: t.mipmap_tex = a[1] != EGL_FALSE; break;
+        case EGL_COLORSPACE: case EGL_ALPHA_FORMAT: if ((e = surf_vg_attr(&t, a[0], a[1]))) EGL_FAIL(e, NULL); break;
+        default: EGL_FAIL(EGL_BAD_ATTRIBUTE, NULL);
+        }
+    }
+    if (t.w < 0 || t.h < 0) EGL_FAIL(EGL_BAD_PARAMETER, NULL);
+    if ((t.tex_format == EGL_NO_TEXTURE) != (t.tex_target == EGL_NO_TEXTURE)) EGL_FAIL(EGL_BAD_MATCH, NULL);
+    if (t.tex_format != EGL_NO_TEXTURE) EGL_FAIL(EGL_BAD_ATTRIBUTE, NULL);            /* no config binds to a texture: EGL_BIND_TO_TEXTURE_RGB / RGBA are false */
+    if (t.colorspace == EGL_COLORSPACE_LINEAR || t.alpha_format == EGL_ALPHA_FORMAT_PRE) EGL_FAIL(EGL_BAD_MATCH, NULL);
+    if (!(s = surf_new(&t))) return NULL;
     E_OK();
     return s;
 }
 EGLBoolean EGLAPI eglDestroySurface(EGLDisplay d, EGLSurface s)
 {
+    egl_surf *x;
     CHECK_DPY(d, 0);
-    if (!s) { g_egl_err = EGL_BAD_SURFACE; return 0; }
-    if (s == g_cur_surf) g_cur_surf = NULL;
-    free(s);
+    if (!(x = surf_of(s))) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    if (x->thread) x->dead = 1; else surf_free(x);
     E_OK();
     return 1;
 }
+/* §3.5.6. A pbuffer's own attributes leave value as it is on a window */
 EGLBoolean EGLAPI eglQuerySurface(EGLDisplay d, EGLSurface s, EGLint a, EGLint *v)
 {
-    egl_surf *x = (egl_surf *)s;
+    egl_surf *x;
     CHECK_DPY(d, 0);
-    if (!x) { g_egl_err = EGL_BAD_SURFACE; return 0; }
+    if (!(x = surf_of(s))) EGL_FAIL(EGL_BAD_SURFACE, 0);
     if (x->hwnd) win_size(x->hwnd, &x->w, &x->h);
     switch (a) {
     case EGL_WIDTH: *v = x->w; break;
     case EGL_HEIGHT: *v = x->h; break;
     case EGL_CONFIG_ID: *v = x->cfg; break;
+    case EGL_HORIZONTAL_RESOLUTION: case EGL_VERTICAL_RESOLUTION: case EGL_PIXEL_ASPECT_RATIO: *v = EGL_UNKNOWN; break;
     case EGL_RENDER_BUFFER: *v = EGL_BACK_BUFFER; break;
-    case EGL_SWAP_BEHAVIOR: *v = EGL_BUFFER_DESTROYED; break;
-    default: *v = 0; break;
+    case EGL_SWAP_BEHAVIOR: *v = x->swap_behavior; break;
+    case EGL_MULTISAMPLE_RESOLVE: *v = x->ms_resolve; break;
+    case EGL_COLORSPACE: *v = x->colorspace; break;
+    case EGL_ALPHA_FORMAT: *v = x->alpha_format; break;
+    case EGL_LARGEST_PBUFFER: if (x->pbuffer) *v = x->largest; break;
+    case EGL_TEXTURE_FORMAT: if (x->pbuffer) *v = x->tex_format; break;
+    case EGL_TEXTURE_TARGET: if (x->pbuffer) *v = x->tex_target; break;
+    case EGL_MIPMAP_TEXTURE: if (x->pbuffer) *v = x->mipmap_tex; break;
+    case EGL_MIPMAP_LEVEL: if (x->pbuffer) *v = x->mipmap_level; break;
+    default: EGL_FAIL(EGL_BAD_ATTRIBUTE, 0);
     }
     E_OK();
     return 1;
 }
-EGLBoolean EGLAPI eglBindAPI(EGLenum a) { if (a != EGL_OPENGL_ES_API) { g_egl_err = EGL_BAD_PARAMETER; return 0; } E_OK(); return 1; }
-EGLenum EGLAPI eglQueryAPI(void) { return EGL_OPENGL_ES_API; }
+EGLBoolean EGLAPI eglBindAPI(EGLenum a) { if (a != EGL_OPENGL_ES_API) { EGL_ERR = EGL_BAD_PARAMETER; return 0; } E_OK(); return 1; }
+EGLenum EGLAPI eglQueryAPI(void) { E_OK(); return EGL_OPENGL_ES_API; }
 EGLContext EGLAPI eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext sh, const EGLint *a)
 {
     size_t n = (size_t)(&S.ctx_end - &S.ctx_begin);
     int ver = 1;
     egl_ctx *x;
     char *keep;
-    (void)sh;                                                   /* objects are shared by all contexts here */
     CHECK_DPY(d, NULL);
-    if (!cfg_ok(c)) { g_egl_err = EGL_BAD_CONFIG; return NULL; }
+    if (!cfg_ok(c)) EGL_FAIL(EGL_BAD_CONFIG, NULL);
+    if (sh && !ctx_of(sh)) EGL_FAIL(EGL_BAD_CONTEXT, NULL);    /* objects are shared by all contexts here */
     for (; a && a[0] != EGL_NONE; a += 2) {
         if (a[0] == EGL_CONTEXT_CLIENT_VERSION) ver = a[1];
-        else { g_egl_err = EGL_BAD_ATTRIBUTE; return NULL; }
+        else EGL_FAIL(EGL_BAD_ATTRIBUTE, NULL);
     }
-    if (ver != 2) { g_egl_err = EGL_BAD_MATCH; return NULL; }   /* OpenGL ES 2.0 only */
+    if (ver == 1) EGL_FAIL(EGL_BAD_CONFIG, NULL);               /* §3.7.1: no config has EGL_OPENGL_ES_BIT */
+    if (ver != 2) EGL_FAIL(EGL_BAD_MATCH, NULL);                /* OpenGL ES 2.0 only */
     x = (egl_ctx *)calloc(1, sizeof *x);
     keep = (char *)malloc(n);
     if (x) x->saved = (char *)malloc(n);
-    if (!x || !keep || !x->saved) { free(keep); if (x) free(x->saved); free(x); return NULL; }
+    if (!x || !keep || !x->saved) { free(keep); if (x) free(x->saved); free(x); EGL_FAIL(EGL_BAD_ALLOC, NULL); }
     x->cfg = (int)(intptr_t)c;
     memcpy(keep, &S.ctx_begin, n);                              /* the context's initial state, built in place */
     init_state();
     memcpy(x->saved, &S.ctx_begin, n);
     memcpy(&S.ctx_begin, keep, n);
     free(keep);
+    x->next = g_ctxs; g_ctxs = x;
     E_OK();
     return x;
 }
 EGLBoolean EGLAPI eglDestroyContext(EGLDisplay d, EGLContext c)
 {
-    egl_ctx *x = (egl_ctx *)c;
+    egl_ctx *x;
     CHECK_DPY(d, 0);
-    if (!x) { g_egl_err = EGL_BAD_CONTEXT; return 0; }
-    if (x == g_cur_ctx) g_cur_ctx = NULL;
-    free(x->saved);
-    free(x);
+    if (!(x = ctx_of(c))) EGL_FAIL(EGL_BAD_CONTEXT, 0);
+    if (x->thread) x->dead = 1; else ctx_free(x);
     E_OK();
     return 1;
 }
+/* §3.7.3. A context or surface current in another thread is EGL_BAD_ACCESS. Releasing (no surfaces, no context) works on a display already terminated too. A dead surface or context
+   that stops being current goes */
 EGLBoolean EGLAPI eglMakeCurrent(EGLDisplay d, EGLSurface ds, EGLSurface rs, EGLContext c)
 {
-    size_t n = (size_t)(&S.ctx_end - &S.ctx_begin);
-    egl_surf *x = (egl_surf *)ds;
-    egl_ctx *cx = (egl_ctx *)c;
-    CHECK_DPY(d, 0);
-    if (ds != rs) { g_egl_err = EGL_BAD_MATCH; return 0; }      /* one framebuffer for drawing and reading */
-    if (cx != g_cur_ctx) {
-        if (S.r) g2r_end_pass(S.r);
-        if (g_cur_ctx) memcpy(g_cur_ctx->saved, &S.ctx_begin, n);
-        if (cx) memcpy(&S.ctx_begin, cx->saved, n);
-        g_cur_ctx = cx;
-    }
-    g_cur_surf = x;
-    if (!x || !cx) { S.live = 0; E_OK(); return 1; }
-    if (dev_up() < 0) { g_egl_err = EGL_NOT_INITIALIZED; return 0; }
+    egl_thread *t = thr();
+    DWORD me = GetCurrentThreadId();
+    egl_surf *x = NULL, *rx = NULL, *old_s = t->surf;
+    egl_ctx *cx = NULL, *old_c = t->ctx;
+    if (d != DISPLAY) EGL_FAIL(EGL_BAD_DISPLAY, 0);
+    if (!g_egl_init && (ds || rs || c)) EGL_FAIL(EGL_NOT_INITIALIZED, 0);
+    if (c && !(cx = ctx_of(c))) EGL_FAIL(EGL_BAD_CONTEXT, 0);
+    if ((ds && !(x = surf_of(ds))) || (rs && !(rx = surf_of(rs)))) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    if (!c && (ds || rs)) EGL_FAIL(EGL_BAD_MATCH, 0);
+    if (c && (!ds || !rs)) EGL_FAIL(EGL_BAD_MATCH, 0);          /* no surfaceless contexts */
+    if (x != rx) EGL_FAIL(EGL_BAD_MATCH, 0);                    /* one framebuffer for drawing and reading */
+    if ((cx && cx->thread && cx->thread != me) || (x && x->thread && x->thread != me)) EGL_FAIL(EGL_BAD_ACCESS, 0);
+    if (x && dev_up() < 0) EGL_FAIL(EGL_NOT_INITIALIZED, 0);
+    if (old_c) old_c->thread = 0;
+    if (old_s) old_s->thread = 0;
+    t->ctx = cx; t->surf = x;
+    if (cx) cx->thread = me;
+    if (x) x->thread = me;
+    thread_bind();
+    if (old_s && old_s != x && old_s->dead && !old_s->thread) surf_free(old_s);
+    if (old_c && old_c != cx && old_c->dead && !old_c->thread) ctx_free(old_c);
+    if (!x) { E_OK(); return 1; }
     if (x->hwnd) win_size(x->hwnd, &x->w, &x->h);
-    default_fb(x->w, x->h, x->cfg, x->hwnd != NULL);
-    if (!S.vp_set) { S.vp[2] = S.vw; S.vp[3] = S.vh; S.sc[2] = S.vw; S.sc[3] = S.vh; S.vp_set = 1; }     /* §2.12: the first time, the surface's size */
-    S.live = 1;
-    S.hwnd = x->hwnd;
+    default_fb(x->w > 0 ? x->w : 1, x->h > 0 ? x->h : 1, x->cfg, x->hwnd != NULL);
+    if (!S.vp_set) { S.vp[2] = SF->vw; S.vp[3] = SF->vh; S.sc[2] = SF->vw; S.sc[3] = SF->vh; S.vp_set = 1; }     /* §2.12: the first time, the surface's size */
     E_OK();
     return 1;
 }
-EGLContext EGLAPI eglGetCurrentContext(void) { return g_cur_ctx; }
-EGLSurface EGLAPI eglGetCurrentSurface(EGLint r) { (void)r; return g_cur_surf; }
-EGLDisplay EGLAPI eglGetCurrentDisplay(void) { return g_cur_ctx ? DISPLAY : NULL; }
+EGLContext EGLAPI eglGetCurrentContext(void) { E_OK(); return thr()->ctx; }
+EGLSurface EGLAPI eglGetCurrentSurface(EGLint r)
+{
+    if (r != EGL_DRAW && r != EGL_READ) EGL_FAIL(EGL_BAD_PARAMETER, NULL);
+    E_OK();
+    return thr()->surf;
+}
+EGLDisplay EGLAPI eglGetCurrentDisplay(void) { E_OK(); return thr()->ctx ? DISPLAY : NULL; }
 EGLBoolean EGLAPI eglSwapBuffers(EGLDisplay d, EGLSurface s)
 {
+    egl_surf *x;
     CHECK_DPY(d, 0);
-    if (s != g_cur_surf || !s) { g_egl_err = EGL_BAD_SURFACE; return 0; }
-    if (S.live && ((egl_surf *)s)->hwnd) swap_buffers();        /* EGL 1.4 §3.9.3: on a pbuffer it has no effect, its colour buffer stays as it is */
+    if (!(x = surf_of(s)) || x != thr()->surf) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    thread_bind();
+    if (S.live && x->hwnd) swap_buffers();                      /* EGL 1.4 §3.9.3: on a pbuffer it has no effect, its colour buffer stays as it is */
     E_OK();
     return 1;
 }
-EGLBoolean EGLAPI eglSwapInterval(EGLDisplay d, EGLint i) { CHECK_DPY(d, 0); S.swap_interval = i > 0; E_OK(); return 1; }
-EGLBoolean EGLAPI eglCopyBuffers(EGLDisplay d, EGLSurface s, void *t) { (void)d; (void)s; (void)t; g_egl_err = EGL_BAD_MATCH; return 0; }
-EGLBoolean EGLAPI eglWaitGL(void) { if (S.live) g2r_finish(S.r); return 1; }
-EGLBoolean EGLAPI eglWaitNative(EGLint e) { (void)e; return 1; }
+/* for the window surface of the current context, clamped to the configs' 0 .. 1 */
+EGLBoolean EGLAPI eglSwapInterval(EGLDisplay d, EGLint i)
+{
+    egl_thread *t = thr();
+    CHECK_DPY(d, 0);
+    if (!t->ctx) EGL_FAIL(EGL_BAD_CONTEXT, 0);
+    if (!t->surf) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    t->surf->sf.swap_interval = i > 0;
+    E_OK();
+    return 1;
+}
+/* §3.9.2: no native pixmaps here */
+EGLBoolean EGLAPI eglCopyBuffers(EGLDisplay d, EGLSurface s, void *t)
+{
+    (void)t;
+    CHECK_DPY(d, 0);
+    if (!surf_of(s)) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    EGL_FAIL(EGL_BAD_NATIVE_PIXMAP, 0);
+}
+EGLBoolean EGLAPI eglWaitGL(void) { thread_bind(); if (S.live) g2r_finish(S.r); E_OK(); return 1; }
+EGLBoolean EGLAPI eglWaitNative(EGLint e) { (void)e; E_OK(); return 1; }       /* no surface takes native rendering, so no engine is wrong */
 EGLBoolean EGLAPI eglWaitClient(void) { return eglWaitGL(); }
-EGLBoolean EGLAPI eglReleaseThread(void) { E_OK(); return 1; }
-EGLBoolean EGLAPI eglSurfaceAttrib(EGLDisplay d, EGLSurface s, EGLint a, EGLint v) { (void)d; (void)s; (void)a; (void)v; E_OK(); return 1; }
-EGLBoolean EGLAPI eglBindTexImage(EGLDisplay d, EGLSurface s, EGLint b) { (void)d; (void)s; (void)b; g_egl_err = EGL_BAD_MATCH; return 0; }   /* no config has BIND_TO_TEXTURE */
-EGLBoolean EGLAPI eglReleaseTexImage(EGLDisplay d, EGLSurface s, EGLint b) { (void)d; (void)s; (void)b; g_egl_err = EGL_BAD_MATCH; return 0; }
-EGLSurface EGLAPI eglCreatePixmapSurface(EGLDisplay d, EGLConfig c, void *p, const EGLint *a) { (void)d; (void)c; (void)p; (void)a; g_egl_err = EGL_BAD_MATCH; return NULL; }
-EGLSurface EGLAPI eglCreatePbufferFromClientBuffer(EGLDisplay d, EGLenum t, void *b, EGLConfig c, const EGLint *a) { (void)d; (void)t; (void)b; (void)c; (void)a; g_egl_err = EGL_BAD_PARAMETER; return NULL; }
+/* §3.11: the thread back to its state at start: no current context */
+EGLBoolean EGLAPI eglReleaseThread(void)
+{
+    if (thr()->ctx || thr()->surf) eglMakeCurrent(DISPLAY, NULL, NULL, NULL);
+    E_OK();
+    return 1;
+}
+/* §3.5.6: EGL_MIPMAP_LEVEL (no effect on a window), EGL_MULTISAMPLE_RESOLVE and EGL_SWAP_BEHAVIOR; the box filter and preserved buffers need config bits none has */
+EGLBoolean EGLAPI eglSurfaceAttrib(EGLDisplay d, EGLSurface s, EGLint a, EGLint v)
+{
+    egl_surf *x;
+    CHECK_DPY(d, 0);
+    if (!(x = surf_of(s))) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    switch (a) {
+    case EGL_MIPMAP_LEVEL: if (x->pbuffer) x->mipmap_level = v; break;
+    case EGL_MULTISAMPLE_RESOLVE:
+        if (v == EGL_MULTISAMPLE_RESOLVE_BOX) EGL_FAIL(EGL_BAD_MATCH, 0);
+        if (v != EGL_MULTISAMPLE_RESOLVE_DEFAULT) EGL_FAIL(EGL_BAD_PARAMETER, 0);
+        x->ms_resolve = v;
+        break;
+    case EGL_SWAP_BEHAVIOR:
+        if (v == EGL_BUFFER_PRESERVED) EGL_FAIL(EGL_BAD_MATCH, 0);
+        if (v != EGL_BUFFER_DESTROYED) EGL_FAIL(EGL_BAD_PARAMETER, 0);
+        x->swap_behavior = v;
+        break;
+    default: EGL_FAIL(EGL_BAD_ATTRIBUTE, 0);
+    }
+    E_OK();
+    return 1;
+}
+/* §3.6: no surface has a texture format, as no config binds to a texture */
+static EGLBoolean tex_image_call(EGLDisplay d, EGLSurface s, EGLint b)
+{
+    egl_surf *x;
+    CHECK_DPY(d, 0);
+    if (!(x = surf_of(s))) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    if (b != EGL_BACK_BUFFER) EGL_FAIL(EGL_BAD_PARAMETER, 0);
+    if (!x->pbuffer) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    EGL_FAIL(EGL_BAD_MATCH, 0);
+}
+EGLBoolean EGLAPI eglBindTexImage(EGLDisplay d, EGLSurface s, EGLint b) { return tex_image_call(d, s, b); }
+EGLBoolean EGLAPI eglReleaseTexImage(EGLDisplay d, EGLSurface s, EGLint b) { return tex_image_call(d, s, b); }
+EGLSurface EGLAPI eglCreatePixmapSurface(EGLDisplay d, EGLConfig c, void *p, const EGLint *a)
+{
+    (void)p; (void)a;
+    CHECK_DPY(d, NULL);
+    if (!cfg_ok(c)) EGL_FAIL(EGL_BAD_CONFIG, NULL);
+    EGL_FAIL(EGL_BAD_MATCH, NULL);                              /* no config has EGL_PIXMAP_BIT */
+}
+EGLSurface EGLAPI eglCreatePbufferFromClientBuffer(EGLDisplay d, EGLenum t, void *b, EGLConfig c, const EGLint *a)
+{
+    (void)t; (void)b; (void)c; (void)a;
+    CHECK_DPY(d, NULL);
+    EGL_FAIL(EGL_BAD_PARAMETER, NULL);                          /* EGL_OPENVG_IMAGE is the one client buffer, and there is no OpenVG */
+}
 EGLBoolean EGLAPI eglQueryContext(EGLDisplay d, EGLContext c, EGLint a, EGLint *v)
 {
-    egl_ctx *x = (egl_ctx *)c;
+    egl_ctx *x;
     CHECK_DPY(d, 0);
-    if (!x) { g_egl_err = EGL_BAD_CONTEXT; return 0; }
+    if (!(x = ctx_of(c))) EGL_FAIL(EGL_BAD_CONTEXT, 0);
     switch (a) {
     case EGL_CONFIG_ID: *v = x->cfg; break;
     case EGL_CONTEXT_CLIENT_TYPE: *v = EGL_OPENGL_ES_API; break;
     case EGL_CONTEXT_CLIENT_VERSION: *v = 2; break;
-    case EGL_RENDER_BUFFER: *v = EGL_BACK_BUFFER; break;
-    default: g_egl_err = EGL_BAD_ATTRIBUTE; return 0;
+    case EGL_RENDER_BUFFER: *v = x->thread ? EGL_BACK_BUFFER : EGL_NONE; break;     /* §3.7.4: EGL_NONE while bound to no surface (a current context always has one) */
+    default: EGL_FAIL(EGL_BAD_ATTRIBUTE, 0);
     }
     E_OK();
     return 1;
@@ -3458,15 +3826,29 @@ EGLBoolean EGLAPI eglQueryContext(EGLDisplay d, EGLContext c, EGLint a, EGLint *
 static HMODULE g_module;
 void *EGLAPI eglGetProcAddress(const char *name) { return (void *)GetProcAddress(g_module, name); }
 
+/* A thread that ends lets go of its context and surface, as a release would. Without g_lock: the loader lock is held here, and a thread inside a call may be waiting for
+   it (a DLL its socket code loads). No other thread changes or frees what is current in this one; once its thread is 0 this thread touches it no more. A dead one goes at
+   eglTerminate; no board work here */
 BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID r)
 {
     (void)r;
     if (why == DLL_PROCESS_ATTACH) {
         g_module = h;
-        DisableThreadLibraryCalls(h);
+        InitializeCriticalSection(&g_lock);
+        g_tls = TlsAlloc();
+        S.sfp = &g_nosfc;
         init_state();
-        S.swap_interval = 1;
         SetProcessDPIAware();                                   /* before the game's first window (gl_dev.c says why) */
+    } else if (why == DLL_THREAD_DETACH && g_tls != TLS_OUT_OF_INDEXES) {
+        egl_thread *t = (egl_thread *)TlsGetValue(g_tls);
+        if (t && t != &g_thr_spare) {
+            if (t->surf) *(volatile DWORD *)&t->surf->thread = 0;
+            if (t->ctx) *(volatile DWORD *)&t->ctx->thread = 0;
+            TlsSetValue(g_tls, NULL);
+            free(t);
+        }
     }
     return TRUE;
 }
+
+#include "gles_entry_gen.h"

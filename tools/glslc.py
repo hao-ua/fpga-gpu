@@ -1261,6 +1261,7 @@ class Codegen:
         self.consts={}           # tuple(4 floats) -> uniform slot
         self.const_order=[]      # slots in order
         self.creg={}             # tuple(4 floats) -> pinned Reg (loaded once, reused)
+        self.cvreg={}            # (type, 4 floats) -> pinned Reg of a constant vector (kvec)
         self.remat_consts=False  # True -> rematerialize constants (fresh LDP per use) to cut register pressure
         self.uniforms={}         # name -> (slot, type)  (user uniforms)
         self.samplers={}         # name -> texture unit (sampler2D/samplerCube/sampler3D)
@@ -1339,6 +1340,29 @@ class Codegen:
         v=[1.0 if i==c else 0.0 for i in range(4)]; return self.kload(*v)
     def kf(self, f):        # scalar constant broadcast (type float: broadcast to all lanes; packed on isa64)
         r=self.kload(f,f,f,f); r.ty='float'; r.const=float(f); self.svregs.add(r.n); return r
+    def kvec(self, ty, vals):
+        """a float vector of known components: one constant row, the lanes past ty's the last component (a splat is a splat), loaded
+        once (remat_consts: at every use) into a register of its own, not kf's (a scalar's register is one lane of a packed one)"""
+        v=tuple(float(x) for x in vals)+(float(vals[-1]),)*(4-len(vals))
+        key=(ty,)+v
+        if not self.remat_consts and key in self.cvreg: return self.cvreg[key]
+        r=self.alloc(ty)
+        self.emit('LDP', f'r{r.n}', self.ckey_index(*v))
+        r.cvec=tuple(float(x) for x in vals)
+        if not self.remat_consts: r.tmp=False; self.cvreg[key]=r
+        return r
+    def _known(self, a):
+        """a value's components known at compile time (a matrix column by column), as _cvec takes them, else None"""
+        if isinstance(a,MatVal):
+            out=[]
+            for c in a.cols:
+                k=self._known(c)
+                if k is None: return None
+                out+=k
+            return out
+        if not isinstance(a,Reg): return None
+        if is_scalar(a.ty): return None if a.const is None else [a.const]
+        return None if a.cvec is None else list(a.cvec[:ncomp(a.ty)])
     def zeroreg(self):
         if self.zero is None:
             self.zero=self.kf(0.0); self.zero.tmp=False
@@ -1433,6 +1457,9 @@ class Codegen:
         n=ncomp2(ty)
         if len(args)==1 and isinstance(args[0],MatVal):   # from a matrix: its components where they exist, the identity elsewhere
             m=args[0]; k=ncomp2(m.ty); cols=[]
+            kn=self._known(m)
+            if kn is not None:                            # known: a constant row a column
+                return MatVal([self.kvec(f'vec{n}', [kn[j*k+i] if j<k and i<k else (1.0 if i==j else 0.0) for i in range(n)]) for j in range(n)], ty)
             for j in range(n):
                 col=self.alloc(f'vec{n}')
                 for i in range(n):
@@ -1441,13 +1468,22 @@ class Codegen:
                 cols.append(col)
             return MatVal(cols, ty)
         if len(args)==1 and is_scalar(args[0].ty):        # matN(f) = f on the diagonal, 0 elsewhere
-            f=args[0]; z=self.zeroreg(); cols=[]
+            f=args[0]
+            if f.const is not None: return MatVal([self.kvec(f'vec{n}', [f.const if i==j else 0.0 for i in range(n)]) for j in range(n)], ty)
+            z=self.zeroreg(); cols=[]
             for j in range(n):
                 col=self.alloc(f'vec{n}'); self.emit('MOV', f'r{col.n}', f'r{z.n}')
                 self.emit(f'MOV.{"xyzw"[j]}', f'r{col.n}', f'r{f.n}'); cols.append(col)
             return MatVal(cols, ty)
         if len(args)==n and all(isinstance(a,Reg) and is_vec(a.ty) and ncomp(a.ty)==n for a in args):   # n column vectors
             return MatVal(list(args), ty)
+        kn=[]
+        for a in args:
+            k=self._known(a)
+            if k is None: kn=None; break
+            kn+=k
+        if kn is not None and len(kn)>=n*n:               # every component known: a constant row a column
+            return MatVal([self.kvec(f'vec{n}', kn[j*n:(j+1)*n]) for j in range(n)], ty)
         srcs=[]                                           # anything else: the components in order, column-major
         for a in args:
             if isinstance(a,MatVal):
@@ -1477,6 +1513,8 @@ class Codegen:
         flat=[]
         for a in args: flat+=a.cols if isinstance(a,MatVal) else [a]     # a matrix goes in column by column
         orig=flat; args=[self._asf(a) for a in flat]                     # int components -> float
+        cv=self._cvec(ty, args)
+        if cv is not None: return self.kvec(ty, cv)                       # every component known: one constant row
         n=ncomp(ty); r=self.alloc(ty); lane=0
         # single scalar -> broadcast to all N
         if len(args)==1 and is_scalar(args[0].ty):
@@ -1855,6 +1893,8 @@ class Compiler(Codegen):
                 for c in a.cols: r=self.alloc(c.ty); self.emit('MOV', f'r{r.n}', f'-r{c.n}'); cols.append(r)
                 return MatVal(cols, a.ty)
             if op=='-':                                    # negate = MOV sign-flip (is_simp, lat 1) — much
+                if isinstance(a,Reg) and a.ty=='float' and a.const is not None and a.const!=0.0: return self.kf(-a.const)   # known: a constant (not 0: -0.0 is a value of its own)
+                if isinstance(a,Reg) and a.ty in ('vec2','vec3','vec4') and a.cvec is not None and all(x!=0.0 for x in a.cvec): return self.kvec(a.ty, [-x for x in a.cvec])
                 if isinstance(a,Reg) and a.ty=='int':      # int negate: 0 - a (sign-flip is a float trick)
                     r=self.alloc('int'); self.emit('ISUB', f'r{r.n}', f'r{self._asi_lit(0).n}', f'r{a.n}'); self.freer(a); return r
                 r=self.alloc(a.ty); self.emit('MOV', f'r{r.n}', f'-r{a.n}'); self.freer(a); return r  # cheaper than SUB via madd

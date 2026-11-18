@@ -88,7 +88,7 @@ def main():
                 src = reorder(src, order)
             pack = read_pack(path)
             bound = attrs is not None and stage == 'vs' and not pack and not order and not unread
-            r = glslc.compile_stage(src, stage, isa64=True, forward=True, unread=unread if stage == 'vs' else 0, strict=strict and not pack and not bound, pack=pack, xops=xops, noops=noops,
+            r = glslc.compile_stage(src, stage, isa64=True, forward=True, unread=unread if stage == 'vs' and not pack else 0, strict=strict and not pack and not bound, pack=pack, xops=xops, noops=noops,
                                     attrs=attrs if bound else None)
             words, _ = isa64.assemble(r['sasm'].splitlines(), vs=stage == 'vs')
         except Exception as e:

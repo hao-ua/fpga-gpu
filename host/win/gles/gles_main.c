@@ -75,6 +75,12 @@
 #define GL_TRANSLATED_SHADER_SOURCE_LENGTH_ANGLE 0x93A0
 #define GL_TEXTURE_IMMUTABLE_FORMAT_EXT 0x912F
 #define GL_BGRA8_EXT 0x93A1
+#ifndef GL_UNSIGNED_SHORT_4_4_4_4_REV_EXT
+#define GL_UNSIGNED_SHORT_4_4_4_4_REV_EXT 0x8365
+#endif
+#ifndef GL_UNSIGNED_SHORT_1_5_5_5_REV_EXT
+#define GL_UNSIGNED_SHORT_1_5_5_5_REV_EXT 0x8366
+#endif
 #define GL_LUMINANCE8_EXT 0x8040
 #define GL_ALPHA8_EXT 0x803C
 #define GL_LUMINANCE8_ALPHA8_EXT 0x8045
@@ -2451,9 +2457,9 @@ void ES_APIENTRY glGetIntegerv(GLenum p, GLint *v)
     int n, i;
     if (get_int(p, v)) return;
     if ((n = get_float(p, f))) {
-        /* §6.1.2: colours and depth values convert to the integer range */
-        int norm = p == GL_COLOR_CLEAR_VALUE || p == GL_BLEND_COLOR || p == GL_DEPTH_CLEAR_VALUE || p == GL_DEPTH_RANGE || p == GL_SAMPLE_COVERAGE_VALUE;
-        for (i = 0; i < n; i++) v[i] = norm ? (GLint)((double)f[i] * 2147483647.0) : (GLint)f[i];
+        /* §6.1.2: colours, depth range and the depth clear value map onto the integer range, any other value rounds to the nearest integer */
+        int norm = p == GL_COLOR_CLEAR_VALUE || p == GL_BLEND_COLOR || p == GL_DEPTH_CLEAR_VALUE || p == GL_DEPTH_RANGE;
+        for (i = 0; i < n; i++) v[i] = norm ? (GLint)((double)f[i] * 2147483647.0) : round_int(f[i]);
         return;
     }
     *v = glIsEnabled(p);
@@ -2463,7 +2469,12 @@ void ES_APIENTRY glGetFloatv(GLenum p, GLfloat *v)
     GLint iv[8];
     int n, i;
     if (get_float(p, v)) return;
-    if ((n = get_int(p, iv))) { for (i = 0; i < n; i++) v[i] = (GLfloat)iv[i]; return; }
+    if ((n = get_int(p, iv))) {
+        /* the stencil masks are unsigned: all ones is 2^32 - 1, not -1 */
+        int uns = p == GL_STENCIL_VALUE_MASK || p == GL_STENCIL_BACK_VALUE_MASK || p == GL_STENCIL_WRITEMASK || p == GL_STENCIL_BACK_WRITEMASK;
+        for (i = 0; i < n; i++) v[i] = uns ? (GLfloat)(GLuint)iv[i] : (GLfloat)iv[i];
+        return;
+    }
     *v = glIsEnabled(p);
 }
 void ES_APIENTRY glGetBooleanv(GLenum p, GLboolean *v)
@@ -2482,13 +2493,18 @@ void ES_APIENTRY glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum for
     uint8_t *tmp;
     int row, r, c, x0, y0, x1, y1;
     if (w < 0 || h < 0) { SET_ERR(GL_INVALID_VALUE); return; }
-    if ((format != GL_RGBA && format != GL_BGRA_EXT && format != GL_RGB && format != GL_ALPHA) ||
-        (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT_5_6_5 && type != GL_UNSIGNED_SHORT_4_4_4_4 && type != GL_UNSIGNED_SHORT_5_5_5_1)) { SET_ERR(GL_INVALID_ENUM); return; }
+    /* §4.3.1: format and type from table 3.4 (EXT_read_format_bgra adds BGRA_EXT and its two packed types), of which RGBA / UNSIGNED_BYTE and the
+       IMPLEMENTATION_COLOR_READ pair go, and BGRA_EXT / UNSIGNED_BYTE; any other pair of accepted values is INVALID_OPERATION */
+    if ((format != GL_RGBA && format != GL_BGRA_EXT && format != GL_RGB && format != GL_ALPHA && format != GL_LUMINANCE && format != GL_LUMINANCE_ALPHA) ||
+        (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT_5_6_5 && type != GL_UNSIGNED_SHORT_4_4_4_4 && type != GL_UNSIGNED_SHORT_5_5_5_1 &&
+         type != GL_UNSIGNED_SHORT_4_4_4_4_REV_EXT && type != GL_UNSIGNED_SHORT_1_5_5_5_REV_EXT)) { SET_ERR(GL_INVALID_ENUM); return; }
     if ((format != GL_RGBA && format != GL_BGRA_EXT) || type != GL_UNSIGNED_BYTE) { SET_ERR(GL_INVALID_OPERATION); return; }
+    if (!S.live) return;
     {
         GLuint draw_fb = S.fb;
         int bound;
-        if (!S.live || !w || !h) return;
+        if (!read_fb_target(&g)) return;                        /* also when it reads no pixels */
+        if (!w || !h) return;
         S.fb = S.read_fb;
         bound = bind_target(&g);
         S.fb = draw_fb;
@@ -2630,7 +2646,9 @@ static void do_draw(GLenum mode, const uint32_t *idx, uint32_t n, uint32_t first
     uint32_t lo = first, hi = first + n - 1, i, ioff = 0;
     int a, c;
     if (mode > GL_TRIANGLE_FAN) { SET_ERR(GL_INVALID_ENUM); return; }
-    if (!S.live || !p || !n) return;                            /* §2.11: no current program, the draw has no effect */
+    if (!S.live) return;
+    if (fb_target(&g) != GL_FRAMEBUFFER_COMPLETE) { SET_ERR(GL_INVALID_FRAMEBUFFER_OPERATION); return; }     /* §4.4.5: also a draw of nothing, or with no program */
+    if (!p || !n) return;                                       /* §2.11: no current program, the draw has no effect */
     if (bind_target(&g) < 0) return;
     if (idx) {
         lo = 0xFFFFFFFFu; hi = 0;
@@ -2638,7 +2656,9 @@ static void do_draw(GLenum mode, const uint32_t *idx, uint32_t n, uint32_t first
     }
     memset(&s, 0, sizeof s);
     fill_state(&s, p, &g);
-    if (mode != GL_POINTS) g2r_scissor_viewport(&s, g.t.width, g.t.height);     /* §2.13: a point goes by near and far only */
+    /* board A drops what is outside x and y of the view volume only at its guard band: the scissor keeps every primitive to the viewport. So a point goes by near and far, and
+       of a wide point the part inside the viewport is drawn, also when its centre is just outside */
+    g2r_scissor_viewport(&s, g.t.width, g.t.height);
     s.prog = depth_variant(p);
     for (a = 0; a < 16; a++) { s.attr[a].size = 4; s.attr[a].type = G2_AT_FP24; s.attr[a].constant[3] = g2_fp24(1.0); }
     memset(v, 0, sizeof v);
@@ -2780,7 +2800,7 @@ static void draw_elements(GLenum m, GLsizei n, GLenum type, const void *indices,
         if (!o || !o->data || (uintptr_t)indices + (uint64_t)n * bytes > (uint64_t)o->size) { SET_ERR(GL_INVALID_OPERATION); return; }
         ip = o->data + (uintptr_t)indices;
     }
-    if (!n) return;
+    if (!n) { do_draw(m, NULL, 0, 0); return; }                 /* no vertices: the mode and the framebuffer are still checked */
     idx = (uint32_t *)malloc((size_t)n * 4);
     if (!idx) { SET_ERR(GL_OUT_OF_MEMORY); return; }
     for (i = 0; i < (uint32_t)n; i++) {
@@ -3406,7 +3426,7 @@ EGLBoolean EGLAPI eglSwapBuffers(EGLDisplay d, EGLSurface s)
 {
     CHECK_DPY(d, 0);
     if (s != g_cur_surf || !s) { g_egl_err = EGL_BAD_SURFACE; return 0; }
-    if (S.live) swap_buffers();
+    if (S.live && ((egl_surf *)s)->hwnd) swap_buffers();        /* EGL 1.4 §3.9.3: on a pbuffer it has no effect, its colour buffer stays as it is */
     E_OK();
     return 1;
 }

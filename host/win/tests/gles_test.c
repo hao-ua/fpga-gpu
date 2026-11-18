@@ -25,6 +25,8 @@ EGLDisplay EGLAPI eglGetDisplay(void *);
 int EGLAPI eglInitialize(EGLDisplay, EGLint *, EGLint *);
 int EGLAPI eglChooseConfig(EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *);
 EGLSurface EGLAPI eglCreateWindowSurface(EGLDisplay, EGLConfig, HWND, const EGLint *);
+EGLSurface EGLAPI eglCreatePbufferSurface(EGLDisplay, EGLConfig, const EGLint *);
+int EGLAPI eglDestroySurface(EGLDisplay, EGLSurface);
 EGLContext EGLAPI eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
 int EGLAPI eglMakeCurrent(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
 int EGLAPI eglSwapBuffers(EGLDisplay, EGLSurface);
@@ -3028,6 +3030,91 @@ static void test_fbo_objects(void)
     err(GL_NO_ERROR, "framebuffer objects");
 }
 
+static void test_state_conversions(void)
+{
+    GLfloat f = 0;
+    GLint v = 0;
+    /* §6.1.2: an unsigned mask read as a float stays unsigned; a float read as an integer rounds to the nearest, unless it is a colour or a depth value */
+    glGetFloatv(GL_STENCIL_VALUE_MASK, &f); ok(f >= 255.0f, "STENCIL_VALUE_MASK as a float");
+    glGetFloatv(GL_STENCIL_BACK_WRITEMASK, &f); ok(f >= 255.0f, "STENCIL_BACK_WRITEMASK as a float");
+    glLineWidth(20.6f);
+    glGetIntegerv(GL_LINE_WIDTH, &v); ieq(v, 21, "LINE_WIDTH as an integer");
+    glLineWidth(1.0f);
+    glPolygonOffset(-4770.93f, 39542.6f);
+    glGetIntegerv(GL_POLYGON_OFFSET_FACTOR, &v); ieq(v, -4771, "POLYGON_OFFSET_FACTOR as an integer");
+    glGetIntegerv(GL_POLYGON_OFFSET_UNITS, &v); ieq(v, 39543, "POLYGON_OFFSET_UNITS as an integer");
+    glPolygonOffset(0, 0);
+    glSampleCoverage(0.75f, GL_FALSE);
+    glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE, &v); ieq(v, 1, "SAMPLE_COVERAGE_VALUE rounds, it is no colour");
+    glSampleCoverage(1.0f, GL_FALSE);
+    err(GL_NO_ERROR, "state conversions");
+}
+
+static void test_read_draw_errors(void)
+{
+    static const uint8_t idx[1] = { 0 };
+    uint8_t c[16];
+    GLuint fb;
+    glReadPixels(0, 0, 1, 1, GL_LUMINANCE_ALPHA, GL_UNSIGNED_SHORT_4_4_4_4, c); err(GL_INVALID_OPERATION, "glReadPixels LUMINANCE_ALPHA, UNSIGNED_SHORT_4_4_4_4");
+    glReadPixels(0, 0, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, c); err(GL_INVALID_OPERATION, "glReadPixels RGB, UNSIGNED_BYTE");
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_SHORT_5_6_5, c); err(GL_INVALID_OPERATION, "glReadPixels RGBA, UNSIGNED_SHORT_5_6_5");
+    glReadPixels(0, 0, 1, 1, 0x1234, GL_UNSIGNED_BYTE, c); err(GL_INVALID_ENUM, "glReadPixels of format 0x1234");
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, c); err(GL_INVALID_ENUM, "glReadPixels of type FLOAT");
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glReadPixels(0, 0, 0, 0, GL_RGBA, GL_UNSIGNED_BYTE, c); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glReadPixels of no pixels, incomplete framebuffer");
+    /* a draw into a framebuffer that is not complete: an error also with no program, and of no vertices */
+    glUseProgram(0);
+    glDrawArrays(GL_POINTS, 0, 1); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawArrays, incomplete framebuffer, no program");
+    glDrawArrays(GL_POINTS, 0, 0); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawArrays of nothing, incomplete framebuffer");
+    glDrawElements(GL_POINTS, 1, GL_UNSIGNED_BYTE, idx); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawElements, incomplete framebuffer, no program");
+    glDrawElements(GL_POINTS, 0, GL_UNSIGNED_BYTE, idx); err(GL_INVALID_FRAMEBUFFER_OPERATION, "glDrawElements of nothing, incomplete framebuffer");
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fb);
+    glDrawElements(0x77, 0, GL_UNSIGNED_BYTE, idx); err(GL_INVALID_ENUM, "glDrawElements of nothing, mode 0x77");
+    glDrawArrays(GL_POINTS, 0, 1); err(GL_NO_ERROR, "glDrawArrays with no program");
+}
+
+/* wide points against a viewport smaller than the window: the scissor keeps them to it, and a point whose centre is just outside draws its part inside */
+static void test_point_viewport(void)
+{
+    static const GLfloat pts[12] = { 0.0f, 0.0f, 0.0f, 1.0f,  1.01f, 0.0f, 0.0f, 1.0f,  1.3f, 0.0f, 0.0f, 1.0f };
+    GLuint p = prog("attribute vec4 a_pos; void main() { gl_Position = a_pos; gl_PointSize = 5.0; }\n", "precision mediump float; void main() { gl_FragColor = vec4(1.0); }\n");
+    GLint a = glGetAttribLocation(p, "a_pos");
+    clear_to(0, 0, 0, 1);
+    glViewport(100, 100, 100, 100);
+    glUseProgram(p);
+    glVertexAttribPointer((GLuint)a, 4, GL_FLOAT, GL_FALSE, 0, pts);
+    glEnableVertexAttribArray((GLuint)a);
+    glDrawArrays(GL_POINTS, 0, 3);
+    glDisableVertexAttribArray((GLuint)a);
+    glViewport(0, 0, W, H);
+    px(150, 150, "a wide point inside the viewport", 255, 255, 255, 255);
+    px(199, 150, "a wide point whose centre is outside: its part inside the viewport", 255, 255, 255, 255);
+    px(201, 150, "nothing beside the viewport", 0, 0, 0, 255);
+    px(215, 150, "a point far outside the view volume", 0, 0, 0, 255);
+    glDeleteProgram(p);
+    err(GL_NO_ERROR, "points and the viewport");
+}
+
+/* EGL 1.4 §3.9.3: eglSwapBuffers on a pbuffer has no effect: its colour buffer keeps what was drawn */
+static void test_pbuffer_swap(void)
+{
+    static const EGLint pa[] = { 0x3057, 64, 0x3056, 64, 0x3038 };
+    EGLSurface pb = eglCreatePbufferSurface(g_dpy, g_cfg, pa);
+    ok(pb != NULL, "eglCreatePbufferSurface");
+    if (!pb) return;
+    ok(eglMakeCurrent(g_dpy, pb, pb, g_ctx), "eglMakeCurrent on a pbuffer");
+    clear_to(0.25f, 0.5f, 0.75f, 1);
+    ok(eglSwapBuffers(g_dpy, pb), "eglSwapBuffers on a pbuffer");
+    px(1, 1, "a pbuffer after eglSwapBuffers", 64, 128, 191, 255);
+    ok(eglSwapBuffers(g_dpy, pb), "eglSwapBuffers on a pbuffer, again");
+    px(1, 1, "a pbuffer after two eglSwapBuffers", 64, 128, 191, 255);
+    eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx);
+    ok(eglDestroySurface(g_dpy, pb), "eglDestroySurface");
+    err(GL_NO_ERROR, "pbuffer swap");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -3115,8 +3202,12 @@ int main(void)
     test_uniform_values();
     test_format_errors();
     test_fbo_objects();
+    test_state_conversions();
+    test_read_draw_errors();
+    test_point_viewport();
     test_scaled();
     test_configs();
+    test_pbuffer_swap();
     test_swap();
     printf("%d checks, %d failed\n", g_checks, g_bad);
     if (!g_bad) printf("OK gles_test\n");

@@ -3198,19 +3198,22 @@ static uint32_t pixel_at(int x, int y)
 
 /* what a second thread does, and what it saw: its checks are counted by the main thread after it ended */
 typedef struct thr_job {
-    int what;                                   /* 0: an EGL error of its own; 1: render in its own context; 2: end with a context current */
-    EGLSurface surf;
+    int what;                                   /* 0: try what another thread holds; 1: render in its own context; 2: end with a context current; 3: clears in a loop */
+    EGLSurface surf, busy_surf;
     EGLContext ctx;
     float rgb[3];
     uint32_t want;
-    int bad_surf, made, own_ctx, err_after, cleared, wrong;
+    int bad_surf, access_ctx, access_surf, made, own_ctx, err_after, cleared, rounds, wrong;
 } thr_job;
 
 static DWORD WINAPI thr_main(void *p)
 {
     thr_job *j = (thr_job *)p;
+    int i;
     if (j->what == 0) {
         j->bad_surf = !eglMakeCurrent(g_dpy, (EGLSurface)(intptr_t)-1, (EGLSurface)(intptr_t)-1, j->ctx) ? eglGetError() : 0;
+        j->access_ctx = !eglMakeCurrent(g_dpy, j->surf, j->surf, g_ctx) ? eglGetError() : 0;
+        j->access_surf = !eglMakeCurrent(g_dpy, j->busy_surf, j->busy_surf, j->ctx) ? eglGetError() : 0;
         j->own_ctx = eglGetCurrentContext() == NULL;
         return 0;
     }
@@ -3218,10 +3221,12 @@ static DWORD WINAPI thr_main(void *p)
     j->own_ctx = eglGetCurrentContext() == j->ctx;
     if (!j->made) return 0;
     glViewport(0, 0, 16, 16);
-    glClearColor(j->rgb[0], j->rgb[1], j->rgb[2], 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    if (pixel_at(3, 3) != j->want) j->wrong++;
-    else j->cleared++;
+    for (i = 0; i < (j->what == 3 ? j->rounds : 1); i++) {
+        glClearColor(j->rgb[0], j->rgb[1], j->rgb[2], 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (pixel_at(3, 3) != j->want) j->wrong++;
+        else j->cleared++;
+    }
     j->err_after = (int)glGetError();
     if (j->what != 2) eglMakeCurrent(g_dpy, NULL, NULL, NULL);
     return 0;
@@ -3236,25 +3241,37 @@ static void thr_run(thr_job *j, int n)
     for (i = 0; i < n; i++) CloseHandle(h[i]);
 }
 
-/* EGL §3.1: a current context and surface per thread, its own error per thread */
+/* EGL §3.7.3, §3.1: a current context and surface per thread, its own error per thread; a context or surface current in another thread is EGL_BAD_ACCESS. Each surface keeps its own
+   colour buffer: two pbuffers of one size, one after the other in one context */
 static void test_threads(void)
 {
     static const EGLint ca[] = { 0x3098, 2, 0x3038 }, pa[] = { 0x3057, 16, 0x3056, 16, 0x3038 };
     EGLSurface a = eglCreatePbufferSurface(g_dpy, g_cfg, pa), b = eglCreatePbufferSurface(g_dpy, g_cfg, pa);
-    EGLContext c2 = eglCreateContext(g_dpy, g_cfg, NULL, ca);
-    thr_job j[1];
+    EGLContext c2 = eglCreateContext(g_dpy, g_cfg, NULL, ca), c3 = eglCreateContext(g_dpy, g_cfg, NULL, ca);
+    thr_job j[2];
     float cc[4];
-    ok(a && b && c2, "two pbuffers and another context");
-    if (!a || !b || !c2) return;
-    /* another thread's EGL error is its own */
-    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current for the thread tests");
+    ok(a && b && c2 && c3, "two pbuffers and two more contexts");
+    if (!a || !b || !c2 || !c3) return;
+    /* two surfaces of one size keep two colour buffers */
+    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current");
     glViewport(0, 0, 16, 16);
+    clear_to(1, 0, 0, 1);
+    ok(eglMakeCurrent(g_dpy, b, b, g_ctx), "pbuffer b current");
+    clear_to(0, 0, 1, 1);
+    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current again");
+    px(3, 3, "pbuffer a kept its own colour", 255, 0, 0, 255);
+    ok(eglMakeCurrent(g_dpy, b, b, g_ctx), "pbuffer b current again");
+    px(3, 3, "pbuffer b kept its own colour", 0, 0, 255, 255);
+    /* another thread cannot take this thread's context or surface; its error is its own */
+    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current for the thread tests");
     glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
     memset(j, 0, sizeof j);
-    j[0].what = 0; j[0].ctx = c2;
+    j[0].what = 0; j[0].surf = b; j[0].busy_surf = a; j[0].ctx = c2;
     thr_run(j, 1);
     ieq(j[0].bad_surf, 0x300D, "another thread's eglMakeCurrent of no surface: EGL_BAD_SURFACE there");
-    ok(j[0].own_ctx, "the other thread has no context");
+    ieq(j[0].access_ctx, 0x3002, "another thread makes this thread's context current: EGL_BAD_ACCESS");
+    ieq(j[0].access_surf, 0x3002, "another thread makes this thread's surface current: EGL_BAD_ACCESS");
+    ok(j[0].own_ctx, "the other thread still has no context");
     ok(eglGetError() == 0x3000, "this thread's EGL error is not the other thread's");
     ok(eglGetCurrentContext() == g_ctx, "this thread keeps its context");
     /* another thread renders in its own context and surface; this thread's state stays as it was */
@@ -3275,10 +3292,18 @@ static void test_threads(void)
     ok(j[0].made && j[0].cleared == 1, "a thread clears pbuffer a and ends with it current");
     ok(eglMakeCurrent(g_dpy, a, a, c2), "its context and pbuffer current here after it ended");
     px(3, 3, "pbuffer a holds what the ended thread cleared", 255, 0, 255, 255);
+    /* two threads clear and read back at once, each in its own context and pbuffer */
     ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "this thread back on the window");
+    memset(j, 0, sizeof j);
+    j[0].what = 3; j[0].surf = a; j[0].ctx = c2; j[0].rgb[0] = 1.0f; j[0].want = 0xFF0000FFu; j[0].rounds = 40;
+    j[1].what = 3; j[1].surf = b; j[1].ctx = c3; j[1].rgb[2] = 1.0f; j[1].want = 0x0000FFFFu; j[1].rounds = 40;
+    thr_run(j, 2);
+    ok(j[0].made && j[1].made, "two threads with a context each");
+    ieq(j[0].wrong + j[1].wrong, 0, "two threads at once: reads of another thread's colour");
+    ieq(j[0].cleared + j[1].cleared, 80, "two threads at once: clears read back");
     glViewport(0, 0, W, H);
     eglDestroySurface(g_dpy, a); eglDestroySurface(g_dpy, b);
-    eglDestroyContext(g_dpy, c2);
+    eglDestroyContext(g_dpy, c2); eglDestroyContext(g_dpy, c3);
     err(GL_NO_ERROR, "threads");
 }
 

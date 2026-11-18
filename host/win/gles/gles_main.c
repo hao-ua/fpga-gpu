@@ -192,17 +192,27 @@ typedef struct es_tg {
     double kx, ky;                              /* the target's pixels per application pixel: 1 except for a window larger than the hardware */
 } es_tg;
 
+/* an EGL surface's own framebuffer on board B: its colour buffers (three, presented in turn) and its depth-stencil buffer */
+typedef struct es_sfc {
+    HWND hwnd;                                  /* NULL: a pbuffer */
+    int vw, vh, fb_w, fb_h, back, front, swap_interval;     /* vw, vh: the window; fb_w, fb_h: what is rendered */
+    uint16_t color[3], ds;
+    uint32_t color_base[3], ds_base;
+    int cfg, depth16, stencil;                  /* the surface's EGL config: its depth has 16 bits, it has stencil */
+    uint32_t color_fmt;                         /* and its colour: RGBA8 or RGB565 */
+} es_sfc;
+#define SF (S.sfp)                              /* the surface of the calling thread's context */
+
 static struct {
     g2_board *bd;
     g2r *r;
-    /* window system */
-    HWND hwnd;
-    int vw, vh, fb_w, fb_h, mode, mode_w, mode_h, back, front, scan_idx, hold, stretch, swap_interval;      /* vw, vh: the window; fb_w, fb_h: what is rendered */
+    /* window system: board B's display, shared by every window surface */
+    int mode, mode_w, mode_h, scan_idx, hold, stretch;
     uint32_t frame;
-    uint16_t color[3], ds, scan[3];
-    uint32_t color_base[3], ds_base, scan_base[3];
-    int cfg, depth16, stencil;              /* the surface's EGL config: its depth has 16 bits, it has stencil */
-    uint32_t color_fmt;                     /* and its colour: RGBA8 or RGB565 */
+    uint16_t scan[3];                           /* mode-sized images a smaller framebuffer is copied into to be shown */
+    uint32_t scan_base[3];
+    int scan_w, scan_h;
+    es_sfc *sfp;
     /* objects: shared by all contexts, names never repeat */
     es_buf *bufs[HASH];
     es_tex *texs[HASH], *tex_default[3];
@@ -282,15 +292,27 @@ static int dev_up(void)
 static const struct { int color, depth, stencil; } CFG[] = { { 32, 24, 8 }, { 32, 0, 0 }, { 32, 16, 0 }, { 16, 24, 8 }, { 16, 16, 0 }, { 16, 0, 0 } };
 #define NCFG ((int)(sizeof CFG / sizeof CFG[0]))
 
+/* a surface's images back to board B */
+static void sfc_free(es_sfc *f)
+{
+    int i;
+    if (!S.r) return;
+    g2r_end_pass(S.r);
+    for (i = 0; i < 3; i++) { if (f->color[i]) g2r_image_destroy(S.r, f->color[i], f->color_base[i]); f->color[i] = 0; }
+    if (f->ds) g2r_image_destroy(S.r, f->ds, f->ds_base);
+    f->ds = 0;
+}
+
+/* the framebuffer of the calling thread's surface (SF), made or made again for vw x vh and config cfg */
 static void default_fb(int vw, int vh, int cfg, int window)
 {
     int i, w, h, maxh = window ? MAX_SCAN_H : MAX_TEX, maxw = g2e_get_int("GPU2_MAX_W", MAX_RT_W);    /* a lower GPU2_MAX_W trades resolution for speed: fill rate is what limits most games */
     int depth = CFG[cfg - 1].depth != 0;
     if (vw < 1) vw = 640;
     if (vh < 1) vh = 480;
-    if (vw == S.vw && vh == S.vh && S.color[0] && S.cfg == cfg) return;
-    S.cfg = cfg; S.depth16 = CFG[cfg - 1].depth == 16; S.stencil = CFG[cfg - 1].stencil != 0;
-    S.color_fmt = CFG[cfg - 1].color == 16 ? G2_FMT_RGB565 : G2_FMT_RGBA8;
+    if (vw == SF->vw && vh == SF->vh && SF->color[0] && SF->cfg == cfg) return;
+    SF->cfg = cfg; SF->depth16 = CFG[cfg - 1].depth == 16; SF->stencil = CFG[cfg - 1].stencil != 0;
+    SF->color_fmt = CFG[cfg - 1].color == 16 ? G2_FMT_RGB565 : G2_FMT_RGBA8;
     if (maxw > MAX_RT_W || maxw < 1) maxw = MAX_RT_W;
     w = vw; h = vh;
     if (w > maxw || h > maxh) {
@@ -300,34 +322,36 @@ static void default_fb(int vw, int vh, int cfg, int window)
         if (w > maxw) w = maxw;
         if (h > maxh) h = maxh;
     }
-    g2r_end_pass(S.r);
-    for (i = 0; i < 3; i++) {
-        if (S.color[i]) g2r_image_destroy(S.r, S.color[i], S.color_base[i]);
-        if (S.scan[i]) g2r_image_destroy(S.r, S.scan[i], S.scan_base[i]);
-        S.color[i] = S.scan[i] = 0;
-    }
-    if (S.ds) g2r_image_destroy(S.r, S.ds, S.ds_base);
-    S.ds = 0;
+    sfc_free(SF);
     if (window) {                               /* the smallest mode that holds the window */
         if (g2_mode_select(S.bd, w, h, &S.mode) < 0) g2e_log("gles: SET_MODE for %d x %d: %s", w, h, g2_error_text(S.bd));
         S.mode_w = G2_MODE_W[S.mode]; S.mode_h = G2_MODE_H[S.mode];
     }
     for (i = 0; i < 3; i++) {
-        if (g2r_image_create(S.r, &S.color[i], &S.color_base[i], (uint32_t)w, (uint32_t)h, S.color_fmt, 1, 1, 1, G2_USE_RT | G2_USE_SCANOUT | G2_USE_TRANSFER | G2_USE_SAMPLED) < 0)
+        if (g2r_image_create(S.r, &SF->color[i], &SF->color_base[i], (uint32_t)w, (uint32_t)h, SF->color_fmt, 1, 1, 1, G2_USE_RT | G2_USE_SCANOUT | G2_USE_TRANSFER | G2_USE_SAMPLED) < 0)
             g2e_log("gles: no room for the framebuffer");
     }
     if (depth) {
-        g2r_image_create(S.r, &S.ds, &S.ds_base, (uint32_t)w, (uint32_t)h, G2_FMT_D24S8, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER);
-        g2r_stencil_undefined(S.r, S.ds);
+        g2r_image_create(S.r, &SF->ds, &SF->ds_base, (uint32_t)w, (uint32_t)h, G2_FMT_D24S8, 1, 1, 1, G2_USE_RT | G2_USE_TRANSFER);
+        g2r_stencil_undefined(S.r, SF->ds);
     }
-    if (w != S.mode_w || h != S.mode_h) {
-        for (i = 0; i < 3; i++) {
-            g2r_image_create(S.r, &S.scan[i], &S.scan_base[i], (uint32_t)S.mode_w, (uint32_t)S.mode_h, G2_FMT_RGBA8, 1, 1, 1, G2_USE_SCANOUT | G2_USE_TRANSFER);
-            g2_fill_image(S.bd, S.scan[i], G2_TF_RAW, 0x000000FFu, 0, 0, (uint32_t)S.mode_w, (uint32_t)S.mode_h, 0xF, 0, 0);
-        }
-    }
-    S.vw = vw; S.vh = vh; S.fb_w = w; S.fb_h = h; S.back = S.front = 0;
+    SF->vw = vw; SF->vh = vh; SF->fb_w = w; SF->fb_h = h; SF->back = SF->front = 0;
     g2e_log("gles: window %d x %d, framebuffer %d x %d, colour %d depth %d stencil %d, HDMI mode %d", vw, vh, w, h, CFG[cfg - 1].color, CFG[cfg - 1].depth, CFG[cfg - 1].stencil, S.mode);
+}
+
+/* board B shows a framebuffer of the mode's size itself and a smaller one through a mode-sized copy: those copies, made when a swap needs them, again after the mode changed */
+static void scan_fit(void)
+{
+    int i;
+    if (S.scan[0] && S.scan_w == S.mode_w && S.scan_h == S.mode_h) return;
+    g2r_end_pass(S.r);
+    for (i = 0; i < 3; i++) {
+        if (S.scan[i]) g2r_image_destroy(S.r, S.scan[i], S.scan_base[i]);
+        S.scan[i] = 0;
+        g2r_image_create(S.r, &S.scan[i], &S.scan_base[i], (uint32_t)S.mode_w, (uint32_t)S.mode_h, G2_FMT_RGBA8, 1, 1, 1, G2_USE_SCANOUT | G2_USE_TRANSFER);
+        g2_fill_image(S.bd, S.scan[i], G2_TF_RAW, 0x000000FFu, 0, 0, (uint32_t)S.mode_w, (uint32_t)S.mode_h, 0xF, 0, 0);
+    }
+    S.scan_w = S.mode_w; S.scan_h = S.mode_h;
 }
 
 static void win_size(HWND w, int *x, int *y)
@@ -347,17 +371,17 @@ static void dump_frame(uint16_t image)
     if (every < 0) every = g2e_get_int("GPU2_DUMP_EVERY", 120);
     if (S.frame % (uint32_t)every != 1) return;
     snprintf(path, sizeof path, "%s\\frame_%05u.bmp", g2e_get("GPU2_DUMP", ""), S.frame);
-    px = (uint8_t *)malloc((size_t)S.fb_w * S.fb_h * 4);
+    px = (uint8_t *)malloc((size_t)SF->fb_w * SF->fb_h * 4);
     f = fopen(path, "wb");
     if (px && f) {
         BITMAPFILEHEADER fh;
         BITMAPINFOHEADER ih;
         g2_fence(S.bd, 5.0);
-        g2_read_image(S.bd, image, G2_TF_BGRA8888, 0, 0, (uint32_t)S.fb_w, (uint32_t)S.fb_h, 0, 0, S.color_fmt, 0, 0, px);
+        g2_read_image(S.bd, image, G2_TF_BGRA8888, 0, 0, (uint32_t)SF->fb_w, (uint32_t)SF->fb_h, 0, 0, SF->color_fmt, 0, 0, px);
         memset(&fh, 0, sizeof fh); memset(&ih, 0, sizeof ih);
-        fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih; fh.bfSize = fh.bfOffBits + (DWORD)S.fb_w * S.fb_h * 4;
-        ih.biSize = sizeof ih; ih.biWidth = S.fb_w; ih.biHeight = S.fb_h; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;     /* bottom-up, as GL */
-        fwrite(&fh, sizeof fh, 1, f); fwrite(&ih, sizeof ih, 1, f); fwrite(px, 4, (size_t)S.fb_w * S.fb_h, f);
+        fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih; fh.bfSize = fh.bfOffBits + (DWORD)SF->fb_w * SF->fb_h * 4;
+        ih.biSize = sizeof ih; ih.biWidth = SF->fb_w; ih.biHeight = SF->fb_h; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;     /* bottom-up, as GL */
+        fwrite(&fh, sizeof fh, 1, f); fwrite(&ih, sizeof ih, 1, f); fwrite(px, 4, (size_t)SF->fb_w * SF->fb_h, f);
     }
     if (f) fclose(f);
     free(px);
@@ -365,35 +389,36 @@ static void dump_frame(uint16_t image)
 
 static void swap_buffers(void)
 {
-    uint16_t image = S.color[S.back];
-    int hold = S.hold && S.swap_interval, w, h;
+    uint16_t image = SF->color[SF->back];
+    int hold = S.hold && SF->swap_interval, w, h;
     g2r_end_pass(S.r);
-    if (S.fb_w == S.mode_w && S.fb_h == S.mode_h) {
+    if (SF->fb_w == S.mode_w && SF->fb_h == S.mode_h) {
         g2r_present(S.r, image, hold);
     } else {
         int dw = S.mode_w, dh = S.mode_h, dx = 0, dy = 0;
         if (!S.stretch) {
-            int sx = S.mode_w / S.fb_w, sy = S.mode_h / S.fb_h, s = sx < sy ? sx : sy;
+            int sx = S.mode_w / SF->fb_w, sy = S.mode_h / SF->fb_h, s = sx < sy ? sx : sy;
             if (s < 1) s = 1;
-            dw = S.fb_w * s; dh = S.fb_h * s;
+            dw = SF->fb_w * s; dh = SF->fb_h * s;
             if (dw > S.mode_w) dw = S.mode_w;
             if (dh > S.mode_h) dh = S.mode_h;
             dx = (S.mode_w - dw) / 2; dy = (S.mode_h - dh) / 2;
         }
+        scan_fit();
         S.scan_idx = (S.scan_idx + 1) % 3;
-        g2_copy_image(S.bd, image, S.scan[S.scan_idx], 0, 0, (uint32_t)S.fb_w, (uint32_t)S.fb_h, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        g2_copy_image(S.bd, image, S.scan[S.scan_idx], 0, 0, (uint32_t)SF->fb_w, (uint32_t)SF->fb_h, (uint32_t)dx, (uint32_t)dy, (uint32_t)dw, (uint32_t)dh, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         g2r_present(S.r, S.scan[S.scan_idx], hold);
     }
     S.frame++;
     g2r_stats_tick(S.r);
     dump_frame(image);
-    S.front = S.back;
-    S.back = (S.back + 1) % 3;
+    SF->front = SF->back;
+    SF->back = (SF->back + 1) % 3;
     /* EGL_BUFFER_DESTROYED: the colour buffer is undefined after a swap, which spares the next frame a band load */
-    g2r_discard_color(S.r, S.color[S.back]);
-    if (S.hwnd) {
-        win_size(S.hwnd, &w, &h);
-        if (w != S.vw || h != S.vh) default_fb(w, h, S.cfg, 1);
+    g2r_discard_color(S.r, SF->color[SF->back]);
+    if (SF->hwnd) {
+        win_size(SF->hwnd, &w, &h);
+        if (w != SF->vw || h != SF->vh) default_fb(w, h, SF->cfg, 1);
     }
 }
 
@@ -418,14 +443,14 @@ static GLenum fb_target(es_tg *g)
     memset(g, 0, sizeof *g);
     g->fmt = G2_FMT_RGBA8;
     if (!f) {
-        g->fmt = S.color_fmt;
-        g->t.color = S.color[S.back]; g->t.ds = S.ds;
-        g->t.width = (uint32_t)S.fb_w; g->t.height = (uint32_t)S.fb_h;
+        g->fmt = SF->color_fmt;
+        g->t.color = SF->color[SF->back]; g->t.ds = SF->ds;
+        g->t.width = (uint32_t)SF->fb_w; g->t.height = (uint32_t)SF->fb_h;
         g->t.bits_r = rb_bits(g->fmt, 0); g->t.bits_g = rb_bits(g->fmt, 1); g->t.bits_b = rb_bits(g->fmt, 2); g->t.bits_a = rb_bits(g->fmt, 3);
-        g->t.depth16 = S.depth16;
-        g->has_d = S.ds != 0; g->has_s = S.ds != 0 && S.stencil;
-        g->vw = S.vw; g->vh = S.vh;
-        g->kx = (double)S.fb_w / S.vw; g->ky = (double)S.fb_h / S.vh;
+        g->t.depth16 = SF->depth16;
+        g->has_d = SF->ds != 0; g->has_s = SF->ds != 0 && SF->stencil;
+        g->vw = SF->vw; g->vh = SF->vh;
+        g->kx = (double)SF->fb_w / SF->vw; g->ky = (double)SF->fb_h / SF->vh;
         return GL_FRAMEBUFFER_COMPLETE;
     }
     c = &f->a[ATT_COLOR]; da = &f->a[ATT_DEPTH]; sa = &f->a[ATT_STENCIL];
@@ -3177,6 +3202,7 @@ typedef struct egl_surf {
     int w, h, cfg, pbuffer, dead;
     DWORD thread;
     EGLint largest, tex_format, tex_target, mipmap_tex, mipmap_level, swap_behavior, ms_resolve, colorspace, alpha_format;
+    es_sfc sf;                                  /* its own framebuffer on board B */
 } egl_surf;
 typedef struct egl_ctx { struct egl_ctx *next; char *saved; int cfg, dead; DWORD thread; } egl_ctx;
 static egl_surf *g_surfs;
@@ -3184,12 +3210,13 @@ static egl_ctx *g_ctxs;
 static int g_egl_init;
 
 /* §3.1: each thread has its own current context and surface and its own error. GL and EGL calls are taken one at a time (g_lock, around every export): a GL call first puts its
-   thread's context in S (thread_bind). The surfaces still share one framebuffer */
+   thread's context in S and its surface in SF (thread_bind) */
 typedef struct egl_thread { egl_ctx *ctx; egl_surf *surf; EGLint err; } egl_thread;
 static CRITICAL_SECTION g_lock;
 static DWORD g_tls = TLS_OUT_OF_INDEXES;
 static egl_thread g_thr_spare;                  /* a thread whose own record could not be had */
 static egl_ctx *g_loaded;                       /* the context whose state is in S; NULL: S's context block is no context's */
+static es_sfc g_nosfc;                          /* SF of a thread with no surface */
 static egl_thread *thr(void)
 {
     egl_thread *t = (egl_thread *)TlsGetValue(g_tls);
@@ -3210,7 +3237,7 @@ static void thread_bind(void)
         if (t->ctx) memcpy(&S.ctx_begin, t->ctx->saved, n);
         g_loaded = t->ctx;
     }
-    S.hwnd = t->surf ? t->surf->hwnd : NULL;
+    S.sfp = t->surf ? &t->surf->sf : &g_nosfc;
     S.live = t->ctx && t->surf;
 }
 /* the generated exports (gles_entry_gen.h) call the implementations between these */
@@ -3229,6 +3256,8 @@ static egl_ctx *ctx_of(EGLContext c) { egl_ctx *x; for (x = g_ctxs; x; x = x->ne
 static void surf_free(egl_surf *x)
 {
     egl_surf **p = &g_surfs;
+    sfc_free(&x->sf);
+    if (S.sfp == &x->sf) S.sfp = &g_nosfc;
     while (*p && *p != x) p = &(*p)->next;
     if (*p) *p = x->next;
     free(x);
@@ -3448,6 +3477,7 @@ static void surf_defaults(egl_surf *t, EGLConfig c, int pbuffer)
     t->tex_format = t->tex_target = EGL_NO_TEXTURE;
     t->swap_behavior = EGL_BUFFER_DESTROYED; t->ms_resolve = EGL_MULTISAMPLE_RESOLVE_DEFAULT;
     t->colorspace = EGL_COLORSPACE_sRGB; t->alpha_format = EGL_ALPHA_FORMAT_NONPRE;
+    t->sf.swap_interval = 1;                    /* §3.9.3 */
 }
 /* the OpenVG attributes any surface takes: 0, or the error */
 static EGLint surf_vg_attr(egl_surf *t, EGLint name, EGLint v)
@@ -3475,7 +3505,7 @@ EGLSurface EGLAPI eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWin
     if (t.colorspace == EGL_COLORSPACE_LINEAR || t.alpha_format == EGL_ALPHA_FORMAT_PRE) EGL_FAIL(EGL_BAD_MATCH, NULL);
     if (!w || !IsWindow(w)) EGL_FAIL(EGL_BAD_NATIVE_WINDOW, NULL);
     for (s = g_surfs; s; s = s->next) if (!s->dead && s->hwnd == w) EGL_FAIL(EGL_BAD_ALLOC, NULL);     /* §3.5.1: one surface a window */
-    t.hwnd = w;
+    t.hwnd = t.sf.hwnd = w;
     win_size(w, &t.w, &t.h);
     if (!(s = surf_new(&t))) return NULL;
     E_OK();
@@ -3584,7 +3614,8 @@ EGLBoolean EGLAPI eglDestroyContext(EGLDisplay d, EGLContext c)
     E_OK();
     return 1;
 }
-/* §3.7.3. Releasing (no surfaces, no context) works on a display already terminated too. A dead surface or context that stops being current goes */
+/* §3.7.3. A context or surface current in another thread is EGL_BAD_ACCESS. Releasing (no surfaces, no context) works on a display already terminated too. A dead surface or context
+   that stops being current goes */
 EGLBoolean EGLAPI eglMakeCurrent(EGLDisplay d, EGLSurface ds, EGLSurface rs, EGLContext c)
 {
     egl_thread *t = thr();
@@ -3598,6 +3629,7 @@ EGLBoolean EGLAPI eglMakeCurrent(EGLDisplay d, EGLSurface ds, EGLSurface rs, EGL
     if (!c && (ds || rs)) EGL_FAIL(EGL_BAD_MATCH, 0);
     if (c && (!ds || !rs)) EGL_FAIL(EGL_BAD_MATCH, 0);          /* no surfaceless contexts */
     if (x != rx) EGL_FAIL(EGL_BAD_MATCH, 0);                    /* one framebuffer for drawing and reading */
+    if ((cx && cx->thread && cx->thread != me) || (x && x->thread && x->thread != me)) EGL_FAIL(EGL_BAD_ACCESS, 0);
     if (x && dev_up() < 0) EGL_FAIL(EGL_NOT_INITIALIZED, 0);
     if (old_c) old_c->thread = 0;
     if (old_s) old_s->thread = 0;
@@ -3610,7 +3642,7 @@ EGLBoolean EGLAPI eglMakeCurrent(EGLDisplay d, EGLSurface ds, EGLSurface rs, EGL
     if (!x) { E_OK(); return 1; }
     if (x->hwnd) win_size(x->hwnd, &x->w, &x->h);
     default_fb(x->w > 0 ? x->w : 1, x->h > 0 ? x->h : 1, x->cfg, x->hwnd != NULL);
-    if (!S.vp_set) { S.vp[2] = S.vw; S.vp[3] = S.vh; S.sc[2] = S.vw; S.sc[3] = S.vh; S.vp_set = 1; }     /* §2.12: the first time, the surface's size */
+    if (!S.vp_set) { S.vp[2] = SF->vw; S.vp[3] = SF->vh; S.sc[2] = SF->vw; S.sc[3] = SF->vh; S.vp_set = 1; }     /* §2.12: the first time, the surface's size */
     E_OK();
     return 1;
 }
@@ -3639,7 +3671,7 @@ EGLBoolean EGLAPI eglSwapInterval(EGLDisplay d, EGLint i)
     CHECK_DPY(d, 0);
     if (!t->ctx) EGL_FAIL(EGL_BAD_CONTEXT, 0);
     if (!t->surf) EGL_FAIL(EGL_BAD_SURFACE, 0);
-    S.swap_interval = i > 0;
+    t->surf->sf.swap_interval = i > 0;
     E_OK();
     return 1;
 }
@@ -3738,8 +3770,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID r)
         g_module = h;
         InitializeCriticalSection(&g_lock);
         g_tls = TlsAlloc();
+        S.sfp = &g_nosfc;
         init_state();
-        S.swap_interval = 1;
         SetProcessDPIAware();                                   /* before the game's first window (gl_dev.c says why) */
     } else if (why == DLL_THREAD_DETACH && g_tls != TLS_OUT_OF_INDEXES) {
         egl_thread *t = (egl_thread *)TlsGetValue(g_tls);

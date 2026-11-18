@@ -337,17 +337,42 @@ static const g2sc_struct *struct_of(const g2sc_result *r, const char *ty)
     return NULL;
 }
 
-/* a struct goes member by member; an array of them stays a block, a run-time index steps over whole structs */
-static int pk_leaf(const g2sc_result *r, const char *ty, int slot, int count, pk_var *o, int n)
+/* the uniform slots a stage's code reads, from the text the compile left: bit 0 an LDP of the slot, bit 1 the first slot of an LDPX (a run-time index added) */
+static void pk_loads(const char *sasm, unsigned char *ld, int n)
+{
+    const char *p = sasm;
+    while (p && *p) {
+        const char *e = strchr(p, '\n'), *end = e ? e : p + strlen(p), *q;
+        int x = end - p > 4 && p[3] == 'X';
+        if (end - p > 4 && !strncmp(p, "LDP", 3) && (p[3 + x] == ' ' || p[3 + x] == '.') && (q = memchr(p, ' ', (size_t)(end - p))) != NULL
+            && (q = memchr(q + 1, ' ', (size_t)(end - q - 1))) != NULL && q + 1 < end && q[1] >= '0' && q[1] <= '9') {
+            long v = strtol(q + 1, NULL, 10);
+            if (v < n) ld[v] |= (unsigned char)(x ? 2 : 1);
+        }
+        p = e ? e + 1 : NULL;
+    }
+}
+
+/* a struct goes member by member, an array of them element by element; one the code indexes at run time (an LDPX in it) stays a block, the index steps over whole
+ * structs. What the code never reads takes no row (§2.10.4: not an active uniform), as a sampler in a struct: its slot is a texture unit */
+static int pk_leaf(const g2sc_result *r, const char *ty, int slot, int count, pk_var *o, int n, const unsigned char *ld, int nld)
 {
     const g2sc_struct *s = struct_of(r, ty);
-    int i;
-    if (s && count) { o[n].slot = slot; o[n].rows = s->nslots * count; o[n].rank = 2; return n + 1; }
-    if (s) {
-        for (i = 0; i < s->nmembers; i++) n = pk_leaf(r, s->members[i].type, slot + s->members[i].offset, s->members[i].has_array ? s->members[i].array : 0, o, n);
+    int i, k, rows;
+    if (s && count) {
+        for (k = slot; k < slot + s->nslots * count && k < nld && !(ld[k] & 2); k++) ;
+        if (k < slot + s->nslots * count && k < nld) { o[n].slot = slot; o[n].rows = s->nslots * count; o[n].rank = 2; return n + 1; }
+        for (k = 0; k < count; k++) n = pk_leaf(r, ty, slot + k * s->nslots, 0, o, n, ld, nld);
         return n;
     }
-    o[n].slot = slot; o[n].rows = mat_rows(ty) * (count ? count : 1); o[n].rank = rank_of(ty);
+    if (s) {
+        for (i = 0; i < s->nmembers; i++) n = pk_leaf(r, s->members[i].type, slot + s->members[i].offset, s->members[i].has_array ? s->members[i].array : 0, o, n, ld, nld);
+        return n;
+    }
+    rows = mat_rows(ty) * (count ? count : 1);
+    for (k = slot; k < slot + rows && k < nld && !ld[k]; k++) ;
+    if (k == slot + rows || k >= nld) return n;
+    o[n].slot = slot; o[n].rows = rows; o[n].rank = rank_of(ty);
     return n + 1;
 }
 
@@ -363,25 +388,38 @@ static int pk_place(const pk_var *v, int n, int max_rows, int *map)
     return rows;
 }
 
-/* the uniform slots of a stage, into room rows; the compiler's own and the built-ins stay whole rows, the draw fills them so */
+/* the uniform slots of a stage, into room rows; the compiler's own and the built-ins stay whole rows, the draw fills them so. A slot the code never reads is -1 */
 static int *pk_uniforms(const g2sc_result *r, int room, int *urows)
 {
     pk_var *v = (pk_var *)malloc(((size_t)r->const_base + 1) * sizeof *v);
-    int *map = (int *)calloc((size_t)r->const_base + 1, sizeof(int));
+    int *map = (int *)malloc(((size_t)r->const_base + 1) * sizeof(int));
+    unsigned char *ld = (unsigned char *)calloc((size_t)r->const_base + 1, 1);
     int i, n = 0;
-    if (!v || !map) { free(v); free(map); return NULL; }
+    if (!v || !map || !ld) { free(v); free(map); free(ld); return NULL; }
+    for (i = 0; i <= r->const_base; i++) map[i] = -1;
+    pk_loads(r->sasm, ld, r->const_base);
     for (i = 0; i < r->nuniforms; i++) {
         const char *nm = sym_name(&r->uniforms[i]), *ty = sym_type(&r->uniforms[i]);
         int count = r->uniforms[i].has_array ? r->uniforms[i].array : 0;
         if (!strncmp(nm, "gl_", 3) || !strncmp(nm, "_g2_", 4) || !strncmp(nm, "g2", 2)) {
             const g2sc_struct *s = struct_of(r, ty);
             v[n].slot = r->uniforms[i].loc; v[n].rows = s ? s->nslots : mat_rows(ty) * (count ? count : 1); v[n].rank = 2; n++;
-        } else n = pk_leaf(r, ty, r->uniforms[i].loc, count, v, n);
+        } else n = pk_leaf(r, ty, r->uniforms[i].loc, count, v, n, ld, r->const_base);
     }
     *urows = room > 0 ? pk_place(v, n, room, map) : -1;
-    free(v);
+    free(v); free(ld);
     if (*urows < 0) { free(map); return NULL; }
     return map;
+}
+
+/* the map a packed compile takes: a slot the code never reads loads row 0, a load the optimizer removes (the first compile's code had none of it) */
+static int *pk_for_compile(const int *map, int n)
+{
+    int *c, i;
+    if (!map) return NULL;
+    c = (int *)malloc(((size_t)n + 1) * sizeof(int));
+    if (c) for (i = 0; i <= n; i++) c[i] = map[i] < 0 ? 0 : map[i];
+    return c;
 }
 
 void g2sc_link_free(g2sc_linked *l)
@@ -477,6 +515,7 @@ int g2sc_link_bound(const char *vs, const char *fs, const g2sc_bind *binds, int 
     if (pack_v || pack_uv || pack_uf) {
         g2sc_pack pk;
         g2sc_result r2;
+        int *cu_v, *cu_f, rc;
         memset(&pk, 0, sizeof pk);
         if (pack_v) {
             for (i = 0; i < MAX_VARY_SLOTS; i++) vmap[i] = -1;
@@ -488,13 +527,18 @@ int g2sc_link_bound(const char *vs, const char *fs, const g2sc_bind *binds, int 
         }
         if (pack_uv && !(o->umap_vs = pk_uniforms(rv, 256 - rv->nconst, &urv))) LINK_ERR("vertex stage: the uniforms do not pack into %d vectors", 256 - rv->nconst);
         if (pack_uf && !(o->umap_fs = pk_uniforms(rf, 64 - rf->nconst, &urf))) LINK_ERR("fragment stage: the uniforms do not pack into %d vectors", 64 - rf->nconst);
-        pk.umap = o->umap_vs; pk.urows = urv; pk.unread = unread;
+        cu_v = pk_for_compile(o->umap_vs, rv->const_base); cu_f = pk_for_compile(o->umap_fs, rf->const_base);
+        if ((o->umap_vs && !cu_v) || (o->umap_fs && !cu_f)) { free(cu_v); free(cu_f); LINK_ERR("out of memory"); }
+        pk.umap = cu_v; pk.urows = urv; pk.unread = unread;
         memset(&r2, 0, sizeof r2);
-        if (compile_opts(vs, G2SC_VS, NULL, 0, pk.unread, 0, 1, &pk, binds, nbinds, &r2) < 0) { snprintf(o->error, sizeof o->error, "vertex shader: %s", r2.error); g2sc_free(&r2); goto fail; }
+        rc = compile_opts(vs, G2SC_VS, NULL, 0, pk.unread, 0, 1, &pk, binds, nbinds, &r2);
+        if (rc < 0) { snprintf(o->error, sizeof o->error, "vertex shader: %s", r2.error); g2sc_free(&r2); free(cu_v); free(cu_f); goto fail; }
         g2sc_free(rv); *rv = r2;
-        pk.umap = o->umap_fs; pk.urows = urf; pk.unread = 0; pk.depth_units = depth_units;
+        pk.umap = cu_f; pk.urows = urf; pk.unread = 0; pk.depth_units = depth_units;
         memset(&r2, 0, sizeof r2);
-        if (g2sc_compile_packed(fs, G2SC_FS, order, nslots, &pk, &r2) < 0) { snprintf(o->error, sizeof o->error, "fragment shader: %s", r2.error); g2sc_free(&r2); goto fail; }
+        rc = g2sc_compile_packed(fs, G2SC_FS, order, nslots, &pk, &r2);
+        free(cu_v); free(cu_f);
+        if (rc < 0) { snprintf(o->error, sizeof o->error, "fragment shader: %s", r2.error); g2sc_free(&r2); goto fail; }
         g2sc_free(rf); *rf = r2;
     } else if (unread) {
         g2sc_result r2;

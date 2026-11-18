@@ -2,222 +2,222 @@ LIBRARY libGLESv2.dll
 EXPORTS
     angleForceDX9 @180
     angleSetLogDirectory @181
-    glActiveTexture @1
-    glAttachShader @2
-    glBeginQueryEXT @168
-    glBindAttribLocation @3
-    glBindBuffer @4
-    glBindFramebuffer @5
-    glBindRenderbuffer @6
-    glBindTexture @7
-    glBlendColor @8
-    glBlendEquation @9
-    glBlendEquationSeparate @10
-    glBlendFunc @11
-    glBlendFuncSeparate @12
-    glBlitFramebufferANGLE @149
-    glBufferData @13
-    glBufferSubData @14
-    glCheckFramebufferStatus @15
-    glClear @16
-    glClearColor @17
-    glClearDepthf @18
-    glClearStencil @19
-    glColorMask @20
-    glCompileShader @21
-    glCompressedTexImage2D @22
-    glCompressedTexSubImage2D @23
-    glCopyTexImage2D @24
-    glCopyTexSubImage2D @25
-    glCreateProgram @26
-    glCreateShader @27
-    glCullFace @28
-    glDeleteBuffers @29
-    glDeleteFencesNV @151
-    glDeleteFramebuffers @30
-    glDeleteProgram @32
-    glDeleteQueriesEXT @166
-    glDeleteRenderbuffers @33
-    glDeleteShader @34
-    glDeleteTextures @31
-    glDepthFunc @36
-    glDepthMask @37
-    glDepthRangef @38
-    glDetachShader @35
-    glDisable @39
-    glDisableVertexAttribArray @40
-    glDrawArrays @41
-    glDrawArraysInstancedANGLE @173
-    glDrawBuffersEXT @179
-    glDrawElements @42
-    glDrawElementsInstancedANGLE @174
-    glEnable @43
-    glEnableVertexAttribArray @44
-    glEndQueryEXT @169
-    glFinish @45
-    glFinishFenceNV @152
-    glFlush @46
-    glFramebufferRenderbuffer @47
-    glFramebufferTexture2D @48
-    glFrontFace @49
-    glGenBuffers @50
-    glGenFencesNV @153
-    glGenFramebuffers @52
-    glGenQueriesEXT @165
-    glGenRenderbuffers @53
-    glGenTextures @54
-    glGenerateMipmap @51
-    glGetActiveAttrib @55
-    glGetActiveUniform @56
-    glGetAttachedShaders @57
-    glGetAttribLocation @58
-    glGetBooleanv @59
-    glGetBufferParameteriv @60
-    glGetError @61
-    glGetFenceivNV @154
-    glGetFloatv @62
-    glGetFramebufferAttachmentParameteriv @63
-    glGetGraphicsResetStatusEXT @161
-    glGetIntegerv @64
-    glGetProgramBinaryOES @176
-    glGetProgramInfoLog @66
-    glGetProgramiv @65
-    glGetQueryObjectuivEXT @171
-    glGetQueryivEXT @170
-    glGetRenderbufferParameteriv @67
-    glGetShaderInfoLog @69
-    glGetShaderPrecisionFormat @70
-    glGetShaderSource @71
-    glGetShaderiv @68
-    glGetString @72
-    glGetTexParameterfv @73
-    glGetTexParameteriv @74
-    glGetTranslatedShaderSourceANGLE @159
-    glGetUniformLocation @77
-    glGetUniformfv @75
-    glGetUniformiv @76
-    glGetVertexAttribPointerv @80
-    glGetVertexAttribfv @78
-    glGetVertexAttribiv @79
-    glGetnUniformfvEXT @163
-    glGetnUniformivEXT @164
-    glHint @81
-    glIsBuffer @82
-    glIsEnabled @83
-    glIsFenceNV @155
-    glIsFramebuffer @84
-    glIsProgram @85
-    glIsQueryEXT @167
-    glIsRenderbuffer @86
-    glIsShader @87
-    glIsTexture @88
-    glLineWidth @89
-    glLinkProgram @90
-    glPixelStorei @91
-    glPolygonOffset @92
-    glProgramBinaryOES @175
-    glReadPixels @93
-    glReadnPixelsEXT @162
-    glReleaseShaderCompiler @94
-    glRenderbufferStorage @95
-    glRenderbufferStorageMultisampleANGLE @150
-    glSampleCoverage @96
-    glScissor @97
-    glSetFenceNV @156
-    glShaderBinary @98
-    glShaderSource @99
-    glStencilFunc @100
-    glStencilFuncSeparate @101
-    glStencilMask @102
-    glStencilMaskSeparate @103
-    glStencilOp @104
-    glStencilOpSeparate @105
-    glTestFenceNV @157
-    glTexImage2D @106
-    glTexImage3DOES @143
-    glTexParameterf @107
-    glTexParameterfv @108
-    glTexParameteri @109
-    glTexParameteriv @110
-    glTexStorage2DEXT @160
-    glTexSubImage2D @111
-    glUniform1f @112
-    glUniform1fv @113
-    glUniform1i @114
-    glUniform1iv @115
-    glUniform2f @116
-    glUniform2fv @117
-    glUniform2i @118
-    glUniform2iv @119
-    glUniform3f @120
-    glUniform3fv @121
-    glUniform3i @122
-    glUniform3iv @123
-    glUniform4f @124
-    glUniform4fv @125
-    glUniform4i @126
-    glUniform4iv @127
-    glUniformMatrix2fv @128
-    glUniformMatrix3fv @129
-    glUniformMatrix4fv @130
-    glUseProgram @131
-    glValidateProgram @132
-    glVertexAttrib1f @133
-    glVertexAttrib1fv @134
-    glVertexAttrib2f @135
-    glVertexAttrib2fv @136
-    glVertexAttrib3f @137
-    glVertexAttrib3fv @138
-    glVertexAttrib4f @139
-    glVertexAttrib4fv @140
-    glVertexAttribDivisorANGLE @172
-    glVertexAttribPointer @141
-    glViewport @142
-    eglBindAPI @182
-    eglBindTexImage @183
-    eglChooseConfig @184
-    eglCopyBuffers @185
-    eglCreateContext @186
-    eglCreatePbufferFromClientBuffer @187
-    eglCreatePbufferSurface @188
-    eglCreatePixmapSurface @189
-    eglCreateWindowSurface @190
-    eglDestroyContext @191
-    eglDestroySurface @192
-    eglGetConfigAttrib @193
-    eglGetConfigs @194
-    eglGetCurrentContext @195
-    eglGetCurrentDisplay @196
-    eglGetCurrentSurface @197
-    eglGetDisplay @198
-    eglGetError @199
-    eglGetProcAddress @200
-    eglInitialize @201
-    eglMakeCurrent @202
-    eglQueryAPI @203
-    eglQueryContext @204
-    eglQueryString @205
-    eglQuerySurface @206
-    eglReleaseTexImage @207
-    eglReleaseThread @208
-    eglSurfaceAttrib @209
-    eglSwapBuffers @210
-    eglSwapInterval @211
-    eglTerminate @212
-    eglWaitClient @213
-    eglWaitGL @214
-    eglWaitNative @215
-    glMapBufferOES @216
-    glUnmapBufferOES @217
-    glGetBufferPointervOES @218
-    glGenVertexArraysOES @219
-    glBindVertexArrayOES @220
-    glDeleteVertexArraysOES @221
-    glIsVertexArrayOES @222
-    glDiscardFramebufferEXT @223
-    glCompressedTexImage3DOES @224
-    glCompressedTexSubImage3DOES @225
-    glCopyTexSubImage3DOES @226
-    glFramebufferTexture3DOES @227
-    glTexStorage3DEXT @228
-    glTexSubImage3DOES @229
+    glActiveTexture = w_glActiveTexture @1
+    glAttachShader = w_glAttachShader @2
+    glBeginQueryEXT = w_glBeginQueryEXT @168
+    glBindAttribLocation = w_glBindAttribLocation @3
+    glBindBuffer = w_glBindBuffer @4
+    glBindFramebuffer = w_glBindFramebuffer @5
+    glBindRenderbuffer = w_glBindRenderbuffer @6
+    glBindTexture = w_glBindTexture @7
+    glBlendColor = w_glBlendColor @8
+    glBlendEquation = w_glBlendEquation @9
+    glBlendEquationSeparate = w_glBlendEquationSeparate @10
+    glBlendFunc = w_glBlendFunc @11
+    glBlendFuncSeparate = w_glBlendFuncSeparate @12
+    glBlitFramebufferANGLE = w_glBlitFramebufferANGLE @149
+    glBufferData = w_glBufferData @13
+    glBufferSubData = w_glBufferSubData @14
+    glCheckFramebufferStatus = w_glCheckFramebufferStatus @15
+    glClear = w_glClear @16
+    glClearColor = w_glClearColor @17
+    glClearDepthf = w_glClearDepthf @18
+    glClearStencil = w_glClearStencil @19
+    glColorMask = w_glColorMask @20
+    glCompileShader = w_glCompileShader @21
+    glCompressedTexImage2D = w_glCompressedTexImage2D @22
+    glCompressedTexSubImage2D = w_glCompressedTexSubImage2D @23
+    glCopyTexImage2D = w_glCopyTexImage2D @24
+    glCopyTexSubImage2D = w_glCopyTexSubImage2D @25
+    glCreateProgram = w_glCreateProgram @26
+    glCreateShader = w_glCreateShader @27
+    glCullFace = w_glCullFace @28
+    glDeleteBuffers = w_glDeleteBuffers @29
+    glDeleteFencesNV = w_glDeleteFencesNV @151
+    glDeleteFramebuffers = w_glDeleteFramebuffers @30
+    glDeleteProgram = w_glDeleteProgram @32
+    glDeleteQueriesEXT = w_glDeleteQueriesEXT @166
+    glDeleteRenderbuffers = w_glDeleteRenderbuffers @33
+    glDeleteShader = w_glDeleteShader @34
+    glDeleteTextures = w_glDeleteTextures @31
+    glDepthFunc = w_glDepthFunc @36
+    glDepthMask = w_glDepthMask @37
+    glDepthRangef = w_glDepthRangef @38
+    glDetachShader = w_glDetachShader @35
+    glDisable = w_glDisable @39
+    glDisableVertexAttribArray = w_glDisableVertexAttribArray @40
+    glDrawArrays = w_glDrawArrays @41
+    glDrawArraysInstancedANGLE = w_glDrawArraysInstancedANGLE @173
+    glDrawBuffersEXT = w_glDrawBuffersEXT @179
+    glDrawElements = w_glDrawElements @42
+    glDrawElementsInstancedANGLE = w_glDrawElementsInstancedANGLE @174
+    glEnable = w_glEnable @43
+    glEnableVertexAttribArray = w_glEnableVertexAttribArray @44
+    glEndQueryEXT = w_glEndQueryEXT @169
+    glFinish = w_glFinish @45
+    glFinishFenceNV = w_glFinishFenceNV @152
+    glFlush = w_glFlush @46
+    glFramebufferRenderbuffer = w_glFramebufferRenderbuffer @47
+    glFramebufferTexture2D = w_glFramebufferTexture2D @48
+    glFrontFace = w_glFrontFace @49
+    glGenBuffers = w_glGenBuffers @50
+    glGenFencesNV = w_glGenFencesNV @153
+    glGenFramebuffers = w_glGenFramebuffers @52
+    glGenQueriesEXT = w_glGenQueriesEXT @165
+    glGenRenderbuffers = w_glGenRenderbuffers @53
+    glGenTextures = w_glGenTextures @54
+    glGenerateMipmap = w_glGenerateMipmap @51
+    glGetActiveAttrib = w_glGetActiveAttrib @55
+    glGetActiveUniform = w_glGetActiveUniform @56
+    glGetAttachedShaders = w_glGetAttachedShaders @57
+    glGetAttribLocation = w_glGetAttribLocation @58
+    glGetBooleanv = w_glGetBooleanv @59
+    glGetBufferParameteriv = w_glGetBufferParameteriv @60
+    glGetError = w_glGetError @61
+    glGetFenceivNV = w_glGetFenceivNV @154
+    glGetFloatv = w_glGetFloatv @62
+    glGetFramebufferAttachmentParameteriv = w_glGetFramebufferAttachmentParameteriv @63
+    glGetGraphicsResetStatusEXT = w_glGetGraphicsResetStatusEXT @161
+    glGetIntegerv = w_glGetIntegerv @64
+    glGetProgramBinaryOES = w_glGetProgramBinaryOES @176
+    glGetProgramInfoLog = w_glGetProgramInfoLog @66
+    glGetProgramiv = w_glGetProgramiv @65
+    glGetQueryObjectuivEXT = w_glGetQueryObjectuivEXT @171
+    glGetQueryivEXT = w_glGetQueryivEXT @170
+    glGetRenderbufferParameteriv = w_glGetRenderbufferParameteriv @67
+    glGetShaderInfoLog = w_glGetShaderInfoLog @69
+    glGetShaderPrecisionFormat = w_glGetShaderPrecisionFormat @70
+    glGetShaderSource = w_glGetShaderSource @71
+    glGetShaderiv = w_glGetShaderiv @68
+    glGetString = w_glGetString @72
+    glGetTexParameterfv = w_glGetTexParameterfv @73
+    glGetTexParameteriv = w_glGetTexParameteriv @74
+    glGetTranslatedShaderSourceANGLE = w_glGetTranslatedShaderSourceANGLE @159
+    glGetUniformLocation = w_glGetUniformLocation @77
+    glGetUniformfv = w_glGetUniformfv @75
+    glGetUniformiv = w_glGetUniformiv @76
+    glGetVertexAttribPointerv = w_glGetVertexAttribPointerv @80
+    glGetVertexAttribfv = w_glGetVertexAttribfv @78
+    glGetVertexAttribiv = w_glGetVertexAttribiv @79
+    glGetnUniformfvEXT = w_glGetnUniformfvEXT @163
+    glGetnUniformivEXT = w_glGetnUniformivEXT @164
+    glHint = w_glHint @81
+    glIsBuffer = w_glIsBuffer @82
+    glIsEnabled = w_glIsEnabled @83
+    glIsFenceNV = w_glIsFenceNV @155
+    glIsFramebuffer = w_glIsFramebuffer @84
+    glIsProgram = w_glIsProgram @85
+    glIsQueryEXT = w_glIsQueryEXT @167
+    glIsRenderbuffer = w_glIsRenderbuffer @86
+    glIsShader = w_glIsShader @87
+    glIsTexture = w_glIsTexture @88
+    glLineWidth = w_glLineWidth @89
+    glLinkProgram = w_glLinkProgram @90
+    glPixelStorei = w_glPixelStorei @91
+    glPolygonOffset = w_glPolygonOffset @92
+    glProgramBinaryOES = w_glProgramBinaryOES @175
+    glReadPixels = w_glReadPixels @93
+    glReadnPixelsEXT = w_glReadnPixelsEXT @162
+    glReleaseShaderCompiler = w_glReleaseShaderCompiler @94
+    glRenderbufferStorage = w_glRenderbufferStorage @95
+    glRenderbufferStorageMultisampleANGLE = w_glRenderbufferStorageMultisampleANGLE @150
+    glSampleCoverage = w_glSampleCoverage @96
+    glScissor = w_glScissor @97
+    glSetFenceNV = w_glSetFenceNV @156
+    glShaderBinary = w_glShaderBinary @98
+    glShaderSource = w_glShaderSource @99
+    glStencilFunc = w_glStencilFunc @100
+    glStencilFuncSeparate = w_glStencilFuncSeparate @101
+    glStencilMask = w_glStencilMask @102
+    glStencilMaskSeparate = w_glStencilMaskSeparate @103
+    glStencilOp = w_glStencilOp @104
+    glStencilOpSeparate = w_glStencilOpSeparate @105
+    glTestFenceNV = w_glTestFenceNV @157
+    glTexImage2D = w_glTexImage2D @106
+    glTexImage3DOES = w_glTexImage3DOES @143
+    glTexParameterf = w_glTexParameterf @107
+    glTexParameterfv = w_glTexParameterfv @108
+    glTexParameteri = w_glTexParameteri @109
+    glTexParameteriv = w_glTexParameteriv @110
+    glTexStorage2DEXT = w_glTexStorage2DEXT @160
+    glTexSubImage2D = w_glTexSubImage2D @111
+    glUniform1f = w_glUniform1f @112
+    glUniform1fv = w_glUniform1fv @113
+    glUniform1i = w_glUniform1i @114
+    glUniform1iv = w_glUniform1iv @115
+    glUniform2f = w_glUniform2f @116
+    glUniform2fv = w_glUniform2fv @117
+    glUniform2i = w_glUniform2i @118
+    glUniform2iv = w_glUniform2iv @119
+    glUniform3f = w_glUniform3f @120
+    glUniform3fv = w_glUniform3fv @121
+    glUniform3i = w_glUniform3i @122
+    glUniform3iv = w_glUniform3iv @123
+    glUniform4f = w_glUniform4f @124
+    glUniform4fv = w_glUniform4fv @125
+    glUniform4i = w_glUniform4i @126
+    glUniform4iv = w_glUniform4iv @127
+    glUniformMatrix2fv = w_glUniformMatrix2fv @128
+    glUniformMatrix3fv = w_glUniformMatrix3fv @129
+    glUniformMatrix4fv = w_glUniformMatrix4fv @130
+    glUseProgram = w_glUseProgram @131
+    glValidateProgram = w_glValidateProgram @132
+    glVertexAttrib1f = w_glVertexAttrib1f @133
+    glVertexAttrib1fv = w_glVertexAttrib1fv @134
+    glVertexAttrib2f = w_glVertexAttrib2f @135
+    glVertexAttrib2fv = w_glVertexAttrib2fv @136
+    glVertexAttrib3f = w_glVertexAttrib3f @137
+    glVertexAttrib3fv = w_glVertexAttrib3fv @138
+    glVertexAttrib4f = w_glVertexAttrib4f @139
+    glVertexAttrib4fv = w_glVertexAttrib4fv @140
+    glVertexAttribDivisorANGLE = w_glVertexAttribDivisorANGLE @172
+    glVertexAttribPointer = w_glVertexAttribPointer @141
+    glViewport = w_glViewport @142
+    eglBindAPI = w_eglBindAPI @182
+    eglBindTexImage = w_eglBindTexImage @183
+    eglChooseConfig = w_eglChooseConfig @184
+    eglCopyBuffers = w_eglCopyBuffers @185
+    eglCreateContext = w_eglCreateContext @186
+    eglCreatePbufferFromClientBuffer = w_eglCreatePbufferFromClientBuffer @187
+    eglCreatePbufferSurface = w_eglCreatePbufferSurface @188
+    eglCreatePixmapSurface = w_eglCreatePixmapSurface @189
+    eglCreateWindowSurface = w_eglCreateWindowSurface @190
+    eglDestroyContext = w_eglDestroyContext @191
+    eglDestroySurface = w_eglDestroySurface @192
+    eglGetConfigAttrib = w_eglGetConfigAttrib @193
+    eglGetConfigs = w_eglGetConfigs @194
+    eglGetCurrentContext = w_eglGetCurrentContext @195
+    eglGetCurrentDisplay = w_eglGetCurrentDisplay @196
+    eglGetCurrentSurface = w_eglGetCurrentSurface @197
+    eglGetDisplay = w_eglGetDisplay @198
+    eglGetError = w_eglGetError @199
+    eglGetProcAddress = w_eglGetProcAddress @200
+    eglInitialize = w_eglInitialize @201
+    eglMakeCurrent = w_eglMakeCurrent @202
+    eglQueryAPI = w_eglQueryAPI @203
+    eglQueryContext = w_eglQueryContext @204
+    eglQueryString = w_eglQueryString @205
+    eglQuerySurface = w_eglQuerySurface @206
+    eglReleaseTexImage = w_eglReleaseTexImage @207
+    eglReleaseThread = w_eglReleaseThread @208
+    eglSurfaceAttrib = w_eglSurfaceAttrib @209
+    eglSwapBuffers = w_eglSwapBuffers @210
+    eglSwapInterval = w_eglSwapInterval @211
+    eglTerminate = w_eglTerminate @212
+    eglWaitClient = w_eglWaitClient @213
+    eglWaitGL = w_eglWaitGL @214
+    eglWaitNative = w_eglWaitNative @215
+    glMapBufferOES = w_glMapBufferOES @216
+    glUnmapBufferOES = w_glUnmapBufferOES @217
+    glGetBufferPointervOES = w_glGetBufferPointervOES @218
+    glGenVertexArraysOES = w_glGenVertexArraysOES @219
+    glBindVertexArrayOES = w_glBindVertexArrayOES @220
+    glDeleteVertexArraysOES = w_glDeleteVertexArraysOES @221
+    glIsVertexArrayOES = w_glIsVertexArrayOES @222
+    glDiscardFramebufferEXT = w_glDiscardFramebufferEXT @223
+    glCompressedTexImage3DOES = w_glCompressedTexImage3DOES @224
+    glCompressedTexSubImage3DOES = w_glCompressedTexSubImage3DOES @225
+    glCopyTexSubImage3DOES = w_glCopyTexSubImage3DOES @226
+    glFramebufferTexture3DOES = w_glFramebufferTexture3DOES @227
+    glTexStorage3DEXT = w_glTexStorage3DEXT @228
+    glTexSubImage3DOES = w_glTexSubImage3DOES @229

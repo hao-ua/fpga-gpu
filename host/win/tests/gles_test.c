@@ -39,6 +39,7 @@ int EGLAPI eglQuerySurface(EGLDisplay, EGLSurface, EGLint, EGLint *);
 int EGLAPI eglGetConfigAttrib(EGLDisplay, EGLConfig, EGLint, EGLint *);
 EGLint EGLAPI eglGetError(void);
 void *EGLAPI eglGetProcAddress(const char *);
+EGLContext EGLAPI eglGetCurrentContext(void);
 
 #define W 640
 #define H 480
@@ -3187,6 +3188,100 @@ static void test_egl_api(void)
     err(GL_NO_ERROR, "EGL handles and errors");
 }
 
+/* one pixel as 0xRRGGBBAA */
+static uint32_t pixel_at(int x, int y)
+{
+    uint8_t c[4];
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+    return (uint32_t)c[0] << 24 | (uint32_t)c[1] << 16 | (uint32_t)c[2] << 8 | c[3];
+}
+
+/* what a second thread does, and what it saw: its checks are counted by the main thread after it ended */
+typedef struct thr_job {
+    int what;                                   /* 0: an EGL error of its own; 1: render in its own context; 2: end with a context current */
+    EGLSurface surf;
+    EGLContext ctx;
+    float rgb[3];
+    uint32_t want;
+    int bad_surf, made, own_ctx, err_after, cleared, wrong;
+} thr_job;
+
+static DWORD WINAPI thr_main(void *p)
+{
+    thr_job *j = (thr_job *)p;
+    if (j->what == 0) {
+        j->bad_surf = !eglMakeCurrent(g_dpy, (EGLSurface)(intptr_t)-1, (EGLSurface)(intptr_t)-1, j->ctx) ? eglGetError() : 0;
+        j->own_ctx = eglGetCurrentContext() == NULL;
+        return 0;
+    }
+    j->made = eglMakeCurrent(g_dpy, j->surf, j->surf, j->ctx);
+    j->own_ctx = eglGetCurrentContext() == j->ctx;
+    if (!j->made) return 0;
+    glViewport(0, 0, 16, 16);
+    glClearColor(j->rgb[0], j->rgb[1], j->rgb[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (pixel_at(3, 3) != j->want) j->wrong++;
+    else j->cleared++;
+    j->err_after = (int)glGetError();
+    if (j->what != 2) eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+    return 0;
+}
+
+static void thr_run(thr_job *j, int n)
+{
+    HANDLE h[4];
+    int i;
+    for (i = 0; i < n; i++) h[i] = CreateThread(NULL, 0, thr_main, &j[i], 0, NULL);
+    WaitForMultipleObjects((DWORD)n, h, TRUE, 30000);
+    for (i = 0; i < n; i++) CloseHandle(h[i]);
+}
+
+/* EGL §3.1: a current context and surface per thread, its own error per thread */
+static void test_threads(void)
+{
+    static const EGLint ca[] = { 0x3098, 2, 0x3038 }, pa[] = { 0x3057, 16, 0x3056, 16, 0x3038 };
+    EGLSurface a = eglCreatePbufferSurface(g_dpy, g_cfg, pa), b = eglCreatePbufferSurface(g_dpy, g_cfg, pa);
+    EGLContext c2 = eglCreateContext(g_dpy, g_cfg, NULL, ca);
+    thr_job j[1];
+    float cc[4];
+    ok(a && b && c2, "two pbuffers and another context");
+    if (!a || !b || !c2) return;
+    /* another thread's EGL error is its own */
+    ok(eglMakeCurrent(g_dpy, a, a, g_ctx), "pbuffer a current for the thread tests");
+    glViewport(0, 0, 16, 16);
+    glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
+    memset(j, 0, sizeof j);
+    j[0].what = 0; j[0].ctx = c2;
+    thr_run(j, 1);
+    ieq(j[0].bad_surf, 0x300D, "another thread's eglMakeCurrent of no surface: EGL_BAD_SURFACE there");
+    ok(j[0].own_ctx, "the other thread has no context");
+    ok(eglGetError() == 0x3000, "this thread's EGL error is not the other thread's");
+    ok(eglGetCurrentContext() == g_ctx, "this thread keeps its context");
+    /* another thread renders in its own context and surface; this thread's state stays as it was */
+    memset(j, 0, sizeof j);
+    j[0].what = 1; j[0].surf = b; j[0].ctx = c2; j[0].rgb[1] = 1.0f; j[0].want = 0x00FF00FFu;
+    thr_run(j, 1);
+    ok(j[0].made && j[0].own_ctx, "a second thread makes its own context and pbuffer b current");
+    ieq(j[0].cleared, 1, "the second thread reads what it cleared");
+    ieq(j[0].err_after, GL_NO_ERROR, "no GL error in the second thread");
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+    ok(cc[0] == 0.5f && cc[1] == 0.5f, "this thread's clear colour is its own");
+    ok(eglMakeCurrent(g_dpy, b, b, g_ctx), "pbuffer b, released by the other thread, current here");
+    px(3, 3, "pbuffer b holds what the other thread cleared", 0, 255, 0, 255);
+    /* a thread that ends with a context current lets it go */
+    memset(j, 0, sizeof j);
+    j[0].what = 2; j[0].surf = a; j[0].ctx = c2; j[0].rgb[0] = 1.0f; j[0].rgb[2] = 1.0f; j[0].want = 0xFF00FFFFu;
+    thr_run(j, 1);
+    ok(j[0].made && j[0].cleared == 1, "a thread clears pbuffer a and ends with it current");
+    ok(eglMakeCurrent(g_dpy, a, a, c2), "its context and pbuffer current here after it ended");
+    px(3, 3, "pbuffer a holds what the ended thread cleared", 255, 0, 255, 255);
+    ok(eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx), "this thread back on the window");
+    glViewport(0, 0, W, H);
+    eglDestroySurface(g_dpy, a); eglDestroySurface(g_dpy, b);
+    eglDestroyContext(g_dpy, c2);
+    err(GL_NO_ERROR, "threads");
+}
+
 int main(void)
 {
     static const EGLint want[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3026, 8, 0x3033, 4, 0x3040, 4, 0x3038 };
@@ -3281,6 +3376,7 @@ int main(void)
     test_configs();
     test_pbuffer_swap();
     test_egl_api();
+    test_threads();
     test_swap();
     printf("%d checks, %d failed\n", g_checks, g_bad);
     if (!g_bad) printf("OK gles_test\n");

@@ -211,7 +211,7 @@ static struct {
     es_shader *shaders[HASH];
     es_prog *progs[HASH];
     GLuint next_name;
-    char ctx_begin;                             /* from here to ctx_end: one context's state, swapped by eglMakeCurrent */
+    char ctx_begin;                             /* from here to ctx_end: one context's state, swapped when a thread with another context calls (thread_bind) */
     GLenum error;
     int vp_set, tex_storing;
     GLuint array_buf, elem_buf, fb, read_fb, rb;
@@ -3169,53 +3169,101 @@ enum { EGL_SUCCESS = 0x3000, EGL_NOT_INITIALIZED = 0x3001, EGL_BAD_ATTRIBUTE = 0
        EGL_ALPHA_FORMAT_NONPRE = 0x308B, EGL_ALPHA_FORMAT_PRE = 0x308C, EGL_HORIZONTAL_RESOLUTION = 0x3090, EGL_VERTICAL_RESOLUTION = 0x3091, EGL_PIXEL_ASPECT_RATIO = 0x3092, EGL_BUFFER_PRESERVED = 0x3094,
        EGL_MULTISAMPLE_RESOLVE = 0x3099, EGL_MULTISAMPLE_RESOLVE_DEFAULT = 0x309A, EGL_MULTISAMPLE_RESOLVE_BOX = 0x309B };
 
-/* A surface or context handle is the object's address, valid while the object is in its list. One destroyed while current is dead: its handle is no longer valid, and it goes when it is
-   released (§3.5.5, §3.7.2). The configs have no VG bits, no EGL_SWAP_BEHAVIOR_PRESERVED_BIT and no EGL_MULTISAMPLE_RESOLVE_BOX_BIT */
+/* A surface or context handle is the object's address, valid while the object is in its list. One destroyed while current is dead: its handle is no longer valid, and it goes when no
+   thread has it current (§3.5.5, §3.7.2). thread: the thread it is current in, 0 for none. The configs have no VG bits, no EGL_SWAP_BEHAVIOR_PRESERVED_BIT and no EGL_MULTISAMPLE_RESOLVE_BOX_BIT */
 typedef struct egl_surf {
     struct egl_surf *next;
     HWND hwnd;
     int w, h, cfg, pbuffer, dead;
+    DWORD thread;
     EGLint largest, tex_format, tex_target, mipmap_tex, mipmap_level, swap_behavior, ms_resolve, colorspace, alpha_format;
 } egl_surf;
-typedef struct egl_ctx { struct egl_ctx *next; char *saved; int cfg, dead; } egl_ctx;
+typedef struct egl_ctx { struct egl_ctx *next; char *saved; int cfg, dead; DWORD thread; } egl_ctx;
 static egl_surf *g_surfs;
 static egl_ctx *g_ctxs;
-static EGLint g_egl_err = EGL_SUCCESS;
-static egl_surf *g_cur_surf;
-static egl_ctx *g_cur_ctx;
 static int g_egl_init;
-#define E_OK() (g_egl_err = EGL_SUCCESS)
+
+/* §3.1: each thread has its own current context and surface and its own error. GL and EGL calls are taken one at a time (g_lock, around every export): a GL call first puts its
+   thread's context in S (thread_bind). The surfaces still share one framebuffer */
+typedef struct egl_thread { egl_ctx *ctx; egl_surf *surf; EGLint err; } egl_thread;
+static CRITICAL_SECTION g_lock;
+static DWORD g_tls = TLS_OUT_OF_INDEXES;
+static egl_thread g_thr_spare;                  /* a thread whose own record could not be had */
+static egl_ctx *g_loaded;                       /* the context whose state is in S; NULL: S's context block is no context's */
+static egl_thread *thr(void)
+{
+    egl_thread *t = (egl_thread *)TlsGetValue(g_tls);
+    if (!t) {
+        t = (egl_thread *)calloc(1, sizeof *t);
+        if (!t) t = &g_thr_spare;
+        TlsSetValue(g_tls, t);
+    }
+    return t;
+}
+static void thread_bind(void)
+{
+    egl_thread *t = thr();
+    size_t n = (size_t)(&S.ctx_end - &S.ctx_begin);
+    if (t->ctx != g_loaded) {
+        if (S.r) g2r_end_pass(S.r);
+        if (g_loaded) memcpy(g_loaded->saved, &S.ctx_begin, n);
+        if (t->ctx) memcpy(&S.ctx_begin, t->ctx->saved, n);
+        g_loaded = t->ctx;
+    }
+    S.hwnd = t->surf ? t->surf->hwnd : NULL;
+    S.live = t->ctx && t->surf;
+}
+/* the generated exports (gles_entry_gen.h) call the implementations between these */
+static void gl_enter(void) { EnterCriticalSection(&g_lock); thread_bind(); }
+static void egl_enter(void) { EnterCriticalSection(&g_lock); }
+static void api_leave(void) { LeaveCriticalSection(&g_lock); }
+
+#define EGL_ERR (thr()->err)
+#define E_OK() (EGL_ERR = EGL_SUCCESS)
 #define DISPLAY ((EGLDisplay)1)
-#define CHECK_DPY(d, ret) do { if ((d) != DISPLAY) { g_egl_err = EGL_BAD_DISPLAY; return ret; } if (!g_egl_init) { g_egl_err = EGL_NOT_INITIALIZED; return ret; } } while (0)
-#define EGL_FAIL(e, ret) do { g_egl_err = (e); return ret; } while (0)
+#define CHECK_DPY(d, ret) do { if ((d) != DISPLAY) { EGL_ERR = EGL_BAD_DISPLAY; return ret; } if (!g_egl_init) { EGL_ERR = EGL_NOT_INITIALIZED; return ret; } } while (0)
+#define EGL_FAIL(e, ret) do { EGL_ERR = (e); return ret; } while (0)
 
 static egl_surf *surf_of(EGLSurface s) { egl_surf *x; for (x = g_surfs; x; x = x->next) if ((void *)x == s) return x->dead ? NULL : x; return NULL; }
 static egl_ctx *ctx_of(EGLContext c) { egl_ctx *x; for (x = g_ctxs; x; x = x->next) if ((void *)x == c) return x->dead ? NULL : x; return NULL; }
-static void surf_free(egl_surf *x) { egl_surf **p = &g_surfs; while (*p && *p != x) p = &(*p)->next; if (*p) *p = x->next; free(x); }
-static void ctx_free(egl_ctx *x) { egl_ctx **p = &g_ctxs; while (*p && *p != x) p = &(*p)->next; if (*p) *p = x->next; free(x->saved); free(x); }
+static void surf_free(egl_surf *x)
+{
+    egl_surf **p = &g_surfs;
+    while (*p && *p != x) p = &(*p)->next;
+    if (*p) *p = x->next;
+    free(x);
+}
+static void ctx_free(egl_ctx *x)
+{
+    egl_ctx **p = &g_ctxs;
+    if (g_loaded == x) g_loaded = NULL;
+    while (*p && *p != x) p = &(*p)->next;
+    if (*p) *p = x->next;
+    free(x->saved);
+    free(x);
+}
 
-EGLint EGLAPI eglGetError(void) { EGLint e = g_egl_err; g_egl_err = EGL_SUCCESS; return e; }
+EGLint EGLAPI eglGetError(void) { EGLint e = EGL_ERR; EGL_ERR = EGL_SUCCESS; return e; }
 EGLDisplay EGLAPI eglGetDisplay(void *id) { (void)id; E_OK(); return DISPLAY; }
 EGLBoolean EGLAPI eglInitialize(EGLDisplay d, EGLint *maj, EGLint *min)
 {
-    if (d != DISPLAY) { g_egl_err = EGL_BAD_DISPLAY; return 0; }
+    if (d != DISPLAY) { EGL_ERR = EGL_BAD_DISPLAY; return 0; }
     g_egl_init = 1;
     if (maj) *maj = 1;
     if (min) *min = 4;
     E_OK();
     return 1;
 }
-/* §3.2: every surface and context of the display goes; one that is current lives on, with a handle no longer valid, until it is released */
+/* §3.2: every surface and context of the display goes; one that is current lives on, with a handle no longer valid, until it is released. Also the dead ones whose thread
+   ended while they were current */
 EGLBoolean EGLAPI eglTerminate(EGLDisplay d)
 {
     egl_surf *s, *sn;
     egl_ctx *c, *cn;
     if (d != DISPLAY) EGL_FAIL(EGL_BAD_DISPLAY, 0);
-    if (g_egl_init) {
-        for (s = g_surfs; s; s = sn) { sn = s->next; if (s == g_cur_surf) s->dead = 1; else surf_free(s); }
-        for (c = g_ctxs; c; c = cn) { cn = c->next; if (c == g_cur_ctx) c->dead = 1; else ctx_free(c); }
-        g_egl_init = 0;
-    }
+    for (s = g_surfs; s; s = sn) { sn = s->next; if (s->thread) s->dead = 1; else surf_free(s); }
+    for (c = g_ctxs; c; c = cn) { cn = c->next; if (c->thread) c->dead = 1; else ctx_free(c); }
+    g_egl_init = 0;
     E_OK();
     return 1;
 }
@@ -3228,7 +3276,7 @@ const char *EGLAPI eglQueryString(EGLDisplay d, EGLint n)
     case EGL_VERSION: return "1.4 gpu2";
     case EGL_EXTENSIONS: return "";
     case EGL_CLIENT_APIS: return "OpenGL_ES";
-    default: g_egl_err = EGL_BAD_PARAMETER; return NULL;
+    default: EGL_ERR = EGL_BAD_PARAMETER; return NULL;
     }
 }
 
@@ -3378,9 +3426,9 @@ EGLBoolean EGLAPI eglGetConfigAttrib(EGLDisplay d, EGLConfig c, EGLint a, EGLint
 {
     int i = (int)(intptr_t)c;
     CHECK_DPY(d, 0);
-    if (!cfg_ok(c)) { g_egl_err = EGL_BAD_CONFIG; return 0; }
+    if (!cfg_ok(c)) { EGL_ERR = EGL_BAD_CONFIG; return 0; }
     *v = cfg_attr(i, a);
-    if (*v == -1) { g_egl_err = EGL_BAD_ATTRIBUTE; return 0; }
+    if (*v == -1) { EGL_ERR = EGL_BAD_ATTRIBUTE; return 0; }
     E_OK();
     return 1;
 }
@@ -3388,7 +3436,7 @@ EGLBoolean EGLAPI eglGetConfigAttrib(EGLDisplay d, EGLConfig c, EGLint a, EGLint
 static egl_surf *surf_new(const egl_surf *t)
 {
     egl_surf *s = (egl_surf *)malloc(sizeof *s);
-    if (!s) { g_egl_err = EGL_BAD_ALLOC; return NULL; }
+    if (!s) { EGL_ERR = EGL_BAD_ALLOC; return NULL; }
     *s = *t;
     s->next = g_surfs; g_surfs = s;
     return s;
@@ -3465,7 +3513,7 @@ EGLBoolean EGLAPI eglDestroySurface(EGLDisplay d, EGLSurface s)
     egl_surf *x;
     CHECK_DPY(d, 0);
     if (!(x = surf_of(s))) EGL_FAIL(EGL_BAD_SURFACE, 0);
-    if (x == g_cur_surf) x->dead = 1; else surf_free(x);
+    if (x->thread) x->dead = 1; else surf_free(x);
     E_OK();
     return 1;
 }
@@ -3496,7 +3544,7 @@ EGLBoolean EGLAPI eglQuerySurface(EGLDisplay d, EGLSurface s, EGLint a, EGLint *
     E_OK();
     return 1;
 }
-EGLBoolean EGLAPI eglBindAPI(EGLenum a) { if (a != EGL_OPENGL_ES_API) { g_egl_err = EGL_BAD_PARAMETER; return 0; } E_OK(); return 1; }
+EGLBoolean EGLAPI eglBindAPI(EGLenum a) { if (a != EGL_OPENGL_ES_API) { EGL_ERR = EGL_BAD_PARAMETER; return 0; } E_OK(); return 1; }
 EGLenum EGLAPI eglQueryAPI(void) { E_OK(); return EGL_OPENGL_ES_API; }
 EGLContext EGLAPI eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext sh, const EGLint *a)
 {
@@ -3532,16 +3580,17 @@ EGLBoolean EGLAPI eglDestroyContext(EGLDisplay d, EGLContext c)
     egl_ctx *x;
     CHECK_DPY(d, 0);
     if (!(x = ctx_of(c))) EGL_FAIL(EGL_BAD_CONTEXT, 0);
-    if (x == g_cur_ctx) x->dead = 1; else ctx_free(x);
+    if (x->thread) x->dead = 1; else ctx_free(x);
     E_OK();
     return 1;
 }
 /* §3.7.3. Releasing (no surfaces, no context) works on a display already terminated too. A dead surface or context that stops being current goes */
 EGLBoolean EGLAPI eglMakeCurrent(EGLDisplay d, EGLSurface ds, EGLSurface rs, EGLContext c)
 {
-    size_t n = (size_t)(&S.ctx_end - &S.ctx_begin);
-    egl_surf *x = NULL, *rx = NULL, *old_s = g_cur_surf;
-    egl_ctx *cx = NULL, *old_c = g_cur_ctx;
+    egl_thread *t = thr();
+    DWORD me = GetCurrentThreadId();
+    egl_surf *x = NULL, *rx = NULL, *old_s = t->surf;
+    egl_ctx *cx = NULL, *old_c = t->ctx;
     if (d != DISPLAY) EGL_FAIL(EGL_BAD_DISPLAY, 0);
     if (!g_egl_init && (ds || rs || c)) EGL_FAIL(EGL_NOT_INITIALIZED, 0);
     if (c && !(cx = ctx_of(c))) EGL_FAIL(EGL_BAD_CONTEXT, 0);
@@ -3549,38 +3598,36 @@ EGLBoolean EGLAPI eglMakeCurrent(EGLDisplay d, EGLSurface ds, EGLSurface rs, EGL
     if (!c && (ds || rs)) EGL_FAIL(EGL_BAD_MATCH, 0);
     if (c && (!ds || !rs)) EGL_FAIL(EGL_BAD_MATCH, 0);          /* no surfaceless contexts */
     if (x != rx) EGL_FAIL(EGL_BAD_MATCH, 0);                    /* one framebuffer for drawing and reading */
-    if (cx != g_cur_ctx) {
-        if (S.r) g2r_end_pass(S.r);
-        if (g_cur_ctx) memcpy(g_cur_ctx->saved, &S.ctx_begin, n);
-        if (cx) memcpy(&S.ctx_begin, cx->saved, n);
-        g_cur_ctx = cx;
-    }
-    g_cur_surf = x;
-    if (old_s && old_s != x && old_s->dead) surf_free(old_s);
-    if (old_c && old_c != cx && old_c->dead) ctx_free(old_c);
-    if (!x) { S.live = 0; E_OK(); return 1; }
-    if (dev_up() < 0) EGL_FAIL(EGL_NOT_INITIALIZED, 0);
+    if (x && dev_up() < 0) EGL_FAIL(EGL_NOT_INITIALIZED, 0);
+    if (old_c) old_c->thread = 0;
+    if (old_s) old_s->thread = 0;
+    t->ctx = cx; t->surf = x;
+    if (cx) cx->thread = me;
+    if (x) x->thread = me;
+    thread_bind();
+    if (old_s && old_s != x && old_s->dead && !old_s->thread) surf_free(old_s);
+    if (old_c && old_c != cx && old_c->dead && !old_c->thread) ctx_free(old_c);
+    if (!x) { E_OK(); return 1; }
     if (x->hwnd) win_size(x->hwnd, &x->w, &x->h);
     default_fb(x->w > 0 ? x->w : 1, x->h > 0 ? x->h : 1, x->cfg, x->hwnd != NULL);
     if (!S.vp_set) { S.vp[2] = S.vw; S.vp[3] = S.vh; S.sc[2] = S.vw; S.sc[3] = S.vh; S.vp_set = 1; }     /* §2.12: the first time, the surface's size */
-    S.live = 1;
-    S.hwnd = x->hwnd;
     E_OK();
     return 1;
 }
-EGLContext EGLAPI eglGetCurrentContext(void) { E_OK(); return g_cur_ctx; }
+EGLContext EGLAPI eglGetCurrentContext(void) { E_OK(); return thr()->ctx; }
 EGLSurface EGLAPI eglGetCurrentSurface(EGLint r)
 {
     if (r != EGL_DRAW && r != EGL_READ) EGL_FAIL(EGL_BAD_PARAMETER, NULL);
     E_OK();
-    return g_cur_surf;
+    return thr()->surf;
 }
-EGLDisplay EGLAPI eglGetCurrentDisplay(void) { E_OK(); return g_cur_ctx ? DISPLAY : NULL; }
+EGLDisplay EGLAPI eglGetCurrentDisplay(void) { E_OK(); return thr()->ctx ? DISPLAY : NULL; }
 EGLBoolean EGLAPI eglSwapBuffers(EGLDisplay d, EGLSurface s)
 {
     egl_surf *x;
     CHECK_DPY(d, 0);
-    if (!(x = surf_of(s)) || x != g_cur_surf) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    if (!(x = surf_of(s)) || x != thr()->surf) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    thread_bind();
     if (S.live && x->hwnd) swap_buffers();                      /* EGL 1.4 §3.9.3: on a pbuffer it has no effect, its colour buffer stays as it is */
     E_OK();
     return 1;
@@ -3588,9 +3635,10 @@ EGLBoolean EGLAPI eglSwapBuffers(EGLDisplay d, EGLSurface s)
 /* for the window surface of the current context, clamped to the configs' 0 .. 1 */
 EGLBoolean EGLAPI eglSwapInterval(EGLDisplay d, EGLint i)
 {
+    egl_thread *t = thr();
     CHECK_DPY(d, 0);
-    if (!g_cur_ctx) EGL_FAIL(EGL_BAD_CONTEXT, 0);
-    if (!g_cur_surf) EGL_FAIL(EGL_BAD_SURFACE, 0);
+    if (!t->ctx) EGL_FAIL(EGL_BAD_CONTEXT, 0);
+    if (!t->surf) EGL_FAIL(EGL_BAD_SURFACE, 0);
     S.swap_interval = i > 0;
     E_OK();
     return 1;
@@ -3603,13 +3651,13 @@ EGLBoolean EGLAPI eglCopyBuffers(EGLDisplay d, EGLSurface s, void *t)
     if (!surf_of(s)) EGL_FAIL(EGL_BAD_SURFACE, 0);
     EGL_FAIL(EGL_BAD_NATIVE_PIXMAP, 0);
 }
-EGLBoolean EGLAPI eglWaitGL(void) { if (S.live) g2r_finish(S.r); E_OK(); return 1; }
+EGLBoolean EGLAPI eglWaitGL(void) { thread_bind(); if (S.live) g2r_finish(S.r); E_OK(); return 1; }
 EGLBoolean EGLAPI eglWaitNative(EGLint e) { (void)e; E_OK(); return 1; }       /* no surface takes native rendering, so no engine is wrong */
 EGLBoolean EGLAPI eglWaitClient(void) { return eglWaitGL(); }
 /* §3.11: the thread back to its state at start: no current context */
 EGLBoolean EGLAPI eglReleaseThread(void)
 {
-    if (g_cur_ctx || g_cur_surf) eglMakeCurrent(DISPLAY, NULL, NULL, NULL);
+    if (thr()->ctx || thr()->surf) eglMakeCurrent(DISPLAY, NULL, NULL, NULL);
     E_OK();
     return 1;
 }
@@ -3670,7 +3718,7 @@ EGLBoolean EGLAPI eglQueryContext(EGLDisplay d, EGLContext c, EGLint a, EGLint *
     case EGL_CONFIG_ID: *v = x->cfg; break;
     case EGL_CONTEXT_CLIENT_TYPE: *v = EGL_OPENGL_ES_API; break;
     case EGL_CONTEXT_CLIENT_VERSION: *v = 2; break;
-    case EGL_RENDER_BUFFER: *v = x == g_cur_ctx && g_cur_surf ? EGL_BACK_BUFFER : EGL_NONE; break;     /* §3.7.4: EGL_NONE while bound to no surface */
+    case EGL_RENDER_BUFFER: *v = x->thread ? EGL_BACK_BUFFER : EGL_NONE; break;     /* §3.7.4: EGL_NONE while bound to no surface (a current context always has one) */
     default: EGL_FAIL(EGL_BAD_ATTRIBUTE, 0);
     }
     E_OK();
@@ -3680,15 +3728,29 @@ EGLBoolean EGLAPI eglQueryContext(EGLDisplay d, EGLContext c, EGLint a, EGLint *
 static HMODULE g_module;
 void *EGLAPI eglGetProcAddress(const char *name) { return (void *)GetProcAddress(g_module, name); }
 
+/* A thread that ends lets go of its context and surface, as a release would. Without g_lock: the loader lock is held here, and a thread inside a call may be waiting for
+   it (a DLL its socket code loads). No other thread changes or frees what is current in this one; once its thread is 0 this thread touches it no more. A dead one goes at
+   eglTerminate; no board work here */
 BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID r)
 {
     (void)r;
     if (why == DLL_PROCESS_ATTACH) {
         g_module = h;
-        DisableThreadLibraryCalls(h);
+        InitializeCriticalSection(&g_lock);
+        g_tls = TlsAlloc();
         init_state();
         S.swap_interval = 1;
         SetProcessDPIAware();                                   /* before the game's first window (gl_dev.c says why) */
+    } else if (why == DLL_THREAD_DETACH && g_tls != TLS_OUT_OF_INDEXES) {
+        egl_thread *t = (egl_thread *)TlsGetValue(g_tls);
+        if (t && t != &g_thr_spare) {
+            if (t->surf) *(volatile DWORD *)&t->surf->thread = 0;
+            if (t->ctx) *(volatile DWORD *)&t->ctx->thread = 0;
+            TlsSetValue(g_tls, NULL);
+            free(t);
+        }
     }
     return TRUE;
 }
+
+#include "gles_entry_gen.h"
